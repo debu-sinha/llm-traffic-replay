@@ -38,3 +38,23 @@ def test_shard_partitions_exactly():
     together = np.sort(np.concatenate(parts))
     assert np.array_equal(together, s["timestamps"])
     assert abs(len(parts[0]) - len(parts[1])) <= 1
+
+
+def test_load_trace_replaces_synthetic(tmp_path_factory=None):
+    import tempfile
+    from pathlib import Path
+    from traffic_replay.schedule import load_trace
+    d = Path(tempfile.mkdtemp())
+    # plain-text timestamps, unsorted, non-zero-based
+    (d / "trace.txt").write_text("\n".join(
+        str(t) for t in [100.5, 100.1, 103.0, 101.7, 102.2]))
+    s = load_trace(d / "trace.txt")
+    ts = s["timestamps"]
+    assert ts[0] == 0.0                      # shifted to start at zero
+    assert (np.diff(ts) >= 0).all()          # sorted
+    assert len(ts) == 5
+    # JSONL form with duration cap
+    (d / "trace.jsonl").write_text("\n".join(
+        f'{{"t": {t}}}' for t in [10.0, 11.0, 12.0, 40.0]))
+    s2 = load_trace(d / "trace.jsonl", duration_cap_s=5.0)
+    assert len(s2["timestamps"]) == 3        # the 40s arrival capped out

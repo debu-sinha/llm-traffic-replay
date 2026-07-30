@@ -47,6 +47,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # arrival honesty
     lags = [r.get("dispatch_lag_ms") for r in results
             if r.get("dispatch_lag_ms") is not None]
+    retried = sum(1 for r in results if r.get("retries"))
 
     dur = None
     if results:
@@ -58,6 +59,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "requests_total": len(results),
         "requests_ok": len(ok),
         "requests_failed": len(failed),
+        "requests_retried": retried,
         "error_rate": len(failed) / len(results) if results else None,
         "failures_by_error": _top_errors(failed),
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in ok]),
@@ -146,6 +148,10 @@ def render_markdown(summary: dict, title: str) -> str:
         if arr.get("achieved_qps_overall") else "- arrivals: n/a",
         f"- failures: {json.dumps(s['failures_by_error'])}"
         if s["requests_failed"] else "- failures: none",
+        f"- requests that needed a connection retry: {s['requests_retried']} "
+        "(retried requests restart their latency clock; a nonzero count "
+        "here means the tail has survivorship bias, read with care)"
+        if s.get("requests_retried") else "- connection retries: none",
     ]
     label = (s.get("run") or {}).get("label")
     if label:

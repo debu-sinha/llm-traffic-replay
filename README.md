@@ -7,13 +7,15 @@ Flat-rate load tests with uniform prompts produce latency numbers that do
 not transfer to production. Real agent traffic has three properties that
 drive serving behavior, and this harness reproduces all three:
 
-1. **Heavy-tailed prompt sizes** — sampled from distributions fitted to your
+1. **Heavy-tailed prompt sizes**: sampled from distributions fitted to your
    stated quantiles (e.g. P50 10K input tokens, P95 24K; outputs 40 to 90).
-2. **High, variable prompt-cache hit ratio** (e.g. P50 60%, P95 87%) — you
+2. **High, variable prompt-cache hit ratio** (e.g. P50 60%, P95 87%): you
    cannot ask an endpoint for a hit rate; the harness **constructs** it by
    making requests share long leading context the way production traffic
    actually repeats.
-3. **Bursty arrivals** — spikes between 10 and 500 QPS, not a steady drip.
+3. **Bursty arrivals**: spikes between 10 and 500 QPS, not a steady drip.
+   Synthetic bursts by default; your own production arrival trace drops in
+   via `timestamps_file` and replaces the synthetic schedule entirely.
 
 It works against any OpenAI-compatible streaming chat endpoint, which
 includes Databricks provisioned throughput and pay-per-token serving as
@@ -28,7 +30,14 @@ zero-dependency runner if you don't.
 
 ## Quickstart (no endpoint needed, ~60 seconds)
 
+Every command in this README runs from the repository root (the directory
+containing this file). Do not cd into `traffic_replay/`; it is the package,
+and `python -m traffic_replay` plus the relative `configs/` paths both
+resolve from the root.
+
 ```bash
+cd llm-traffic-replay
+
 # 1. Full test suite
 python -m pytest                          # or: python3 scripts/run_tests_stdlib.py
 
@@ -36,8 +45,8 @@ python -m pytest                          # or: python3 scripts/run_tests_stdlib
 python -m traffic_replay validate
 ```
 
-`validate` runs the entire pipeline — sampler, prefix pool, burst schedule,
-streaming client, measurement — against a local mock server that KNOWS its
+`validate` runs the entire pipeline (sampler, prefix pool, burst schedule,
+streaming client, measurement) against a local mock server that KNOWS its
 own true latency per request, then reports client-measured minus
 server-true error. Current calibration on a laptop-class machine: TTFT
 error p50 ≈ 2 ms, p95 < 5 ms. If this does not PASS on your machine, do not
@@ -53,15 +62,41 @@ python -m traffic_replay run --config configs/run_smoke.json
 
 Outputs land in `results/<timestamp>/`:
 
-- `requests.jsonl` — every request: TTFT/TTFB/E2E ms, endpoint-reported
+- `requests.jsonl`: every request: TTFT/TTFB/E2E ms, endpoint-reported
   prompt/completion/cached tokens, intended sizes, document id, dispatch
   lag, errors.
-- `summary.json` — percentile tables plus the believability block.
-- `report.md` — the human-readable readout.
+- `summary.json`: percentile tables plus the believability block.
+- `report.md`: the human-readable readout.
 
 Then follow `docs/PRODUCTION_TESTING.md` for the staged plan: smoke test on
 shared capacity (client correctness only), then the provisioned throughput
 endpoint at stepped rate scales, then customer-dataset replay.
+
+## Where to run it
+
+The harness measures client side, so the machine it runs on is part of the
+experiment. Match the machine to the stage:
+
+**Tests and `validate` (stage 0):** anywhere with Python 3.10+ and numpy.
+A laptop is fine; the mock is local, no network is involved.
+
+**Smoke test (stage 1):** a Databricks notebook is the easiest path and is
+what `notebooks/smoke_test_e2e_demo.ipynb` does: serverless or classic
+compute, ambient workspace auth, no token handling. A laptop or VM with a
+PAT works equally well at smoke rates (a few QPS).
+
+**Measured PT runs (stage 2):** use a dedicated machine in the same cloud
+region as the endpoint's workspace, and nothing else running on it. Two
+good options: a single-node cloud VM (8 or more vCPUs, network-optimized),
+or a single-node Databricks cluster in that workspace with the run started
+from its driver (web terminal or a notebook `%sh` cell). Avoid laptops for
+measured runs: Wi-Fi jitter, VPNs, sleep states and cross-region paths all
+land in your TTFT tail and are indistinguishable from endpoint behavior
+after the fact. The believability block will expose a struggling client as
+dispatch lag, but the better plan is not to generate that noise at all.
+If dispatch lag p95 grows past ~100 ms at full rate_scale, split the
+schedule across two machines with `shard_index`/`shard_total` and pool the
+`requests.jsonl` files.
 
 ## Reading results: the honesty rules
 
@@ -81,6 +116,45 @@ believed, and the report prints them together:
 - **Profile label**: runs built to stated (spoken) figures carry that
   label until the exact production dataset replaces the profile config.
 
+## Settings reference
+
+Run configs are plain JSON deserialized into `RunConfig`
+(`traffic_replay/runner.py`). Every field, with defaults:
+
+| field | default | meaning |
+|---|---|---|
+| `profile_path` | required | path to a profile JSON (see below) |
+| `endpoint.base_url` | required | `https://<workspace-host>`, no trailing slash |
+| `endpoint.path` | required | e.g. `/serving-endpoints/<name>/invocations` |
+| `endpoint.auth_token_env` | `DATABRICKS_TOKEN` | env var read for the bearer token |
+| `endpoint.model` | null | set only for shared `/chat/completions` routes |
+| `endpoint.connect_timeout_s` | 10 | TCP/TLS connect timeout |
+| `endpoint.read_timeout_s` | 120 | per-read socket timeout during streaming |
+| `endpoint.temperature` | 0.0 | request temperature (keep 0 for benchmarks) |
+| `endpoint.max_retries` | 1 | connection-error retries; retried count prints in the report |
+| `duration_s` | 300 | schedule length in seconds |
+| `qps_base` / `qps_burst` | 25 / 350 | mean rates of the two arrival states |
+| `qps_min` / `qps_max` | 10 / 500 | hard clamp on the rate curve |
+| `rate_scale` | 1.0 | uniform thinning, preserves shape; step 0.1 to 1.0 per the run plan |
+| `timestamps_file` | null | real arrival trace (text or JSONL `{"t": s}`); replaces the synthetic schedule |
+| `max_concurrency` | 256 | thread pool bound; excess arrivals show up as dispatch lag |
+| `seed` | 7 | root seed; same config plus same seed is the same experiment |
+| `cpt` | 4.0 | starting characters-per-token guess; recalibrated during warmup |
+| `calibrate_n` | 12 | sequential warmup requests used to calibrate cpt |
+| `shard_index` / `shard_total` | 0 / 1 | deterministic 1-of-n schedule split across client machines |
+| `pool_docs_per_bucket` | 40 | shared-prefix documents per size bucket |
+| `pool_zipf_s` | 1.1 | popularity skew; higher concentrates traffic on hot documents |
+| `out_dir` | `results` | output root; each run writes a timestamped subdirectory |
+| `title` / `label` | "" | report title and the provenance label printed at the bottom |
+| `max_output_tokens_cap` | 512 | safety cap on max_tokens per request (32 in the smoke config) |
+
+Profile JSON fields: `name`; `input_tokens`, `output_tokens`,
+`cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1));
+`provenance` (where the numbers came from); `label` (printed on every
+report built from this profile). Auth is never stored in any config; the
+token comes from the environment variable at run time or, in a notebook,
+from the ambient workspace context.
+
 ## Architecture
 
 ![architecture](docs/diagrams/architecture.svg)
@@ -98,8 +172,10 @@ traffic_replay/          the package (profile, prefix_pool, schedule,
                          textgen, sse, client, metrics, runner,
                          mock_server, cli)
 configs/                 profiles and run configs (JSON)
-tests/                   pytest suite (32 tests)
+tests/                   pytest suite (33 tests)
 scripts/run_tests_stdlib.py   zero-dependency test runner
+notebooks/               self-contained Databricks workspace smoke notebook
+                         (embeds this repo, ambient auth, smoke labels)
 docs/ARCHITECTURE.md     diagrams and design decisions
 docs/PRODUCTION_TESTING.md   step-by-step run plan
 ```

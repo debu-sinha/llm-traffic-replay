@@ -48,6 +48,39 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
             "timestamps": np.sort(ts)}
 
 
+def load_trace(path, duration_cap_s: float | None = None) -> dict:
+    """Replace the synthetic schedule with a real arrival trace.
+
+    Accepts a file of arrival timestamps in seconds, one per line (plain
+    text or JSONL with a `t` field). Timestamps are shifted to start at 0
+    and sorted. This is the bring-your-own-trace path: the customer's
+    production arrival log becomes the schedule, and every downstream
+    stage (sizing, cache construction, measurement) is unchanged.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    ts = []
+    for line in _Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("{"):
+            ts.append(float(_json.loads(line)["t"]))
+        else:
+            ts.append(float(line))
+    if not ts:
+        raise ValueError(f"no timestamps in {path}")
+    arr = np.sort(np.asarray(ts, dtype=float))
+    arr = arr - arr[0]
+    if duration_cap_s is not None:
+        arr = arr[arr <= duration_cap_s]
+    dur = int(np.ceil(arr[-1])) + 1 if len(arr) else 0
+    counts = np.bincount(arr.astype(int), minlength=dur)
+    return {"rates": counts.astype(float), "counts": counts,
+            "timestamps": arr, "source": str(path)}
+
+
 def shard(schedule: dict, index: int, total: int) -> dict:
     """Deterministic 1-of-n split for multi-process clients."""
     if not (0 <= index < total):

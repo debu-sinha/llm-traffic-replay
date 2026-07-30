@@ -25,7 +25,13 @@ endpoint evaluation, the endpoint saturates long before the client does.
 **TTFT keys on first content delta, not first byte.** Real servers send a
 role-only chunk immediately on connection; timing that would flatter the
 endpoint. The bundled mock deliberately reproduces this trap and the test
-suite asserts the client does not fall into it.
+suite asserts the client does not fall into it. Known limitation, stated
+rather than hidden: for reasoning models that stream a reasoning channel
+before visible output, the first reasoning delta counts as first content.
+If the SLO under test is time to first VISIBLE token, agree on that
+definition before the run; splitting the two timestamps is a planned
+extension and the current behavior always errs toward the stricter
+(earlier) reading.
 
 **Cache is constructed, never asserted.** The pool guarantees the traffic
 STRUCTURE (shared leading text, popularity skew, cold first-uses). Whether

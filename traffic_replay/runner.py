@@ -24,7 +24,7 @@ from . import profile as prof
 from .client import EndpointClient, EndpointConfig, new_request_id
 from .metrics import summarize, write_outputs
 from .prefix_pool import PrefixPool
-from .schedule import make_schedule, schedule_report, shard
+from .schedule import load_trace, make_schedule, schedule_report, shard
 from .textgen import TextMaterializer, calibrate_cpt
 
 
@@ -44,6 +44,9 @@ class RunConfig:
     calibrate_n: int = 12
     shard_index: int = 0
     shard_total: int = 1
+    timestamps_file: str | None = None  # real arrival trace replaces synthetic
+    pool_docs_per_bucket: int = 40      # cache-pool shape knobs
+    pool_zipf_s: float = 1.1
     out_dir: str = "results"
     title: str = "traffic replay"
     label: str = ""
@@ -60,12 +63,17 @@ def run(rc: RunConfig, token_override: str | None = None,
     ecfg = EndpointConfig(**rc.endpoint)
     client = EndpointClient(ecfg, token_override or _token(ecfg))
     mat = TextMaterializer(cpt=rc.cpt)
-    pool = PrefixPool(seed=rc.seed + 4)
+    pool = PrefixPool(seed=rc.seed + 4,
+                      docs_per_bucket=rc.pool_docs_per_bucket,
+                      zipf_s=rc.pool_zipf_s)
 
-    sched = make_schedule(
-        duration_s=rc.duration_s, qps_base=rc.qps_base,
-        qps_burst=rc.qps_burst, qps_min=rc.qps_min, qps_max=rc.qps_max,
-        rate_scale=rc.rate_scale, seed=rc.seed + 16)
+    if rc.timestamps_file:
+        sched = load_trace(rc.timestamps_file, duration_cap_s=rc.duration_s)
+    else:
+        sched = make_schedule(
+            duration_s=rc.duration_s, qps_base=rc.qps_base,
+            qps_burst=rc.qps_burst, qps_min=rc.qps_min, qps_max=rc.qps_max,
+            rate_scale=rc.rate_scale, seed=rc.seed + 16)
     if rc.shard_total > 1:
         sched = shard(sched, rc.shard_index, rc.shard_total)
     ts = sched["timestamps"]

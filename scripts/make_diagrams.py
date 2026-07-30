@@ -159,7 +159,8 @@ def build_excalidraw(spec, with_lifelines=False):
             "files": {}}
 
 
-FONT = "font-family='Segoe Print, Bradley Hand, Comic Sans MS, cursive'"
+FONT = ("font-family='-apple-system, BlinkMacSystemFont, Segoe UI, "
+        "Helvetica, Arial, sans-serif'")
 
 
 def svg_of(spec, with_lifelines=False):

@@ -3,35 +3,36 @@
 Replay **your production traffic shape** against an LLM serving endpoint,
 instead of testing with generic synthetic load.
 
-Flat-rate load tests with uniform prompts produce latency numbers that do
-not transfer to production. Real agent traffic has three properties that
+Flat-rate load tests with uniform prompts produce latency numbers that
+don't transfer to production. Real agent traffic has three properties that
 drive serving behavior, and this harness reproduces all three:
 
-1. **Heavy-tailed prompt sizes**: sampled from distributions fitted to your
-   stated quantiles (e.g. P50 10K input tokens, P95 24K; outputs 40 to 90).
-2. **High, variable prompt-cache hit ratio** (e.g. P50 60%, P95 87%): you
-   cannot ask an endpoint for a hit rate; the harness **constructs** it by
+1. **Heavy-tailed prompt sizes**, sampled from distributions fitted to your
+   stated quantiles (e.g. P50 10K input tokens, P95 24K, outputs 40 to 90).
+2. **High, variable prompt-cache hit ratio** (e.g. P50 60%, P95 87%). You
+   can't ask an endpoint for a hit rate, so the harness **constructs** it by
    making requests share long leading context the way production traffic
    actually repeats.
 3. **Bursty arrivals**: spikes between 10 and 500 QPS, not a steady drip.
-   Synthetic bursts by default; your own production arrival trace drops in
-   via `timestamps_file` and replaces the synthetic schedule entirely.
+   You get synthetic bursts by default, and your own production arrival
+   trace drops in via `timestamps_file` and replaces the synthetic schedule
+   entirely.
 
-It works against any OpenAI-compatible streaming chat endpoint, which
+It works against any OpenAI-compatible streaming chat endpoint. That
 includes Databricks provisioned throughput and pay-per-token serving as
 well as other hosted providers, so the same instrument that measures your
 candidate endpoint also measures the alternatives on an identical basis.
 
 ## Requirements
 
-Python 3.10+, `numpy`. That is the whole list; the HTTP client is standard
+Python 3.10+, `numpy`. That's the whole list. The HTTP client is standard
 library. Tests run with `pytest` if you have it, or with the bundled
 zero-dependency runner if you don't.
 
 ## Quickstart (no endpoint needed, ~60 seconds)
 
 Every command in this README runs from the repository root (the directory
-containing this file). Do not cd into `traffic_replay/`; it is the package,
+containing this file). Don't cd into `traffic_replay/`. That's the package,
 and `python -m traffic_replay` plus the relative `configs/` paths both
 resolve from the root.
 
@@ -49,7 +50,7 @@ python -m traffic_replay validate
 streaming client, measurement) against a local mock server that KNOWS its
 own true latency per request, then reports client-measured minus
 server-true error. Current calibration on a laptop-class machine: TTFT
-error p50 ≈ 2 ms, p95 < 5 ms. If this does not PASS on your machine, do not
+error p50 ≈ 2 ms, p95 < 5 ms. If it doesn't PASS on your machine, don't
 trust any number the harness produces there.
 
 ## Run against a real endpoint
@@ -78,7 +79,7 @@ The harness measures client side, so the machine it runs on is part of the
 experiment. Match the machine to the stage:
 
 **Tests and `validate` (stage 0):** anywhere with Python 3.10+ and numpy.
-A laptop is fine; the mock is local, no network is involved.
+A laptop is fine. The mock is local, so no network's involved.
 
 **Smoke test (stage 1):** a Databricks notebook is the easiest path and is
 what `notebooks/smoke_test_e2e_demo.ipynb` does: serverless or classic
@@ -108,10 +109,10 @@ believed, and the report prints them together:
 - **Constructed vs achieved**: what the traffic intended vs what the
   endpoint served. Cold first-uses are included and visible per document.
 - **Token targeting error**: text is generated through a calibrated
-  characters-per-token ratio; endpoint-reported token counts are the source
-  of truth and the residual error is printed.
+  characters-per-token ratio. Endpoint-reported token counts are the source
+  of truth, and the residual error is printed.
 - **Dispatch lag**: how late the client fired versus the schedule. If the
-  client saturates, that is reported as client lag, not silently blended
+  client saturates, that's reported as client lag, not silently blended
   into endpoint latency.
 - **Profile label**: runs built to stated (spoken) figures carry that
   label until the exact production dataset replaces the profile config.
@@ -131,38 +132,35 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `endpoint.connect_timeout_s` | 10 | TCP/TLS connect timeout |
 | `endpoint.read_timeout_s` | 120 | per-read socket timeout during streaming |
 | `endpoint.temperature` | 0.0 | request temperature (keep 0 for benchmarks) |
-| `endpoint.max_retries` | 1 | connection-error retries; retried count prints in the report |
+| `endpoint.max_retries` | 1 | connection-error retries. The retried count prints in the report |
 | `duration_s` | 300 | schedule length in seconds |
 | `qps_base` / `qps_burst` | 25 / 350 | mean rates of the two arrival states |
 | `qps_min` / `qps_max` | 10 / 500 | hard clamp on the rate curve |
-| `rate_scale` | 1.0 | uniform thinning, preserves shape; step 0.1 to 1.0 per the run plan |
-| `timestamps_file` | null | real arrival trace (text or JSONL `{"t": s}`); replaces the synthetic schedule |
-| `max_concurrency` | 256 | thread pool bound; excess arrivals show up as dispatch lag |
-| `seed` | 7 | root seed; same config plus same seed is the same experiment |
-| `cpt` | 4.0 | starting characters-per-token guess; recalibrated during warmup |
+| `rate_scale` | 1.0 | uniform thinning that preserves shape. Step 0.1 to 1.0 per the run plan |
+| `timestamps_file` | null | real arrival trace (text or JSONL `{"t": s}`) that replaces the synthetic schedule |
+| `max_concurrency` | 256 | thread pool bound. Excess arrivals show up as dispatch lag |
+| `seed` | 7 | root seed. Same config plus same seed is the same experiment |
+| `cpt` | 4.0 | starting characters-per-token guess, recalibrated during warmup |
 | `calibrate_n` | 12 | sequential warmup requests used to calibrate cpt |
 | `shard_index` / `shard_total` | 0 / 1 | deterministic 1-of-n schedule split across client machines |
 | `pool_docs_per_bucket` | 40 | shared-prefix documents per size bucket |
-| `pool_zipf_s` | 1.1 | popularity skew; higher concentrates traffic on hot documents |
-| `out_dir` | `results` | output root; each run writes a timestamped subdirectory |
+| `pool_zipf_s` | 1.1 | popularity skew. Higher concentrates traffic on hot documents |
+| `out_dir` | `results` | output root. Each run writes a timestamped subdirectory |
 | `title` / `label` | "" | report title and the provenance label printed at the bottom |
 | `max_output_tokens_cap` | 512 | safety cap on max_tokens per request (32 in the smoke config) |
 
-Profile JSON fields: `name`; `input_tokens`, `output_tokens`,
-`cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1));
-`provenance` (where the numbers came from); `label` (printed on every
-report built from this profile). Auth is never stored in any config; the
-token comes from the environment variable at run time or, in a notebook,
-from the ambient workspace context.
+Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
+`cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1)).
+`provenance` records where the numbers came from, and `label` is printed on
+every report built from this profile. Auth is never stored in any config.
+The token comes from the environment variable at run time or, in a
+notebook, from the ambient workspace context.
 
 ## Architecture
 
 ![architecture](docs/diagrams/architecture.svg)
 
-Editable source: `docs/diagrams/architecture.excalidraw` (open at
-excalidraw.com; regenerate both files with `python3 scripts/make_diagrams.py`).
-
-Per-request sequence and the validation design are in
+The per-request sequence and the validation design are in
 `docs/ARCHITECTURE.md`.
 
 ## Repository layout

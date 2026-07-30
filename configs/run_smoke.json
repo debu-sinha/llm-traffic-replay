@@ -1,0 +1,21 @@
+{
+  "profile_path": "configs/profile_validation_small.json",
+  "endpoint": {
+    "base_url": "https://YOUR-WORKSPACE-HOST",
+    "path": "/serving-endpoints/YOUR-ENDPOINT-NAME/invocations",
+    "auth_token_env": "DATABRICKS_TOKEN"
+  },
+  "duration_s": 60,
+  "qps_base": 2.0,
+  "qps_burst": 5.0,
+  "qps_min": 1.0,
+  "qps_max": 6.0,
+  "rate_scale": 1.0,
+  "max_concurrency": 16,
+  "cpt": 4.0,
+  "calibrate_n": 8,
+  "out_dir": "results/smoke",
+  "title": "smoke test: client correctness only",
+  "label": "SMOKE TEST on shared capacity: verifies auth, streaming, TTFT capture and usage parsing. LATENCY NUMBERS FROM THIS RUN ARE NOT PERFORMANCE EVIDENCE.",
+  "max_output_tokens_cap": 32
+}

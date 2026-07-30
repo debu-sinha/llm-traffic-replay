@@ -1,0 +1,21 @@
+{
+  "profile_path": "configs/profile_decagon_20260723.json",
+  "endpoint": {
+    "base_url": "https://YOUR-WORKSPACE-HOST",
+    "path": "/serving-endpoints/YOUR-PT-ENDPOINT/invocations",
+    "auth_token_env": "DATABRICKS_TOKEN"
+  },
+  "duration_s": 300,
+  "qps_base": 25.0,
+  "qps_burst": 350.0,
+  "qps_min": 10.0,
+  "qps_max": 500.0,
+  "rate_scale": 0.1,
+  "max_concurrency": 512,
+  "cpt": 4.0,
+  "calibrate_n": 12,
+  "out_dir": "results/pt",
+  "title": "provisioned throughput replay, customer traffic shape",
+  "label": "Built to spoken 2026-07-23 figures; exact production dataset pending. Raise rate_scale stepwise (0.1 -> 0.25 -> 0.5 -> 1.0) per the run plan in docs/PRODUCTION_TESTING.md.",
+  "max_output_tokens_cap": 512
+}

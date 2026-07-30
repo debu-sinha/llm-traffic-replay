@@ -1,0 +1,8 @@
+{
+  "name": "decagon_customer_stated_20260723",
+  "input_tokens":  {"p50": 10000, "p95": 24000},
+  "output_tokens": {"p50": 40,    "p95": 90},
+  "cache_fraction": {"p50": 0.60, "p95": 0.87},
+  "provenance": "Customer-stated figures, infra call 2026-07-23. TTFT targets: p50 500ms / p95 900ms. Full generation: p50 700ms / p95 1500ms.",
+  "label": "ASSUMPTION: built to spoken figures from the 2026-07-23 call; replace this file with the exact production dataset when it lands and the label comes off."
+}

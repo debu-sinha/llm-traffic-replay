@@ -18,8 +18,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import numpy as np
-
 from . import profile as prof
 from .client import EndpointClient, EndpointConfig, new_request_id
 from .metrics import summarize, write_outputs

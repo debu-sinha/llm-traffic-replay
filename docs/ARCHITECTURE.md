@@ -2,46 +2,15 @@
 
 ## Components and data flow
 
-```mermaid
-flowchart TB
-    subgraph inputs [Inputs]
-        PJ[profile JSON\nstated quantiles + provenance label]
-        RJ[run config JSON\nendpoint, schedule, scale, caps]
-    end
+![components and data flow](diagrams/architecture.svg)
 
-    PJ --> PR[profile.py\nlognormal / logit-normal closed-form fits\nper-request: input, output, cache target]
-    PR --> PP[prefix_pool.py\nbucketed docs, Zipf popularity\nper-request: doc_id, prefix tokens]
-    RJ --> SC[schedule.py\ntwo-state modulated Poisson\nabsolute timestamps, rate_scale, shard]
-
-    PP --> TG[textgen.py\ndeterministic doc text, unique suffixes\ncpt calibrated against endpoint truth]
-    TG --> RU[runner.py\ncalibration pass, paced dispatch\nbounded ThreadPoolExecutor]
-    SC --> RU
-
-    RU --> CL[client.py\nhttp.client streaming POST\nmonotonic TTFB/TTFT/E2E\nusage extraction via sse.py]
-    CL --> EP[(endpoint\nreal PT / pay-per-token / mock)]
-    EP --> CL
-    CL --> ME[metrics.py\npercentiles, achieved cache,\ntoken targeting, dispatch lag]
-    ME --> OUT[(results dir\nrequests.jsonl / summary.json / report.md)]
-```
+Editable source: `diagrams/architecture.excalidraw` (excalidraw.com).
 
 ## Per-request sequence
 
-```mermaid
-sequenceDiagram
-    participant R as runner (dispatcher)
-    participant W as worker thread
-    participant E as endpoint
-    R->>R: sleep until scheduled timestamp
-    R->>W: submit(messages, max_tokens, request_id)
-    Note over R: lateness recorded as dispatch_lag_ms
-    W->>E: POST chat completion, stream=true (t_send)
-    E-->>W: SSE role-only chunk (TTFB; NOT TTFT)
-    E-->>W: SSE first content delta (TTFT)
-    E-->>W: ... content chunks ...
-    E-->>W: final chunk with usage + [DONE] (E2E)
-    W->>W: extract usage: prompt / completion / cached tokens
-    W-->>R: RequestResult (all timings + intended vs reported)
-```
+![request sequence](diagrams/request-sequence.svg)
+
+Editable source: `diagrams/request-sequence.excalidraw` (excalidraw.com).
 
 ## Design decisions and their tradeoffs
 

@@ -83,25 +83,10 @@ believed, and the report prints them together:
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph plan [Plan  fully deterministic, seeded]
-        P[profile.py\nquantiles to per-request\ntoken plan] --> A[prefix_pool.py\ndoc + prefix length\nper request]
-        S[schedule.py\nbursty arrival\ntimestamps]
-    end
-    subgraph exec [Execute]
-        A --> T[textgen.py\nshared-prefix text,\ncalibrated cpt]
-        S --> R[runner.py\npaced dispatch,\nbounded thread pool]
-        T --> R
-        R --> C[client.py\nstreaming HTTP,\nTTFT and E2E timing]
-    end
-    subgraph endpoints [Endpoint]
-        C -->|POST stream| E[real endpoint\nor mock_server.py]
-        E -->|SSE chunks + usage| C
-    end
-    C --> M[metrics.py\npercentiles +\nbelievability block]
-    M --> O[results/\nrequests.jsonl,\nsummary.json, report.md]
-```
+![architecture](docs/diagrams/architecture.svg)
+
+Editable source: `docs/diagrams/architecture.excalidraw` (open at
+excalidraw.com; regenerate both files with `python3 scripts/make_diagrams.py`).
 
 Per-request sequence and the validation design are in
 `docs/ARCHITECTURE.md`.

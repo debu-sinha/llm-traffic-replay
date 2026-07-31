@@ -2,6 +2,7 @@
 achieved cache p50 differ by more than 0.10 (the fake-comparison trap)."""
 import json
 import tempfile
+import pytest
 from pathlib import Path
 from traffic_replay.aggregate import compare_runs
 
@@ -53,3 +54,12 @@ def test_warns_only_when_cache_gap_exceeds_threshold():
 def test_boundary_just_over_and_under():
     assert "WARNING" not in _compare([0.50, 0.60])   # gap exactly 0.10
     assert "WARNING" in _compare([0.50, 0.61])       # gap 0.11
+
+
+def test_compare_missing_input_dir_gives_clean_error():
+    base = _tmp()
+    d = base / "r0"; d.mkdir(parents=True, exist_ok=True)
+    (d / "summary.json").write_text(json.dumps(_summary("p0", 0.60)))
+    from traffic_replay.aggregate import compare_runs
+    with pytest.raises(ValueError):
+        compare_runs(base / "cmp", [d, base / "missing"])

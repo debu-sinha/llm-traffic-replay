@@ -54,3 +54,18 @@ def test_merge_refuses_mismatched_endpoints_without_force():
         merge_runs(base / "o1", [base / "a", base / "b"])
     out = merge_runs(base / "o2", [base / "a", base / "b"], force=True)
     assert json.loads((out / "summary.json").read_text())["requests_total"] == 6
+
+
+def test_merge_missing_input_dir_gives_clean_error():
+    base = _tmp()
+    _mkrun(base / "a", "/serving-endpoints/pt/invocations", [100] * 3)
+    with pytest.raises(ValueError):
+        merge_runs(base / "out", [base / "a", base / "does_not_exist"])
+
+
+def test_merged_report_carries_concurrency_note():
+    base = _tmp()
+    _mkrun(base / "a", "/serving-endpoints/pt/invocations", [100] * 4)
+    _mkrun(base / "b", "/serving-endpoints/pt/invocations", [200] * 4)
+    out = merge_runs(base / "out", [base / "a", base / "b"])
+    assert "union wall-clock window" in (out / "report.md").read_text()

@@ -135,7 +135,11 @@ def cmd_merge(args) -> int:
 
 def cmd_compare(args) -> int:
     from .aggregate import compare_runs
-    out = compare_runs(args.out, args.inputs)
+    try:
+        out = compare_runs(args.out, args.inputs)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     print(f"wrote {out}/comparison.md")
     return 0
 

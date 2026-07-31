@@ -22,6 +22,13 @@ def _run_title(d: Path, summ: dict) -> str:
     return (summ.get("run") or {}).get("title") or d.name
 
 
+def _require_run_dir(d: Path, need: str) -> None:
+    if not d.is_dir():
+        raise ValueError(f"input run dir not found: {d}")
+    if not (d / need).exists():
+        raise ValueError(f"{d} is not a run dir (missing {need})")
+
+
 def _replay_rows(d: Path) -> list[dict]:
     rows = []
     for line in (d / "requests.jsonl").read_text().splitlines():
@@ -37,6 +44,8 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
                force=False) -> Path:
     """Concatenate replay rows from each run dir and re-summarize the union."""
     dirs = [Path(d) for d in input_dirs]
+    for d in dirs:
+        _require_run_dir(d, "requests.jsonl")
     endpoints, rows = set(), []
     for d in dirs:
         ep = (_load_summary(d).get("run") or {}).get("endpoint_path")
@@ -52,6 +61,9 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "endpoint_path": sorted(endpoints)[0] if len(endpoints) == 1
         else "MIXED",
         "label": f"merged from {len(dirs)} runs",
+        "merge_note": (f"pooled from {len(dirs)} run dirs. throughput is over "
+                       "the union wall-clock window, so it is the aggregate "
+                       "rate only when the shards ran concurrently."),
     }
     summary = summarize(rows, run_meta=meta, acceptance=acceptance)
     return write_outputs(rows, summary, out_dir,
@@ -67,6 +79,8 @@ def compare_runs(out_dir, input_dirs) -> Path:
     warn when their achieved cache rates diverge enough to make the latency
     comparison meaningless."""
     dirs = [Path(d) for d in input_dirs]
+    for d in dirs:
+        _require_run_dir(d, "summary.json")
     summ = [_load_summary(d) for d in dirs]
     titles = [_run_title(d, s) for d, s in zip(dirs, summ)]
     n = len(titles)

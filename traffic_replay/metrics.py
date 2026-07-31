@@ -272,6 +272,9 @@ def render_markdown(summary: dict, title: str) -> str:
         lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
                       f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
                       "tokens/min (endpoint-reported counts over wall time)"]
+    merge_note = (s.get("run") or {}).get("merge_note")
+    if merge_note:
+        lines += ["", merge_note]
 
     sla = s.get("sla")
     if sla:

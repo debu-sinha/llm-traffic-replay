@@ -64,7 +64,7 @@ python -m traffic_replay validate
 streaming client, measurement) against a local mock server that KNOWS its
 own true latency per request, then reports client-measured minus
 server-true error. Current calibration on a laptop-class machine: TTFT
-error p50 ≈ 2 ms, p95 < 5 ms. If it doesn't PASS on your machine, don't
+error p50 ~2 ms, p95 < 5 ms. If it doesn't PASS on your machine, don't
 trust any number the harness produces there.
 
 ## Run against a real endpoint
@@ -239,7 +239,9 @@ Run configs are plain JSON deserialized into `RunConfig`
 Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
 `cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1)).
 `provenance` records where the numbers came from, and `label` is printed on
-every report built from this profile. Auth is never stored in any config.
+every report built from this profile. An optional `acceptance_targets`
+object (ttft_ms, ttfg_ms, hard_timeouts, success_rate, interchunk_ms) drives
+the SLA scorecard; without it, no scorecard is printed. Auth is never stored in any config.
 The token comes from the environment variable at run time or, in a
 notebook, from the ambient workspace context.
 

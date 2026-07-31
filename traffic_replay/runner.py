@@ -48,8 +48,8 @@ class RunConfig:
     out_dir: str = "results"
     title: str = "traffic replay"
     label: str = ""
-    max_output_tokens_cap: int = 512
-    ttft_definition: str = "first_content"   # or "first_visible"; sla scores it  # safety cap for smoke runs; full runs raise it
+    max_output_tokens_cap: int = 512  # safety cap; full runs raise it
+    ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
 
 def _token(cfg: EndpointConfig) -> str | None:

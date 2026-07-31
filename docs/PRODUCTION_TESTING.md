@@ -59,7 +59,7 @@ bundled profile carries its ASSUMPTION label and so does every report).
    counts breaches against the success rate.
 3. Step the load, one knob, in this order, reading the believability block
    between steps:
-   - `rate_scale`: 0.1 → 0.25 → 0.5 → 1.0
+   - `rate_scale`: 0.1 -> 0.25 -> 0.5 -> 1.0
    - at each step: error rate first, then dispatch lag (client health),
      then achieved cache fraction, THEN latency percentiles.
 4. Two workload classes = two profile configs = two runs. Do not blend

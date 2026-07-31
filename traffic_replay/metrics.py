@@ -118,6 +118,7 @@ def render_markdown(summary: dict, title: str) -> str:
     intent = s["intended_cache_fraction"]
     tt = s["token_targeting"]
     arr = s["arrivals"]
+    sched_src = (s.get("schedule") or {}).get("source", "synthetic")
 
     lines = [
         f"# {title}",
@@ -146,6 +147,8 @@ def render_markdown(summary: dict, title: str) -> str:
         f"overall; dispatch lag p95 "
         f"{arr['dispatch_lag_ms'].get('p95', float('nan')):.0f} ms"
         if arr.get("achieved_qps_overall") else "- arrivals: n/a",
+        f"- arrival schedule: from trace {sched_src}"
+        if sched_src != "synthetic" else "- arrival schedule: synthetic bursts",
         f"- failures: {json.dumps(s['failures_by_error'])}"
         if s["requests_failed"] else "- failures: none",
         f"- requests that needed a connection retry: {s['requests_retried']} "

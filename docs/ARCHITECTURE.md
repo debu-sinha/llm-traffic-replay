@@ -35,6 +35,12 @@ a request actually hits is the endpoint's business, read back from the
 usage block, with the exact field name recorded. When an endpoint doesn't
 report cached tokens, the report says NOT REPORTED rather than guessing.
 
+**Synthetic text: shape, not content.** Request text is generated to hit
+the token sizes and cache structure, not to mean anything. Serving latency
+and throughput depend on token counts, cache hits, and arrival timing, so
+the numbers transfer. Content-dependent behavior (quality, guardrail
+triggers, semantic routing) is out of scope and needs real prompts.
+
 **Token counts are targeted, reported, and corrected.** Text is generated
 to a characters-per-token budget, cpt is recalibrated during the warmup
 pass from endpoint-reported prompt_tokens, and the residual targeting

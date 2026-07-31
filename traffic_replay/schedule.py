@@ -92,7 +92,8 @@ def shard(schedule: dict, index: int, total: int) -> dict:
 def schedule_report(sched: dict) -> dict:
     r = np.asarray(sched["rates"])
     if r.size == 0:
-        return {"seconds": 0, "requests": 0}
+        return {"seconds": 0, "requests": 0,
+                "source": sched.get("source", "synthetic")}
     return {
         "seconds": int(len(r)),
         "requests": int(np.asarray(sched["counts"]).sum()),
@@ -101,4 +102,5 @@ def schedule_report(sched: dict) -> dict:
         "rate_p95": float(np.percentile(r, 95)),
         "rate_max": float(r.max()),
         "spiky": bool(r.max() / max(r.min(), 1e-9) >= 8.0),
+        "source": sched.get("source", "synthetic"),
     }

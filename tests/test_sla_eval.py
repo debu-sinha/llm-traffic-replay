@@ -71,3 +71,36 @@ def test_no_acceptance_no_sla_section():
     s = summarize(rows)
     assert "sla" not in s
     assert "SLA scorecard" not in render_markdown(s, "t")
+
+
+def test_interchunk_threshold_counts_as_breach():
+    # 40 clean (interchunk 5ms), 10 stalled (interchunk 50ms) vs a 20ms cap
+    rows = [_row(i, 400.0, 800.0, inter=5.0) for i in range(40)]
+    rows += [_row(i, 400.0, 800.0, inter=50.0) for i in range(40, 50)]
+    accept = {"interchunk_ms": 20, "success_rate": 0.95}
+    s = summarize(rows, acceptance=accept)
+    assert s["sla"]["interchunk_breaches"] == 10
+    sr = s["sla"]["success_rate"]
+    assert sr["actual"] == 0.80 and sr["met"] is False
+    assert "interchunk breaches" in render_markdown(s, "t")
+
+
+def test_no_interchunk_target_no_breach_field():
+    rows = [_row(i, 400.0, 800.0, inter=99.0) for i in range(10)]
+    s = summarize(rows, acceptance={"success_rate": 0.99})
+    assert "interchunk_breaches" not in s["sla"]
+
+
+def test_output_token_targeting_reports_ratio_and_finish_reasons():
+    rows = [_row(i, 400.0, 800.0, comp=40) for i in range(30)]   # stop, ratio 1.0
+    for i in range(30, 40):
+        r = _row(i, 400.0, 800.0, comp=40)
+        r["finish_reason"] = "length"
+        r["completion_tokens"] = 100                              # ran to the cap
+        rows.append(r)
+    s = summarize(rows)
+    tt = s["token_targeting"]
+    assert tt["output_reported_over_intended_p50"] is not None
+    assert tt["finish_reasons"]["stop"] == 30
+    assert tt["finish_reasons"]["length"] == 10
+    assert "output tokens" in render_markdown(s, "t")

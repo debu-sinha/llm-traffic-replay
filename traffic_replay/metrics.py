@@ -45,6 +45,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     ratios = [r["prompt_tokens"] / r["intended_input_tokens"]
               for r in ok
               if r.get("prompt_tokens") and r.get("intended_input_tokens")]
+    out_ratios = [r["completion_tokens"] / r["intended_output_tokens"]
+                  for r in ok
+                  if r.get("completion_tokens")
+                  and r.get("intended_output_tokens")]
+    finish_reasons: dict[str, int] = {}
+    for r in ok:
+        fr = r.get("finish_reason")
+        if fr:
+            finish_reasons[fr] = finish_reasons.get(fr, 0) + 1
 
     # arrival honesty
     lags = [r.get("dispatch_lag_ms") for r in results
@@ -92,7 +101,16 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "abs_error_pct_p50":
                 float(abs(np.percentile(ratios, 50) - 1.0) * 100)
                 if ratios else None,
-            "note": "endpoint-reported prompt_tokens are the source of truth",
+            "output_reported_over_intended_p50":
+                float(np.percentile(out_ratios, 50)) if out_ratios else None,
+            "output_abs_error_pct_p50":
+                float(abs(np.percentile(out_ratios, 50) - 1.0) * 100)
+                if out_ratios else None,
+            "finish_reasons": finish_reasons,
+            "note": "endpoint-reported token counts are the source of truth. "
+                    "input side is calibrated, output side is only reported "
+                    "(models may stop before max_tokens: finish_reason stop "
+                    "vs length)",
         },
         "arrivals": {
             "achieved_qps_overall": len(results) / dur if dur else None,
@@ -147,23 +165,34 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
     hard = acceptance.get("hard_timeouts") or {}
     ttft_cap = (hard.get("ttft_s") or 0) * 1000.0
     ttfg_cap = (hard.get("ttfg_s") or 0) * 1000.0
-    timeouts = 0
-    for r in ok:
-        if ttft_cap and (r.get("ttft_ms") or 0) > ttft_cap:
+    inter_cap = acceptance.get("interchunk_ms")
+    timeouts = inter_breaches = 0
+    failing = set()
+    for idx, r in enumerate(ok):
+        over_time = bool(
+            (ttft_cap and (r.get("ttft_ms") or 0) > ttft_cap)
+            or (ttfg_cap and (r.get("e2e_ms") or 0) > ttfg_cap))
+        over_inter = bool(inter_cap) and r.get("interchunk_max_ms") is not None \
+            and r["interchunk_max_ms"] > inter_cap
+        if over_time:
             timeouts += 1
-        elif ttfg_cap and (r.get("e2e_ms") or 0) > ttfg_cap:
-            timeouts += 1
+        if over_inter:
+            inter_breaches += 1
+        if over_time or over_inter:
+            failing.add(idx)
     out["hard_timeout_breaches"] = timeouts
+    if inter_cap is not None:
+        out["interchunk_breaches"] = inter_breaches
 
     target_sr = acceptance.get("success_rate")
     if target_sr and total:
-        effective_ok = len(ok) - timeouts
-        actual_sr = effective_ok / total
+        actual_sr = (len(ok) - len(failing)) / total
         out["success_rate"] = {
             "target": target_sr,
             "actual": round(actual_sr, 6),
             "met": actual_sr >= target_sr,
-            "note": "failures plus hard-timeout breaches count against it",
+            "note": "failures, hard-timeout breaches, and interchunk breaches "
+                    "count against it",
         }
     return out
 
@@ -220,6 +249,11 @@ def render_markdown(summary: dict, title: str) -> str:
         f"(abs error {tt['abs_error_pct_p50']:.1f}%)"
         if tt.get("reported_over_intended_p50") else
         "- token targeting: endpoint did not report prompt_tokens",
+        (f"- output tokens: reported/intended p50 = "
+         f"{tt['output_reported_over_intended_p50']:.3f} "
+         f"(finish_reasons {json.dumps(tt.get('finish_reasons') or {})})"
+         if tt.get("output_reported_over_intended_p50") else
+         "- output tokens: endpoint did not report completion_tokens"),
         f"- achieved arrival rate: {arr['achieved_qps_overall']:.2f} QPS "
         f"overall; dispatch lag p95 "
         f"{arr['dispatch_lag_ms'].get('p95', float('nan')):.0f} ms"
@@ -253,6 +287,10 @@ def render_markdown(summary: dict, title: str) -> str:
         lines.append(f"| hard timeout breaches | - | - | "
                      f"{sla.get('hard_timeout_breaches', 0)} | "
                      f"{'yes' if not sla.get('hard_timeout_breaches') else 'NO'} |")
+        if "interchunk_breaches" in sla:
+            ib = sla["interchunk_breaches"]
+            lines.append(f"| interchunk breaches | - | - | {ib} | "
+                         f"{'yes' if not ib else 'NO'} |")
         sr = sla.get("success_rate")
         if sr:
             lines.append(f"| success rate | - | {sr['target']} | "

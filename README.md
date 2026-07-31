@@ -37,6 +37,58 @@ It doesn't measure anything content-dependent. Response quality, guardrail
 and safety triggers, and semantic routing all need real prompts. This is a
 load-shape benchmark, not a quality eval.
 
+## How the load model works
+
+Three properties of your production traffic get rebuilt, each from settings
+you control. The picture below is the whole mental model: you set the shape on
+the left, the harness fills it with meaningless synthetic text, and the only
+thing left to measure is the endpoint on the right.
+
+![how the load is shaped, and which settings control it](docs/diagrams/load-model.svg)
+
+| Traffic property | How it is built | Settings that control it |
+| --- | --- | --- |
+| Prompt sizes (heavy-tailed) | Fit a lognormal to your p50 and p95, then draw every request's input and output size from that fit. | Profile: `input_tokens` p50/p95, `output_tokens` p50/p95 |
+| Cache reuse (shared prefixes) | A pool of shared-prefix documents, picked by Zipf popularity, gives requests a common leading block so the endpoint's prompt cache can engage. Your number is the target hit rate. | Profile: `cache_fraction` p50/p95. Config: `pool_zipf_s`, `pool_docs_per_bucket` |
+| Arrival timing (bursty) | A two-state on/off model (MMPP) makes quiet stretches broken by spikes, or you replay your real arrival trace exactly. | Config: `qps_base`, `qps_burst`, `qps_min`, `qps_max`, `rate_scale`, or `timestamps_file` |
+
+You can look at either shape before spending a single endpoint call.
+
+`sample` draws from a profile and prints the sizes and cache fraction it
+recovered, so you can confirm the profile matches your traffic:
+
+```bash
+python3 -m traffic_replay sample --profile configs/profile_decagon_20260723.json
+```
+```json
+"recovered": {
+  "input_tokens":  {"p50": 9967.0,  "p95": 23854.1},
+  "output_tokens": {"p50": 40.0,    "p95": 90.0},
+  "cache_fraction":{"p50": 0.60,    "p95": 0.87}
+}
+```
+
+`schedule` builds an arrival curve and prints how bursty it is, so you know
+what a config produces before you point it at anything:
+
+```bash
+python3 -m traffic_replay schedule --duration 300
+```
+```json
+{
+  "seconds": 300,
+  "requests": 36928,
+  "rate_p50": 38.2,
+  "rate_p95": 438.9,
+  "rate_max": 500.0,
+  "spiky": true
+}
+```
+
+`spiky` is true when peak QPS is at least 8x the trough. That is the bursty
+regime this arrival model is built for; a flat load test won't surface the
+queueing behavior that bursts do.
+
 ## Requirements
 
 Python 3.10 or newer and `numpy`. That's the whole list; the HTTP client is

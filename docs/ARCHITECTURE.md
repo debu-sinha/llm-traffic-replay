@@ -72,6 +72,6 @@ numbers.
   endpoint latency.
 - Cold cache at run start: warmup/calibration phase is logged separately
   (`phase` field) and excluded from the replay summary.
-- Mid-stream stalls: the widest interchunk gap is recorded per request; when
+- Mid-stream stalls: the widest interchunk gap is recorded per request. When
   the profile sets `acceptance_targets.interchunk_ms`, requests over it count
   as SLA breaches against the success rate.

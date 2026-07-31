@@ -86,12 +86,12 @@ python3 -m traffic_replay schedule --duration 300
 ```
 
 `spiky` is true when peak QPS is at least 8x the trough. That is the bursty
-regime this arrival model is built for; a flat load test won't surface the
+regime this arrival model is built for. A flat load test won't surface the
 queueing behavior that bursts do.
 
 ## Requirements
 
-Python 3.10 or newer and `numpy`. That's the whole list; the HTTP client is
+Python 3.10 or newer and `numpy`. That's the whole list, the HTTP client is
 standard library. `pytest` is optional (a bundled zero-dependency runner runs
 the same tests without it).
 
@@ -106,7 +106,7 @@ works too.
 ## Quickstart (no endpoint needed, about 60 seconds)
 
 Run every command from the repository root (the directory holding this file).
-Don't `cd` into `traffic_replay/`; that is the package, and both
+Don't `cd` into `traffic_replay/`, that is the package, and both
 `python3 -m traffic_replay` and the relative `configs/` paths resolve from
 the root.
 
@@ -193,7 +193,7 @@ input_tokens,output_tokens,cached_tokens
 24310,88,15220
 ```
 
-Only those three numbers per row are read; no prompt text is needed or
+Only those three numbers per row are read. No prompt text is needed or
 touched. Build a profile from the export and check it:
 
 ```bash
@@ -471,43 +471,43 @@ believed, and the report prints them together:
 Run configs are plain JSON deserialized into `RunConfig`
 (`traffic_replay/runner.py`). Every field, with defaults:
 
-| field | default | meaning |
-|---|---|---|
-| `profile_path` | null | path to a profile JSON (shape mode). Set this or `prompts_file` |
-| `prompts_file` | null | path to a real-prompts file, `.jsonl` / `.txt` / `.json` (prompts mode). Set this or `profile_path` |
-| `endpoint.base_url` | required | `https://<workspace-host>`, no trailing slash |
-| `endpoint.path` | required | e.g. `/serving-endpoints/<name>/invocations` |
-| `endpoint.auth_token_env` | `DATABRICKS_TOKEN` | env var read for the bearer token |
-| `endpoint.model` | null | set only for shared `/chat/completions` routes |
-| `endpoint.connect_timeout_s` | 10 | TCP/TLS connect timeout |
-| `endpoint.read_timeout_s` | 120 | per-read socket timeout during streaming |
-| `endpoint.temperature` | 0.0 | request temperature (keep 0 for benchmarks) |
-| `endpoint.max_retries` | 1 | connection-error retries. The retried count prints in the report |
-| `endpoint.extra_body` | null | passthrough request params merged into the body (top_p, stop, response_format, provider thinking control). The harness-owned keys always win. See [Steering model behavior](#steering-model-behavior-extra_body) |
-| `duration_s` | 300 | schedule length in seconds |
-| `qps_base` / `qps_burst` | 25 / 350 | mean rates of the two arrival states |
-| `qps_min` / `qps_max` | 10 / 500 | hard clamp on the rate curve |
-| `rate_scale` | 1.0 | uniform thinning that preserves shape. Step 0.1 to 1.0 per the run plan |
-| `timestamps_file` | null | real arrival trace (text or JSONL `{"t": s}`) that replaces the synthetic schedule |
-| `max_concurrency` | 256 | thread pool bound. Excess arrivals show up as dispatch lag |
-| `seed` | 7 | root seed. Same config plus same seed is the same experiment |
-| `cpt` | 4.0 | starting characters-per-token guess, recalibrated during warmup |
-| `calibrate_n` | 12 | sequential warmup requests used to calibrate cpt |
-| `shard_index` / `shard_total` | 0 / 1 | deterministic 1-of-n schedule split across client machines |
-| `pool_docs_per_bucket` | 40 | shared-prefix documents per size bucket |
-| `pool_zipf_s` | 1.1 | popularity skew. Higher concentrates traffic on hot documents |
-| `out_dir` | `results` | output root. Each run writes a timestamped subdirectory |
-| `title` / `label` | "" | report title and the provenance label printed at the bottom |
-| `max_output_tokens_cap` | 512 | safety cap on max_tokens per request (32 in the smoke config) |
-| `acceptance_targets` | null | inline SLA targets (`ttft_ms`, `ttfg_ms`, `hard_timeouts`, `success_rate`, `interchunk_ms`). In prompts mode this is how the scorecard gets its targets |
-| `ttft_definition` | `first_content` | `first_content` (first token of either kind) or `first_visible` (skip reasoning-channel deltas). The SLA scorecard scores whichever is set |
+| field | default | example | what it does, and when to change it |
+|---|---|---|---|
+| `profile_path` | null | `"configs/profile_decagon_real.json"` | path to a profile JSON (shape mode). Set this or `prompts_file`, not both |
+| `prompts_file` | null | `"your_prompts.jsonl"` | path to a real-prompts file, `.jsonl` / `.txt` / `.json` (prompts mode). Set this or `profile_path` |
+| `endpoint.base_url` | required | `"https://your-ws.cloud.databricks.com"` | workspace host, no trailing slash |
+| `endpoint.path` | required | `"/serving-endpoints/my-ep/invocations"` | the serving endpoint route. Model-serving uses `.../invocations` |
+| `endpoint.auth_token_env` | `DATABRICKS_TOKEN` | `"DATABRICKS_TOKEN"` | env var the bearer token is read from. Never put the token in the config |
+| `endpoint.model` | null | `"databricks-meta-llama-3-3-70b-instruct"` | set only for shared `/chat/completions` routes that need a model field; leave null for a dedicated `.../invocations` endpoint |
+| `endpoint.connect_timeout_s` | 10 | `10` | TCP/TLS connect timeout. Raise on a slow/cold endpoint |
+| `endpoint.read_timeout_s` | 120 | `120` | per-read socket timeout while streaming. Raise for long generations |
+| `endpoint.temperature` | 0.0 | `0.0` | request temperature. Keep 0 for repeatable benchmarks |
+| `endpoint.max_retries` | 1 | `1` | connection-error retries only. The retried count prints in the report |
+| `endpoint.extra_body` | null | `{"top_p": 0.95}` | passthrough request params (top_p, stop, response_format, thinking control). Harness-owned keys always win. See [Steering model behavior](#steering-model-behavior-extra_body) |
+| `duration_s` | 300 | `300` | how long the schedule runs, in seconds |
+| `qps_base` / `qps_burst` | 25 / 350 | `2` / `8` | mean request rates of the two arrival states (quiet and burst). Set both low for a gentle probe, high for a stress run |
+| `qps_min` / `qps_max` | 10 / 500 | `1` / `12` | hard floor and ceiling clamped on the rate curve |
+| `rate_scale` | 1.0 | `0.5` | uniform thinning that keeps the shape. Step it 0.1 to 1.0 to find where the endpoint bends |
+| `timestamps_file` | null | `"your_arrivals.txt"` | real arrival trace (one epoch/line, or JSONL `{"t": s}`) that replaces the synthetic schedule |
+| `max_concurrency` | 256 | `64` | in-flight request bound. Excess arrivals surface as dispatch lag, not fake latency |
+| `seed` | 7 | `7` | root RNG seed. Same config plus same seed is the same experiment |
+| `cpt` | 4.0 | `4.0` | starting characters-per-token guess, recalibrated during warmup (profile mode only) |
+| `calibrate_n` | 12 | `8` | warmup requests run before the schedule. Also primes the endpoint cache |
+| `shard_index` / `shard_total` | 0 / 1 | `0` / `3` | deterministic 1-of-n schedule split, one per client machine, then `merge` the outputs |
+| `pool_docs_per_bucket` | 40 | `40` | shared-prefix documents per size bucket (profile-mode cache structure) |
+| `pool_zipf_s` | 1.1 | `1.1` | document popularity skew. Higher concentrates traffic on hot documents |
+| `out_dir` | `results` | `"results/decagon"` | output root. Each run writes a timestamped subdirectory under it |
+| `title` / `label` | "" | `"decagon PT 250K"` | report title and the provenance label printed at the bottom of the report |
+| `max_output_tokens_cap` | 512 | `300` | ceiling on `max_tokens` per request. Reasoning models spend this budget thinking first |
+| `acceptance_targets` | null | `{"ttft_ms": {"p95": 900}}` | inline SLA targets (`ttft_ms`, `ttfg_ms`, `hard_timeouts`, `success_rate`, `interchunk_ms`). In prompts mode this is how the scorecard gets its targets |
+| `ttft_definition` | `first_content` | `"first_visible"` | `first_content` (first token of either kind) or `first_visible` (skip reasoning deltas). The SLA scorecard scores whichever is set |
 
 Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
 `cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1)).
 `provenance` records where the numbers came from, and `label` is printed on
 every report built from this profile. An optional `acceptance_targets`
 object (ttft_ms, ttfg_ms, hard_timeouts, success_rate, interchunk_ms) drives
-the SLA scorecard; without it, no scorecard is printed. Auth is never stored in any config.
+the SLA scorecard. Without it, no scorecard is printed. Auth is never stored in any config.
 The token comes from the environment variable at run time or, in a
 notebook, from the ambient workspace context.
 

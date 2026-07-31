@@ -1,5 +1,7 @@
 # llm-traffic-replay
 
+[![tests](https://github.com/debu-sinha/llm-traffic-replay/actions/workflows/tests.yml/badge.svg)](https://github.com/debu-sinha/llm-traffic-replay/actions/workflows/tests.yml)
+
 Replay **your production traffic shape** against an LLM serving endpoint,
 instead of testing with generic synthetic load.
 

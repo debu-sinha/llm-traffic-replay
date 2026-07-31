@@ -1,0 +1,32 @@
+name: tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install
+        run: pip install numpy pytest
+      - name: pytest
+        run: python -m pytest -q
+      - name: zero-dependency runner
+        run: python3 scripts/run_tests_stdlib.py
+      - name: instrument self-test
+        run: python -m traffic_replay validate --duration 15 --tolerance-ms 120 --workdir /tmp/trv
+      - name: no em dashes
+        run: |
+          if grep -rn $'\xe2\x80\x94' . --exclude-dir=.git; then
+            echo "em dash found in the repo"; exit 1
+          fi
+      - name: no ai-tell vocabulary
+        run: |
+          if grep -rniE "delve|seamless|robust|comprehensive|leverage|cutting.edge|state.of.the.art|empower" --include="*.md" --include="*.py" . | grep -v '\.git'; then
+            echo "ai-tell vocabulary found"; exit 1
+          fi

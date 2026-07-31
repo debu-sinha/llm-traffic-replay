@@ -18,16 +18,17 @@ reported per request) plus `shard` support to split a schedule across
 processes or machines when a single client saturates. For a single-node
 endpoint evaluation, the endpoint saturates long before the client does.
 
-**TTFT keys on first content delta, not first byte.** Real servers send a
+**TTFT split: first token, reasoning, first visible.** Real servers send a
 role-only chunk immediately on connection, and timing off that byte would
-flatter the endpoint. The bundled mock deliberately reproduces this trap
-and the test suite asserts the client doesn't fall into it. One known
-limitation, stated rather than hidden: for reasoning models that stream a
-reasoning channel before visible output, the first reasoning delta counts
-as first content. If the SLO under test is time to first VISIBLE token,
-agree on that definition before the run. Splitting the two timestamps is a
-planned extension, and the current behavior always errs toward the stricter
-(earlier) reading.
+flatter the endpoint. The bundled mock reproduces this trap and the suite
+asserts the client keys on the first content delta, not the first byte. For
+thinking models that stream a reasoning channel before visible output the
+client records three timestamps per request: `ttft` (first token of either
+kind, kept for back compat), `ttfr` (first reasoning delta) and `ttfv`
+(first visible content delta). The run config's `ttft_definition`
+(`first_content` or `first_visible`) chooses which one the SLA scorecard
+scores, and the report flags when they diverge so the definition is agreed
+before a number is quoted.
 
 **Cache is constructed, never asserted.** The pool guarantees the traffic
 STRUCTURE (shared leading text, popularity skew, cold first-uses). Whether
@@ -71,3 +72,6 @@ numbers.
   endpoint latency.
 - Cold cache at run start: warmup/calibration phase is logged separately
   (`phase` field) and excluded from the replay summary.
+- Mid-stream stalls: the widest interchunk gap is recorded per request; when
+  the profile sets `acceptance_targets.interchunk_ms`, requests over it count
+  as SLA breaches against the success rate.

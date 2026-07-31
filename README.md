@@ -150,6 +150,29 @@ If dispatch lag p95 grows past ~100 ms at full rate_scale, split the
 schedule across two machines with `shard_index`/`shard_total` and pool the
 `requests.jsonl` files.
 
+## Pooling and comparing runs
+
+Sharded across machines? Pool their output dirs into one summary:
+
+```bash
+python -m traffic_replay merge results/pooled \
+  results/m1/2026* results/m2/2026* results/m3/2026*
+```
+
+Comparing providers (the cost-parity motion) means running each on this
+same instrument, then:
+
+```bash
+python -m traffic_replay compare results/compare \
+  results/dbx-pt results/together results/baseten
+```
+
+`compare` writes `comparison.md`, one column per run, and warns in bold when
+the runs' achieved cache p50 differ by more than 0.10, because comparing
+latency at different cache rates is not a comparison. Pass `--profile` to
+`merge` to score the pooled run against acceptance targets, and `--force` to
+merge runs whose endpoint paths differ.
+
 ## Reading results: the honesty rules
 
 Every latency table ships with the context that decides whether it can be
@@ -167,6 +190,18 @@ believed, and the report prints them together:
   into endpoint latency.
 - **Profile label**: runs built to stated (spoken) figures carry that
   label until the exact production dataset replaces the profile config.
+- **Interchunk max**: the widest gap between streamed content chunks per
+  request, so an SLA sensitive to mid-stream stalls has a number to read.
+- **Output token targeting**: reported completion tokens vs intended, with
+  the finish_reason mix (stop vs length), so a compressed output
+  distribution is visible next to the calibrated input side.
+- **SLA scorecard**: when the profile carries `acceptance_targets`, the
+  report prints a pass/fail scorecard (TTFT, TTFG, hard-timeout and
+  interchunk breaches, success rate). A missed target prints NO, not a dash.
+- **Reasoning split**: for thinking models the report gives `ttft` (first
+  token of either kind), `ttfr` (first reasoning) and `ttfv` (first visible)
+  and flags when they diverge. `ttft_definition` picks which the scorecard
+  scores.
 
 ## Settings reference
 
@@ -199,6 +234,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `out_dir` | `results` | output root. Each run writes a timestamped subdirectory |
 | `title` / `label` | "" | report title and the provenance label printed at the bottom |
 | `max_output_tokens_cap` | 512 | safety cap on max_tokens per request (32 in the smoke config) |
+| `ttft_definition` | `first_content` | `first_content` (first token of either kind) or `first_visible` (skip reasoning-channel deltas). The SLA scorecard scores whichever is set |
 
 Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
 `cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1)).
@@ -219,9 +255,9 @@ The per-request sequence and the validation design are in
 ```
 traffic_replay/          the package (profile, prefix_pool, schedule,
                          textgen, sse, client, metrics, runner,
-                         mock_server, cli)
+                         mock_server, aggregate, cli)
 configs/                 profiles and run configs (JSON)
-tests/                   pytest suite (33 tests)
+tests/                   pytest suite (unit + end-to-end)
 scripts/run_tests_stdlib.py   zero-dependency test runner
 scripts/profile_from_logs.py  build a profile JSON from real request logs
 notebooks/               self-contained Databricks workspace smoke notebook

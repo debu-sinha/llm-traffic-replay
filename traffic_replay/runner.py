@@ -48,7 +48,8 @@ class RunConfig:
     out_dir: str = "results"
     title: str = "traffic replay"
     label: str = ""
-    max_output_tokens_cap: int = 512  # safety cap for smoke runs; full runs raise it
+    max_output_tokens_cap: int = 512
+    ttft_definition: str = "first_content"   # or "first_visible"; sla scores it  # safety cap for smoke runs; full runs raise it
 
 
 def _token(cfg: EndpointConfig) -> str | None:
@@ -166,7 +167,8 @@ def run(rc: RunConfig, token_override: str | None = None,
     }
     summary = summarize([r for r in results if r.get("phase") == "replay"],
                         schedule_meta=schedule_report(sched), run_meta=meta,
-                        acceptance=(p.extra or {}).get("acceptance_targets"))
+                        acceptance=(p.extra or {}).get("acceptance_targets"),
+                        ttft_definition=rc.ttft_definition)
     out = write_outputs(results, summary,
                         Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
                         rc.title)

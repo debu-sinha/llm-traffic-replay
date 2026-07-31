@@ -35,6 +35,7 @@ DEFAULTS = {
     "ttft_base_ms": 120.0,
     "ms_per_1k_uncached": 40.0,
     "per_token_ms": 4.0,
+    "reasoning_tokens": 0,
     "cache_capacity_chains": 4096,
     "cache_ttl_s": 900.0,
 }
@@ -138,6 +139,14 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                                "finish_reason": None}]})
 
             time.sleep(ttft_planned_ms / 1000.0)
+            reasoning_n = int(params.get("reasoning_tokens", 0))
+            for i in range(reasoning_n):
+                if i:
+                    time.sleep(params["per_token_ms"] / 1000.0)
+                emit({"choices": [{"delta": {"reasoning_content": "hmm"},
+                                   "finish_reason": None}]})
+            if reasoning_n:
+                time.sleep(params["per_token_ms"] / 1000.0)
             t_first_content = time.monotonic()
             emit({"choices": [{"delta": {"content": "The"},
                                "finish_reason": None}]})

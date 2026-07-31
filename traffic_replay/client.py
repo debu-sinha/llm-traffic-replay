@@ -48,7 +48,9 @@ class RequestResult:
     dispatch_lag_ms: float           # how late the client fired vs schedule
     t_send_unix: float
     ttfb_ms: float | None
-    ttft_ms: float | None
+    ttft_ms: float | None            # first content of either kind (back compat)
+    ttfr_ms: float | None            # first reasoning-channel delta, else None
+    ttfv_ms: float | None            # first visible content delta, else None
     e2e_ms: float | None
     status: int | None
     ok: bool
@@ -156,7 +158,7 @@ class EndpointClient:
                     self._include_usage_supported = True
 
                 state = StreamState()
-                ttfb_ms = ttft_ms = None
+                ttfb_ms = ttft_ms = ttfr_ms = ttfv_ms = None
                 interchunk_max = None
                 last_content_t = None
                 for raw in resp:
@@ -167,9 +169,15 @@ class EndpointClient:
                     if event is None:
                         continue
                     chunks_before = state.content_chunks
+                    reasoning_before = state.saw_first_reasoning
+                    visible_before = state.saw_first_visible
                     first = update_state(state, event)
                     if first and ttft_ms is None:
                         ttft_ms = (now - t_send) * 1000.0
+                    if state.saw_first_reasoning and not reasoning_before:
+                        ttfr_ms = (now - t_send) * 1000.0
+                    if state.saw_first_visible and not visible_before:
+                        ttfv_ms = (now - t_send) * 1000.0
                     if state.content_chunks > chunks_before:
                         if last_content_t is not None:
                             gap = (now - last_content_t) * 1000.0
@@ -184,7 +192,8 @@ class EndpointClient:
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
-                                    attempt - 1, interchunk_max)
+                                    attempt - 1, interchunk_max,
+                                    ttfr_ms, ttfv_ms)
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
@@ -202,12 +211,14 @@ class EndpointClient:
     def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
                 ttfb_ms, ttft_ms, e2e_ms, status, ok, error, state,
                 intended, chars_sent, retries,
-                interchunk_max_ms=None) -> RequestResult:
+                interchunk_max_ms=None,
+                ttfr_ms=None, ttfv_ms=None) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
             dispatch_lag_ms=dispatch_lag_ms, t_send_unix=t_send_unix,
-            ttfb_ms=ttfb_ms, ttft_ms=ttft_ms, e2e_ms=e2e_ms, status=status,
+            ttfb_ms=ttfb_ms, ttft_ms=ttft_ms, ttfr_ms=ttfr_ms,
+            ttfv_ms=ttfv_ms, e2e_ms=e2e_ms, status=status,
             ok=ok, error=error, content_chunks=state.content_chunks,
             interchunk_max_ms=interchunk_max_ms,
             finish_reason=state.finish_reason,

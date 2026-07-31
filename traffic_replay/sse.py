@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 @dataclass
 class StreamState:
     saw_first_content: bool = False
+    saw_first_visible: bool = False       # first visible content delta
+    saw_first_reasoning: bool = False     # first reasoning-channel delta
     content_chunks: int = 0
     finish_reason: str | None = None
     usage: dict | None = None
@@ -53,12 +55,17 @@ def update_state(state: StreamState, event: dict) -> bool:
     first_content = False
     for choice in event.get("choices") or []:
         delta = choice.get("delta") or {}
-        content = delta.get("content") or delta.get("reasoning_content")
-        if content:
+        visible = delta.get("content")
+        reasoning = delta.get("reasoning_content")
+        if visible or reasoning:
             state.content_chunks += 1
             if not state.saw_first_content:
                 state.saw_first_content = True
                 first_content = True
+        if reasoning and not state.saw_first_reasoning:
+            state.saw_first_reasoning = True
+        if visible and not state.saw_first_visible:
+            state.saw_first_visible = True
         fr = choice.get("finish_reason")
         if fr:
             state.finish_reason = fr

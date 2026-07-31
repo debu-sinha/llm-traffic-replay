@@ -28,7 +28,8 @@ def _pct_table(values: list[float | None]) -> dict:
 
 def summarize(results: list[dict], schedule_meta: dict | None = None,
               run_meta: dict | None = None,
-              acceptance: dict | None = None) -> dict:
+              acceptance: dict | None = None,
+              ttft_definition: str = "first_content") -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
 
@@ -103,13 +104,19 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": run_meta or {},
     }
+    for fld in ("ttfr_ms", "ttfv_ms"):
+        vals = [r.get(fld) for r in ok]
+        if any(v is not None for v in vals):
+            summary[fld] = _pct_table(vals)
     if acceptance:
-        summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance)
+        summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance,
+                                       ttft_definition)
     return summary
 
 
 def _evaluate_sla(ok: list[dict], total: int, summary: dict,
-                  acceptance: dict) -> dict:
+                  acceptance: dict,
+                  ttft_definition: str = "first_content") -> dict:
     """Score the run against customer acceptance targets.
 
     Expected shape (all sections optional):
@@ -119,12 +126,13 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
                                                 as SLA failures
       success_rate: 0.9999
     """
-    out: dict = {"targets_source": "profile acceptance_targets"}
+    out: dict = {"targets_source": "profile acceptance_targets",
+                "ttft_definition": ttft_definition}
 
     def score(name, table_key, targets):
         rows = []
         for q, target in (targets or {}).items():
-            actual = summary[table_key].get(q)
+            actual = (summary.get(table_key) or {}).get(q)
             rows.append({
                 "quantile": q, "target_ms": target,
                 "actual_ms": round(actual, 1) if actual is not None else None,
@@ -132,7 +140,8 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
             })
         out[name] = rows
 
-    score("ttft_vs_target", "ttft_ms", acceptance.get("ttft_ms"))
+    ttft_key = "ttft_ms" if ttft_definition == "first_content" else "ttfv_ms"
+    score("ttft_vs_target", ttft_key, acceptance.get("ttft_ms"))
     score("ttfg_vs_target", "e2e_ms", acceptance.get("ttfg_ms"))
 
     hard = acceptance.get("hard_timeouts") or {}
@@ -248,6 +257,17 @@ def render_markdown(summary: dict, title: str) -> str:
         if sr:
             lines.append(f"| success rate | - | {sr['target']} | "
                          f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
+
+    if s.get("ttfr_ms"):
+        tft = s["ttft_ms"].get("p50")
+        tfv = (s.get("ttfv_ms") or {}).get("p50")
+        vis = (f"ttfv (first visible token) p50 {tfv:.0f} ms"
+               if tfv is not None else
+               "some requests emitted no visible content within max_tokens")
+        lines += ["", "note: reasoning model detected. ttft (first token of "
+                  f"either kind) p50 {tft:.0f} ms; {vis}. agree which "
+                  "definition the SLA scores via ttft_definition in the run "
+                  "config."]
 
     label = (s.get("run") or {}).get("label")
     if label:

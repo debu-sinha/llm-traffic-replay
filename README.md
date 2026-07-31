@@ -23,6 +23,18 @@ includes Databricks provisioned throughput and pay-per-token serving as
 well as other hosted providers, so the same instrument that measures your
 candidate endpoint also measures the alternatives on an identical basis.
 
+## What it measures, and what it doesn't
+
+The harness reproduces the *shape* of your traffic: prompt sizes, cache
+structure, and arrival timing. It fills that shape with synthetic text. An
+endpoint's latency and throughput depend on token counts, cache hits, and
+arrival rate, not on what the words say, so the numbers transfer to
+production even though the prompts themselves are gibberish.
+
+It doesn't measure anything content-dependent. Response quality, guardrail
+and safety triggers, and semantic routing all need real prompts. This is a
+load-shape benchmark, not a quality eval.
+
 ## Requirements
 
 Python 3.10+, `numpy`. That's the whole list. The HTTP client is standard
@@ -72,6 +84,43 @@ Outputs land in `results/<timestamp>/`:
 Then follow `docs/PRODUCTION_TESTING.md` for the staged plan: smoke test on
 shared capacity (client correctness only), then the provisioned throughput
 endpoint at stepped rate scales, then customer-dataset replay.
+
+## Bring your own data
+
+The bundled profile is built to spoken figures. When you have real numbers,
+two inputs plug in, and the prompt text stays synthetic on purpose.
+
+**Traffic shape, from your logs.** Export per-request token counts (input
+tokens, output tokens, and cached prompt tokens) as JSONL or CSV, then build
+a profile:
+
+```bash
+python3 scripts/profile_from_logs.py \
+  --input your_logs.jsonl --name decagon_real \
+  --out configs/profile_decagon_real.json
+
+# check the recovered quantiles match your data
+python -m traffic_replay sample --profile configs/profile_decagon_real.json
+```
+
+The defaults read `input_tokens`, `output_tokens`, and `cached_tokens`.
+Override with `--input-field`, `--output-field`, `--cached-field`, or pass
+`--cache-fraction-field` if you already have a per-request fraction. Only the
+distribution is read, no prompt text, so a token-count export is enough and
+no customer content moves. Point your run config's `profile_path` at the new
+file.
+
+**Arrival timing, from your trace.** Write your request arrival times to a
+file, one epoch-second value per line (or JSONL `{"t": <seconds>}`), and set
+`"timestamps_file"` in the run config. It replaces the synthetic burst
+schedule: the line count is the request count, the timing is yours, and the
+report names the trace it ran from.
+
+**Prompt text stays synthetic** (see "What it measures"). Exact-prompt replay
+isn't supported today.
+
+A full real-data run uses both: your quantiles in the profile, your
+timestamps in `timestamps_file`.
 
 ## Where to run it
 
@@ -172,6 +221,7 @@ traffic_replay/          the package (profile, prefix_pool, schedule,
 configs/                 profiles and run configs (JSON)
 tests/                   pytest suite (33 tests)
 scripts/run_tests_stdlib.py   zero-dependency test runner
+scripts/profile_from_logs.py  build a profile JSON from real request logs
 notebooks/               self-contained Databricks workspace smoke notebook
                          (embeds this repo, ambient auth, smoke labels)
 docs/ARCHITECTURE.md     diagrams and design decisions

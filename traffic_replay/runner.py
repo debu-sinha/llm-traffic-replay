@@ -75,6 +75,9 @@ def run(rc: RunConfig, token_override: str | None = None,
 
     ecfg = EndpointConfig(**rc.endpoint)
     client = EndpointClient(ecfg, token_override or _token(ecfg))
+    req_params = {"temperature": ecfg.temperature,
+                  "max_output_tokens_cap": rc.max_output_tokens_cap,
+                  "extra_body": ecfg.extra_body or {}}
 
     # arrival schedule is shared by both modes
     if rc.timestamps_file:
@@ -190,6 +193,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "input_mode": "prompts",
             "prompts_file": rc.prompts_file, "prompts_count": m,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
+            "request_params": req_params,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
         }
         acceptance = rc.acceptance_targets
@@ -199,6 +203,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "profile": p.name, "profile_provenance": p.provenance,
             "profile_label": p.label, "cpt_final": mat.cpt,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
+            "request_params": req_params,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
         }
         acceptance = (rc.acceptance_targets

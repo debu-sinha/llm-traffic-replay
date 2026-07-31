@@ -115,6 +115,9 @@ def compare_runs(out_dir, input_dirs) -> Path:
                      "{:,.0f}"),
               scalar("output tokens/min",
                      lambda s: (s.get("throughput") or {}).get("output_tokens_per_min"),
+                     "{:,.0f}"),
+              scalar("reasoning tokens (total)",
+                     lambda s: s.get("reasoning_tokens_total"),
                      "{:,.0f}"), ""])
 
     L.extend(["## believability (read before trusting the latency tables)",

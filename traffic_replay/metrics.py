@@ -126,6 +126,16 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         vals = [r.get(fld) for r in ok]
         if any(v is not None for v in vals):
             summary[fld] = _pct_table(vals)
+    reason_vals = [r.get("reasoning_tokens") for r in ok]
+    if any(v is not None for v in reason_vals):
+        total = sum(v for v in reason_vals if v)
+        summary["reasoning_tokens"] = _pct_table(reason_vals)
+        summary["reasoning_tokens_total"] = total
+        summary["reasoning_tokens_source"] = next(
+            (r.get("reasoning_tokens_source") for r in ok
+             if r.get("reasoning_tokens_source")), None)
+        if dur_min:
+            summary["throughput"]["reasoning_tokens_per_min"] = total / dur_min
     if acceptance:
         summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance,
                                        ttft_definition)
@@ -277,11 +287,29 @@ def render_markdown(summary: dict, title: str) -> str:
         "here means the tail has survivorship bias, read with care)"
         if s.get("requests_retried") else "- connection retries: none",
     ]
+    rt = s.get("reasoning_tokens_total")
+    if rt is not None:
+        rtab = s.get("reasoning_tokens") or {}
+        rpm = (s.get("throughput") or {}).get("reasoning_tokens_per_min")
+        permin = f", {rpm:,.0f}/min" if rpm else ""
+        lines.append(
+            f"- reasoning tokens: {rt:,} total{permin}, p50 "
+            f"{rtab.get('p50', 0):.0f} per request "
+            f"(field: {s.get('reasoning_tokens_source')})")
+
     tp = s.get("throughput") or {}
     if tp.get("input_tokens_per_min"):
         lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
                       f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
                       "tokens/min (endpoint-reported counts over wall time)"]
+    rp = (s.get("run") or {}).get("request_params")
+    if rp:
+        eb = rp.get("extra_body") or {}
+        line = (f"request params: temperature {rp.get('temperature')}, "
+                f"max_tokens cap {rp.get('max_output_tokens_cap')}")
+        if eb:
+            line += f", extra_body {json.dumps(eb)}"
+        lines += ["", line]
     merge_note = (s.get("run") or {}).get("merge_note")
     if merge_note:
         lines += ["", merge_note]

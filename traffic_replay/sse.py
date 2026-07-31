@@ -84,15 +84,16 @@ CACHED_TOKEN_PATHS = (
     ("cache_read_input_tokens",),                 # Anthropic-style naming
 )
 
+# Reasoning (thinking) token counts, same convention.
+REASONING_TOKEN_PATHS = (
+    ("completion_tokens_details", "reasoning_tokens"),   # OpenAI o-series
+    ("reasoning_tokens",),                               # flat variants
+)
 
-def extract_usage(usage: dict | None) -> dict:
-    """Normalize a usage block. Absent fields come back None, never guessed."""
-    if not usage:
-        return {"prompt_tokens": None, "completion_tokens": None,
-                "cached_tokens": None, "cached_tokens_source": None}
-    cached = None
-    source = None
-    for path in CACHED_TOKEN_PATHS:
+
+def _walk(usage: dict, paths) -> tuple[int | None, str | None]:
+    """First present integer at any of `paths`, with its dotted source."""
+    for path in paths:
         node = usage
         ok = True
         for key in path:
@@ -102,12 +103,23 @@ def extract_usage(usage: dict | None) -> dict:
                 ok = False
                 break
         if ok and isinstance(node, (int, float)):
-            cached = int(node)
-            source = ".".join(path)
-            break
+            return int(node), ".".join(path)
+    return None, None
+
+
+def extract_usage(usage: dict | None) -> dict:
+    """Normalize a usage block. Absent fields come back None, never guessed."""
+    if not usage:
+        return {"prompt_tokens": None, "completion_tokens": None,
+                "cached_tokens": None, "cached_tokens_source": None,
+                "reasoning_tokens": None, "reasoning_tokens_source": None}
+    cached, cached_src = _walk(usage, CACHED_TOKEN_PATHS)
+    reasoning, reasoning_src = _walk(usage, REASONING_TOKEN_PATHS)
     return {
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "cached_tokens": cached,
-        "cached_tokens_source": source,
+        "cached_tokens_source": cached_src,
+        "reasoning_tokens": reasoning,
+        "reasoning_tokens_source": reasoning_src,
     }

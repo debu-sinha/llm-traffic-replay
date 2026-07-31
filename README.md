@@ -329,6 +329,57 @@ targeting not applicable, while still reporting achieved cache, throughput,
 arrival honesty, and finish reasons. Set either `profile_path` or
 `prompts_file`, not both.
 
+## Steering model behavior (extra_body)
+
+`endpoint.extra_body` is a dict merged into every request body, so you can
+pass any parameter the endpoint accepts: sampling knobs, structured output,
+and provider-specific thinking control. The harness-owned keys (`messages`,
+`max_tokens`, `temperature`, `stream`, `stream_options`, `model`) always win,
+so a run stays measurable no matter what you put here. Use the `temperature`
+field for temperature, not `extra_body`.
+
+Sampling and output shape, provider-independent:
+
+```json
+"endpoint": {
+  "base_url": "https://your-workspace.cloud.databricks.com",
+  "path": "/serving-endpoints/your-endpoint/invocations",
+  "extra_body": {"top_p": 0.95, "stop": ["\n\n"], "seed": 42}
+}
+```
+
+Turning thinking on or off depends on the model. Common shapes:
+
+```json
+"extra_body": {"reasoning_effort": "low"}
+```
+```json
+"extra_body": {"thinking": {"type": "enabled", "budget_tokens": 2000}}
+```
+```json
+"extra_body": {"chat_template_kwargs": {"enable_thinking": false}}
+```
+
+The first is OpenAI o-series style, the second is Anthropic extended thinking,
+the third is how Qwen and GLM thinking models toggle on a vLLM-backed
+Databricks endpoint. Check your endpoint's docs for the exact key, since a
+param the endpoint doesn't recognize is usually ignored, and some reject it
+with a 400 that the report shows as a failed request.
+
+Every run echoes its parameters in the report so a reader knows what produced
+the numbers:
+
+```
+request params: temperature 0.0, max_tokens cap 220, extra_body {"top_p": 0.95}
+```
+
+When the endpoint reports a thinking-token count
+(`completion_tokens_details.reasoning_tokens`), the believability block adds a
+line for it. Endpoints that stream a reasoning channel but don't report the
+count leave the line out rather than guessing. To measure what thinking costs
+on an endpoint, run it once with thinking on and once off, then `compare` the
+two: the reasoning-token, TTFT, and end-to-end differences land side by side.
+
 ## Where to run it
 
 The harness measures client side, so the machine it runs on is part of the
@@ -407,6 +458,13 @@ believed, and the report prints them together:
   token of either kind), `ttfr` (first reasoning) and `ttfv` (first visible)
   and flags when they diverge. `ttft_definition` picks which the scorecard
   scores.
+- **Reasoning tokens**: when the endpoint reports a thinking-token count, the
+  report prints total and per-request reasoning tokens with the usage field it
+  came from. Endpoints that stream reasoning but don't report the count leave
+  the line out rather than guessing.
+- **Request params**: the report echoes the temperature, max-tokens cap, and
+  any `extra_body`, so a reader knows exactly what request parameters produced
+  the numbers.
 
 ## Settings reference
 
@@ -425,6 +483,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `endpoint.read_timeout_s` | 120 | per-read socket timeout during streaming |
 | `endpoint.temperature` | 0.0 | request temperature (keep 0 for benchmarks) |
 | `endpoint.max_retries` | 1 | connection-error retries. The retried count prints in the report |
+| `endpoint.extra_body` | null | passthrough request params merged into the body (top_p, stop, response_format, provider thinking control). The harness-owned keys always win. See [Steering model behavior](#steering-model-behavior-extra_body) |
 | `duration_s` | 300 | schedule length in seconds |
 | `qps_base` / `qps_burst` | 25 / 350 | mean rates of the two arrival states |
 | `qps_min` / `qps_max` | 10 / 500 | hard clamp on the rate curve |

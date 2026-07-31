@@ -39,6 +39,7 @@ class EndpointConfig:
     read_timeout_s: float = 120.0
     temperature: float = 0.0
     max_retries: int = 1             # connection-level errors only
+    extra_body: dict | None = None   # passthrough request params (see _body)
 
 
 @dataclass
@@ -68,6 +69,8 @@ class RequestResult:
     doc_id: int                      # pooled document; -1 = no shared prefix
     chars_sent: int
     retries: int = 0
+    reasoning_tokens: int | None = None   # thinking tokens, when reported
+    reasoning_tokens_source: str | None = None  # usage field it was read from
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -94,12 +97,20 @@ class EndpointClient:
 
     def _body(self, messages: list[dict], max_tokens: int,
               include_usage: bool) -> bytes:
-        payload: dict = {
-            "messages": messages,
-            "max_tokens": int(max_tokens),
-            "temperature": self.cfg.temperature,
-            "stream": True,
-        }
+        # extra_body is user passthrough (top_p, stop, response_format, and
+        # provider thinking control like reasoning_effort / thinking /
+        # chat_template_kwargs). The harness owns the keys below: they are
+        # popped first so nothing in extra_body can survive, then set from
+        # their dedicated config, so a run stays measurable no matter what
+        # the user put in extra_body.
+        owned = ("messages", "max_tokens", "temperature", "stream",
+                 "model", "stream_options")
+        payload: dict = {k: v for k, v in (self.cfg.extra_body or {}).items()
+                         if k not in owned}
+        payload["messages"] = messages
+        payload["max_tokens"] = int(max_tokens)
+        payload["temperature"] = self.cfg.temperature
+        payload["stream"] = True
         if self.cfg.model:
             payload["model"] = self.cfg.model
         if include_usage:
@@ -231,6 +242,8 @@ class EndpointClient:
             intended_cache_fraction=intended[2],
             doc_id=intended[3] if len(intended) > 3 else -1,
             chars_sent=chars_sent, retries=retries,
+            reasoning_tokens=u["reasoning_tokens"],
+            reasoning_tokens_source=u["reasoning_tokens_source"],
         )
 
 

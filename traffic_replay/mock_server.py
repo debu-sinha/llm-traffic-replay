@@ -160,6 +160,9 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                 "total_tokens": prompt_tokens + completion_tokens,
                 "prompt_tokens_details": {"cached_tokens": cached_tokens},
             }
+            if reasoning_n:
+                usage["completion_tokens_details"] = {
+                    "reasoning_tokens": reasoning_n}
             emit({"choices": [{"delta": {}, "finish_reason": "stop"}],
                   "usage": usage})
             t_done = time.monotonic()

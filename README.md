@@ -44,7 +44,7 @@ standard library. `pytest` is optional (a bundled zero-dependency runner runs
 the same tests without it).
 
 ```bash
-pip install numpy          # add pytest for nicer test output, optional
+python3 -m pip install numpy      # add pytest for nicer test output, optional
 ```
 
 Commands below use `python3`, which is what a stock macOS or Linux box has.

@@ -920,13 +920,13 @@
    "updated": 1785457600000,
    "link": null,
    "locked": false,
-   "text": "streaming HTTP,\nTTFT on first content token",
+   "text": "streaming HTTP; ttft, ttfr,\nttfv, interchunk max",
    "fontSize": 11,
    "fontFamily": 2,
    "textAlign": "center",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "streaming HTTP,\nTTFT on first content token",
+   "originalText": "streaming HTTP; ttft, ttfr,\nttfv, interchunk max",
    "lineHeight": 1.25
   },
   {
@@ -1019,13 +1019,13 @@
    "updated": 1785457600000,
    "link": null,
    "locked": false,
-   "text": "percentiles +\nbelievability block",
+   "text": "percentiles, believability,\nSLA scorecard",
    "fontSize": 11,
    "fontFamily": 2,
    "textAlign": "center",
    "verticalAlign": "top",
    "containerId": null,
-   "originalText": "percentiles +\nbelievability block",
+   "originalText": "percentiles, believability,\nSLA scorecard",
    "lineHeight": 1.25
   },
   {

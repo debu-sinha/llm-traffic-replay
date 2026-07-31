@@ -40,7 +40,8 @@ def cmd_run(args) -> int:
     rc = RunConfig(**cfg)
     out = run(rc)
     print(json.dumps(out["summary"], indent=2)[:4000])
-    print(f"\nfull outputs: {out['out_dir']}")
+    print(f"\nopen in a browser: {out['out_dir']}/report.html")
+    print(f"full outputs:      {out['out_dir']}")
     return 0
 
 

@@ -217,5 +217,6 @@ def run(rc: RunConfig, token_override: str | None = None,
                         Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
                         rc.title)
     if not quiet:
-        print(f"[runner] wrote {out}/report.md")
+        print(f"[runner] wrote {out}/report.html (open in a browser) "
+              f"and {out}/report.md")
     return {"summary": summary, "out_dir": str(out), "results_n": len(results)}

@@ -154,7 +154,10 @@ Outputs land in `results/<timestamp>/`:
   prompt/completion/cached tokens, intended sizes, document id, dispatch
   lag, errors.
 - `summary.json`: percentile tables plus the believability block.
-- `report.md`: the human-readable readout.
+- `report.html`: the readout to open in a browser or share. Stat cards, a
+  color-coded SLA scorecard, units on every metric, and the believability
+  block as a callout. Self-contained, no internet needed.
+- `report.md`: the same readout in plain text, for terminals and diffs.
 
 Then follow `docs/PRODUCTION_TESTING.md` for the staged plan: smoke test on
 shared capacity (client correctness only), then the provisioned throughput

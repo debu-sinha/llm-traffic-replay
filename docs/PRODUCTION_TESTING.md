@@ -31,7 +31,8 @@ endpoint exists or without spending its capacity.
 3. Run: `python3 -m traffic_replay run --config configs/run_smoke.json`
    (about 60 seconds at 1 to 6 QPS, small prompts, `max_output_tokens_cap`
    32, cost is negligible).
-4. Read `results/smoke/<ts>/report.md` and check, in order:
+4. Open `results/smoke/<ts>/report.html` in a browser (or read `report.md`)
+   and check, in order:
    - error rate 0%, or every failure explained
    - TTFT populated for every ok request (role-only chunks not counted)
    - `prompt_tokens` reported, token targeting error under ~15% after

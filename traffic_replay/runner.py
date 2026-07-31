@@ -164,7 +164,8 @@ def run(rc: RunConfig, token_override: str | None = None,
         "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
     }
     summary = summarize([r for r in results if r.get("phase") == "replay"],
-                        schedule_meta=schedule_report(sched), run_meta=meta)
+                        schedule_meta=schedule_report(sched), run_meta=meta,
+                        acceptance=(p.extra or {}).get("acceptance_targets"))
     out = write_outputs(results, summary,
                         Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
                         rc.title)

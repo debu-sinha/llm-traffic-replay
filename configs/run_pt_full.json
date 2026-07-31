@@ -1,5 +1,5 @@
 {
-  "profile_path": "configs/profile_decagon_20260723.json",
+  "profile_path": "configs/profile_decagon_poc_doc_20260727.json",
   "endpoint": {
     "base_url": "https://YOUR-WORKSPACE-HOST",
     "path": "/serving-endpoints/YOUR-PT-ENDPOINT/invocations",

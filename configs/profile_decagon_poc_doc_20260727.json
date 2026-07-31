@@ -1,0 +1,25 @@
+{
+  "name": "decagon_poc_doc_20260727",
+  "input_tokens":  {"p50": 10000, "p95": 24000},
+  "output_tokens": {"p50": 40,    "p95": 90},
+  "cache_fraction": {"p50": 0.60, "p95": 0.87},
+  "provenance": "POC doc appendix, July 27th revision (PT POC with 1 B300 node). Matches the customer's spoken 7/23 figures at P50/P95 and extends them.",
+  "label": "Blended across both workload classes. The doc's own P90 points (input 13K, cache 75%) are inconsistent with a single distribution through these P50/P95 anchors, which is what two blended classes look like. Run per-class profiles when the per-class quantiles land.",
+  "doc_quantiles_full": {
+    "input_tokens":  {"p50": 10000, "p90": 13000, "p95": 24000, "p99": 25000},
+    "output_tokens": {"p50": 40, "p90": 70, "p95": 90, "p99": 165},
+    "cache_fraction": {"p50": 0.60, "p90": 0.75, "p95": 0.87, "p99": 0.98},
+    "median_qps_min_rps": 5,
+    "reference_rps": 40,
+    "note": "peak QPS pending what 1 B300 node can achieve; no need to load test at 40 RPS"
+  },
+  "acceptance_targets": {
+    "ttft_ms":  {"p50": 500, "p90": 800, "p95": 900, "p99": 1600},
+    "ttfg_ms":  {"p50": 700, "p90": 1200, "p95": 1500, "p99": 3000},
+    "hard_timeouts": {"ttft_s": 15, "ttfg_s": 45, "note": "requests over budget count as failures against SLA"},
+    "success_rate": 0.9999,
+    "gpu_util_baseline_other_providers": 0.30,
+    "serving_config": "TP4, FP4 weights",
+    "priority": "TTFT and throughput; very sensitive to interchunk failures and timeouts"
+  }
+}

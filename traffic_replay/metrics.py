@@ -27,7 +27,8 @@ def _pct_table(values: list[float | None]) -> dict:
 
 
 def summarize(results: list[dict], schedule_meta: dict | None = None,
-              run_meta: dict | None = None) -> dict:
+              run_meta: dict | None = None,
+              acceptance: dict | None = None) -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
 
@@ -55,6 +56,12 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         t1 = max(r["t_send_unix"] for r in results)
         dur = max(t1 - t0, 1e-9)
 
+    # throughput in the customer's own vocabulary (tokens per minute)
+    in_tok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
+    out_tok = sum(r["completion_tokens"] for r in ok
+                  if r.get("completion_tokens"))
+    dur_min = (dur / 60.0) if dur else None
+
     summary = {
         "requests_total": len(results),
         "requests_ok": len(ok),
@@ -65,6 +72,13 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in ok]),
         "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in ok]),
         "e2e_ms": _pct_table([r.get("e2e_ms") for r in ok]),
+        "interchunk_max_ms": _pct_table(
+            [r.get("interchunk_max_ms") for r in ok]),
+        "throughput": {
+            "input_tokens_per_min": in_tok / dur_min if dur_min else None,
+            "output_tokens_per_min": out_tok / dur_min if dur_min else None,
+            "note": "endpoint-reported token counts over wall time",
+        },
         "achieved_cache_fraction": _pct_table(ach) | {
             "reported_for_n": len(ach),
             "source_fields": cache_sources or ["NOT REPORTED BY ENDPOINT"],
@@ -89,7 +103,60 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": run_meta or {},
     }
+    if acceptance:
+        summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance)
     return summary
+
+
+def _evaluate_sla(ok: list[dict], total: int, summary: dict,
+                  acceptance: dict) -> dict:
+    """Score the run against customer acceptance targets.
+
+    Expected shape (all sections optional):
+      ttft_ms:  {p50: 500, p90: 800, p95: 900, p99: 1600}
+      ttfg_ms:  {p50: 700, ...}          evaluated against measured E2E
+      hard_timeouts: {ttft_s: 15, ttfg_s: 45}   over-budget requests count
+                                                as SLA failures
+      success_rate: 0.9999
+    """
+    out: dict = {"targets_source": "profile acceptance_targets"}
+
+    def score(name, table_key, targets):
+        rows = []
+        for q, target in (targets or {}).items():
+            actual = summary[table_key].get(q)
+            rows.append({
+                "quantile": q, "target_ms": target,
+                "actual_ms": round(actual, 1) if actual is not None else None,
+                "met": (actual <= target) if actual is not None else None,
+            })
+        out[name] = rows
+
+    score("ttft_vs_target", "ttft_ms", acceptance.get("ttft_ms"))
+    score("ttfg_vs_target", "e2e_ms", acceptance.get("ttfg_ms"))
+
+    hard = acceptance.get("hard_timeouts") or {}
+    ttft_cap = (hard.get("ttft_s") or 0) * 1000.0
+    ttfg_cap = (hard.get("ttfg_s") or 0) * 1000.0
+    timeouts = 0
+    for r in ok:
+        if ttft_cap and (r.get("ttft_ms") or 0) > ttft_cap:
+            timeouts += 1
+        elif ttfg_cap and (r.get("e2e_ms") or 0) > ttfg_cap:
+            timeouts += 1
+    out["hard_timeout_breaches"] = timeouts
+
+    target_sr = acceptance.get("success_rate")
+    if target_sr and total:
+        effective_ok = len(ok) - timeouts
+        actual_sr = effective_ok / total
+        out["success_rate"] = {
+            "target": target_sr,
+            "actual": round(actual_sr, 6),
+            "met": actual_sr >= target_sr,
+            "note": "failures plus hard-timeout breaches count against it",
+        }
+    return out
 
 
 def _top_errors(failed: list[dict], k: int = 5) -> dict:
@@ -131,7 +198,8 @@ def render_markdown(summary: dict, title: str) -> str:
         "|---|---|---|---|---|---|",
         row("TTFT", s["ttft_ms"]),
         row("TTFB", s["ttfb_ms"]),
-        row("E2E", s["e2e_ms"]),
+        row("TTFG (E2E)", s["e2e_ms"]),
+        row("interchunk max", s["interchunk_max_ms"]),
         "",
         "## Believability block (read before quoting any number above)",
         f"- achieved cache fraction, endpoint-reported: {ach_line}",
@@ -156,6 +224,31 @@ def render_markdown(summary: dict, title: str) -> str:
         "here means the tail has survivorship bias, read with care)"
         if s.get("requests_retried") else "- connection retries: none",
     ]
+    tp = s.get("throughput") or {}
+    if tp.get("input_tokens_per_min"):
+        lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
+                      f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
+                      "tokens/min (endpoint-reported counts over wall time)"]
+
+    sla = s.get("sla")
+    if sla:
+        lines += ["", "## SLA scorecard (targets from the profile config)",
+                  "", "| metric | quantile | target ms | actual ms | met |",
+                  "|---|---|---|---|---|"]
+        for name, key in (("TTFT", "ttft_vs_target"),
+                          ("TTFG", "ttfg_vs_target")):
+            for r in sla.get(key) or []:
+                met = {True: "yes", False: "NO", None: "-"}[r["met"]]
+                lines.append(f"| {name} | {r['quantile']} | {r['target_ms']} "
+                             f"| {r['actual_ms']} | {met} |")
+        lines.append(f"| hard timeout breaches | - | - | "
+                     f"{sla.get('hard_timeout_breaches', 0)} | "
+                     f"{'yes' if not sla.get('hard_timeout_breaches') else 'NO'} |")
+        sr = sla.get("success_rate")
+        if sr:
+            lines.append(f"| success rate | - | {sr['target']} | "
+                         f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
+
     label = (s.get("run") or {}).get("label")
     if label:
         lines += ["", f"**Label: {label}**"]

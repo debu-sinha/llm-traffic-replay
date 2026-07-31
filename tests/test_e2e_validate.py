@@ -117,3 +117,11 @@ def test_report_carries_believability_block(run_out):
     assert "Believability block" in report
     assert "achieved cache fraction" in report
     assert "dispatch lag" in report
+
+
+def test_interchunk_gap_measured_against_real_stream(run_out):
+    inter = run_out["out"]["summary"]["interchunk_max_ms"]
+    # mock streams completion chunks at per_token_ms=2.0; the widest gap per
+    # request should be a few ms on localhost, never zero, never huge
+    assert inter["n"] > 60
+    assert 0.5 <= inter["p50"] <= 60.0, f"interchunk p50 {inter['p50']}"

@@ -54,6 +54,7 @@ class RequestResult:
     ok: bool
     error: str | None
     content_chunks: int
+    interchunk_max_ms: float | None   # widest gap between content chunks
     finish_reason: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
@@ -156,6 +157,8 @@ class EndpointClient:
 
                 state = StreamState()
                 ttfb_ms = ttft_ms = None
+                interchunk_max = None
+                last_content_t = None
                 for raw in resp:
                     now = time.monotonic()
                     if ttfb_ms is None:
@@ -163,8 +166,16 @@ class EndpointClient:
                     event = parse_sse_line(raw)
                     if event is None:
                         continue
-                    if update_state(state, event) and ttft_ms is None:
+                    chunks_before = state.content_chunks
+                    first = update_state(state, event)
+                    if first and ttft_ms is None:
                         ttft_ms = (now - t_send) * 1000.0
+                    if state.content_chunks > chunks_before:
+                        if last_content_t is not None:
+                            gap = (now - last_content_t) * 1000.0
+                            if interchunk_max is None or gap > interchunk_max:
+                                interchunk_max = gap
+                        last_content_t = now
                     if state.done:
                         break
                 e2e_ms = (time.monotonic() - t_send) * 1000.0
@@ -173,7 +184,7 @@ class EndpointClient:
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
-                                    attempt - 1)
+                                    attempt - 1, interchunk_max)
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
@@ -190,13 +201,15 @@ class EndpointClient:
     @staticmethod
     def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
                 ttfb_ms, ttft_ms, e2e_ms, status, ok, error, state,
-                intended, chars_sent, retries) -> RequestResult:
+                intended, chars_sent, retries,
+                interchunk_max_ms=None) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
             dispatch_lag_ms=dispatch_lag_ms, t_send_unix=t_send_unix,
             ttfb_ms=ttfb_ms, ttft_ms=ttft_ms, e2e_ms=e2e_ms, status=status,
             ok=ok, error=error, content_chunks=state.content_chunks,
+            interchunk_max_ms=interchunk_max_ms,
             finish_reason=state.finish_reason,
             prompt_tokens=u["prompt_tokens"],
             completion_tokens=u["completion_tokens"],

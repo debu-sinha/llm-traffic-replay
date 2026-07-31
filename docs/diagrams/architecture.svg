@@ -1,60 +1,80 @@
-<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1420 510' width='1420' height='510'>
-<defs><marker id='ah' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M 0 1 L 9 5 L 0 9' fill='none' stroke='#1e1e1e' stroke-width='1.4' stroke-linecap='round'/></marker></defs>
-<rect width='1420' height='510' fill='white'/>
-<text x='710.0' y='26' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='19' fill='#1e1e1e'>llm-traffic-replay: architecture</text>
-<rect x='40' y='40' rx='10' width='210' height='70' fill='#ffec99' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='145.0' y='62' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>profile + run configs</text>
-<text x='145.0' y='79' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>JSON, provenance labels</text>
-<rect x='320' y='40' rx='10' width='210' height='70' fill='#a5d8ff' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='425.0' y='62' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>profile.py</text>
-<text x='425.0' y='79' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>quantiles -> per-request</text>
-<text x='425.0' y='94' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>token plan (lognormal fits)</text>
-<rect x='600' y='40' rx='10' width='210' height='70' fill='#a5d8ff' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='705.0' y='62' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>prefix_pool.py</text>
-<text x='705.0' y='79' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>doc + prefix length,</text>
-<text x='705.0' y='94' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>Zipf popularity</text>
-<rect x='320' y='170' rx='10' width='210' height='70' fill='#a5d8ff' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='425.0' y='192' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>schedule.py</text>
-<text x='425.0' y='209' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>bursty arrivals,</text>
-<text x='425.0' y='224' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>rate_scale, shard</text>
-<rect x='600' y='170' rx='10' width='210' height='70' fill='#b2f2bb' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='705.0' y='192' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>textgen.py</text>
-<text x='705.0' y='209' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>shared-prefix text,</text>
-<text x='705.0' y='224' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>calibrated chars/token</text>
-<rect x='880' y='105' rx='10' width='210' height='70' fill='#b2f2bb' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='985.0' y='127' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>runner.py</text>
-<text x='985.0' y='144' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>paced dispatch,</text>
-<text x='985.0' y='159' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>bounded thread pool</text>
-<rect x='880' y='260' rx='10' width='210' height='70' fill='#b2f2bb' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='985.0' y='282' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>client.py</text>
-<text x='985.0' y='299' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>streaming HTTP,</text>
-<text x='985.0' y='314' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>TTFT on first content</text>
-<rect x='600' y='390' rx='10' width='210' height='70' fill='#ffc9c9' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='705.0' y='412' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>endpoint</text>
-<text x='705.0' y='429' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>real PT / pay-per-token</text>
-<text x='705.0' y='444' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>or bundled mock</text>
-<rect x='1160' y='260' rx='10' width='210' height='70' fill='#e9ecef' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='1265.0' y='282' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>metrics.py</text>
-<text x='1265.0' y='299' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>percentiles +</text>
-<text x='1265.0' y='314' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>believability block</text>
-<rect x='1160' y='390' rx='10' width='210' height='70' fill='#e9ecef' stroke='#1e1e1e' stroke-width='1.3'/>
-<text x='1265.0' y='412' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='bold' fill='#1e1e1e'>results/</text>
-<text x='1265.0' y='429' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>requests.jsonl,</text>
-<text x='1265.0' y='444' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='12' fill='#343a40'>summary.json, report.md</text>
-<path d='M 250 75.0 L 320 75.0' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<path d='M 530 75.0 L 600 75.0' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='565.0' y='69.0' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>prefix tokens</text>
-<path d='M 705.0 110 L 705.0 170' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='705.0' y='104' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>doc id + cut</text>
-<path d='M 425 240 L 425 252 L 940 252 L 940 178' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='682.5' y='172' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>timestamps</text>
-<path d='M 810 205.0 L 880 140.0' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='845.0' y='134.0' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>messages</text>
-<path d='M 985.0 175 L 985.0 260' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='985.0' y='169' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>paced submit</text>
-<path d='M 880 295.0 L 810 425.0' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='845.0' y='289.0' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>SSE stream</text>
-<path d='M 1090 295.0 L 1160 295.0' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
-<text x='1125.0' y='289.0' text-anchor='middle' font-family='-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif' font-size='11.5' fill='#495057'>timings + usage</text>
-<path d='M 1265.0 330 L 1265.0 390' stroke='#1e1e1e' stroke-width='1.3' fill='none' marker-end='url(#ah)'/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="20 -10 1400 690" width="1400" height="690" font-family="Helvetica, Arial, sans-serif">
+<rect x="20" y="-10" width="1400" height="690" fill="#ffffff"/>
+<marker id="ablue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1971c2"/></marker>
+<marker id="agreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2f9e44"/></marker>
+<marker id="agray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#495057"/></marker>
+<text x="40" y="34" font-size="26" font-weight="700" fill="#1e1e1e">llm-traffic-replay architecture</text>
+<rect x="40" y="70" width="190" height="70" rx="10" fill="#ebfbee" stroke="#2f9e44" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="135" y="96" font-size="15" font-weight="600" fill="#2f9e44" text-anchor="middle">your request logs</text>
+<text x="135" y="113" font-size="11" fill="#2f9e44" text-anchor="middle">profile_from_logs.py</text>
+<rect x="40" y="300" width="190" height="70" rx="10" fill="#ebfbee" stroke="#2f9e44" stroke-width="2" stroke-dasharray="6 4"/>
+<text x="135" y="326" font-size="15" font-weight="600" fill="#2f9e44" text-anchor="middle">your arrival trace</text>
+<text x="135" y="343" font-size="11" fill="#2f9e44" text-anchor="middle">timestamps_file</text>
+<rect x="40" y="510" width="190" height="70" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
+<text x="135" y="536" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">run config (JSON)</text>
+<text x="135" y="553" font-size="11" fill="#495057" text-anchor="middle">endpoint / profile / seed</text>
+<rect x="300" y="60" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="408" y="86" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">profile.py</text>
+<text x="408" y="103" font-size="11" fill="#1971c2" text-anchor="middle">quantiles -&gt; token plan</text>
+<text x="408" y="118" font-size="11" fill="#1971c2" text-anchor="middle">(lognormal / logit-normal)</text>
+<rect x="300" y="180" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="408" y="206" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">prefix_pool.py</text>
+<text x="408" y="223" font-size="11" fill="#1971c2" text-anchor="middle">shared-prefix docs,</text>
+<text x="408" y="238" font-size="11" fill="#1971c2" text-anchor="middle">Zipf popularity</text>
+<rect x="300" y="300" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="408" y="326" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">textgen.py</text>
+<text x="408" y="343" font-size="11" fill="#1971c2" text-anchor="middle">prefix + unique text,</text>
+<text x="408" y="358" font-size="11" fill="#1971c2" text-anchor="middle">calibrated chars/token</text>
+<rect x="300" y="480" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="408" y="506" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">schedule.py</text>
+<text x="408" y="523" font-size="11" fill="#1971c2" text-anchor="middle">bursty arrivals</text>
+<text x="408" y="538" font-size="11" fill="#1971c2" text-anchor="middle">or your trace</text>
+<rect x="600" y="230" width="215" height="150" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="708" y="280" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">runner.py</text>
+<text x="708" y="297" font-size="11" fill="#1971c2" text-anchor="middle">calibration warmup,</text>
+<text x="708" y="312" font-size="11" fill="#1971c2" text-anchor="middle">then paced dispatch</text>
+<text x="708" y="327" font-size="11" fill="#1971c2" text-anchor="middle">(bounded thread pool)</text>
+<rect x="890" y="140" width="215" height="90" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="998" y="172" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">client.py</text>
+<text x="998" y="189" font-size="11" fill="#1971c2" text-anchor="middle">streaming HTTP,</text>
+<text x="998" y="204" font-size="11" fill="#1971c2" text-anchor="middle">TTFT on first content token</text>
+<rect x="890" y="420" width="215" height="90" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
+<text x="998" y="452" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">metrics.py</text>
+<text x="998" y="469" font-size="11" fill="#1971c2" text-anchor="middle">percentiles +</text>
+<text x="998" y="484" font-size="11" fill="#1971c2" text-anchor="middle">believability block</text>
+<rect x="1160" y="140" width="230" height="90" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
+<text x="1275" y="172" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">endpoint</text>
+<text x="1275" y="189" font-size="11" fill="#495057" text-anchor="middle">OpenAI-compatible chat</text>
+<text x="1275" y="204" font-size="11" fill="#495057" text-anchor="middle">(Databricks PT / mock)</text>
+<rect x="1160" y="420" width="230" height="90" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
+<text x="1275" y="452" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">results/</text>
+<text x="1275" y="469" font-size="11" fill="#495057" text-anchor="middle">requests.jsonl / summary.json</text>
+<text x="1275" y="484" font-size="11" fill="#495057" text-anchor="middle">/ report.md</text>
+<polyline points="230,100 300,100" fill="none" stroke="#2f9e44" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agreen)"/>
+<polyline points="230,335 300,515" fill="none" stroke="#2f9e44" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agreen)"/>
+<polyline points="230,545 600,300" fill="none" stroke="#495057" stroke-width="1.6" marker-end="url(#agray)"/>
+<polyline points="407,140 407,180" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="407,260 407,300" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="515,335 600,300" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="515,515 600,340" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="815,290 890,190" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="1105,180 1160,180" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="1160,205 1105,205" fill="none" stroke="#495057" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agray)"/>
+<polyline points="997,230 997,420" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="1105,465 1160,465" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
+<polyline points="930,230 930,600 407,600 407,380" fill="none" stroke="#495057" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agray)"/>
+<text x="238" y="84" font-size="11" fill="#2f9e44">profile_from_logs.py</text>
+<text x="240" y="426" font-size="11" fill="#2f9e44">timestamps_file</text>
+<text x="360" y="410" font-size="11" fill="#495057">config</text>
+<text x="415" y="156" font-size="11" fill="#1971c2">prefix tokens</text>
+<text x="415" y="274" font-size="11" fill="#1971c2">doc id + cut</text>
+<text x="520" y="306" font-size="11" fill="#1971c2">messages</text>
+<text x="520" y="461" font-size="11" fill="#1971c2">timestamps</text>
+<text x="820" y="231" font-size="11" fill="#1971c2">paced submit</text>
+<text x="1112" y="164" font-size="11" fill="#1971c2">POST</text>
+<text x="1100" y="222" font-size="11" fill="#495057">SSE + usage</text>
+<text x="1000" y="326" font-size="11" fill="#1971c2">timings + usage</text>
+<text x="1110" y="449" font-size="11" fill="#1971c2">write</text>
+<text x="690" y="611" font-size="11" fill="#495057">warmup: reported tokens recalibrate cpt</text>
+<text x="40" y="656" font-size="12" fill="#495057">green dashed = bring-your-own-data inputs      gray dashed = feedback / return path</text>
 </svg>

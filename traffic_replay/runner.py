@@ -161,6 +161,7 @@ def run(rc: RunConfig, token_override: str | None = None,
         "profile": p.name, "profile_provenance": p.provenance,
         "profile_label": p.label, "cpt_final": mat.cpt,
         "endpoint_path": ecfg.path, "label": rc.label,
+        "title": rc.title,
         "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
     }
     summary = summarize([r for r in results if r.get("phase") == "replay"],

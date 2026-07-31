@@ -4,6 +4,8 @@
   python -m traffic_replay schedule --duration 300
   python -m traffic_replay validate            # full self-test vs bundled mock
   python -m traffic_replay run      --config configs/run_smoke.json
+  python -m traffic_replay merge    OUT_DIR RUN_DIR1 RUN_DIR2 ...
+  python -m traffic_replay compare  OUT_DIR RUN_DIR_A RUN_DIR_B ...
 """
 from __future__ import annotations
 
@@ -114,6 +116,30 @@ def cmd_validate(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_merge(args) -> int:
+    from . import profile as prof
+    from .aggregate import merge_runs
+    acceptance = None
+    if args.profile:
+        acceptance = (prof.Profile.from_json(args.profile).extra or {}).get(
+            "acceptance_targets")
+    try:
+        out = merge_runs(args.out, args.inputs, title=args.title,
+                         acceptance=acceptance, force=args.force)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"merged -> {out}")
+    return 0
+
+
+def cmd_compare(args) -> int:
+    from .aggregate import compare_runs
+    out = compare_runs(args.out, args.inputs)
+    print(f"wrote {out}/comparison.md")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="traffic_replay")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -140,6 +166,21 @@ def main(argv=None) -> int:
     s.add_argument("--tolerance-ms", type=float, default=60.0)
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_validate)
+
+    s = sub.add_parser("merge", help="pool sharded run outputs into one")
+    s.add_argument("out")
+    s.add_argument("inputs", nargs="+")
+    s.add_argument("--profile", default=None,
+                   help="profile whose acceptance_targets score the merge")
+    s.add_argument("--title", default=None)
+    s.add_argument("--force", action="store_true",
+                   help="merge even if endpoint paths differ")
+    s.set_defaults(fn=cmd_merge)
+
+    s = sub.add_parser("compare", help="compare several runs side by side")
+    s.add_argument("out")
+    s.add_argument("inputs", nargs="+")
+    s.set_defaults(fn=cmd_compare)
 
     args = ap.parse_args(argv)
     return args.fn(args)

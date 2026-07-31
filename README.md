@@ -162,9 +162,16 @@ endpoint at stepped rate scales, then customer-dataset replay.
 
 ## Bring your own data
 
-Two inputs plug in: your traffic SHAPE (a token-count export) and, optionally,
-your arrival TIMING (an arrival-time export). The prompt text stays synthetic
-on purpose (see "What it measures"), so no real prompt content ever moves.
+There are two ways to feed the harness, pick the one that matches what you
+have:
+
+- **Token-count logs** (no prompt text): build a statistical profile and the
+  harness sends synthetic text shaped to it. This section. Real prompt content
+  never leaves your side.
+- **The actual prompts you test with**: replay them verbatim. See
+  [Bring your own prompts](#bring-your-own-prompts-real-text-no-profile) below.
+
+Arrival timing (a trace) is optional and plugs into either path.
 
 ### 1. Traffic shape, from your logs
 
@@ -269,6 +276,59 @@ Every field you leave out falls back to the default in the settings reference
 below. The report names the trace it ran from and carries the profile's
 label, so a reader can see exactly what shaped the run.
 
+## Bring your own prompts (real text, no profile)
+
+If you don't have token-count logs but you do have the prompts you actually
+test with, skip the profile entirely and replay those prompts verbatim. The
+harness sends your real text and measures the endpoint on it. Sizes and any
+cache reuse are whatever your prompts already are, so there's nothing to
+construct or calibrate.
+
+Put your prompts in a file. JSONL is the most flexible, one prompt per line,
+each line any of these shapes:
+
+```json
+{"messages": [{"role": "system", "content": "You are a concise support agent."}, {"role": "user", "content": "A customer's order arrived two days late. Draft a short apology."}]}
+{"prompt": "Explain provisioned throughput vs pay-per-token in two sentences."}
+{"text": "Classify this ticket as billing, technical, or account: 'I was charged twice.'"}
+```
+
+`messages` is a full chat turn, sent as-is. `prompt` and `text` are shorthand
+for a single user message. A plain `.txt` file works too (one prompt per
+line), and a `.json` file may hold an array of any of the shapes above.
+
+Point a run config at the file with `prompts_file` instead of `profile_path`.
+Arrival timing still applies: leave it synthetic, or add `timestamps_file` for
+your real trace. Your prompts cycle across the scheduled arrivals. Acceptance
+targets are optional and score the same SLA scorecard:
+
+```json
+{
+  "prompts_file": "your_prompts.jsonl",
+  "endpoint": {
+    "base_url": "https://your-workspace.cloud.databricks.com",
+    "path": "/serving-endpoints/your-endpoint-name/invocations",
+    "auth_token_env": "DATABRICKS_TOKEN"
+  },
+  "duration_s": 120,
+  "max_output_tokens_cap": 300,
+  "acceptance_targets": {"ttft_ms": {"p50": 1500, "p95": 3000}, "success_rate": 0.99},
+  "out_dir": "results/decagon_prompts",
+  "title": "decagon prompts-mode run"
+}
+```
+
+```bash
+export DATABRICKS_TOKEN=<your token>
+python3 -m traffic_replay run --config configs/run_prompts.json
+```
+
+The report's believability block tells the reader this was real text, not a
+constructed shape: it prints "real prompts replayed verbatim" and marks token
+targeting not applicable, while still reporting achieved cache, throughput,
+arrival honesty, and finish reasons. Set either `profile_path` or
+`prompts_file`, not both.
+
 ## Where to run it
 
 The harness measures client side, so the machine it runs on is part of the
@@ -355,7 +415,8 @@ Run configs are plain JSON deserialized into `RunConfig`
 
 | field | default | meaning |
 |---|---|---|
-| `profile_path` | required | path to a profile JSON (see below) |
+| `profile_path` | null | path to a profile JSON (shape mode). Set this or `prompts_file` |
+| `prompts_file` | null | path to a real-prompts file, `.jsonl` / `.txt` / `.json` (prompts mode). Set this or `profile_path` |
 | `endpoint.base_url` | required | `https://<workspace-host>`, no trailing slash |
 | `endpoint.path` | required | e.g. `/serving-endpoints/<name>/invocations` |
 | `endpoint.auth_token_env` | `DATABRICKS_TOKEN` | env var read for the bearer token |
@@ -379,6 +440,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `out_dir` | `results` | output root. Each run writes a timestamped subdirectory |
 | `title` / `label` | "" | report title and the provenance label printed at the bottom |
 | `max_output_tokens_cap` | 512 | safety cap on max_tokens per request (32 in the smoke config) |
+| `acceptance_targets` | null | inline SLA targets (`ttft_ms`, `ttfg_ms`, `hard_timeouts`, `success_rate`, `interchunk_ms`). In prompts mode this is how the scorecard gets its targets |
 | `ttft_definition` | `first_content` | `first_content` (first token of either kind) or `first_visible` (skip reasoning-channel deltas). The SLA scorecard scores whichever is set |
 
 Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and

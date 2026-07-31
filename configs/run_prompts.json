@@ -1,0 +1,19 @@
+{
+  "prompts_file": "configs/prompts_example.jsonl",
+  "endpoint": {
+    "base_url": "https://YOUR-WORKSPACE-HOST",
+    "path": "/serving-endpoints/YOUR-ENDPOINT-NAME/invocations",
+    "auth_token_env": "DATABRICKS_TOKEN"
+  },
+  "duration_s": 120,
+  "qps_base": 1.0,
+  "qps_burst": 3.0,
+  "qps_min": 0.5,
+  "qps_max": 4.0,
+  "max_concurrency": 8,
+  "calibrate_n": 2,
+  "max_output_tokens_cap": 300,
+  "acceptance_targets": {"ttft_ms": {"p50": 1500, "p95": 3000}, "success_rate": 0.99},
+  "out_dir": "results/decagon_prompts",
+  "title": "decagon prompts-mode run"
+}

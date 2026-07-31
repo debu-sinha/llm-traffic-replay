@@ -98,7 +98,8 @@ def _run_module(path: Path) -> tuple[int, int, list[str]]:
 
     passed = failed = 0
     failures: list[str] = []
-    for name, fn in vars(mod).items():
+    # snapshot: running a test can add __warningregistry__ to the module dict
+    for name, fn in list(vars(mod).items()):
         if not (name.startswith("test_") and callable(fn)):
             continue
         try:

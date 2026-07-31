@@ -224,6 +224,7 @@ def render_markdown(summary: dict, title: str) -> str:
     tt = s["token_targeting"]
     arr = s["arrivals"]
     sched_src = (s.get("schedule") or {}).get("source", "synthetic")
+    mode = (s.get("run") or {}).get("input_mode", "profile")
 
     lines = [
         f"# {title}",
@@ -241,15 +242,24 @@ def render_markdown(summary: dict, title: str) -> str:
         "",
         "## Believability block (read before quoting any number above)",
         f"- achieved cache fraction, endpoint-reported: {ach_line}",
-        f"- constructed (intended) cache fraction: "
-        f"p50 {intent['p50']:.3f} / p95 {intent['p95']:.3f}"
-        if intent.get("n") else "- constructed cache fraction: n/a",
-        f"- token targeting: reported/intended p50 = "
-        f"{tt['reported_over_intended_p50']:.3f} "
-        f"(abs error {tt['abs_error_pct_p50']:.1f}%)"
-        if tt.get("reported_over_intended_p50") else
-        "- token targeting: endpoint did not report prompt_tokens",
-        (f"- output tokens: reported/intended p50 = "
+        ("- input: real prompts replayed verbatim, sizes and any cache "
+         "reuse are the prompts' own"
+         if mode == "prompts" else
+         f"- constructed (intended) cache fraction: "
+         f"p50 {intent['p50']:.3f} / p95 {intent['p95']:.3f}"
+         if intent.get("n") else "- constructed cache fraction: n/a"),
+        ("- token targeting: n/a for real prompts (no synthetic size to hit)"
+         if mode == "prompts" else
+         f"- token targeting: reported/intended p50 = "
+         f"{tt['reported_over_intended_p50']:.3f} "
+         f"(abs error {tt['abs_error_pct_p50']:.1f}%)"
+         if tt.get("reported_over_intended_p50") else
+         "- token targeting: endpoint did not report prompt_tokens"),
+        (f"- output tokens: finish_reasons "
+         f"{json.dumps(tt.get('finish_reasons') or {})} "
+         "(real prompts: no intended output size, only reported)"
+         if mode == "prompts" else
+         f"- output tokens: reported/intended p50 = "
          f"{tt['output_reported_over_intended_p50']:.3f} "
          f"(finish_reasons {json.dumps(tt.get('finish_reasons') or {})})"
          if tt.get("output_reported_over_intended_p50") else
@@ -278,7 +288,8 @@ def render_markdown(summary: dict, title: str) -> str:
 
     sla = s.get("sla")
     if sla:
-        lines += ["", "## SLA scorecard (targets from the profile config)",
+        _tgt_src = "run config" if mode == "prompts" else "profile config"
+        lines += ["", f"## SLA scorecard (targets from the {_tgt_src})",
                   "", "| metric | quantile | target ms | actual ms | met |",
                   "|---|---|---|---|---|"]
         for name, key in (("TTFT", "ttft_vs_target"),

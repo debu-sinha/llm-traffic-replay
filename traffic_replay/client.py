@@ -64,7 +64,7 @@ class RequestResult:
     cached_tokens_source: str | None
     intended_input_tokens: int
     intended_output_tokens: int
-    intended_cache_fraction: float
+    intended_cache_fraction: float | None
     doc_id: int                      # pooled document; -1 = no shared prefix
     chars_sent: int
     retries: int = 0

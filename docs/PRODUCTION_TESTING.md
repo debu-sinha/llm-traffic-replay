@@ -6,8 +6,8 @@ list of what its numbers may and may not be used for. Do not skip stages.
 ## Stage 0: prove the instrument (no endpoint, 2 minutes)
 
 ```bash
-python -m pytest                      # the full suite
-python -m traffic_replay validate     # end-to-end vs bundled mock
+python3 -m pytest                      # the full suite
+python3 -m traffic_replay validate     # end-to-end vs bundled mock
 ```
 
 PASS criteria: all tests green; validate reports TTFT error p95 under the
@@ -28,7 +28,7 @@ endpoint exists or without spending its capacity.
 2. Auth: `export DATABRICKS_TOKEN=<your PAT>` on the machine running the
    harness. Inside a Databricks notebook you can instead read the ambient
    context token; see `notebooks/` if present.
-3. Run: `python -m traffic_replay run --config configs/run_smoke.json`
+3. Run: `python3 -m traffic_replay run --config configs/run_smoke.json`
    (about 60 seconds at 1 to 6 QPS, small prompts, `max_output_tokens_cap`
    32, cost is negligible).
 4. Read `results/smoke/<ts>/report.md` and check, in order:
@@ -67,9 +67,9 @@ bundled profile carries its ASSUMPTION label and so does every report).
 5. If the client's dispatch lag p95 grows past ~100 ms at high rate_scale,
    split the schedule across processes: `shard_index`/`shard_total` in two
    run configs on two machines, then pool their output dirs with
-   `python -m traffic_replay merge`. To put Databricks PT next to another
+   `python3 -m traffic_replay merge`. To put Databricks PT next to another
    provider on identical measurement, run each and
-   `python -m traffic_replay compare` them; it warns when their achieved
+   `python3 -m traffic_replay compare` them; it warns when their achieved
    cache rates differ enough to make the latency comparison unfair.
 6. Warm vs cold: the summary excludes the calibration phase; per-document
    first uses remain in the data (`doc_id` per row) so cold-start behavior

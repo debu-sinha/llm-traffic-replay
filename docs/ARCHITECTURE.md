@@ -53,7 +53,7 @@ and suffixes are all seeded. Two runs with the same config are the same
 experiment except for the endpoint's behavior, which is the variable under
 test.
 
-**Instrument validated before use.** `python -m traffic_replay validate`
+**Instrument validated before use.** `python3 -m traffic_replay validate`
 runs the whole pipeline against the bundled mock, whose latency model is
 known by construction and whose server-side truth log is joined back to
 client measurements by request id. The suite asserts error bounds, and the

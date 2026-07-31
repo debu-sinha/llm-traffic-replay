@@ -39,25 +39,34 @@ load-shape benchmark, not a quality eval.
 
 ## Requirements
 
-Python 3.10+, `numpy`. That's the whole list. The HTTP client is standard
-library. Tests run with `pytest` if you have it, or with the bundled
-zero-dependency runner if you don't.
-
-## Quickstart (no endpoint needed, ~60 seconds)
-
-Every command in this README runs from the repository root (the directory
-containing this file). Don't cd into `traffic_replay/`. That's the package,
-and `python -m traffic_replay` plus the relative `configs/` paths both
-resolve from the root.
+Python 3.10 or newer and `numpy`. That's the whole list; the HTTP client is
+standard library. `pytest` is optional (a bundled zero-dependency runner runs
+the same tests without it).
 
 ```bash
+pip install numpy          # add pytest for nicer test output, optional
+```
+
+Commands below use `python3`, which is what a stock macOS or Linux box has.
+If your `python` already points at 3.10+ (a venv or conda env), `python`
+works too.
+
+## Quickstart (no endpoint needed, about 60 seconds)
+
+Run every command from the repository root (the directory holding this file).
+Don't `cd` into `traffic_replay/`; that is the package, and both
+`python3 -m traffic_replay` and the relative `configs/` paths resolve from
+the root.
+
+```bash
+git clone https://github.com/debu-sinha/llm-traffic-replay.git
 cd llm-traffic-replay
 
-# 1. Full test suite
-python -m pytest                          # or: python3 scripts/run_tests_stdlib.py
+# 1. Run the test suite (either runner; they run the same tests)
+python3 -m pytest                 # no pytest? python3 scripts/run_tests_stdlib.py
 
-# 2. Instrument self-test against the bundled mock (known latency model)
-python -m traffic_replay validate
+# 2. Self-test the instrument against the bundled mock (known latency model)
+python3 -m traffic_replay validate
 ```
 
 `validate` runs the entire pipeline (sampler, prefix pool, burst schedule,
@@ -69,10 +78,22 @@ trust any number the harness produces there.
 
 ## Run against a real endpoint
 
+Open `configs/run_smoke.json` and fill in the two `YOUR-...` placeholders,
+your workspace host and the endpoint path:
+
+```json
+"endpoint": {
+  "base_url": "https://your-workspace.cloud.databricks.com",
+  "path": "/serving-endpoints/your-endpoint-name/invocations",
+  "auth_token_env": "DATABRICKS_TOKEN"
+}
+```
+
+Export the token that `auth_token_env` names, then run:
+
 ```bash
-export DATABRICKS_TOKEN=...   # or any bearer token your endpoint accepts
-# edit configs/run_smoke.json: base_url, path
-python -m traffic_replay run --config configs/run_smoke.json
+export DATABRICKS_TOKEN=<your PAT, or any bearer token the endpoint accepts>
+python3 -m traffic_replay run --config configs/run_smoke.json
 ```
 
 Outputs land in `results/<timestamp>/`:
@@ -89,40 +110,112 @@ endpoint at stepped rate scales, then customer-dataset replay.
 
 ## Bring your own data
 
-The bundled profile is built to spoken figures. When you have real numbers,
-two inputs plug in, and the prompt text stays synthetic on purpose.
+Two inputs plug in: your traffic SHAPE (a token-count export) and, optionally,
+your arrival TIMING (an arrival-time export). The prompt text stays synthetic
+on purpose (see "What it measures"), so no real prompt content ever moves.
 
-**Traffic shape, from your logs.** Export per-request token counts (input
-tokens, output tokens, and cached prompt tokens) as JSONL or CSV, then build
-a profile:
+### 1. Traffic shape, from your logs
+
+Export one row per request with three token counts. JSONL, one object per
+line:
+
+```json
+{"input_tokens": 10231, "output_tokens": 42, "cached_tokens": 6100}
+{"input_tokens": 8977,  "output_tokens": 55, "cached_tokens": 8004}
+{"input_tokens": 24310, "output_tokens": 88, "cached_tokens": 15220}
+```
+
+or CSV with a header row:
+
+```
+input_tokens,output_tokens,cached_tokens
+10231,42,6100
+8977,55,8004
+24310,88,15220
+```
+
+Only those three numbers per row are read; no prompt text is needed or
+touched. Build a profile from the export and check it:
 
 ```bash
 python3 scripts/profile_from_logs.py \
   --input your_logs.jsonl --name decagon_real \
   --out configs/profile_decagon_real.json
 
-# check the recovered quantiles match your data
-python -m traffic_replay sample --profile configs/profile_decagon_real.json
+# confirm the recovered quantiles match your data
+python3 -m traffic_replay sample --profile configs/profile_decagon_real.json
 ```
 
-The defaults read `input_tokens`, `output_tokens`, and `cached_tokens`.
-Override with `--input-field`, `--output-field`, `--cached-field`, or pass
-`--cache-fraction-field` if you already have a per-request fraction. Only the
-distribution is read, no prompt text, so a token-count export is enough and
-no customer content moves. Point your run config's `profile_path` at the new
-file.
+That writes a profile like this (the P50/P95 the harness will reproduce):
 
-**Arrival timing, from your trace.** Write your request arrival times to a
-file, one epoch-second value per line (or JSONL `{"t": <seconds>}`), and set
-`"timestamps_file"` in the run config. It replaces the synthetic burst
-schedule: the line count is the request count, the timing is yours, and the
-report names the trace it ran from.
+```json
+{
+  "name": "decagon_real",
+  "input_tokens":   {"p50": 10126, "p95": 23193},
+  "output_tokens":  {"p50": 45,    "p95": 86},
+  "cache_fraction": {"p50": 0.618, "p95": 0.832},
+  "provenance": "Computed from 400 request records.",
+  "label": "Built from a real dataset. ..."
+}
+```
 
-**Prompt text stays synthetic** (see "What it measures"). Exact-prompt replay
-isn't supported today.
+If your columns have other names, pass `--input-field` / `--output-field` /
+`--cached-field`, or `--cache-fraction-field` if you already have a
+per-request cache fraction instead of a cached-token count.
 
-A full real-data run uses both: your quantiles in the profile, your
-timestamps in `timestamps_file`.
+### 2. Arrival timing, from your trace (optional)
+
+Export your request arrival times, one epoch-second value per line:
+
+```
+0.0
+0.4
+0.9
+1.2
+2.1
+```
+
+or JSONL with a `t` field per line:
+
+```json
+{"t": 0.0}
+{"t": 0.4}
+{"t": 0.9}
+```
+
+Times are shifted to start at zero and sorted for you, and the line count is
+the request count. Leave this out and the harness uses its synthetic bursty
+schedule instead.
+
+### 3. Point a run config at both
+
+Copy `configs/run_smoke.json` to `configs/run_byod.json`, set `profile_path`
+to your new profile, add `timestamps_file` if you have a trace, and fill in
+the endpoint. A minimal config:
+
+```json
+{
+  "profile_path": "configs/profile_decagon_real.json",
+  "timestamps_file": "your_arrivals.txt",
+  "endpoint": {
+    "base_url": "https://your-workspace.cloud.databricks.com",
+    "path": "/serving-endpoints/your-endpoint-name/invocations",
+    "auth_token_env": "DATABRICKS_TOKEN"
+  },
+  "duration_s": 300,
+  "out_dir": "results/decagon",
+  "title": "decagon real-data run"
+}
+```
+
+```bash
+export DATABRICKS_TOKEN=<your token>
+python3 -m traffic_replay run --config configs/run_byod.json
+```
+
+Every field you leave out falls back to the default in the settings reference
+below. The report names the trace it ran from and carries the profile's
+label, so a reader can see exactly what shaped the run.
 
 ## Where to run it
 
@@ -155,7 +248,7 @@ schedule across two machines with `shard_index`/`shard_total` and pool the
 Sharded across machines? Pool their output dirs into one summary:
 
 ```bash
-python -m traffic_replay merge results/pooled \
+python3 -m traffic_replay merge results/pooled \
   results/m1/2026* results/m2/2026* results/m3/2026*
 ```
 
@@ -163,7 +256,7 @@ Comparing providers (the cost-parity motion) means running each on this
 same instrument, then:
 
 ```bash
-python -m traffic_replay compare results/compare \
+python3 -m traffic_replay compare results/compare \
   results/dbx-pt results/together results/baseten
 ```
 

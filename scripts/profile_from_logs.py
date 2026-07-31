@@ -17,7 +17,7 @@ Usage:
       --cached-field cached_tokens
 
 Verify the result with:
-  python -m traffic_replay sample --profile configs/profile_decagon_real.json
+  python3 -m traffic_replay sample --profile configs/profile_decagon_real.json
 """
 from __future__ import annotations
 
@@ -127,7 +127,7 @@ def build_profile(records, name, input_field, output_field,
         "cache_fraction": cf_q,
         "provenance": f"Computed from {len(records)} request records.",
         "label": "Built from a real dataset. Verify the recovered quantiles "
-                 "with 'python -m traffic_replay sample --profile <this file>'.",
+                 "with 'python3 -m traffic_replay sample --profile <this file>'.",
     }
 
 

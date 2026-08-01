@@ -57,6 +57,7 @@ class RunConfig:
     label: str = ""
     max_output_tokens_cap: int = 512  # safety cap; full runs raise it
     acceptance_targets: dict | None = None  # SLA targets (either mode)
+    pricing: dict | None = None              # DBU cost rates (see metrics)
     ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
 
@@ -212,7 +213,8 @@ def run(rc: RunConfig, token_override: str | None = None,
     summary = summarize([r for r in results if r.get("phase") == "replay"],
                         schedule_meta=schedule_report(sched), run_meta=meta,
                         acceptance=acceptance,
-                        ttft_definition=rc.ttft_definition)
+                        ttft_definition=rc.ttft_definition,
+                        pricing=rc.pricing)
     out = write_outputs(results, summary,
                         Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
                         rc.title)

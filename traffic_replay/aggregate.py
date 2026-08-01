@@ -65,6 +65,8 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
                        "the union wall-clock window, so it is the aggregate "
                        "rate only when the shards ran concurrently."),
     }
+    # cost is a per-run figure (rates can differ across pooled runs), so
+    # it is not recomputed here; read each run report for its own cost.
     summary = summarize(rows, run_meta=meta, acceptance=acceptance)
     return write_outputs(rows, summary, out_dir,
                          title or f"merged: {len(dirs)} runs")
@@ -118,7 +120,10 @@ def compare_runs(out_dir, input_dirs) -> Path:
                      "{:,.0f}"),
               scalar("reasoning tokens (total)",
                      lambda s: s.get("reasoning_tokens_total"),
-                     "{:,.0f}"), ""])
+                     "{:,.0f}"),
+              scalar("DBU per 1k requests",
+                     lambda s: (s.get("cost") or {}).get("dbu_per_1k_requests"),
+                     "{:,.2f}"), ""])
 
     L.extend(["## believability (read before trusting the latency tables)",
               hdr, sep,

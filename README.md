@@ -383,6 +383,43 @@ count leave the line out rather than guessing. To measure what thinking costs
 on an endpoint, run it once with thinking on and once off, then `compare` the
 two: the reasoning-token, TTFT, and end-to-end differences land side by side.
 
+## Cost in Databricks DBUs
+
+The report can turn the tokens it measured into cost, using rates you supply
+from the [Databricks pricing page](https://www.databricks.com/product/pricing/foundation-model-serving).
+The tool never fetches or hardcodes prices, so the report states the
+arithmetic and the numbers you gave it. Databricks denominates in DBUs, and
+the dollar conversion (`usd_per_dbu`) comes from your own plan or commit, so
+it is optional.
+
+Pay-per-token endpoints bill input, output, and cache-read tokens separately
+(three DBU/M rates on the pricing page). The tool already measures those three
+token counts, so the cost is exact:
+
+```json
+"pricing": {"mode": "per_token",
+  "input_dbu_per_m": 20.0, "output_dbu_per_m": 62.857,
+  "cache_read_dbu_per_m": 2.0, "usd_per_dbu": 0.070}
+```
+
+The report then shows DBU per request (p50/p95), DBU per 1,000 requests, DBU
+per minute, and the DBUs the prompt cache saved. Leave `usd_per_dbu` out to
+stay in DBUs.
+
+Provisioned throughput bills capacity by the hour, not per token, so the
+useful figure is effective cost per 1M tokens at the load you measured:
+
+```json
+"pricing": {"mode": "provisioned", "dbu_per_hour": 85.714, "usd_per_dbu": 0.070}
+```
+
+```
+effective DBU per 1M tokens = dbu_per_hour / (tokens served per hour at the measured throughput)
+```
+
+That figure improves as you fill the endpoint, and it is what a
+cost-per-throughput comparison against another provider actually needs.
+
 ## Where to run it
 
 The harness measures client side, so the machine it runs on is part of the
@@ -463,8 +500,12 @@ believed, and the report prints them together:
   scores.
 - **Reasoning tokens**: when the endpoint reports a thinking-token count, the
   report prints total and per-request reasoning tokens with the usage field it
-  came from. Endpoints that stream reasoning but don't report the count leave
-  the line out rather than guessing.
+  came from. When it streams a reasoning channel but reports no count (GLM on
+  dogfood does this), the report falls back to counting the reasoning deltas
+  and labels the number a stream-counted estimate.
+- **Cost**: when you supply DBU rates, the report shows cost per request, per
+  1,000 requests, and per minute, plus the DBUs the cache saved, all traceable
+  to the tokens measured and the rates you gave. See [Cost](#cost-in-databricks-dbus).
 - **Request params**: the report echoes the temperature, max-tokens cap, and
   any `extra_body`, so a reader knows exactly what request parameters produced
   the numbers.
@@ -504,6 +545,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `max_output_tokens_cap` | 512 | `300` | ceiling on `max_tokens` per request. Reasoning models spend this budget thinking first |
 | `acceptance_targets` | null | `{"ttft_ms": {"p95": 900}}` | inline SLA targets (`ttft_ms`, `ttfg_ms`, `hard_timeouts`, `success_rate`, `interchunk_ms`). In prompts mode this is how the scorecard gets its targets |
 | `ttft_definition` | `first_content` | `"first_visible"` | `first_content` (first token of either kind) or `first_visible` (skip reasoning deltas). The SLA scorecard scores whichever is set |
+| `pricing` | null | `{"mode": "per_token", "input_dbu_per_m": 20, "output_dbu_per_m": 62.857}` | DBU cost rates you supply from the pricing page. The report turns measured tokens into cost. See [Cost](#cost-in-databricks-dbus) |
 
 Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
 `cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1)).

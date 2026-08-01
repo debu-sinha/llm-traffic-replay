@@ -30,7 +30,8 @@ def _pct_table(values: list[float | None]) -> dict:
 def summarize(results: list[dict], schedule_meta: dict | None = None,
               run_meta: dict | None = None,
               acceptance: dict | None = None,
-              ttft_definition: str = "first_content") -> dict:
+              ttft_definition: str = "first_content",
+              pricing: dict | None = None) -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
 
@@ -71,6 +72,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     in_tok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
     out_tok = sum(r["completion_tokens"] for r in ok
                   if r.get("completion_tokens"))
+    cached_tok = sum(r["cached_tokens"] for r in ok if r.get("cached_tokens"))
     dur_min = (dur / 60.0) if dur else None
 
     summary = {
@@ -137,10 +139,104 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
              if r.get("reasoning_tokens_source")), None)
         if dur_min:
             summary["throughput"]["reasoning_tokens_per_min"] = total / dur_min
+    if summary.get("reasoning_tokens_total") is None:
+        # endpoint did not report a reasoning-token count (GLM on dogfood does
+        # not). fall back to counting reasoning_content deltas in the stream,
+        # clearly labeled as an estimate.
+        chunk_vals = [r.get("reasoning_chunks") for r in ok]
+        if any(chunk_vals):
+            ctotal = sum(v for v in chunk_vals if v)
+            summary["reasoning_tokens"] = _pct_table(chunk_vals)
+            summary["reasoning_tokens_total"] = ctotal
+            summary["reasoning_tokens_source"] = \
+                "stream-counted reasoning deltas (estimate)"
+            if dur_min:
+                summary["throughput"]["reasoning_tokens_per_min"] = \
+                    ctotal / dur_min
+    if pricing:
+        summary["cost"] = _cost_block(ok, dur, in_tok, out_tok, cached_tok,
+                                      pricing)
     if acceptance:
         summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance,
                                        ttft_definition)
     return summary
+
+
+def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
+                cached_tok: int, pricing: dict) -> dict:
+    """Cost from endpoint-reported tokens times user-supplied DBU rates.
+
+    Rates come from the Databricks pricing page and are supplied in the run
+    config, never fetched, so the report states the arithmetic and the numbers
+    you gave it. Pay-per-token bills input, output, and cache-read separately
+    (three DBU/M rates). Provisioned throughput bills capacity by the hour, so
+    the useful figure is effective DBU per 1M tokens at the measured load.
+    """
+    mode = pricing.get("mode", "per_token")
+    usd = pricing.get("usd_per_dbu")
+    tok_total = in_tok + out_tok
+
+    if mode == "provisioned":
+        dph = pricing.get("dbu_per_hour")
+        if dph is None:
+            return {"mode": mode, "error": "provisioned needs dbu_per_hour"}
+        dur_hr = (dur / 3600.0) if dur else None
+        tph = (tok_total / dur_hr) if dur_hr else None
+        eff = (dph / (tph / 1e6)) if tph else None
+        block = {"mode": "provisioned", "dbu_per_hour": dph,
+                 "effective_dbu_per_1m_tokens": eff,
+                 "tokens_measured": tok_total,
+                 "note": "provisioned throughput bills by capacity (DBU/hour), "
+                         "not per token. effective cost per 1M tokens is the "
+                         "hourly rate over tokens served per hour at the "
+                         "measured throughput, so it improves as you fill the "
+                         "endpoint. rates are user-supplied from the pricing "
+                         "page."}
+        if usd is not None:
+            block["usd_per_hour"] = dph * usd
+            if eff is not None:
+                block["effective_usd_per_1m_tokens"] = eff * usd
+            block["usd_per_dbu"] = usd
+        return block
+
+    inp = pricing.get("input_dbu_per_m")
+    out = pricing.get("output_dbu_per_m")
+    if inp is None or out is None:
+        return {"mode": mode,
+                "error": "per_token needs input_dbu_per_m and output_dbu_per_m"}
+    cache = pricing.get("cache_read_dbu_per_m")
+    cache = cache if cache is not None else inp
+    per = []
+    for r in ok:
+        pt = r.get("prompt_tokens") or 0
+        ct = r.get("cached_tokens") or 0
+        comp = r.get("completion_tokens") or 0
+        uncached = max(pt - ct, 0)
+        per.append(uncached / 1e6 * inp + ct / 1e6 * cache + comp / 1e6 * out)
+    total = sum(per)
+    n = len(per)
+    block = {
+        "mode": "per_token",
+        "dbu_per_request": _pct_table(per),
+        "dbu_total": total,
+        "dbu_per_1k_requests": (total / n * 1000) if n else None,
+        "dbu_per_min": (total / (dur / 60.0)) if dur else None,
+        "cache_dbu_saved": cached_tok / 1e6 * max(inp - cache, 0.0),
+        "rates_dbu_per_m": {"input": inp, "output": out, "cache_read": cache},
+        "note": "cost from endpoint-reported tokens times user-supplied DBU "
+                "rates (Databricks pricing page). cached input is billed at "
+                "the cache-read rate.",
+    }
+    if usd is not None:
+        block["usd_per_dbu"] = usd
+        block["usd_total"] = total * usd
+        block["usd_per_1k_requests"] = (block["dbu_per_1k_requests"] * usd
+                                        if block["dbu_per_1k_requests"] is not None
+                                        else None)
+        block["usd_per_min"] = (block["dbu_per_min"] * usd
+                                if block["dbu_per_min"] is not None else None)
+        block["cache_usd_saved"] = block["cache_dbu_saved"] * usd
+    return block
 
 
 def _evaluate_sla(ok: list[dict], total: int, summary: dict,
@@ -303,6 +399,27 @@ def render_markdown(summary: dict, title: str) -> str:
         lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
                       f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
                       "tokens/min (endpoint-reported counts over wall time)"]
+    cost = s.get("cost")
+    if cost and cost.get("error"):
+        lines += ["", f"cost: config error, {cost['error']}"]
+    elif cost and cost["mode"] == "per_token":
+        dr = cost.get("dbu_per_request") or {}
+        if dr.get("p50") is None:
+            lines += ["", "cost: no successful requests to price"]
+        else:
+            usd = cost.get("usd_total")
+            dollar = f" (${usd:,.4f} total)" if usd is not None else ""
+            lines += ["", f"cost (per-token, user-supplied DBU rates): "
+                      f"{dr['p50']:.4f} DBU/request p50, "
+                      f"{cost['dbu_per_1k_requests']:,.2f} DBU/1k requests, "
+                      f"{cost['dbu_per_min']:,.3f} DBU/min, cache saved "
+                      f"{cost['cache_dbu_saved']:,.3f} DBU{dollar}"]
+    elif cost:
+        eff = cost.get("effective_dbu_per_1m_tokens")
+        lines += ["", f"cost (provisioned, {cost['dbu_per_hour']} DBU/hour): "
+                  + (f"effective {eff:,.1f} DBU per 1M tokens at the measured "
+                     f"throughput" if eff is not None
+                     else "throughput too low to compute an effective rate")]
     rp = (s.get("run") or {}).get("request_params")
     if rp:
         eb = rp.get("extra_body") or {}
@@ -658,10 +775,71 @@ def render_html(summary: dict, title: str) -> str:
     label_html = (f"<div class='label-note'><b>Label:</b> {esc(label)}</div>"
                   if label else "")
 
+    cost = s.get("cost")
+    cost_html = ""
+    if cost and cost.get("error"):
+        cost_html = (f"<div class='card'><h2>Cost</h2>"
+                     f"<div class='cap'>config error: {esc(cost['error'])}</div>"
+                     f"</div>")
+    elif cost and cost["mode"] == "per_token" \
+            and (cost.get("dbu_per_request") or {}).get("p50") is None:
+        cost_html = ("<div class='card'><h2>Cost (Databricks DBUs)</h2>"
+                     "<div class='cap'>no successful requests to price</div>"
+                     "</div>")
+    elif cost and cost["mode"] == "per_token":
+        usd = cost.get("usd_per_dbu")
+        r = cost.get("rates_dbu_per_m") or {}
+
+        def _money(dbu, nd=4):
+            base = f"{num(dbu, nd)} DBU"
+            if usd is not None and dbu is not None:
+                base += f" (${num(dbu * usd, nd)})"
+            return base
+        rows = [
+            f"<tr><td class='lbl'>DBU per request (p50)</td>"
+            f"<td>{_money(cost['dbu_per_request']['p50'])}</td></tr>",
+            f"<tr><td class='lbl'>DBU per request (p95)</td>"
+            f"<td>{_money(cost['dbu_per_request']['p95'])}</td></tr>",
+            f"<tr><td class='lbl'>DBU per 1,000 requests</td>"
+            f"<td>{_money(cost['dbu_per_1k_requests'], 2)}</td></tr>",
+            f"<tr><td class='lbl'>DBU per minute</td>"
+            f"<td>{_money(cost['dbu_per_min'], 3)}</td></tr>",
+            f"<tr><td class='lbl'>cache DBUs saved</td>"
+            f"<td>{_money(cost['cache_dbu_saved'], 3)}</td></tr>",
+        ]
+        cap = (f"per-token rates you supplied (DBU/M): input {num(r.get('input'), 3)}, "
+               f"output {num(r.get('output'), 3)}, cache-read {num(r.get('cache_read'), 3)}"
+               + (f", at ${usd}/DBU" if usd else "")
+               + ". cached input is billed at the cache-read rate.")
+        cost_html = (f"<div class='card'><h2>Cost (Databricks DBUs)</h2>"
+                     f"<div class='cap'>{cap}</div><table>{''.join(rows)}"
+                     f"</table></div>")
+    elif cost:
+        usd = cost.get("usd_per_dbu")
+        eff = cost.get("effective_dbu_per_1m_tokens")
+        effv = (f"{num(eff, 1)} DBU"
+                + (f" (${num(eff * usd, 2)})" if usd and eff is not None else "")
+                if eff is not None else "throughput too low to compute")
+        rows = [
+            f"<tr><td class='lbl'>capacity rate</td>"
+            f"<td>{num(cost['dbu_per_hour'], 3)} DBU/hour"
+            + (f" (${num(cost['dbu_per_hour'] * usd, 3)})" if usd else "")
+            + "</td></tr>",
+            f"<tr><td class='lbl'>effective cost per 1M tokens</td>"
+            f"<td>{effv}</td></tr>",
+        ]
+        cost_html = (f"<div class='card'><h2>Cost (Databricks DBUs, "
+                     f"provisioned)</h2><div class='cap'>provisioned throughput "
+                     f"bills by capacity, so effective cost per 1M tokens is the "
+                     f"hourly rate over tokens served per hour at the measured "
+                     f"throughput. it improves as you fill the endpoint.</div>"
+                     f"<table>{''.join(rows)}</table></div>")
+
     body = (
         f"<div class='wrap'><h1>{esc(title)}</h1>"
         f"<div class='sub'>{sub}</div>{banner}{stats}"
-        f"{sla_html}{lat_html}{believe}{extra_cards}{note_html}{label_html}"
+        f"{sla_html}{lat_html}{believe}{cost_html}{extra_cards}"
+        f"{note_html}{label_html}"
         f"<div class='foot'>llm-traffic-replay report</div></div>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,"

@@ -17,6 +17,7 @@ class StreamState:
     saw_first_visible: bool = False       # first visible content delta
     saw_first_reasoning: bool = False     # first reasoning-channel delta
     content_chunks: int = 0
+    reasoning_chunks: int = 0             # count of reasoning-channel deltas
     finish_reason: str | None = None
     usage: dict | None = None
     done: bool = False
@@ -62,6 +63,8 @@ def update_state(state: StreamState, event: dict) -> bool:
             if not state.saw_first_content:
                 state.saw_first_content = True
                 first_content = True
+        if reasoning:
+            state.reasoning_chunks += 1
         if reasoning and not state.saw_first_reasoning:
             state.saw_first_reasoning = True
         if visible and not state.saw_first_visible:

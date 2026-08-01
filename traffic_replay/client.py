@@ -71,6 +71,7 @@ class RequestResult:
     retries: int = 0
     reasoning_tokens: int | None = None   # thinking tokens, when reported
     reasoning_tokens_source: str | None = None  # usage field it was read from
+    reasoning_chunks: int = 0             # reasoning deltas seen in the stream
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -244,6 +245,7 @@ class EndpointClient:
             chars_sent=chars_sent, retries=retries,
             reasoning_tokens=u["reasoning_tokens"],
             reasoning_tokens_source=u["reasoning_tokens_source"],
+            reasoning_chunks=state.reasoning_chunks,
         )
 
 

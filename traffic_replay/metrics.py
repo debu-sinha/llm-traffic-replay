@@ -168,7 +168,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     else:
         sample_warning = None
     summary["sample"] = {"n": n_ok, "warning": sample_warning}
-    summary["drift"] = _drift_block(ok)
+    summary["drift"] = _drift_block(ok, failed)
 
     # every report states which harness produced it and what the latency
     # numbers include. 0.3.0 moved the TCP/TLS handshake out of the timed
@@ -215,24 +215,53 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     return summary
 
 
-def _drift_block(ok: list[dict], window_s: int = 60,
-                 min_window_n: int = 20) -> dict:
-    """Per-window p95 over the run, and whether the run held steady.
+def _drift_block(ok: list[dict], failed: list[dict] | None = None,
+                 window_s: int = 60, min_window_n: int = 20) -> dict:
+    """Per-window errors and p95 over the run, and whether it held steady.
 
-    Only windows with enough requests decide the verdict. A trailing partial
-    window carries a handful of requests, and a p95 over a handful is one
-    slow request away from inventing a trend, so those windows are printed
-    but not counted. Needs two counted windows to say anything, and three
-    before it will name a direction, because two points cannot separate a
-    trend from noise.
+    Two questions, two gates. "Was the endpoint erroring" is answered from
+    attempted requests, so a window that lost everything still reaches the
+    verdict rather than vanishing for having no p95. "Did latency move" is
+    answered from successful requests, and a window that shed more than a
+    fifth of its requests is left out of that comparison, because a p95 over
+    survivors is not a latency measurement.
+
+    `failed` is optional so existing single-argument callers keep working.
+    The latency verdict needs two counted windows to say anything and three
+    before it names a direction, since two points cannot separate a trend
+    from noise.
     """
     if not ok:
+        n_failed = len([f for f in (failed or [])
+                        if f.get("t_send_unix") is not None])
+        if n_failed:
+            return {
+                "windows": [], "window_seconds": window_s,
+                "drift_kind": "failing", "drift_flag": True,
+                "drift_headline": (
+                    f"every request failed ({n_failed} of them). there is no "
+                    "latency to report, and nothing here is a performance "
+                    "result. read the failures block"),
+                "note": "no successful requests",
+            }
         return {"windows": [], "note": "no successful requests"}
-    t0 = min(r["t_send_unix"] for r in ok)
+    failed = failed or []
+    everything = ok + [f for f in failed if f.get("t_send_unix") is not None]
+    t0 = min(r["t_send_unix"] for r in everything)
     buckets: dict[int, list] = {}
+    errs: dict[int, int] = {}
     for r in ok:
         w = int((r["t_send_unix"] - t0) // window_s)
         buckets.setdefault(w, []).append(r)
+    # failures get their own count per window. an endpoint that collapses
+    # serves fewer successes, and those survivors are often the fast ones, so
+    # looking at successes alone reads a breakdown as "it got faster".
+    for r in failed:
+        if r.get("t_send_unix") is None:
+            continue
+        w = int((r["t_send_unix"] - t0) // window_s)
+        buckets.setdefault(w, [])
+        errs[w] = errs.get(w, 0) + 1
     short = {"windows": [], "window_seconds": window_s,
              "note": f"run shorter than two {window_s}s windows, cannot show "
                      "drift. run for minutes to test sustained SLA."}
@@ -243,8 +272,11 @@ def _drift_block(ok: list[dict], window_s: int = 60,
         rs = buckets[w]
         tt = [x.get("ttft_ms") for x in rs if x.get("ttft_ms") is not None]
         ee = [x.get("e2e_ms") for x in rs if x.get("e2e_ms") is not None]
+        e = errs.get(w, 0)
+        attempts = len(rs) + e
         rows.append({
-            "window": w, "n": len(rs),
+            "window": w, "n": len(rs), "errors": e, "attempts": attempts,
+            "error_rate": (e / attempts) if attempts else 0.0,
             "ttft_p95": float(np.percentile(tt, 95)) if tt else None,
             "e2e_p95": float(np.percentile(ee, 95)) if ee else None,
         })
@@ -252,25 +284,96 @@ def _drift_block(ok: list[dict], window_s: int = 60,
     # of the run, before its p95 is allowed to move the verdict.
     # true median, and cap the relative term so one very large window cannot
     # push the bar high enough to discard otherwise usable windows.
-    med = float(np.median([r["n"] for r in rows]))
-    floor = max(min_window_n, min(0.25 * med, 50.0))
+    # two different questions need two different gates.
+    #
+    # "was the endpoint erroring" is answered from ATTEMPTS, because a window
+    # that lost every request has no p95 at all and would otherwise vanish.
+    # "did latency move" is answered from SUCCESSES, because a p95 over a
+    # handful of survivors is not a latency measurement.
+    med_att = float(np.median([r["attempts"] for r in rows]))
+    err_floor = max(min_window_n, min(0.25 * med_att, 50.0))
+    med_ok = float(np.median([r["n"] for r in rows]))
+    p95_floor = max(min_window_n, min(0.25 * med_ok, 50.0))
     for r in rows:
-        r["counted"] = bool(r["n"] >= floor and r["ttft_p95"] is not None)
+        # a window that shed heavily is evidence regardless of size. a
+        # trailing partial window is exactly where a breaking-point run ends,
+        # and sizing it out would hide the thing being looked for.
+        r["error_counted"] = bool(
+            r["attempts"] >= err_floor
+            or (r["errors"] >= 5 and r["error_rate"] > 0.20))
+        # a window that shed requests reports a p95 over survivors only, and
+        # survivors skew fast. it must not anchor the latency comparison, or
+        # the fastest number in the table is the one the endpoint produced
+        # while falling over.
+        # a higher bar than the failing verdict on purpose. losing a few
+        # percent still leaves a p95 worth comparing, losing a fifth does not.
+        r["p95_survivorship"] = bool(r["error_rate"] > 0.20)
+        r["counted"] = bool(r["n"] >= p95_floor
+                            and r["ttft_p95"] is not None
+                            and not r["p95_survivorship"])
+    err_counted = [r for r in rows if r["error_counted"]]
     counted = [r for r in rows if r["counted"]]
     skipped = len(rows) - len(counted)
-    note = ("per-window TTFT and E2E p95. the verdict scores TTFT p95 only, "
-            "and calls the run unstable when the worst counted window is more "
-            "than 1.3x the best, in either direction, so warmup and mid-run "
-            "spikes both show up. E2E p95 is printed per window to read "
-            "alongside it. windows "
-            f"with fewer than {floor:.0f} requests are shown but not counted, "
-            "because a p95 over a small window invents trends.")
+    note = ("per-window counts, errors and p95. two rules decide the verdict. "
+            "first, the run is failing when one window lost more than 5 "
+            "percent of its requests while the others held, or when every "
+            "window is losing more than 10 percent, because a p95 over "
+            "survivors is not a latency result. otherwise the run is "
+            "unstable when the worst "
+            "counted window's TTFT p95 is more than 1.3x the best, in either "
+            "direction, so warmup and mid-run spikes both show up. E2E p95 is "
+            "printed alongside but not scored. a window is left out of the "
+            f"latency comparison when it has fewer than {p95_floor:.0f} "
+            "successful requests, when no request returned a first token, or "
+            "when it lost more than a fifth of its requests.")
+    worst_err = max((r["error_rate"] for r in err_counted), default=0.0)
+    base_err = min((r["error_rate"] for r in err_counted), default=0.0)
+    # two ways to be failing: one window fell over while the rest held, or the
+    # whole run sits past the knee and every window sheds requests. the second
+    # needs an absolute test, since uniform loss has no delta.
+    failing = bool(worst_err > 0.05
+                   and (worst_err > base_err + 0.05 or base_err > 0.10))
+    if failing:
+        # name the window where the most requests actually died, not the
+        # highest percentage: a 6-request tail at 100 percent is noise next
+        # to a 165-request window at 84 percent. but only windows that
+        # themselves trip the bar are eligible, or a huge window with a
+        # rounding-error rate could be named and print "failed 0 percent".
+        eligible = [r for r in err_counted if r["error_rate"] > 0.05]
+        bad_w = max(eligible or err_counted,
+                    key=lambda r: (r["errors"], r["error_rate"]))
+        also = ""
+        if bad_w["error_rate"] < worst_err:
+            top = max(err_counted, key=lambda r: r["error_rate"])
+            also = (f" the highest loss rate was window {top['window']} at "
+                    f"{top['error_rate'] * 100:.0f} percent.")
+        return {
+            "windows": rows, "window_seconds": window_s,
+            "counted_windows": len(counted), "skipped_windows": skipped,
+            "worst_window_error_rate": worst_err,
+            "drift_kind": "failing", "drift_flag": True,
+            "drift_headline": (
+                f"window {bad_w['window']} failed "
+                f"{bad_w['error_rate'] * 100:.0f} percent of its requests. "
+                "latency percentiles only cover requests that came back, so "
+                "the surviving numbers in that window describe what the "
+                "endpoint could still serve, not what it was asked for. read "
+                "this as a breaking point, not a latency result." + also
+                + " the window-to-window latency comparison is not reported "
+                "for a failing run"),
+            "note": note,
+        }
     if len(counted) < 2:
+        errs_dominate = any(r["error_rate"] > 0.05 for r in rows)
         return {"windows": rows, "window_seconds": window_s,
                 "counted_windows": len(counted), "skipped_windows": skipped,
-                "note": "not enough windows carry a usable sample, so "
-                        "stability cannot be judged. run longer, or raise the "
-                        "rate so each window holds enough requests."}
+                "note": ("not enough windows carry a usable latency sample, "
+                         "so stability cannot be judged. "
+                         + ("requests were failing, so read the error rate "
+                            "rather than running the same load for longer."
+                            if errs_dominate else
+                            "run longer, or raise the rate so each window "
+                            "holds enough requests."))}
 
     vals = [r["ttft_p95"] for r in counted]
     first, last = vals[0], vals[-1]
@@ -468,6 +571,20 @@ def _top_errors(failed: list[dict], k: int = 5) -> dict:
     return dict(sorted(counts.items(), key=lambda kv: -kv[1])[:k])
 
 
+def _err_cell(w: dict) -> str:
+    """Per-window errors as count and share, shared by both renderers."""
+    if not w.get("errors"):
+        return "0"
+    return f"{w['errors']} ({w['error_rate'] * 100:.0f}%)"
+
+
+def _lag_p95(arr: dict) -> str:
+    """Dispatch lag p95, where a measured 0.0 is a real value and a missing
+    one is not. `or` would collapse the two."""
+    v = (arr.get("dispatch_lag_ms") or {}).get("p95")
+    return "n/a" if v is None else f"{v:.0f}"
+
+
 def render_markdown(summary: dict, title: str) -> str:
     s = summary
 
@@ -541,7 +658,7 @@ def render_markdown(summary: dict, title: str) -> str:
          "- output tokens: endpoint did not report completion_tokens"),
         f"- achieved arrival rate: {arr['achieved_qps_overall']:.2f} QPS "
         f"overall, dispatch lag p95 "
-        f"{arr['dispatch_lag_ms'].get('p95', float('nan')):.0f} ms"
+        f"{_lag_p95(arr)} ms"
         if arr.get("achieved_qps_overall") else "- arrivals: n/a",
         f"- arrival schedule: from trace {sched_src}"
         if sched_src != "synthetic" else "- arrival schedule: synthetic bursts",
@@ -648,7 +765,7 @@ def render_markdown(summary: dict, title: str) -> str:
                   "config."]
 
     drift = s.get("drift") or {}
-    if drift.get("windows"):
+    if drift.get("windows") or drift.get("drift_kind"):
         kind = drift.get("drift_kind")
         if not kind:
             flag = "NOT ENOUGH DATA"
@@ -659,16 +776,20 @@ def render_markdown(summary: dict, title: str) -> str:
         spread = drift.get("ttft_p95_spread_ratio")
         sp = (f" worst window is {spread:.1f}x the best."
               if spread else "")
-        lines += ["", f"stability over time ({flag}), per-"
-                  f"{drift['window_seconds']}s window p95 in ms."
-                  f"{sp} {drift.get('drift_headline') or drift.get('note', '')}",
-                  "| window | n (ok) | TTFT p95 | E2E p95 |", "|---|---|---|---|"]
-        for w in drift["windows"]:
+        lines += ["", f"stability over time ({flag})."
+                  f"{sp} {drift.get('drift_headline') or drift.get('note', '')}"]
+        if drift.get("windows"):
+            lines += ["", f"per-{drift.get('window_seconds', 60)}s windows, p95 in ms:",
+                      "",
+                      "| window | n (ok) | errors | TTFT p95 | E2E p95 |",
+                      "|---|---|---|---|---|"]
+        for w in (drift.get("windows") or []):
             tt = f"{w['ttft_p95']:.0f}" if w['ttft_p95'] is not None else "-"
             ee = f"{w['e2e_p95']:.0f}" if w['e2e_p95'] is not None else "-"
             mark = "" if w.get("counted", True) else " (not counted)"
+            er = _err_cell(w)
             lines.append(
-                f"| {w['window']}{mark} | {w['n']} | {tt} | {ee} |")
+                f"| {w['window']}{mark} | {w['n']} | {er} | {tt} | {ee} |")
         # only when a verdict exists, otherwise the headline already IS the note
         if drift.get("drift_headline"):
             lines.append("")
@@ -1086,12 +1207,13 @@ def render_html(summary: dict, title: str) -> str:
         sample_banner += f"<div class='banner warn'>{esc(rw)}</div>"
 
     drift = s.get("drift") or {}
-    if drift.get("windows"):
+    if drift.get("windows") or drift.get("drift_kind"):
         wr = "".join(
-            f"<tr><td class='lbl'>window {w['window']} ({w['n']} req)"
+            f"<tr><td class='lbl'>window {w['window']} ({w['n']} ok)"
             f"{'' if w.get('counted', True) else ', not counted'}</td>"
+            f"<td>{_err_cell(w)}</td>"
             f"<td>{num(w['ttft_p95'])}</td><td>{num(w['e2e_p95'])}</td></tr>"
-            for w in drift["windows"])
+            for w in (drift.get("windows") or []))
         kind = drift.get("drift_kind")
         if not kind:
             flag = "<span class='pill neutral'>not enough data</span>"
@@ -1103,13 +1225,16 @@ def render_html(summary: dict, title: str) -> str:
         sp = (f"worst window is {spread:.1f}x the best. " if spread else "")
         drift_html = (
             f"<div class='card'><h2>Stability over time &nbsp;{flag}</h2>"
-            f"<div class='cap'>per-{drift['window_seconds']}s window p95 in ms. "
+            f"<div class='cap'>"
+            f"{f'per-' + str(drift.get('window_seconds', 60)) + 's windows, counts and p95 in ms. ' if drift.get('windows') else ''}"
             f"{sp}"
             f"{esc(drift.get('drift_headline') or drift.get('note', ''))}"
             f"{('<br>' + esc(drift.get('note', ''))) if drift.get('drift_headline') else ''}"
             f"</div>"
-            f"<table><tr><th class='lbl'>window</th><th>TTFT p95</th>"
-            f"<th>E2E p95</th></tr>{wr}</table></div>")
+            + (f"<table><tr><th class='lbl'>window</th><th>errors</th>"
+               f"<th>TTFT p95</th><th>E2E p95</th></tr>{wr}</table>"
+               if drift.get("windows") else "")
+            + "</div>")
     else:
         drift_html = (f"<div class='card'><h2>Stability over time</h2>"
                       f"<div class='cap'>{esc(drift.get('note', ''))}</div></div>"

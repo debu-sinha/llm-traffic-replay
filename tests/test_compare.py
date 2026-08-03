@@ -166,3 +166,24 @@ def test_no_run_reporting_cache_is_warned():
     md = _compare_summaries([a, b])
     assert "no run reported cached tokens" in md
     assert "biggest driver" in md
+
+
+def test_a_failing_run_is_named_as_a_breaking_point_in_a_comparison():
+    a = _summary("steady", 0.60)
+    a["drift"] = {"drift_flag": False, "drift_kind": "stable"}
+    b = _summary("broke", 0.60)
+    b["drift"] = {"drift_flag": True, "drift_kind": "failing"}
+    md = _compare_summaries([a, b])
+    assert "broke was shedding requests" in md
+    assert "is a breaking point" in md
+    assert "its surviving percentiles" in md
+
+
+def test_two_failing_runs_read_as_plural():
+    a = _summary("broke-a", 0.60); b = _summary("broke-b", 0.60)
+    for sm in (a, b):
+        sm["drift"] = {"drift_flag": True, "drift_kind": "failing"}
+    md = _compare_summaries([a, b])
+    assert "were shedding requests" in md
+    assert "are breaking points" in md
+    assert "their surviving percentiles" in md

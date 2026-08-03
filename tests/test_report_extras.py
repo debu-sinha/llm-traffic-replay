@@ -225,3 +225,273 @@ def test_report_states_which_harness_version_and_latency_basis():
     assert "NOT included" in s["latency_basis"]
     assert "latency basis" in render_markdown(s, "v")
     assert "Latency basis" in render_html(s, "v")
+
+
+def _fail(n, t0=0.0, dt=1.0):
+    return [{"ok": False, "t_send_unix": t0 + i * dt, "ttft_ms": None,
+             "e2e_ms": None, "error": "upstream timeout", "status": 504}
+            for i in range(n)]
+
+
+def test_endpoint_collapsing_into_errors_is_not_stable():
+    """The breaking-point run PRODUCTION_TESTING stage 2 tells you to do. The
+    endpoint falls over in the last window, most requests fail, and the few
+    survivors come back fast. Scoring successes alone reads that as steady,
+    which is the worst possible answer for a test whose whole purpose is
+    finding where the endpoint bends."""
+    rows = _rows(150, base_ttft=200.0, t0=0.0, dt=0.3)
+    rows += _rows(150, base_ttft=210.0, t0=70.0, dt=0.3)
+    rows += _rows(25, base_ttft=190.0, t0=140.0, dt=0.3)   # fast survivors
+    rows += _fail(140, t0=140.0, dt=0.3)                   # the collapse
+    d = _drift_block([r for r in rows if r["ok"]],
+                     [r for r in rows if not r["ok"]])
+    assert d["drift_kind"] == "failing"
+    assert d["drift_flag"] is True
+    assert "84 percent" in d["drift_headline"]
+    assert "not what it was asked" in d["drift_headline"]
+    # the named window is the biggest failure, so the clause reconciling it
+    # against the highest RATE has to be there too, or the two disagree
+    assert "highest loss rate was window 3" in d["drift_headline"]
+
+
+def test_a_collapsing_window_is_judged_for_errors_not_for_latency():
+    """The window where the endpoint broke has few SUCCESSES. It must still
+    reach the error verdict, which is sized on ATTEMPTS, while staying out of
+    the latency comparison, whose p95 would be survivors only."""
+    rows = _rows(150, base_ttft=200.0, t0=0.0, dt=0.3)
+    rows += _rows(150, base_ttft=210.0, t0=70.0, dt=0.3)
+    rows += _rows(25, base_ttft=190.0, t0=140.0, dt=0.3)
+    fails = _fail(140, t0=140.0, dt=0.3)
+    d = _drift_block(rows, fails)
+    collapsed = [w for w in d["windows"] if w["window"] == 2][0]
+    assert collapsed["n"] == 25              # few successes
+    assert collapsed["errors"] == 134
+    assert collapsed["error_counted"] is True   # reaches the error verdict
+    assert collapsed["counted"] is False        # excluded from latency
+
+
+def test_per_window_errors_render_in_both_formats():
+    rows = _rows(60, base_ttft=200.0, t0=0.0, dt=0.5)
+    rows += _rows(60, base_ttft=205.0, t0=70.0, dt=0.5)
+    fails = _fail(40, t0=70.0, dt=0.5)
+    s = summarize(rows + fails)
+    md = render_markdown(s, "errs")
+    h = render_html(s, "errs")
+    assert "errors" in md
+    assert "<th>errors</th>" in h
+    assert "40 (" in md          # count and share shown together
+
+
+def test_a_uniformly_lossy_run_is_not_called_failing():
+    """Steady 8 percent errors across every window is a bad endpoint, but it
+    is not a breaking point, and the error rate is already reported. Only a
+    window that is materially worse than the rest earns the failing verdict."""
+    rows, fails = [], []
+    for w, t0 in enumerate((0.0, 70.0, 140.0)):
+        rows += _rows(60, base_ttft=200.0 + w, t0=t0, dt=0.5)
+        fails += _fail(5, t0=t0, dt=0.5)
+    d = _drift_block(rows, fails)
+    assert d["drift_kind"] != "failing"
+
+
+def test_a_total_outage_window_is_not_dropped_for_having_no_p95():
+    """The window where every request failed has no p95 at all. Gating the
+    error verdict on the latency gate would make a total outage invisible,
+    which is worse than the partial-collapse bug."""
+    rows = _rows(150, base_ttft=200.0, t0=0.0, dt=0.3)
+    rows += _rows(150, base_ttft=205.0, t0=140.0, dt=0.3)
+    fails = _fail(150, t0=70.0, dt=0.3)
+    d = _drift_block(rows, fails)
+    dead = [w for w in d["windows"] if w["n"] == 0][0]
+    assert dead["errors"] == 150
+    assert dead["ttft_p95"] is None
+    assert d["drift_kind"] == "failing"
+
+
+def test_a_run_failing_in_every_window_is_still_failing():
+    """Past the knee, every window sheds requests, so worst and best error
+    rates are both high and a delta test alone cannot see it."""
+    rows, fails = [], []
+    for w, t0 in enumerate((0.0, 70.0, 140.0)):
+        rows += _rows(70, base_ttft=200.0 + w, t0=t0, dt=0.3)
+        fails += _fail(30, t0=t0, dt=0.3)
+    d = _drift_block(rows, fails)
+    assert d["drift_kind"] == "failing"
+
+
+def test_a_shedding_window_cannot_anchor_the_latency_spread():
+    """The collapsed window's survivors are fast, so letting it into the
+    latency comparison makes the fastest number in the table the one the
+    endpoint produced while falling over."""
+    rows = _rows(150, base_ttft=200.0, t0=0.0, dt=0.3)
+    rows += _rows(150, base_ttft=210.0, t0=70.0, dt=0.3)
+    rows += _rows(25, base_ttft=190.0, t0=140.0, dt=0.3)   # fast survivors
+    fails = _fail(140, t0=140.0, dt=0.3)
+    d = _drift_block(rows, fails)
+    collapsed = [w for w in d["windows"] if w["errors"] == 134][0]
+    assert collapsed["p95_survivorship"] is True
+    assert collapsed["counted"] is False
+    # the failing branch returns before any latency comparison is computed,
+    # so there is no "best" at all. this also fails loudly if the failing and
+    # survivorship thresholds ever diverge enough for both to be reachable.
+    assert "ttft_p95_best" not in d
+
+
+def test_mild_uniform_loss_still_gets_a_latency_verdict():
+    """Losing a few percent leaves a p95 worth comparing. Excluding those
+    windows would silently drop the verdict on an otherwise healthy run."""
+    rows, fails = [], []
+    for w, t0 in enumerate((0.0, 70.0, 140.0)):
+        rows += _rows(60, base_ttft=200.0 + w, t0=t0, dt=0.3)
+        fails += _fail(5, t0=t0, dt=0.3)
+    d = _drift_block(rows, fails)
+    assert d["drift_kind"] == "stable"
+    assert all(w["counted"] for w in d["windows"])
+
+
+def test_a_heavily_shedding_small_window_is_not_sized_out():
+    """A breaking-point run ends in a trailing partial window. Sizing the
+    error rule purely on median attempts would drop exactly the window the
+    run exists to find."""
+    rows = _rows(200, base_ttft=200.0, t0=0.0, dt=0.2)
+    rows += _rows(200, base_ttft=201.0, t0=70.0, dt=0.2)
+    rows += _rows(200, base_ttft=202.0, t0=140.0, dt=0.2)
+    rows += _rows(30, base_ttft=203.0, t0=210.0, dt=0.2)
+    fails = _fail(15, t0=216.0, dt=0.2)          # 33 percent of a small window
+    d = _drift_block(rows, fails)
+    small = d["windows"][-1]
+    assert small["attempts"] < 60                 # well under the median
+    assert small["error_counted"] is True         # judged anyway
+    assert d["drift_kind"] == "failing"
+
+
+def test_a_run_where_everything_failed_says_so():
+    """Zero successes must not fall through to 'stability was never
+    established'. It is the most complete failure there is."""
+    d = _drift_block([], _fail(50, t0=0.0) + _fail(50, t0=70.0))
+    assert d["drift_kind"] == "failing"
+    assert "every request failed" in d["drift_headline"]
+
+
+def test_the_named_window_is_the_largest_failure_not_the_highest_rate():
+    """A tiny tail window at 100 percent should not outrank the window where
+    a hundred requests actually died."""
+    rows = _rows(150, base_ttft=200.0, t0=0.0, dt=0.3)
+    rows += _rows(25, base_ttft=190.0, t0=70.0, dt=0.3)
+    fails = _fail(120, t0=70.0, dt=0.3)      # big collapse, 83 percent
+    fails += _fail(4, t0=140.0, dt=0.3)      # tiny tail, 100 percent
+    d = _drift_block(rows, fails)
+    assert d["drift_kind"] == "failing"
+    assert "window 1" in d["drift_headline"]      # the substantive one
+    assert "100 percent" not in d["drift_headline"]
+
+
+def test_retry_exhausted_failures_keep_their_original_send_time():
+    """The client stamps the FIRST send, not the moment of final failure. A
+    request retried past a read timeout would otherwise land whole windows
+    later and invent a trailing window of errors."""
+    import time
+    from traffic_replay.client import EndpointClient, EndpointConfig
+
+    class SlowFailingConn:
+        """Connects, accepts the request, then dies. Each attempt burns time,
+        the way a read timeout does."""
+        sock = None
+
+        def connect(self): pass
+
+        def request(self, *a, **k):
+            time.sleep(0.15)
+            raise OSError("connection reset by peer")
+
+        def close(self): pass
+
+    cfg = EndpointConfig(base_url="http://127.0.0.1:1",
+                         path="/serving-endpoints/x/invocations",
+                         max_retries=2)
+    c = EndpointClient(cfg, token=None)
+    c._connect = lambda: SlowFailingConn()
+
+    before = time.time()
+    r = c.send([{"role": "user", "content": "hi"}], 8, "req-1",
+               scheduled_s=0.0, dispatch_lag_ms=0.0, intended=(0, 0, None, 0),
+               chars_sent=2)
+    after = time.time()
+
+    assert r.ok is False
+    # the whole call spanned at least two sleeps, so a final-failure stamp
+    # would sit well after the first send
+    assert after - before > 0.25
+    assert r.t_send_unix < before + 0.15
+
+
+def test_a_total_outage_actually_renders_its_verdict():
+    """The zero-success block reaches summary.json, but both renderers used
+    to gate on the window list, which is empty there, so the card printed no
+    verdict at all while compare warned about the same run."""
+    fails = [{"ok": False, "t_send_unix": float(i), "ttft_ms": None,
+              "e2e_ms": None, "error": "upstream refused", "status": 503}
+             for i in range(120)]
+    s = summarize(fails)
+    assert s["drift"]["drift_kind"] == "failing"
+    md = render_markdown(s, "outage")
+    h = render_html(s, "outage")
+    assert "failing" in md.lower()
+    assert "unstable: failing" in h
+    assert "every request failed" in md
+
+
+def test_one_stray_failure_does_not_flip_a_healthy_run():
+    """A run whose duration is not a multiple of the window leaves a tiny
+    tail. At low rates it holds a couple of requests, and one reset there
+    must not read as a breaking point."""
+    rows = _rows(60, base_ttft=200.0, t0=0.0, dt=0.2)
+    rows += _rows(60, base_ttft=201.0, t0=70.0, dt=0.2)
+    d = _drift_block(rows, _fail(1, t0=125.0))
+    assert d["drift_kind"] != "failing"
+
+
+def test_the_headline_window_always_trips_the_bar_itself():
+    """Naming by absolute errors alone names the huge low-rate window, whose
+    3 percent is a rounding error next to a 30 percent collapse, and whose
+    rate can round to 0 percent on a bigger denominator."""
+    rows = _rows(2000, base_ttft=200.0, t0=0.0, dt=0.02)     # big, clean-ish
+    rows += _rows(70, base_ttft=201.0, t0=70.0, dt=0.2)
+    fails = _fail(60, t0=0.0, dt=0.02)                       # 3 percent
+    fails += _fail(30, t0=84.0, dt=0.2)                      # 30 percent
+    d = _drift_block(rows, fails)
+    assert d["drift_kind"] == "failing"
+    # the eligibility filter is what this pins: without it the argmax by
+    # absolute errors names the big low-rate window instead.
+    assert d["drift_headline"].startswith("window 1 failed 30 percent")
+    assert "failed 0 percent" not in d["drift_headline"]
+
+
+def test_a_measured_zero_dispatch_lag_prints_as_zero_not_nan():
+    """A measured 0.0 is a real value. Collapsing it with `or` would print
+    nan on every clean run, which is what the first fix did."""
+    md = render_markdown(summarize(_rows(60)), "lag")
+    assert "dispatch lag p95 0 ms" in md
+    assert "nan" not in md
+
+
+def test_the_window_table_is_a_real_markdown_table():
+    """A GFM table cannot interrupt a paragraph. Without a blank line the
+    whole stability block renders as literal pipes, and report.md is the file
+    that gets pasted into a ticket."""
+    rows = _rows(60, base_ttft=200.0, t0=0.0, dt=0.2)
+    rows += _rows(60, base_ttft=205.0, t0=70.0, dt=0.2)
+    rows += _rows(60, base_ttft=210.0, t0=140.0, dt=0.2)
+    md = render_markdown(summarize(rows), "tbl")
+    block = md[md.index("stability over time"):].splitlines()
+    header = next(i for i, l in enumerate(block) if l.startswith("| window |"))
+    assert block[header - 1].strip() == ""      # blank line before the table
+
+
+def test_a_total_outage_card_does_not_claim_per_window_p95():
+    fails = [{"ok": False, "t_send_unix": float(i), "ttft_ms": None,
+              "e2e_ms": None, "error": "refused", "status": 503}
+             for i in range(60)]
+    s = summarize(fails)
+    assert "window p95 in ms" not in render_html(s, "o")
+    assert "| window |" not in render_markdown(s, "o")

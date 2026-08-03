@@ -157,10 +157,11 @@ read anything into its numbers.
 
 ![the report: stat cards, latency table, stability over time](docs/img/report-example.jpg)
 
-Every number carries its unit. The stability card scores TTFT p95 per
-60-second window and says which shape it saw, and any window too small to
-support a p95 is printed but marked "not counted" rather than quietly moving
-the verdict.
+Every number carries its unit. The stability card asks about errors first,
+then compares TTFT p95 per 60-second window and says which shape it saw. Any
+window too small to support a p95, or one that shed too many requests to have
+a meaningful one, is printed but marked "not counted" rather than quietly
+moving the verdict.
 
 At the bottom sit the two things that decide whether a number can leave the
 room:
@@ -627,24 +628,41 @@ believed, and the report prints them together:
   prints a caution when there are too few. Under 100 requests p99 is unstable,
   and under 30 the whole tail is indicative only. A tight p99 off 20 requests
   is not a result, and the report says so instead of letting the number stand.
-- **Stability over time**: ok requests are bucketed into 60-second windows and
-  each window's TTFT and E2E p95 is printed. The verdict scores TTFT p95 only,
-  with E2E printed beside it to read together. The run is called unstable when
-  the worst counted window is more than 1.3x the best, in either direction, and the
-  report names which shape it saw: `degrading` (every window rises, the
-  endpoint slowed under load), `warming` (every window falls from a slow start,
-  so early requests are cold start and not steady state), `spike` (a middle
-  window is much worse than both ends), or `variable` (the windows move around
-  without a trend, so the run is noisy rather than drifting). A trend is only
-  named when the windows actually move that way, so a noisy run is not sold as
-  degradation. Comparing only the first window to the last is not enough
-  either, because that reads a mid-run spike as stable and reads a 15x cold
-  start as an improvement.
+- **Stability over time**: requests are bucketed into 60-second windows, and
+  each window's success count, error count and TTFT/E2E p95 is printed. Two
+  rules decide the verdict, in this order.
+
+  First, errors. The run is `failing` when one window lost more than 5
+  percent of its requests while the others held, or when every window is
+  losing more than 10 percent. That is decided on error rate, not latency,
+  because the survivors in a shedding window describe what the endpoint could
+  still serve rather than what it was asked for. A window that lost more than
+  a fifth of its requests is also marked "not counted" in the table, so you
+  can see at a glance which rows the latency comparison refused.
+
+  Second, latency. The run is unstable when the worst counted window's TTFT
+  p95 is more than 1.3x the best, in either direction, reported as `degrading`
+  (every window rises, the endpoint slowed under load), `warming` (every
+  window falls from a slow start, so early requests are cold start and not
+  steady state), `spike` (a middle window is much worse than both ends), or
+  `variable` (the windows move around without a trend, so the run is noisy
+  rather than drifting). A trend is only named when the windows actually move
+  that way, so a noisy run is not sold as degradation, and comparing only the
+  first window to the last is not enough either, because that reads a mid-run
+  spike as stable and a 15x cold start as an improvement. E2E p95 is printed
+  beside TTFT but not scored.
+
   Windows too small to support a p95 (a trailing partial window, say) are
-  printed but marked "not counted" and excluded from the verdict, because one
-  slow request in a 5-request window would otherwise invent a trend. A run
-  needs two counted windows to be judged at all and three before any direction
-  is named, so short runs print a note instead of a false verdict.
+  printed but marked "not counted" and left out of the latency comparison,
+  because one slow request in a 5-request window would otherwise invent a
+  trend. The error rule sizes its own floor on attempted requests, and a
+  window that lost at least 5 requests and more than a fifth of them is
+  judged whatever its size, so a window whose successes collapsed is not
+  sized out. Below that, a tail window with 4 or fewer failures is printed
+  with its error count but not scored, which keeps a single stray reset in a
+  2-request tail from reading as a breaking point. A run needs two counted
+  windows to get a latency verdict and three before any direction is named,
+  so short runs print a note instead of a false verdict.
 - **Connection setup (DNS, TCP, TLS)**: setup is timed separately and is
   **excluded** from TTFT, TTFB and TTFG, so don't subtract it again. It is
   several round trips, so read it as an upper bound on how far the client sat

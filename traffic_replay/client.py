@@ -73,6 +73,9 @@ class RequestResult:
     reasoning_tokens_source: str | None = None  # usage field it was read from
     reasoning_chunks: int = 0             # reasoning deltas seen in the stream
     connect_ms: float | None = None       # DNS + TCP + TLS setup time
+    # note: a successful record carries the send time of the attempt
+    # that succeeded, a failed one carries the FIRST attempt's send
+    # time, so a retried failure buckets where it was asked for.
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -127,12 +130,21 @@ class EndpointClient:
         attempt = 0
         include_usage = self._include_usage_supported is not False
         last_err: str | None = None
+        # when every attempt fails we still have to say WHEN the request was
+        # attempted. stamping the moment of final failure puts it up to
+        # (connect_timeout_s + read_timeout_s) * retries later, which buckets
+        # it into the wrong window and can invent a trailing window of errors.
+        first_send_unix: float | None = None
 
         while attempt <= self.cfg.max_retries:
             attempt += 1
             conn = None
             try:
                 conn = self._connect()
+                # stamp before the handshake, so a failure during DNS, TCP or
+                # TLS is still placed in the window it was asked for.
+                if first_send_unix is None:
+                    first_send_unix = time.time()
                 t_conn0 = time.monotonic()
                 conn.connect()
                 connect_ms = (time.monotonic() - t_conn0) * 1000.0
@@ -220,7 +232,9 @@ class EndpointClient:
                     conn.close()
 
         return self._finish(request_id, scheduled_s, dispatch_lag_ms,
-                            time.time(), None, None, None, None, False,
+                            first_send_unix if first_send_unix is not None
+                            else time.time(),
+                            None, None, None, None, False,
                             last_err or "exhausted retries", StreamState(),
                             intended, chars_sent, attempt - 1)
 

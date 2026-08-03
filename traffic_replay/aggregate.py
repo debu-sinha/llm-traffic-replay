@@ -84,8 +84,10 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "windows": [], "window_seconds": 60,
         "note": "stability over time is not computed for a merged run. the "
                 "pooled rows come from separate runs, so time windows would "
-                "span the gaps between them. read each run's own report for "
-                "its stability.",
+                "span the gaps between them. that also means a merged run "
+                "cannot report a breaking point, so if any shard was shedding "
+                "requests, read its own report. the pooled error rate below "
+                "still counts every failure.",
     }
     return write_outputs(rows, summary, out_dir,
                          title or f"merged: {len(dirs)} runs")
@@ -191,10 +193,19 @@ def compare_runs(out_dir, input_dirs) -> Path:
               if (s.get("drift") or {}).get("drift_flag")]
     if moving:
         detail = ", ".join(f"{t} ({k})" for t, k in moving)
+        broke = [t for t, k in moving if k == "failing"]
+        one = len(broke) == 1
+        extra = (f" {', '.join(broke)} {'was' if one else 'were'} shedding "
+                 f"requests, which {'is a breaking point' if one else 'are breaking points'} "
+                 f"rather than {'a latency result' if one else 'latency results'}, "
+                 f"so {'its' if one else 'their'} "
+                 "surviving percentiles are not comparable to anything."
+                 if broke else "")
         warns.append(
             f"these runs were not in steady state: {detail}. Read each run's "
             "stability card. A warming endpoint compared against a warm one "
-            "is a measurement artifact, not a difference between providers.")
+            "is a measurement artifact, not a difference between "
+            f"providers.{extra}")
     # no verdict at all is not the same as passing. a run too short to bucket,
     # or whose windows were too thin to count, was never checked.
     unjudged = [t for t, s in zip(titles, summ)

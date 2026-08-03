@@ -112,14 +112,22 @@ log reduced to per-request token counts and repeat structure):
   under 100 requests because p99 is unstable there. If the caution is
   printed, either run longer or quote p50 and p95 only.
 - Read the stability-over-time card before treating one number as steady
-  state. When the card says unstable it also says which shape: `warming`
-  means the early windows are cold start and you should quote the later ones,
+  state. When the card says unstable it also says which shape.
+
+  `failing` means a window lost a large share of its requests. This is the
+  one to stop on. The surviving latency numbers in that window describe what
+  the endpoint could still serve, not what it was asked for, so they look
+  better than reality. That is your breaking point: record the rate_scale
+  that produced it and step back down, do not run it for longer.
+
+  The other four are latency shapes, and for all of them the answer is a
+  longer or repeated run rather than an average across the change. `warming`
+  means the early windows are cold start and you should quote the later ones.
   `degrading` means the endpoint slowed under sustained load and the run is
-  the story, `spike` means something transient hit mid-run and needs
-  explaining before any number ships, and `variable` means the windows are
-  just noisy, which on shared capacity is common and still disqualifies the
-  run as a steady-state number. In all four the answer is a longer or
-  repeated run, not an average across the change. A run under two minutes
+  the story. `spike` means something transient hit mid-run and needs
+  explaining before any number ships. `variable` means the windows are just
+  noisy, which on shared capacity is common and still disqualifies the run as
+  a steady-state number. A run under two minutes
   can't answer this at all.
 - Don't subtract the connection-setup line from TTFT. Since 0.3.0 the
   handshake is already excluded from TTFT, TTFB and TTFG, and the line is

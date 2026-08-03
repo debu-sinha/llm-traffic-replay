@@ -31,7 +31,14 @@ The new basis is the more representative one, but it isn't the old one. A
   and cautions under 100 (p99 unstable) and under 30 (whole tail indicative
   only). Zero successful requests says so rather than describing a p99.
 - **Stability over time.** Requests are bucketed into 60-second windows with
-  per-window TTFT and E2E p95. A run is unstable when the worst counted window
+  per-window TTFT and E2E p95, plus a per-window error count. A run is
+  reported as `failing`, decided on error rate rather than the 1.3x rule,
+  when one window lost more than 5 percent of its requests while the others
+  held, or when every window is losing more than 10 percent. Latency
+  percentiles only cover requests that came back, and a collapsing
+  endpoint's survivors are the fast ones, so the error rule is asked first
+  and sizes its floor on attempted requests rather than successful ones. A
+  run is unstable when the worst counted window
   is more than 1.3x the best in either direction, reported as `warming`,
   `degrading`, `spike` or `variable`. Windows too small to support a p95 are
   printed but excluded from the verdict, and a direction is only named with at

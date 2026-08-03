@@ -20,24 +20,19 @@ Both profile JSONs are also base64-embedded in the notebook payload by
 inside the notebook. Rename the profiles to something neutral, update every
 reference, and re-run `python3 scripts/pack_notebook.py`.
 
-## Bucket failed requests in the stability check
-
-`_drift_block` buckets successful requests only, so an endpoint that degrades
-into errors can still read `stable`: the survivors stay fast and the window's
-ok-count drops. Bucketing failures changes the meaning of the `n` column and
-the p95 basis, so it wants its own change with its own tests. Pair it with the
-error-rate warning `compare` already emits.
-
 ## Record which serving config was read
 
 `endpoint_meta._summarize` reads the active `config` only. During an endpoint
 update the pending config carries the new workload shape. Recording a
 `config_source` field and rendering it would let the card say which one it
-described.
+described. Severity checked: with the `pending_config` fallback dropped, a
+mid-update endpoint reports NO served-entity rows at all and shows
+`ready: UPDATING`, so the card cannot make a false capacity claim. Cosmetic.
 
 ## Document the dispatch-lag and connect_ms interaction
 
 Dispatch lag is stamped when the request is submitted, and the latency clock
 starts after the handshake, so offered arrivals reach the endpoint roughly
 `connect_ms` after the reported dispatch lag. Worth one sentence in the
-connection-setup line.
+connection-setup line. Severity checked: no wrong number is printed, both
+figures are individually correct and labeled. Documentation only.

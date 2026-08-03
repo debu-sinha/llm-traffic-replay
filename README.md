@@ -148,11 +148,37 @@ export DATABRICKS_TOKEN=<your PAT, or any bearer token the endpoint accepts>
 python3 -m traffic_replay run --config configs/run_smoke.json
 ```
 
+### What the report looks like
+
+The example below is generated against the **bundled mock server**, whose
+latency model is synthetic and known by construction. It shows the report
+format. It is not a measurement of any serving provider, and you should not
+read anything into its numbers.
+
+![the report: stat cards, latency table, stability over time](docs/img/report-example.jpg)
+
+Every number carries its unit. The stability card scores TTFT p95 per
+60-second window and says which shape it saw, and any window too small to
+support a p95 is printed but marked "not counted" rather than quietly moving
+the verdict.
+
+At the bottom sit the two things that decide whether a number can leave the
+room:
+
+![believability block, cost, and both provenance labels](docs/img/report-believability-labels.jpg)
+
+The believability block names the exact usage field the cache fraction came
+from, states that connection setup is excluded from TTFT, and prints the
+latency basis so a saved report says which measurement convention produced it.
+Note the two labels at the very bottom: your run label and the profile's own
+label both print. A profile that says "never quote latency from this profile"
+keeps saying it no matter what label you give the run.
+
 Outputs land in `results/<timestamp>/`:
 
-- `requests.jsonl`: every request: TTFT/TTFB/E2E ms, endpoint-reported
-  prompt/completion/cached tokens, intended sizes, document id, dispatch
-  lag, errors.
+- `requests.jsonl`: every request: TTFT/TTFB/E2E ms, TCP/TLS `connect_ms`,
+  endpoint-reported prompt/completion/cached tokens, intended sizes, document
+  id, dispatch lag, errors.
 - `summary.json`: percentile tables plus the believability block.
 - `report.html`: the readout to open in a browser or share. Stat cards, a
   color-coded SLA scorecard, units on every metric, and the believability
@@ -455,19 +481,99 @@ python3 -m traffic_replay merge results/pooled \
   results/m1/2026* results/m2/2026* results/m3/2026*
 ```
 
-Comparing providers (the cost-parity motion) means running each on this
-same instrument, then:
+Pass `--profile` to `merge` to score the pooled run against acceptance
+targets, and `--force` to merge runs whose endpoint paths differ. A merged run
+gets no stability verdict, because pooled shards ran at different times and a
+trend across them would describe the schedule, not the endpoint.
 
-```bash
-python3 -m traffic_replay compare results/compare \
-  results/dbx-pt results/together results/baseten
+### Comparing Databricks against another provider
+
+This is the main reason the tool exists, so it is worth doing properly. The
+harness speaks OpenAI-compatible streaming chat, so the other provider is a
+config change, not a code change. Only `endpoint` differs between the runs.
+
+Databricks provisioned throughput or pay-per-token:
+
+```json
+"endpoint": {
+  "base_url": "https://your-workspace.cloud.databricks.com",
+  "path": "/serving-endpoints/your-endpoint/invocations",
+  "auth_token_env": "DATABRICKS_TOKEN"
+}
 ```
 
-`compare` writes `comparison.md`, one column per run, and warns in bold when
-the runs' achieved cache p50 differ by more than 0.10, because comparing
-latency at different cache rates is not a comparison. Pass `--profile` to
-`merge` to score the pooled run against acceptance targets, and `--force` to
-merge runs whose endpoint paths differ.
+Any other OpenAI-compatible provider. These routes are shared across models,
+so they need `model`, which a dedicated Databricks endpoint does not:
+
+```json
+"endpoint": {
+  "base_url": "https://api.openai.com",
+  "path": "/v1/chat/completions",
+  "model": "gpt-4o-mini",
+  "auth_token_env": "OPENAI_API_KEY"
+}
+```
+
+The same shape works for Together, Fireworks, Anyscale, Baseten, vLLM and
+anything else exposing `/v1/chat/completions` with bearer auth. Set the token
+in the environment variable you named, never in the config.
+
+There is no shipped config per provider, so make two.
+
+**Start from your own profile, not the bundled one.** Build it from your logs
+with `scripts/profile_from_logs.py` (see
+[Bring your own data](#bring-your-own-data)). `configs/profile_validation_small.json`
+exists to prove the instrument works and caps outputs at 12 tokens, so a
+comparison built on it says nothing about either provider. It carries a label
+saying exactly that, and the report prints a profile's label next to your own
+label rather than instead of it, so that warning follows the numbers wherever
+they go.
+
+Copy `configs/run_smoke.json` twice, then in each copy:
+
+- point `profile_path` at YOUR profile, the same one in both
+- change the `endpoint` block, and give each its own `out_dir`
+- raise `duration_s` to at least 240. A 60-second run is a single time window,
+  so the stability check cannot run and `compare` will tell you it was never
+  established
+- replace the smoke `title` and `label`, which otherwise stamp the run
+  "NOT PERFORMANCE EVIDENCE"
+
+```bash
+cp configs/run_smoke.json configs/run_dbx.json      # edit endpoint + out_dir
+cp configs/run_smoke.json configs/run_other.json    # edit endpoint + out_dir
+
+export DATABRICKS_TOKEN=...
+python3 -m traffic_replay run --config configs/run_dbx.json
+export OPENAI_API_KEY=...
+python3 -m traffic_replay run --config configs/run_other.json
+
+python3 -m traffic_replay compare results/compare \
+  results/dbx/2026* results/other/2026*
+```
+
+**For the comparison to mean anything, hold these constant.** The tool checks
+what it can and says so at the top of `comparison.md`, above the tables, but
+some of it is on you:
+
+| Must match | Why | Checked for you |
+| --- | --- | --- |
+| The profile | Different prompt sizes are different work | No, use one profile file for both runs |
+| The client machine and region | Distance shows up in TTFT | No, run both from the same host |
+| Harness version | 0.3.0 changed what TTFT includes | Yes, warns on mismatch |
+| Achieved cache rate | A cached prompt is much cheaper to serve | Yes, warns on a gap over 0.10 |
+| Cache reporting at all | A provider that reports no cached tokens is not comparable to one serving 57% from cache | Yes, warns loudly |
+| Error rate | Percentiles only cover requests that succeeded, so a provider that dropped its slow requests looks faster | Yes, warns above 1% |
+| Sample size | p99 needs requests behind it | Yes, warns under 100 |
+| Steady state | A warming endpoint against a warm one is an artifact | Yes, warns when either run drifted |
+
+The cache row is the one that most often invalidates a real comparison.
+Databricks reports `prompt_tokens_details.cached_tokens`, and many providers
+report nothing, in which case the achieved cache column reads
+`NOT REPORTED`. That does not mean zero cache, it means you cannot
+verify it, and a latency table built on top of that is not a like-for-like
+result. `compare` says this above the tables, before any latency number, so it
+is not something you have to notice in a cell.
 
 ## Reading results: the honesty rules
 
@@ -500,8 +606,8 @@ believed, and the report prints them together:
   scores.
 - **Reasoning tokens**: when the endpoint reports a thinking-token count, the
   report prints total and per-request reasoning tokens with the usage field it
-  came from. When it streams a reasoning channel but reports no count (GLM on
-  dogfood does this), the report falls back to counting the reasoning deltas
+  came from. When it streams a reasoning channel but reports no count (some
+  models do this), the report falls back to counting the reasoning deltas
   and labels the number a stream-counted estimate.
 - **Cost**: when you supply DBU rates, the report shows cost per request, per
   1,000 requests, and per minute, plus the DBUs the cache saved, all traceable
@@ -509,6 +615,49 @@ believed, and the report prints them together:
 - **Request params**: the report echoes the temperature, max-tokens cap, and
   any `extra_body`, so a reader knows exactly what request parameters produced
   the numbers.
+- **Prompt replay**: in prompts mode the supplied prompts cycle across the
+  scheduled arrivals, so a small prompt set over a long run sends mostly
+  verbatim repeats, and the endpoint prompt cache serves them. The report says
+  how many distinct prompts were replayed and what share of requests were
+  repeats, and cautions whenever there are more requests than prompts. Measured on a real endpoint: 10 prompts over 100
+  requests went from 0% achieved cache on the first pass to 92% on the repeats.
+  Read the achieved cache fraction as replay behavior unless the prompt set is
+  at least as large as the request count.
+- **Sample size**: the report counts the requests behind the percentiles and
+  prints a caution when there are too few. Under 100 requests p99 is unstable,
+  and under 30 the whole tail is indicative only. A tight p99 off 20 requests
+  is not a result, and the report says so instead of letting the number stand.
+- **Stability over time**: ok requests are bucketed into 60-second windows and
+  each window's TTFT and E2E p95 is printed. The verdict scores TTFT p95 only,
+  with E2E printed beside it to read together. The run is called unstable when
+  the worst counted window is more than 1.3x the best, in either direction, and the
+  report names which shape it saw: `degrading` (every window rises, the
+  endpoint slowed under load), `warming` (every window falls from a slow start,
+  so early requests are cold start and not steady state), `spike` (a middle
+  window is much worse than both ends), or `variable` (the windows move around
+  without a trend, so the run is noisy rather than drifting). A trend is only
+  named when the windows actually move that way, so a noisy run is not sold as
+  degradation. Comparing only the first window to the last is not enough
+  either, because that reads a mid-run spike as stable and reads a 15x cold
+  start as an improvement.
+  Windows too small to support a p95 (a trailing partial window, say) are
+  printed but marked "not counted" and excluded from the verdict, because one
+  slow request in a 5-request window would otherwise invent a trend. A run
+  needs two counted windows to be judged at all and three before any direction
+  is named, so short runs print a note instead of a false verdict.
+- **Connection setup (DNS, TCP, TLS)**: setup is timed separately and is
+  **excluded** from TTFT, TTFB and TTFG, so don't subtract it again. It is
+  several round trips, so read it as an upper bound on how far the client sat
+  from the endpoint, not as the per-request network cost a pooled production
+  client pays. Run from where production traffic originates or the number is
+  not yours. This changed in 0.3.0, see [CHANGELOG.md](CHANGELOG.md).
+- **Endpoint under test**: the report reads the serving endpoint's own config
+  and prints what was actually being measured, so a report can't be quietly
+  attributed to the wrong endpoint or a since-changed configuration. You always
+  get the endpoint name, route-optimized and ready state. Task appears when the
+  endpoint reports one. Served entity workload type and size appear only when
+  the endpoint has a provisioned served entity. Pay-per-token foundation model
+  endpoints report just a name, so those rows are absent rather than blank.
 
 ## Settings reference
 
@@ -546,6 +695,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `acceptance_targets` | null | `{"ttft_ms": {"p95": 900}}` | inline SLA targets (`ttft_ms`, `ttfg_ms`, `hard_timeouts`, `success_rate`, `interchunk_ms`). In prompts mode this is how the scorecard gets its targets |
 | `ttft_definition` | `first_content` | `"first_visible"` | `first_content` (first token of either kind) or `first_visible` (skip reasoning deltas). The SLA scorecard scores whichever is set |
 | `pricing` | null | `{"mode": "per_token", "input_dbu_per_m": 20, "output_dbu_per_m": 62.857}` | DBU cost rates you supply from the pricing page. The report turns measured tokens into cost. See [Cost](#cost-in-databricks-dbus) |
+| `capture_endpoint_metadata` | true | `true` | read the serving endpoint's own config (name, task, route-optimized, ready state, and served entity workload type/size when it has a provisioned entity) and print it on the report. Best effort: if the token can't read the endpoint it logs one line to stderr and the run continues without the card. The served model's Unity Catalog path is deliberately not included, so the card is safe to share. Set false to skip the call entirely |
 
 Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
 `cache_fraction` (each `{"p50": .., "p95": ..}`, cache in (0,1)).
@@ -568,13 +718,20 @@ The per-request sequence and the validation design are in
 ```
 traffic_replay/          the package (profile, prefix_pool, schedule,
                          textgen, sse, client, metrics, runner,
-                         mock_server, aggregate, cli)
+                         prompts, endpoint_meta, mock_server,
+                         aggregate, cli)
 configs/                 profiles and run configs (JSON)
 tests/                   pytest suite (unit + end-to-end)
 scripts/run_tests_stdlib.py   zero-dependency test runner
 scripts/profile_from_logs.py  build a profile JSON from real request logs
+scripts/pack_notebook.py      rebuild the notebook's embedded copy of the
+                         package. RUN THIS after any change under
+                         traffic_replay/ or tests/, or the notebook keeps
+                         measuring the old code
 notebooks/               self-contained Databricks workspace smoke notebook
                          (embeds this repo, ambient auth, smoke labels)
+CHANGELOG.md             what changed per release, including what 0.3.0
+                         changed about the latency numbers
 docs/ARCHITECTURE.md     diagrams and design decisions
 docs/PRODUCTION_TESTING.md   step-by-step run plan
 ```

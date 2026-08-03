@@ -108,3 +108,27 @@ log reduced to per-request token counts and repeat structure):
 - Anything built to stated-but-unverified figures carries the assumption
   label all the way into the final deck. The label comes off when the
   dataset does, never before.
+- Check the sample size before quoting a tail number. The report cautions
+  under 100 requests because p99 is unstable there. If the caution is
+  printed, either run longer or quote p50 and p95 only.
+- Read the stability-over-time card before treating one number as steady
+  state. When the card says unstable it also says which shape: `warming`
+  means the early windows are cold start and you should quote the later ones,
+  `degrading` means the endpoint slowed under sustained load and the run is
+  the story, `spike` means something transient hit mid-run and needs
+  explaining before any number ships, and `variable` means the windows are
+  just noisy, which on shared capacity is common and still disqualifies the
+  run as a steady-state number. In all four the answer is a longer or
+  repeated run, not an average across the change. A run under two minutes
+  can't answer this at all.
+- Don't subtract the connection-setup line from TTFT. Since 0.3.0 the
+  handshake is already excluded from TTFT, TTFB and TTFG, and the line is
+  printed so you can see how far the client sat from the endpoint. A
+  handshake is several round trips, so read it as an upper bound on network
+  distance, not as the per-request network cost a pooled production client
+  pays. Run the client from where production traffic actually originates or
+  the number is yours and not the customer's.
+- Confirm the endpoint-under-test card matches the endpoint you meant to
+  measure, including workload size and route-optimized state. Endpoint
+  configs change between runs, and a report without that card pinned to it
+  is not reproducible evidence.

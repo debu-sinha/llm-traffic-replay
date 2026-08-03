@@ -5,7 +5,6 @@ a glance, units on every metric, and HTML-escaping of untrusted label text.
 """
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import threading

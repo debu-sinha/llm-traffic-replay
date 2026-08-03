@@ -72,6 +72,7 @@ class RequestResult:
     reasoning_tokens: int | None = None   # thinking tokens, when reported
     reasoning_tokens_source: str | None = None  # usage field it was read from
     reasoning_chunks: int = 0             # reasoning deltas seen in the stream
+    connect_ms: float | None = None       # DNS + TCP + TLS setup time
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -132,6 +133,9 @@ class EndpointClient:
             conn = None
             try:
                 conn = self._connect()
+                t_conn0 = time.monotonic()
+                conn.connect()
+                connect_ms = (time.monotonic() - t_conn0) * 1000.0
                 headers = {
                     "Content-Type": "application/json",
                     "Accept": "text/event-stream",
@@ -164,7 +168,8 @@ class EndpointClient:
                                         resp.status, False,
                                         f"http {resp.status}: {detail[:300]}",
                                         StreamState(), intended, chars_sent,
-                                        attempt - 1)
+                                        attempt - 1, None, None, None,
+                                        connect_ms)
 
                 if include_usage and self._include_usage_supported is None:
                     self._include_usage_supported = True
@@ -205,7 +210,7 @@ class EndpointClient:
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
                                     attempt - 1, interchunk_max,
-                                    ttfr_ms, ttfv_ms)
+                                    ttfr_ms, ttfv_ms, connect_ms)
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
@@ -224,7 +229,7 @@ class EndpointClient:
                 ttfb_ms, ttft_ms, e2e_ms, status, ok, error, state,
                 intended, chars_sent, retries,
                 interchunk_max_ms=None,
-                ttfr_ms=None, ttfv_ms=None) -> RequestResult:
+                ttfr_ms=None, ttfv_ms=None, connect_ms=None) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
@@ -246,6 +251,7 @@ class EndpointClient:
             reasoning_tokens=u["reasoning_tokens"],
             reasoning_tokens_source=u["reasoning_tokens_source"],
             reasoning_chunks=state.reasoning_chunks,
+            connect_ms=connect_ms,
         )
 
 

@@ -60,6 +60,27 @@ client measurements by request id. The suite asserts error bounds, and the
 validate command prints them. Numbers from an unvalidated instrument aren't
 numbers.
 
+**Endpoint metadata is best effort, never load bearing.** The run reads the
+serving endpoint's own config so the report can name what was measured (task,
+route-optimized, ready state, and served entity workload type and size when
+the endpoint has a provisioned served entity). Pay-per-token foundation model
+endpoints report only a name, so those rows are simply absent. The endpoint
+name is parsed out of the configured path rather than assumed to carry a
+`databricks-` prefix, because customer endpoints are often custom named. Any
+failure (no permission, wrong workspace, timeout) returns nothing and the run
+continues without the card. A measurement tool must not fail a run because a
+descriptive lookup failed.
+
+**Connect time measured separately, and excluded from TTFT.** The client
+completes the TCP/TLS handshake before starting the latency clock, so
+`ttft_ms`, `ttfb_ms` and `e2e_ms` measure the endpoint rather than the
+connection. This harness opens one connection per request while production
+clients pool them, so leaving setup inside TTFT (which is what 0.2.x did)
+overstated per-request latency by roughly a handshake. The handshake is still
+reported as `connect_ms` so client-to-endpoint distance stays visible, and
+every summary carries `latency_basis` so a saved report says which convention
+produced it.
+
 ## Failure modes handled
 
 - Endpoint rejects `stream_options.include_usage`: detected on first 400,
@@ -75,3 +96,10 @@ numbers.
 - Mid-stream stalls: the widest interchunk gap is recorded per request. When
   the profile sets `acceptance_targets.interchunk_ms`, requests over it count
   as SLA breaches against the success rate.
+- Endpoint metadata unreadable: the lookup is best effort with a short
+  timeout, so a token without endpoint read permission costs the report its
+  "endpoint under test" card and nothing else.
+- Too few requests to support a tail number: the summary carries the sample
+  count and prints a caution rather than letting an unstable p99 stand.
+- A run too short to judge stability: the drift block needs at least two
+  time windows and says so instead of reporting a verdict it cannot support.

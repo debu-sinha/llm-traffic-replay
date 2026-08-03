@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from . import __version__
+
 PCTS = (50, 90, 95, 99)
 
 
@@ -84,6 +86,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "failures_by_error": _top_errors(failed),
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in ok]),
         "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in ok]),
+        "connect_ms": _pct_table([r.get("connect_ms") for r in ok]),
         "e2e_ms": _pct_table([r.get("e2e_ms") for r in ok]),
         "interchunk_max_ms": _pct_table(
             [r.get("interchunk_max_ms") for r in ok]),
@@ -140,7 +143,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         if dur_min:
             summary["throughput"]["reasoning_tokens_per_min"] = total / dur_min
     if summary.get("reasoning_tokens_total") is None:
-        # endpoint did not report a reasoning-token count (GLM on dogfood does
+        # endpoint did not report a reasoning-token count (some models do
         # not). fall back to counting reasoning_content deltas in the stream,
         # clearly labeled as an estimate.
         chunk_vals = [r.get("reasoning_chunks") for r in ok]
@@ -153,6 +156,56 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             if dur_min:
                 summary["throughput"]["reasoning_tokens_per_min"] = \
                     ctotal / dur_min
+    n_ok = len(ok)
+    if n_ok == 0:
+        sample_warning = ("no successful requests, so there are no latency "
+                          "numbers to read. check the failures block")
+    elif n_ok < 30:
+        sample_warning = ("very small sample: treat p95/p99 as indicative "
+                          "only, run more requests for a stable tail")
+    elif n_ok < 100:
+        sample_warning = "small sample: p99 is unstable below ~100 requests"
+    else:
+        sample_warning = None
+    summary["sample"] = {"n": n_ok, "warning": sample_warning}
+    summary["drift"] = _drift_block(ok)
+
+    # every report states which harness produced it and what the latency
+    # numbers include. 0.3.0 moved the TCP/TLS handshake out of the timed
+    # region, so a 0.2.x TTFT and a 0.3.x TTFT are not the same measurement
+    # and must not be put in one column.
+    summary["harness_version"] = __version__
+    summary["latency_basis"] = (
+        "ttft/ttfb/ttfg are timed from the moment the request bytes are sent "
+        "on an already-established connection. TCP and TLS setup is measured "
+        "separately as connect_ms and is NOT included. changed in 0.3.0: "
+        "0.2.x and earlier included connection setup in these numbers.")
+
+    # prompts mode cycles the supplied prompts (runner: prompt_msgs[i % m]).
+    # once the set has been through once, every later request is a verbatim
+    # repeat, which the endpoint prompt cache serves. the achieved cache
+    # fraction then describes the replay, not the caller's production mix.
+    rm = run_meta or {}
+    pc = rm.get("prompts_count")
+    if rm.get("input_mode") == "prompts" and pc:
+        repeats = (n_ok / pc) if pc else 0.0
+        summary["replay"] = {
+            "distinct_prompts": pc,
+            "requests": n_ok,
+            "avg_sends_per_prompt": repeats,
+            "repeat_requests": max(0, n_ok - pc),
+            "repeat_share": (max(0, n_ok - pc) / n_ok) if n_ok else 0.0,
+            "warning": (
+                f"{pc} distinct prompts covered {n_ok} requests, so "
+                f"{max(0, n_ok - pc)} of them "
+                f"({max(0, n_ok - pc) / n_ok * 100:.0f} percent) repeat a "
+                f"prompt already sent and are served from the endpoint prompt "
+                f"cache. treat the achieved cache fraction and TTFT as replay "
+                f"behavior, not your production prompt mix. supply at least "
+                f"as many distinct prompts as requests, or read only the "
+                f"first {pc} requests, to see cold behavior."
+                if n_ok > pc else None),
+        }
     if pricing:
         summary["cost"] = _cost_block(ok, dur, in_tok, out_tok, cached_tok,
                                       pricing)
@@ -160,6 +213,109 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance,
                                        ttft_definition)
     return summary
+
+
+def _drift_block(ok: list[dict], window_s: int = 60,
+                 min_window_n: int = 20) -> dict:
+    """Per-window p95 over the run, and whether the run held steady.
+
+    Only windows with enough requests decide the verdict. A trailing partial
+    window carries a handful of requests, and a p95 over a handful is one
+    slow request away from inventing a trend, so those windows are printed
+    but not counted. Needs two counted windows to say anything, and three
+    before it will name a direction, because two points cannot separate a
+    trend from noise.
+    """
+    if not ok:
+        return {"windows": [], "note": "no successful requests"}
+    t0 = min(r["t_send_unix"] for r in ok)
+    buckets: dict[int, list] = {}
+    for r in ok:
+        w = int((r["t_send_unix"] - t0) // window_s)
+        buckets.setdefault(w, []).append(r)
+    short = {"windows": [], "window_seconds": window_s,
+             "note": f"run shorter than two {window_s}s windows, cannot show "
+                     "drift. run for minutes to test sustained SLA."}
+    if len(buckets) < 2:
+        return short
+    rows = []
+    for w in sorted(buckets):
+        rs = buckets[w]
+        tt = [x.get("ttft_ms") for x in rs if x.get("ttft_ms") is not None]
+        ee = [x.get("e2e_ms") for x in rs if x.get("e2e_ms") is not None]
+        rows.append({
+            "window": w, "n": len(rs),
+            "ttft_p95": float(np.percentile(tt, 95)) if tt else None,
+            "e2e_p95": float(np.percentile(ee, 95)) if ee else None,
+        })
+    # a window has to be big enough, both absolutely and relative to the rest
+    # of the run, before its p95 is allowed to move the verdict.
+    # true median, and cap the relative term so one very large window cannot
+    # push the bar high enough to discard otherwise usable windows.
+    med = float(np.median([r["n"] for r in rows]))
+    floor = max(min_window_n, min(0.25 * med, 50.0))
+    for r in rows:
+        r["counted"] = bool(r["n"] >= floor and r["ttft_p95"] is not None)
+    counted = [r for r in rows if r["counted"]]
+    skipped = len(rows) - len(counted)
+    note = ("per-window TTFT and E2E p95. the verdict scores TTFT p95 only, "
+            "and calls the run unstable when the worst counted window is more "
+            "than 1.3x the best, in either direction, so warmup and mid-run "
+            "spikes both show up. E2E p95 is printed per window to read "
+            "alongside it. windows "
+            f"with fewer than {floor:.0f} requests are shown but not counted, "
+            "because a p95 over a small window invents trends.")
+    if len(counted) < 2:
+        return {"windows": rows, "window_seconds": window_s,
+                "counted_windows": len(counted), "skipped_windows": skipped,
+                "note": "not enough windows carry a usable sample, so "
+                        "stability cannot be judged. run longer, or raise the "
+                        "rate so each window holds enough requests."}
+
+    vals = [r["ttft_p95"] for r in counted]
+    first, last = vals[0], vals[-1]
+    best, worst = min(vals), max(vals)
+    ratio = (last / first) if first else None
+    spread = (worst / best) if best else None
+    unstable = bool(spread and spread > 1.3)
+    rising = all(b >= a for a, b in zip(vals, vals[1:]))
+    falling = all(b <= a for a, b in zip(vals, vals[1:]))
+    if not unstable:
+        kind = "stable"
+        headline = "steady across the run"
+    elif len(vals) < 3:
+        kind = "variable"
+        headline = ("two windows moved apart, which is not enough to call a "
+                    "direction. run longer to tell a trend from noise")
+    elif rising and worst == vals[-1]:
+        kind = "degrading"
+        headline = ("TTFT p95 rises across every counted window: the endpoint "
+                    "got slower as the run went on")
+    elif falling and worst == vals[0]:
+        kind = "warming"
+        headline = ("TTFT p95 is worst in the first window and falls from "
+                    "there: early requests are cold start, not steady state. "
+                    "quote the later windows or warm up before measuring")
+    elif worst not in (vals[0], vals[-1]):
+        kind = "spike"
+        headline = ("a middle window is much worse than the ends: something "
+                    "transient hit the endpoint mid-run")
+    else:
+        kind = "variable"
+        headline = ("windows move up and down without a clear trend. the run "
+                    "is noisy rather than drifting, so one p95 from it is not "
+                    "a steady-state number")
+    return {
+        "windows": rows, "window_seconds": window_s,
+        "counted_windows": len(counted), "skipped_windows": skipped,
+        "ttft_p95_drift_ratio": ratio,
+        "ttft_p95_spread_ratio": spread,
+        "ttft_p95_best": best, "ttft_p95_worst": worst,
+        "drift_kind": kind,
+        "drift_headline": headline,
+        "drift_flag": unstable,
+        "note": note,
+    }
 
 
 def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
@@ -333,6 +489,17 @@ def render_markdown(summary: dict, title: str) -> str:
     sched_src = (s.get("schedule") or {}).get("source", "synthetic")
     mode = (s.get("run") or {}).get("input_mode", "profile")
 
+    # disqualifiers go ABOVE the tables. report.md is the file that gets pasted
+    # into a ticket, and a caution printed below the numbers is one nobody
+    # reads. same rule the comparison report follows.
+    cautions: list[str] = []
+    _sw = (s.get("sample") or {}).get("warning")
+    if _sw:
+        cautions += [f"CAUTION (sample size): {_sw}", ""]
+    _rw = (s.get("replay") or {}).get("warning")
+    if _rw:
+        cautions += [f"CAUTION (prompt replay): {_rw}", ""]
+
     lines = [
         f"# {title}",
         "",
@@ -340,6 +507,7 @@ def render_markdown(summary: dict, title: str) -> str:
         f"{s['requests_failed']} failed "
         f"(error rate {100 * (s['error_rate'] or 0):.2f}%)",
         "",
+        *cautions,
         "| metric (ms) | p50 | p90 | p95 | p99 | n |",
         "|---|---|---|---|---|---|",
         row("TTFT", s["ttft_ms"]),
@@ -372,7 +540,7 @@ def render_markdown(summary: dict, title: str) -> str:
          if tt.get("output_reported_over_intended_p50") else
          "- output tokens: endpoint did not report completion_tokens"),
         f"- achieved arrival rate: {arr['achieved_qps_overall']:.2f} QPS "
-        f"overall; dispatch lag p95 "
+        f"overall, dispatch lag p95 "
         f"{arr['dispatch_lag_ms'].get('p95', float('nan')):.0f} ms"
         if arr.get("achieved_qps_overall") else "- arrivals: n/a",
         f"- arrival schedule: from trace {sched_src}"
@@ -380,10 +548,22 @@ def render_markdown(summary: dict, title: str) -> str:
         f"- failures: {json.dumps(s['failures_by_error'])}"
         if s["requests_failed"] else "- failures: none",
         f"- requests that needed a connection retry: {s['requests_retried']} "
-        "(retried requests restart their latency clock; a nonzero count "
+        "(retried requests restart their latency clock. a nonzero count "
         "here means the tail has survivorship bias, read with care)"
         if s.get("requests_retried") else "- connection retries: none",
     ]
+    conn = s.get("connect_ms") or {}
+    if conn.get("n"):
+        lines.append(
+            f"- connection setup (DNS, TCP and TLS, ms): p50 "
+            f"{conn['p50']:.0f} / p95 {conn['p95']:.0f}. this is EXCLUDED "
+            f"from ttft/ttfb/ttfg, do not subtract it again. a handshake is "
+            f"several round trips, so it is not the per-request network cost "
+            f"of a pooled production client, it is an upper bound on it")
+    lb = s.get("latency_basis")
+    if lb:
+        lines.append(f"- latency basis: {lb}")
+
     rt = s.get("reasoning_tokens_total")
     if rt is not None:
         rtab = s.get("reasoning_tokens") or {}
@@ -467,9 +647,50 @@ def render_markdown(summary: dict, title: str) -> str:
                   "definition the SLA scores via ttft_definition in the run "
                   "config."]
 
-    label = (s.get("run") or {}).get("label")
-    if label:
-        lines += ["", f"**Label: {label}**"]
+    drift = s.get("drift") or {}
+    if drift.get("windows"):
+        kind = drift.get("drift_kind")
+        if not kind:
+            flag = "NOT ENOUGH DATA"
+        elif kind == "stable":
+            flag = "stable"
+        else:
+            flag = f"UNSTABLE ({kind})"
+        spread = drift.get("ttft_p95_spread_ratio")
+        sp = (f" worst window is {spread:.1f}x the best."
+              if spread else "")
+        lines += ["", f"stability over time ({flag}), per-"
+                  f"{drift['window_seconds']}s window p95 in ms."
+                  f"{sp} {drift.get('drift_headline') or drift.get('note', '')}",
+                  "| window | n (ok) | TTFT p95 | E2E p95 |", "|---|---|---|---|"]
+        for w in drift["windows"]:
+            tt = f"{w['ttft_p95']:.0f}" if w['ttft_p95'] is not None else "-"
+            ee = f"{w['e2e_p95']:.0f}" if w['e2e_p95'] is not None else "-"
+            mark = "" if w.get("counted", True) else " (not counted)"
+            lines.append(
+                f"| {w['window']}{mark} | {w['n']} | {tt} | {ee} |")
+        # only when a verdict exists, otherwise the headline already IS the note
+        if drift.get("drift_headline"):
+            lines.append("")
+            lines.append(f"note: {drift.get('note', '')}")
+    elif drift.get("note"):
+        lines += ["", f"stability over time: {drift['note']}"]
+
+    em = (s.get("run") or {}).get("endpoint_metadata")
+    if em:
+        se = em.get("served_entities") or []
+        detail = (", ".join(f"{k}={v}" for k, v in se[0].items() if k != "name")
+                  if se else "")
+        _task = f"task {em.get('task')}, " if em.get("task") else ""
+        lines += ["", f"endpoint under test: {em.get('name')}, {_task}"
+                  f"route_optimized {em.get('route_optimized')}, "
+                  f"ready {em.get('ready')}" + (f", {detail}" if detail else "")]
+
+    run_meta = s.get("run") or {}
+    if run_meta.get("label"):
+        lines += ["", f"**Label: {run_meta['label']}**"]
+    if run_meta.get("profile_label"):
+        lines += ["", f"**Profile: {run_meta['profile_label']}**"]
     return "\n".join(lines) + "\n"
 
 
@@ -735,6 +956,17 @@ def render_html(summary: dict, title: str) -> str:
                    f"{num(arr['achieved_qps_overall'], 2)} requests/second "
                    f"(QPS) overall, dispatch lag p95 {num(lag)} ms (client "
                    f"lateness, not endpoint latency)</li>")
+    conn = s.get("connect_ms") or {}
+    if conn.get("n"):
+        bel.append(f"<li><b>Connection setup</b> (DNS, TCP and TLS "
+                   f"setup, in ms): p50 {num(conn['p50'])} / "
+                   f"p95 {num(conn['p95'])}. This is <b>excluded</b> from "
+                   f"TTFT, TTFB and TTFG, so do not subtract it again. A "
+                   f"handshake takes several round trips, so treat it as an "
+                   f"upper bound on network distance rather than the "
+                   f"per-request network cost a pooled production client "
+                   f"pays. Run the client from where production traffic "
+                   f"originates for it to mean anything.</li>")
     fr = (s.get("token_targeting") or {}).get("finish_reasons")
     if fr:
         bel.append(f"<li><b>Finish reasons</b>: {esc(json.dumps(fr))} "
@@ -751,6 +983,10 @@ def render_html(summary: dict, title: str) -> str:
         bel.append(f"<li><b>Request params</b>: temperature "
                    f"{esc(str(rp.get('temperature')))}, max_tokens cap "
                    f"{esc(str(rp.get('max_output_tokens_cap')))}{extra}</li>")
+    lb = s.get("latency_basis")
+    if lb:
+        bel.append(f"<li><b>Latency basis</b>: {esc(lb)}</li>")
+
     believe = (
         "<div class='card believe'><h2>Believability "
         "(read before quoting a number)</h2>"
@@ -771,9 +1007,17 @@ def render_html(summary: dict, title: str) -> str:
                  if merge_note else "")
 
     # ---- provenance label ----
-    label = run.get("label") or run.get("profile_label")
-    label_html = (f"<div class='label-note'><b>Label:</b> {esc(label)}</div>"
-                  if label else "")
+    # both, never one or the other. the profile carries its own warning (a
+    # validation profile says never to quote its latency), and setting a run
+    # label must not be able to hide it.
+    parts = []
+    if run.get("label"):
+        parts.append(f"<div class='label-note'><b>Label:</b> "
+                     f"{esc(run['label'])}</div>")
+    if run.get("profile_label"):
+        parts.append(f"<div class='label-note'><b>Profile:</b> "
+                     f"{esc(run['profile_label'])}</div>")
+    label_html = "".join(parts)
 
     cost = s.get("cost")
     cost_html = ""
@@ -835,11 +1079,70 @@ def render_html(summary: dict, title: str) -> str:
                      f"throughput. it improves as you fill the endpoint.</div>"
                      f"<table>{''.join(rows)}</table></div>")
 
+    sw = (s.get("sample") or {}).get("warning")
+    sample_banner = (f"<div class='banner warn'>{esc(sw)}</div>" if sw else "")
+    rw = (s.get("replay") or {}).get("warning")
+    if rw:
+        sample_banner += f"<div class='banner warn'>{esc(rw)}</div>"
+
+    drift = s.get("drift") or {}
+    if drift.get("windows"):
+        wr = "".join(
+            f"<tr><td class='lbl'>window {w['window']} ({w['n']} req)"
+            f"{'' if w.get('counted', True) else ', not counted'}</td>"
+            f"<td>{num(w['ttft_p95'])}</td><td>{num(w['e2e_p95'])}</td></tr>"
+            for w in drift["windows"])
+        kind = drift.get("drift_kind")
+        if not kind:
+            flag = "<span class='pill neutral'>not enough data</span>"
+        elif kind == "stable":
+            flag = "<span class='pill ok'>stable</span>"
+        else:
+            flag = f"<span class='pill bad'>unstable: {esc(kind)}</span>"
+        spread = drift.get("ttft_p95_spread_ratio")
+        sp = (f"worst window is {spread:.1f}x the best. " if spread else "")
+        drift_html = (
+            f"<div class='card'><h2>Stability over time &nbsp;{flag}</h2>"
+            f"<div class='cap'>per-{drift['window_seconds']}s window p95 in ms. "
+            f"{sp}"
+            f"{esc(drift.get('drift_headline') or drift.get('note', ''))}"
+            f"{('<br>' + esc(drift.get('note', ''))) if drift.get('drift_headline') else ''}"
+            f"</div>"
+            f"<table><tr><th class='lbl'>window</th><th>TTFT p95</th>"
+            f"<th>E2E p95</th></tr>{wr}</table></div>")
+    else:
+        drift_html = (f"<div class='card'><h2>Stability over time</h2>"
+                      f"<div class='cap'>{esc(drift.get('note', ''))}</div></div>"
+                      if drift.get("note") else "")
+
+    em = run.get("endpoint_metadata")
+    em_html = ""
+    if em:
+        se = (em.get("served_entities") or [])
+        detail = ""
+        if se:
+            detail = ", ".join(f"{esc(str(k))}: {esc(str(v))}"
+                               for k, v in se[0].items() if k != "name")
+        em_html = (
+            f"<div class='card'><h2>Endpoint under test</h2>"
+            f"<div class='cap'>read from the serving-endpoints API at run time, "
+            f"so the report states what was tested</div><table>"
+            f"<tr><td class='lbl'>name</td><td>{esc(str(em.get('name')))}</td></tr>"
+            + (f"<tr><td class='lbl'>task</td>"
+               f"<td>{esc(str(em.get('task')))}</td></tr>"
+               if em.get("task") else "")
+            + f"<tr><td class='lbl'>route optimized</td>"
+            f"<td>{esc(str(em.get('route_optimized')))}</td></tr>"
+            f"<tr><td class='lbl'>ready</td><td>{esc(str(em.get('ready')))}</td></tr>"
+            + (f"<tr><td class='lbl'>served entity</td><td>{detail}</td></tr>"
+               if detail else "")
+            + "</table></div>")
+
     body = (
         f"<div class='wrap'><h1>{esc(title)}</h1>"
-        f"<div class='sub'>{sub}</div>{banner}{stats}"
-        f"{sla_html}{lat_html}{believe}{cost_html}{extra_cards}"
-        f"{note_html}{label_html}"
+        f"<div class='sub'>{sub}</div>{sample_banner}{banner}{stats}"
+        f"{em_html}{sla_html}{lat_html}{drift_html}{believe}{cost_html}"
+        f"{extra_cards}{note_html}{label_html}"
         f"<div class='foot'>llm-traffic-replay report</div></div>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,"

@@ -69,3 +69,67 @@ def test_merged_report_carries_concurrency_note():
     _mkrun(base / "b", "/serving-endpoints/pt/invocations", [200] * 4)
     out = merge_runs(base / "out", [base / "a", base / "b"])
     assert "union wall-clock window" in (out / "report.md").read_text()
+
+
+def _mkprompts_run(d: Path, ep: str, n_rows: int, prompts_count: int):
+    """A shard from prompts mode, carrying the fields summarize() needs to
+    know the prompts were cycled."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "summary.json").write_text(json.dumps(
+        {"run": {"endpoint_path": ep, "title": "shard",
+                 "input_mode": "prompts", "prompts_file": "p.jsonl",
+                 "prompts_count": prompts_count}}))
+    with (d / "requests.jsonl").open("w") as f:
+        for i in range(n_rows):
+            f.write(json.dumps(_row(i + 1, 100.0, 300.0)) + "\n")
+
+
+def test_merged_prompts_run_keeps_the_replay_caution():
+    """Each shard cycled the same small prompt file, so the pooled cache
+    fraction is still replay behavior. Losing the caution on merge would put
+    the flattering number in the pooled report with nothing next to it."""
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkprompts_run(base / "a", ep, 60, 10)
+    _mkprompts_run(base / "b", ep, 60, 10)
+    out = merge_runs(base / "pooled", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["run"]["input_mode"] == "prompts"
+    assert summary["replay"]["distinct_prompts"] == 10
+    assert summary["replay"]["warning"] is not None
+    assert "CAUTION (prompt replay)" in (out / "report.md").read_text()
+
+
+def test_merged_run_reports_no_stability_verdict():
+    """Pooled shards ran at different times, so a trend across them would
+    describe the schedule rather than the endpoint."""
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 5)
+    _mkrun(base / "b", ep, [300] * 5)
+    out = merge_runs(base / "pooled", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert "drift_kind" not in summary["drift"]
+    assert "not computed for a merged run" in summary["drift"]["note"]
+
+
+def test_profile_mode_merge_has_no_replay_block():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 5)
+    _mkrun(base / "b", ep, [120] * 5)
+    out = merge_runs(base / "pooled", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert "replay" not in summary
+
+
+def test_shards_disagreeing_on_prompt_count_do_not_claim_one():
+    """Different prompts_count across shards means the pooled repeat factor is
+    not well defined, so the carry-through must not invent one."""
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkprompts_run(base / "a", ep, 60, 10)
+    _mkprompts_run(base / "b", ep, 60, 25)
+    out = merge_runs(base / "pooled", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert "replay" not in summary

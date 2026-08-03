@@ -20,9 +20,12 @@ jobs:
         run: python3 scripts/run_tests_stdlib.py
       - name: instrument self-test
         run: python -m traffic_replay validate --duration 15 --tolerance-ms 120 --workdir /tmp/trv
+      - name: notebook payload is in sync with the package
+        run: python3 scripts/pack_notebook.py --check
+
       - name: no em dashes
         run: |
-          if grep -rn $'\xe2\x80\x94' . --exclude-dir=.git; then
+          if grep -rnI $'\xe2\x80\x94' . --exclude-dir=.git; then
             echo "em dash found in the repo"; exit 1
           fi
       - name: no ai-tell vocabulary

@@ -58,6 +58,7 @@ class RunConfig:
     max_output_tokens_cap: int = 512  # safety cap; full runs raise it
     acceptance_targets: dict | None = None  # SLA targets (either mode)
     pricing: dict | None = None              # DBU cost rates (see metrics)
+    capture_endpoint_metadata: bool = True   # read serving-endpoint config
     ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
 
@@ -75,10 +76,16 @@ def run(rc: RunConfig, token_override: str | None = None,
                          "prompts_file (real prompt text)")
 
     ecfg = EndpointConfig(**rc.endpoint)
-    client = EndpointClient(ecfg, token_override or _token(ecfg))
+    token = token_override or _token(ecfg)
+    client = EndpointClient(ecfg, token)
     req_params = {"temperature": ecfg.temperature,
                   "max_output_tokens_cap": rc.max_output_tokens_cap,
                   "extra_body": ecfg.extra_body or {}}
+    endpoint_meta = None
+    if rc.capture_endpoint_metadata:
+        from .endpoint_meta import fetch_endpoint_metadata
+        endpoint_meta = fetch_endpoint_metadata(ecfg.base_url, ecfg.path,
+                                                token, timeout=5.0)
 
     # arrival schedule is shared by both modes
     if rc.timestamps_file:
@@ -194,7 +201,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "input_mode": "prompts",
             "prompts_file": rc.prompts_file, "prompts_count": m,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
-            "request_params": req_params,
+            "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
         }
         acceptance = rc.acceptance_targets
@@ -204,7 +211,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "profile": p.name, "profile_provenance": p.provenance,
             "profile_label": p.label, "cpt_final": mat.cpt,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
-            "request_params": req_params,
+            "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
         }
         acceptance = (rc.acceptance_targets

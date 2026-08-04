@@ -69,9 +69,9 @@ def test_reasoning_tokens_reported_end_to_end():
     d = tempfile.mkdtemp()
     pf = os.path.join(d, "p.jsonl")
     open(pf, "w").write(json.dumps({"prompt": "think about this"}) + "\n")
-    port = 8873
     truth = Path(d) / "truth.jsonl"
-    srv = serve(port, truth, reasoning_tokens=4)  # mock emits reasoning
+    srv = serve(0, truth, reasoning_tokens=4)  # mock emits reasoning
+    port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     time.sleep(0.3)

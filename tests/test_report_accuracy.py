@@ -22,8 +22,8 @@ from traffic_replay.runner import RunConfig, run
 def test_report_matches_independent_recomputation():
     d = tempfile.mkdtemp()
     truth = Path(d) / "truth.jsonl"
-    port = 8897
-    srv = serve(port, truth, reasoning_tokens=5)
+    srv = serve(0, truth, reasoning_tokens=5)
+    port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     time.sleep(0.3)
@@ -80,7 +80,10 @@ def test_report_matches_independent_recomputation():
         v = r.get("first_send_unix")
         return r["t_send_unix"] if v is None else v
     t0 = min(sent(r) for r in rep)
-    t1 = max(sent(r) for r in rep)
+    # the observation interval ends at the last COMPLETION, not the last
+    # send. token totals include generations that finish during the drain,
+    # so ending the window at the last send overstates throughput.
+    t1 = max(sent(r) + (r.get("e2e_ms") or 0) / 1000.0 for r in rep)
     dmin = max(t1 - t0, 1e-9) / 60.0
     intok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
     outtok = sum(r["completion_tokens"] for r in ok

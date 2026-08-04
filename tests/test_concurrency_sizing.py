@@ -28,12 +28,18 @@ def _cfg(port, **kw):
     return RunConfig(**base)
 
 
-def _with_mock(fn, port):
-    srv = serve(port, str(_tmp() / "truth.jsonl"))
+def _with_mock(make_cfg):
+    """Bind an ephemeral port and hand it to the config builder.
+
+    Fixed ports meant the two test runners could not run at the same time,
+    and a socket left in TIME_WAIT failed the run outright.
+    """
+    srv = serve(0, str(_tmp() / "truth.jsonl"))
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.3)
     try:
-        return fn()
+        return run(make_cfg(port), quiet=True)
     finally:
         srv.shutdown(); srv.server_close()
 
@@ -41,7 +47,7 @@ def _with_mock(fn, port):
 def test_concurrency_derives_the_rate_and_the_pool():
     """The user says 30 in flight. The harness measures service time and
     works out both numbers, which is the arithmetic that used to be theirs."""
-    out = _with_mock(lambda: run(_cfg(8971, concurrency=8), quiet=True), 8971)
+    out = _with_mock(lambda p: _cfg(p, concurrency=8))
     s = out["summary"]
     sched = s["schedule"]
     # a rate was chosen, and it is not the RunConfig default of 25
@@ -56,7 +62,7 @@ def test_the_sizing_rows_never_reach_the_summary():
     """The probe requests are real traffic, so they are written to
     requests.jsonl, but they must not be scored as part of the replay."""
     import json
-    out = _with_mock(lambda: run(_cfg(8972, concurrency=6), quiet=True), 8972)
+    out = _with_mock(lambda p: _cfg(p, concurrency=6))
     rows = [json.loads(x) for x in
             (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
     phases = {r.get("phase") for r in rows}
@@ -66,9 +72,9 @@ def test_the_sizing_rows_never_reach_the_summary():
 
 
 def test_without_concurrency_the_configured_rate_is_used():
-    out = _with_mock(lambda: run(_cfg(8973, qps_base=4.0, qps_burst=4.0,
-                                      qps_min=4.0, qps_max=4.0,
-                                      max_concurrency=8), quiet=True), 8973)
+    out = _with_mock(lambda p: _cfg(p, qps_base=4.0, qps_burst=4.0,
+                                    qps_min=4.0, qps_max=4.0,
+                                    max_concurrency=8))
     assert abs(out["summary"]["schedule"]["rate_p50"] - 4.0) < 1e-6
 
 

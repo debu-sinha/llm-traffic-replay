@@ -18,18 +18,16 @@ import pytest
 from traffic_replay.mock_server import serve
 from traffic_replay.runner import RunConfig, run
 
-PORT = 8809
-
-
 @pytest.fixture(scope="module")
 def mock(tmp_path_factory):
     workdir = tmp_path_factory.mktemp("val")
     truth = workdir / "truth.jsonl"
-    srv = serve(PORT, truth, per_token_ms=2.0)
+    srv = serve(0, truth, per_token_ms=2.0)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.3)
-    yield {"truth": truth, "workdir": workdir}
+    yield {"truth": truth, "workdir": workdir,
+           "port": srv.server_address[1]}
     srv.shutdown()
 
 
@@ -38,7 +36,7 @@ def run_out(mock):
     rc = RunConfig(
         profile_path=str(Path(__file__).parent.parent
                          / "configs" / "profile_validation_small.json"),
-        endpoint={"base_url": f"http://127.0.0.1:{PORT}",
+        endpoint={"base_url": f"http://127.0.0.1:{mock['port']}",
                   "path": "/serving-endpoints/mock/invocations",
                   "auth_token_env": "TRAFFIC_REPLAY_NO_TOKEN"},
         duration_s=20, qps_base=6.0, qps_burst=18.0, qps_min=2.0,

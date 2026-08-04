@@ -16,22 +16,24 @@ from traffic_replay.mock_server import serve
 from traffic_replay.runner import RunConfig, run
 
 
-def _summary(met_p95, label="run"):
+def _summary(met_p95, label="run", n=250):
+    """n defaults above the 100-request tail floor, because the green banner
+    now requires a run big enough to support the numbers it prints."""
     return {
-        "requests_total": 5, "requests_ok": 5, "requests_failed": 0,
+        "requests_total": n, "requests_ok": n, "requests_failed": 0,
         "error_rate": 0.0, "failures_by_error": {},
-        "ttft_ms": {"p50": 100, "p90": 150, "p95": 180, "p99": 200, "n": 5},
-        "e2e_ms": {"p50": 300, "p90": 400, "p95": 450, "p99": 500, "n": 5},
+        "ttft_ms": {"p50": 100, "p90": 150, "p95": 180, "p99": 200, "n": n},
+        "e2e_ms": {"p50": 300, "p90": 400, "p95": 450, "p99": 500, "n": n},
         "ttfb_ms": {"n": 0}, "interchunk_max_ms": {"n": 0},
         "throughput": {"input_tokens_per_min": 1000,
                        "output_tokens_per_min": 50},
-        "achieved_cache_fraction": {"p50": 0.5, "p95": 0.7, "n": 5,
-                                    "reported_for_n": 5,
+        "achieved_cache_fraction": {"p50": 0.5, "p95": 0.7, "n": n,
+                                    "reported_for_n": n,
                                     "source_fields": ["prompt_tokens_details.cached_tokens"]},
-        "intended_cache_fraction": {"p50": 0.45, "p95": 0.72, "n": 5},
+        "intended_cache_fraction": {"p50": 0.45, "p95": 0.72, "n": n},
         "arrivals": {"achieved_qps_overall": 2.0,
                      "dispatch_lag_ms": {"p95": 5}},
-        "token_targeting": {"finish_reasons": {"stop": 5}},
+        "token_targeting": {"finish_reasons": {"stop": n}},
         "run": {"input_mode": "profile", "endpoint_path": "/e",
                 "label": label,
                 "request_params": {"temperature": 0.0,
@@ -78,9 +80,9 @@ def test_html_escapes_untrusted_label():
 
 def test_write_outputs_emits_html_end_to_end():
     d = tempfile.mkdtemp()
-    port = 8882
     truth = Path(d) / "t.jsonl"
-    srv = serve(port, truth)
+    srv = serve(0, truth)
+    port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     time.sleep(0.3)

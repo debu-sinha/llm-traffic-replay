@@ -112,9 +112,9 @@ def test_prompts_mode_sends_the_real_text_end_to_end():
     pf = _write("prompts.jsonl", "\n".join(json.dumps(x) for x in prompts))
     d = tempfile.mkdtemp()
 
-    port = 8871
     truth = Path(d) / "truth.jsonl"
-    srv = serve(port, truth)
+    srv = serve(0, truth)
+    port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     time.sleep(0.3)

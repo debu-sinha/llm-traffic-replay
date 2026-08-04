@@ -44,16 +44,46 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     spans = [(a, b) for a, b in spans if b > a]
     if len(spans) < 2:
         return None
-    lo_all = min(a for a, _ in spans)
-    hi_all = max(b for _, b in spans)
-    if hi_all <= lo_all:
+    # the window is the middle of the LOAD interval, which is bounded by
+    # send times. anchoring it on completions instead let a single straggler
+    # stretch the span into its own drain: 100 one-second requests plus one
+    # that took 1000 seconds put the whole real run inside the first 10
+    # percent, and the reported concurrency collapsed to 1.
+    first_send = min(a for a, _ in spans)
+    last_send = max(a for a, _ in spans)
+    if last_send <= first_send:
         return None
-    # ramp up and drain are real but they are not the load level under test,
-    # so the percentiles describe the middle of the run.
-    lo = lo_all + (hi_all - lo_all) * 0.2
-    hi = lo_all + (hi_all - lo_all) * 0.8
+    lo = first_send + (last_send - first_send) * 0.2
+    hi = first_send + (last_send - first_send) * 0.8
     if hi <= lo:
-        lo, hi = lo_all, hi_all
+        lo, hi = first_send, last_send
+
+    def _sweep(spans_in, w_lo, w_hi):
+        ev: list[tuple[float, int]] = []
+        for a, b in spans_in:
+            a2, b2 = max(a, w_lo), min(b, w_hi)
+            if b2 > a2:
+                ev.append((a2, 1))
+                ev.append((b2, -1))
+        if not ev:
+            return None, {}
+        ev.sort()
+        c = pk = 0
+        prev_t = ev[0][0]
+        acc: dict[int, float] = {}
+        for t, d in ev:
+            if t > prev_t:
+                acc[c] = acc.get(c, 0.0) + (t - prev_t)
+            c += d
+            pk = max(pk, c)
+            prev_t = t
+        return pk, acc
+
+    # the peak is taken over the WHOLE run, since a burst during ramp up is
+    # real load the endpoint carried. cropping it and still calling it a peak
+    # understated it.
+    true_peak, _ = _sweep(spans, min(a for a, _ in spans),
+                          max(b for _, b in spans))
 
     events: list[tuple[float, int]] = []
     for a, b in spans:
@@ -90,10 +120,13 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     out = {
         "in_flight_p50": med,
         "in_flight_p95": _tw(0.95),
-        "in_flight_max": float(peak),
+        "in_flight_max": float(true_peak or peak),
+        "in_flight_max_in_window": float(peak),
         "measured_over": "successful requests only",
-        "method": "exact interval overlap, time-weighted over the middle 60 "
-                  "percent of the run. the maximum is a true peak",
+        "method": ("exact interval overlap. percentiles are time weighted "
+                   "over the middle 60 percent of the LOAD interval, bounded "
+                   "by send times so one straggler cannot stretch the "
+                   "window. the maximum is a true peak over the whole run"),
     }
     if asked:
         out["asked_for"] = asked
@@ -145,14 +178,17 @@ def _pct_table(values: list[float | None]) -> dict:
 
 def _verdict(s: dict) -> tuple[str, str]:
     """The run's verdict, as (kind, sentence). kind is one of
-    invalid / miss / unscored / ok.
+    invalid / miss / caution / ok.
 
-    Both renderers call this. They used to each compute their own, and they
-    disagreed: the html counted the success-rate, hard-timeout and interchunk
-    rows while the markdown counted only the latency rows, so report.md could
-    print "meets every acceptance target" over a run the html called a miss.
-    report.md is the file people paste into email, so it was the wrong one to
-    have drifting.
+    Both renderers call this, so report.md and the html cannot disagree.
+
+    Green requires positive evidence that the run is a valid measurement,
+    not merely the absence of a missed latency target. Enumerating specific
+    failure modes kept leaving doors open: a run with an 8 percent error
+    rate, or one that never held the concurrency on its label, or one whose
+    endpoint collapsed mid-run, could all satisfy a latency target and print
+    "meets every acceptance target". Anything that undermines the
+    measurement now downgrades the verdict and says which thing did.
     """
     sla = s.get("sla") or {}
     a = s.get("answers") or {}
@@ -177,22 +213,52 @@ def _verdict(s: dict) -> tuple[str, str]:
     rate = a.get("answer_rate")
     floor = (sla.get("success_rate") or {}).get("target") or 0.99
     if rate is not None and rate < floor:
-        n = a.get("scored") or a.get("transport_ok") or 0
+        n = a.get("judged") or a.get("attempted") or 0
         bad = n - (a.get("complete_answers") or 0)
         return "miss", (
-            f"{bad} of {n} requests returned HTTP 200 without a readable "
-            f"answer ({rate:.1%} answered). latency figures describe only the "
-            "ones that answered")
+            f"{bad} of {n} requests did not produce a readable answer "
+            f"({rate:.1%} answered). latency figures describe only the ones "
+            "that answered")
+
+    err = s.get("error_rate")
+    if err and err > 0.0:
+        got = s.get("requests_failed") or 0
+        tot = s.get("requests_total") or 0
+        if err > (1.0 - floor):
+            return "miss", (
+                f"{got} of {tot} requests failed ({err:.2%}). latency "
+                "percentiles cover only the ones that came back, and on a "
+                "shedding endpoint those are the fast ones")
+
     if misses:
         return "miss", (f"{misses} acceptance target"
                         f"{'s' if misses != 1 else ''} missed")
+
+    # met the targets. now decide whether the run is good enough to say so.
+    doubts = []
     if unmeasured:
-        return "unscored", (
-            f"not scored. {unmeasured} target"
-            f"{'s' if unmeasured != 1 else ''} had no measurement behind "
-            "them, which is not a pass")
+        doubts.append(f"{unmeasured} target"
+                      f"{'s' if unmeasured != 1 else ''} had no measurement "
+                      "behind them")
     if sla.get("coverage_warning"):
-        return "unscored", ("not scored. see the coverage caution above")
+        doubts.append("the scored metric is missing on many requests")
+    if err:
+        doubts.append(f"{s.get('requests_failed') or 0} requests failed")
+    if (s.get("concurrency") or {}).get("warning"):
+        doubts.append("the run did not hold the concurrency on its label")
+    if (s.get("client") or {}).get("warning"):
+        doubts.append("the load did not reach the endpoint on schedule")
+    dk = (s.get("drift") or {}).get("drift_kind")
+    if dk and dk not in ("stable",):
+        doubts.append(f"latency was {dk} across the run")
+    n_ok = (s.get("ttft_ms") or {}).get("n") or 0
+    if n_ok and n_ok < 100:
+        doubts.append(f"only {n_ok} successful requests, so the tail is "
+                      "indicative only")
+    if doubts:
+        return "caution", ("met every acceptance target, but " +
+                           ", and ".join(doubts) + ". read those before "
+                           "quoting this run")
     return "ok", "meets every acceptance target"
 
 
@@ -232,7 +298,18 @@ def _answer_block(ok: list[dict], attempted: int) -> dict | None:
             1 for r in scored if not r.get("stream_complete")),
         "parse_errors": sum(1 for r in scored if r.get("parse_errors")),
         "truncated": sum(1 for r in scored if r.get("truncated")),
-        "answer_rate": round(complete / n_ok, 6) if n_ok else None,
+        # the denominator is every request we can judge: the ones that came
+        # back and carry the fields, plus the ones that failed outright. a
+        # request that failed did not produce an answer and belongs here.
+        # rows written before these fields existed are NOT counted, because
+        # they are unmeasurable rather than unanswered, and counting them
+        # would fail a merged 0.3.0 shard for having old-format rows.
+        "judged": n_ok + max(0, attempted - len(ok)),
+        "answer_rate": (round(complete / (n_ok + max(0, attempted - len(ok))),
+                              6)
+                        if (n_ok + max(0, attempted - len(ok))) else None),
+        "answer_rate_of_transport_ok": (round(complete / n_ok, 6)
+                                        if n_ok else None),
         "note": "truncation is not counted as a failure. the harness caps "
                 "max_tokens at the sampled output size, so ending on "
                 "\"length\" is the expected way to hit a target output "
@@ -319,11 +396,18 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                      "a scheduled time and a send time.")
     retried = sum(1 for r in results if r.get("retries"))
 
+    # observation interval, not the send window. token totals include
+    # generations that finish after the last request went out, so dividing
+    # by (last_send - first_send) overstates throughput by the length of the
+    # drain. with a 99 second send window and 60 second generations that is
+    # about 61 percent high.
     dur = None
     if results:
         sent = [_sent_at(r) for r in results if _sent_at(r) is not None]
+        done = [_sent_at(r) + (r.get("e2e_ms") or 0) / 1000.0
+                for r in results if _sent_at(r) is not None]
         if sent:
-            dur = max(max(sent) - min(sent), 1e-9)
+            dur = max(max(done) - min(sent), 1e-9)
 
     # throughput in the customer's own vocabulary (tokens per minute)
     in_tok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
@@ -331,6 +415,11 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                   if r.get("completion_tokens"))
     cached_tok = sum(r["cached_tokens"] for r in ok if r.get("cached_tokens"))
     dur_min = (dur / 60.0) if dur else None
+    # how many successful responses actually reported usage. a run where
+    # only a tenth of them do would otherwise understate token throughput
+    # and per-token cost tenfold with nothing said about it.
+    usage_n = sum(1 for r in ok if r.get("prompt_tokens") is not None)
+    usage_coverage = (usage_n / len(ok)) if ok else None
 
     summary = {
         "requests_total": len(results),
@@ -348,7 +437,16 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "throughput": {
             "input_tokens_per_min": in_tok / dur_min if dur_min else None,
             "output_tokens_per_min": out_tok / dur_min if dur_min else None,
-            "note": "endpoint-reported token counts over wall time",
+            "usage_coverage": usage_coverage,
+            "note": ("endpoint-reported token counts over the observation "
+                     "interval, which runs from the first send to the last "
+                     "completion so generations finishing during the drain "
+                     "are inside the window they belong to"),
+            "coverage_warning": (
+                None if usage_coverage is None or usage_coverage > 0.99 else
+                f"only {usage_n} of {len(ok)} successful responses reported "
+                "token usage, so these totals and any per-token cost below "
+                "cover that subset, not the run"),
         },
         "achieved_cache_fraction": _pct_table(ach) | {
             "reported_for_n": len(ach),
@@ -360,13 +458,13 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "reported_over_intended_p50":
                 float(np.percentile(ratios, 50)) if ratios else None,
             "abs_error_pct_p50":
-                float(abs(np.percentile(ratios, 50) - 1.0) * 100)
+                float(np.percentile([abs(x - 1.0) for x in ratios], 50) * 100)
                 if ratios else None,
             "output_reported_over_intended_p50":
                 float(np.percentile(out_ratios, 50)) if out_ratios else None,
             "output_abs_error_pct_p50":
-                float(abs(np.percentile(out_ratios, 50) - 1.0) * 100)
-                if out_ratios else None,
+                float(np.percentile([abs(x - 1.0) for x in out_ratios], 50)
+                      * 100) if out_ratios else None,
             "finish_reasons": finish_reasons,
             "note": "endpoint-reported token counts are the source of truth. "
                     "input side is calibrated, output side is only reported "
@@ -1138,7 +1236,7 @@ def render_markdown(summary: dict, title: str) -> str:
                   "", f"- attempted: {a['attempted']}",
                   f"- returned HTTP 200: {a['transport_ok']}",
                   f"- produced a readable answer: {a['complete_answers']} "
-                  f"({a['answer_rate']:.1%} of attempted)"
+                  f"({a['answer_rate']:.1%} of the {a.get('judged')} judged)"
                   if a.get("answer_rate") is not None else
                   f"- produced a readable answer: {a['complete_answers']}",
                   f"- returned 200 with no visible content: "
@@ -1463,7 +1561,7 @@ def render_html(summary: dict, title: str) -> str:
         # one shared verdict, so report.md and this page cannot disagree
         vkind, vtext = _verdict(s)
         vcls = {"invalid": "bad", "miss": "bad",
-                "unscored": "warn", "ok": "ok"}[vkind]
+                "caution": "warn", "ok": "ok"}[vkind]
         vpre = "INVALID: " if vkind == "invalid" else ""
         cap = vtext[:1].upper() + vtext[1:] if not vpre else vtext
         banner = f"<div class='banner {vcls}'>{vpre}{esc(cap)}</div>"

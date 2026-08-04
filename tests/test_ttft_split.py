@@ -77,9 +77,9 @@ def test_scorecard_scores_configured_definition():
 # ---------- e2e: reasoning stream through the real client + mock ----------
 def test_reasoning_split_end_to_end():
     wd = Path(tempfile.mkdtemp(prefix="ttft-"))
-    port = 8893
-    srv = serve(port, wd / "truth.jsonl", reasoning_tokens=5,
+    srv = serve(0, wd / "truth.jsonl", reasoning_tokens=5,
                 per_token_ms=3.0, ttft_base_ms=25.0, ms_per_1k_uncached=5.0)
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.3)
     prof = wd / "prof.json"
@@ -128,9 +128,9 @@ def test_a_reasoning_only_stream_is_not_counted_as_a_successful_answer():
     pass and this one does not.
     """
     wd = Path(tempfile.mkdtemp(prefix="reasononly-"))
-    port = 8894
-    srv = serve(port, wd / "truth.jsonl", reasoning_tokens=6, reasoning_only=1,
+    srv = serve(0, wd / "truth.jsonl", reasoning_tokens=6, reasoning_only=1,
                 per_token_ms=3.0, ttft_base_ms=25.0, ms_per_1k_uncached=5.0)
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.3)
     prof = wd / "prof.json"

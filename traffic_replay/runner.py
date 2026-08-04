@@ -28,7 +28,9 @@ prompts mode the text is fixed, so the warmup only primes the endpoint.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -53,6 +55,13 @@ class RunConfig:
     qps_max: float = 500.0
     rate_scale: float = 1.0
     max_concurrency: int = 256
+    concurrency: int | None = None    # "hold N requests in flight". when set,
+                                      # a short sizing pass measures service
+                                      # time and the arrival rate and pool are
+                                      # derived from it, overriding qps_* and
+                                      # max_concurrency. load tests are
+                                      # specified this way; the harness does
+                                      # the arithmetic.
     seed: int = 7
     cpt: float = 4.0
     calibrate_n: int = 12
@@ -71,7 +80,148 @@ class RunConfig:
     ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
 
+def _shard_concurrency(rc) -> int | None:
+    """Concurrency this shard is responsible for.
+
+    Sizing derives one rate for the whole target concurrency, then `shard()`
+    hands each worker every Nth arrival. A shard therefore offers rate/N and
+    holds about concurrency/N, so comparing its measured in-flight against
+    the unsharded number reports every shard as falling short.
+    """
+    if not rc.concurrency:
+        return None
+    return max(1, int(round(rc.concurrency / max(1, rc.shard_total))))
+
+
+def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
+                          quiet: bool) -> "RunConfig":
+    """Turn "hold N in flight" into an arrival rate and a pool size.
+
+    Load tests are specified in concurrency, the generator is specified in
+    arrival rate, and converting between them needs the endpoint's service
+    time, which nobody knows before measuring. So measure it: send a few
+    requests sequentially, take the median and p95 end-to-end, then set
+
+        rate = concurrency / e2e_p50
+        pool = rate * e2e_p95 * headroom
+
+    Sizing the pool off p95 rather than p50 matters. At p50 the pool is right
+    half the time and queues the other half, and a queued request is one the
+    endpoint never saw on schedule.
+    """
+    import numpy as _np
+
+    from .client import EndpointClient
+    from .textgen import TextMaterializer as _TM
+    from . import profile as _prof
+    from .prefix_pool import PrefixPool as _PP
+
+    probe_n = max(4, min(rc.calibrate_n, 8))
+    client = EndpointClient(ecfg, token)
+    if rc.prompts_file:
+        from .prompts import load_prompts
+        msgs_list = load_prompts(rc.prompts_file)
+        def _mk(i):
+            m = msgs_list[i % len(msgs_list)]
+            return m, rc.max_output_tokens_cap, (0, 0, None, i % len(msgs_list)), \
+                sum(len(x["content"]) for x in m)
+    else:
+        p = _prof.Profile.from_json(rc.profile_path)
+        mat = _TM(cpt=rc.cpt)
+        pool = _PP(seed=rc.seed + 4, docs_per_bucket=rc.pool_docs_per_bucket,
+                   zipf_s=rc.pool_zipf_s)
+        draw = _prof.sample(p, probe_n, seed=rc.seed)
+        assign = pool.assign(draw["prefix_tokens"])
+        def _mk(i):
+            m = mat.messages(f"size-{i}", int(assign.doc_id[i]),
+                             int(assign.prefix_tokens[i]),
+                             pool.doc_len.get(int(assign.doc_id[i]), 0),
+                             int(draw["suffix_tokens"][i]))
+            return (m, min(int(draw["output_tokens"][i]),
+                           rc.max_output_tokens_cap),
+                    (int(draw["input_tokens"][i]),
+                     int(draw["output_tokens"][i]),
+                     float(draw["cache_target_fraction"][i]),
+                     int(assign.doc_id[i])),
+                    sum(len(x["content"]) for x in m))
+
+    e2e = []
+    for i in range(probe_n):
+        msgs, max_out, intended, chars = _mk(i)
+        res = client.send(msgs, max_out, new_request_id(), scheduled_s=0.0,
+                          dispatch_lag_ms=0.0, intended=intended,
+                          chars_sent=chars)
+        d = dataclasses.asdict(res)
+        d["phase"] = "sizing"
+        out_rows.append(d)
+        if res.ok and res.e2e_ms:
+            e2e.append(res.e2e_ms)
+
+    if not e2e:
+        raise RuntimeError(
+            "sizing pass got no successful response, so the arrival rate for "
+            f"concurrency {rc.concurrency} cannot be derived. check auth and "
+            "the endpoint path, or set qps_base and max_concurrency directly.")
+
+    p50 = float(_np.percentile(e2e, 50)) / 1000.0
+    p95 = float(_np.percentile(e2e, 95)) / 1000.0
+    rate = rc.concurrency / max(p50, 1e-3)
+    pool_size = max(rc.concurrency * 2,
+                    int(math.ceil(rate * p95 * 1.5)))
+    if not quiet:
+        print(f"[runner] sizing from {len(e2e)} probe requests: e2e p50 "
+              f"{p50 * 1000:.0f} ms, p95 {p95 * 1000:.0f} ms")
+        print(f"[runner] to hold {rc.concurrency} in flight: offering "
+              f"{rate:.2f} rps, pool {pool_size}")
+    return dataclasses.replace(
+        rc, qps_base=rate, qps_burst=rate, qps_min=rate, qps_max=rate,
+        rate_scale=1.0, max_concurrency=pool_size)
+
+
+def _token_from_profile(name: str) -> str | None:
+    """Resolve a ~/.databrickscfg profile to a bearer token.
+
+    A PAT profile stores the token directly. An OAuth profile stores no
+    usable bearer token, so the Databricks CLI is asked to mint one, which
+    also refreshes it if it has expired. Returns None if neither works, and
+    the caller falls back to the environment variable.
+    """
+    import configparser
+    import json as _json
+    import subprocess
+    from pathlib import Path
+
+    cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE",
+                                   Path.home() / ".databrickscfg"))
+    parser = configparser.ConfigParser()
+    if cfg_path.exists():
+        parser.read(cfg_path)
+        if parser.has_section(name) or name == "DEFAULT":
+            sect = parser[name]
+            tok = sect.get("token")
+            # a PAT is usable as-is. an OAuth profile has auth_type set and
+            # either no token or a stale one, so prefer the CLI there.
+            if tok and not sect.get("auth_type"):
+                return tok
+    try:
+        out = subprocess.run(["databricks", "auth", "token", "-p", name],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode == 0:
+            return _json.loads(out.stdout).get("access_token") or None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def _token(cfg: EndpointConfig) -> str | None:
+    if cfg.auth_profile:
+        tok = _token_from_profile(cfg.auth_profile)
+        if tok:
+            return tok
+        # falling through silently means a typo runs unauthenticated and
+        # surfaces later as a wall of 401s or "sizing got no response"
+        print(f"auth profile {cfg.auth_profile!r} did not resolve to a token, "
+              f"falling back to ${cfg.auth_token_env}", file=sys.stderr)
     return os.environ.get(cfg.auth_token_env) or None
 
 
@@ -95,6 +245,11 @@ def run(rc: RunConfig, token_override: str | None = None,
         from .endpoint_meta import fetch_endpoint_metadata
         endpoint_meta = fetch_endpoint_metadata(ecfg.base_url, ecfg.path,
                                                 token, timeout=5.0)
+
+    # ---- sizing pass, only when the caller asked for a concurrency --------
+    sizing_rows: list[dict] = []
+    if rc.concurrency:
+        rc = _size_for_concurrency(rc, ecfg, token, sizing_rows, quiet)
 
     # arrival schedule is shared by both modes
     if rc.timestamps_file:
@@ -155,7 +310,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             if p.label:
                 print(f"[runner] profile label: {p.label}")
 
-    results: list[dict] = []
+    results: list[dict] = list(sizing_rows)
 
     # ---- calibration / warmup pass (sequential, low rate) --------------
     calib_n = min(rc.calibrate_n, n)
@@ -212,6 +367,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
+            "concurrency_target": _shard_concurrency(rc),
         }
         acceptance = rc.acceptance_targets
     else:
@@ -222,15 +378,24 @@ def run(rc: RunConfig, token_override: str | None = None,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
+            "concurrency_target": _shard_concurrency(rc),
         }
         acceptance = (rc.acceptance_targets
                       or (p.extra or {}).get("acceptance_targets"))
+
+    # name the origin, so the scorecard cannot credit the profile for numbers
+    # the run config supplied. the CLI stamps its own before we get here.
+    if acceptance and "targets_are" not in acceptance:
+        acceptance = {**acceptance,
+                      "targets_are": ("the run config" if rc.acceptance_targets
+                                      else "this profile")}
 
     summary = summarize([r for r in results if r.get("phase") == "replay"],
                         schedule_meta=schedule_report(sched), run_meta=meta,
                         acceptance=acceptance,
                         ttft_definition=rc.ttft_definition,
-                        pricing=rc.pricing)
+                        pricing=rc.pricing,
+                        concurrency_target=_shard_concurrency(rc))
     out = write_outputs(results, summary,
                         Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
                         rc.title)

@@ -58,7 +58,7 @@ You can look at either shape before spending a single endpoint call.
 recovered, so you can confirm the profile matches your traffic:
 
 ```bash
-python3 -m traffic_replay sample --profile configs/profile_decagon_20260723.json
+python3 -m traffic_replay sample --profile configs/profile_agent_stated.json
 ```
 ```json
 "recovered": {
@@ -229,18 +229,18 @@ touched. Build a profile from the export and check it:
 
 ```bash
 python3 scripts/profile_from_logs.py \
-  --input your_logs.jsonl --name decagon_real \
-  --out configs/profile_decagon_real.json
+  --input your_logs.jsonl --name agent_real \
+  --out configs/profile_agent_real.json
 
 # confirm the recovered quantiles match your data
-python3 -m traffic_replay sample --profile configs/profile_decagon_real.json
+python3 -m traffic_replay sample --profile configs/profile_agent_real.json
 ```
 
 That writes a profile like this (the P50/P95 the harness will reproduce):
 
 ```json
 {
-  "name": "decagon_real",
+  "name": "agent_real",
   "input_tokens":   {"p50": 10126, "p95": 23193},
   "output_tokens":  {"p50": 45,    "p95": 86},
   "cache_fraction": {"p50": 0.618, "p95": 0.832},
@@ -285,7 +285,7 @@ the endpoint. A minimal config:
 
 ```json
 {
-  "profile_path": "configs/profile_decagon_real.json",
+  "profile_path": "configs/profile_agent_real.json",
   "timestamps_file": "your_arrivals.txt",
   "endpoint": {
     "base_url": "https://your-workspace.cloud.databricks.com",
@@ -293,8 +293,8 @@ the endpoint. A minimal config:
     "auth_token_env": "DATABRICKS_TOKEN"
   },
   "duration_s": 300,
-  "out_dir": "results/decagon",
-  "title": "decagon real-data run"
+  "out_dir": "results/agent",
+  "title": "agent real-data run"
 }
 ```
 
@@ -344,8 +344,8 @@ targets are optional and score the same SLA scorecard:
   "duration_s": 120,
   "max_output_tokens_cap": 300,
   "acceptance_targets": {"ttft_ms": {"p50": 1500, "p95": 3000}, "success_rate": 0.99},
-  "out_dir": "results/decagon_prompts",
-  "title": "decagon prompts-mode run"
+  "out_dir": "results/agent_prompts",
+  "title": "agent prompts-mode run"
 }
 ```
 
@@ -698,7 +698,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 
 | field | default | example | what it does, and when to change it |
 |---|---|---|---|
-| `profile_path` | null | `"configs/profile_decagon_real.json"` | path to a profile JSON (shape mode). Set this or `prompts_file`, not both |
+| `profile_path` | null | `"configs/profile_agent_real.json"` | path to a profile JSON (shape mode). Set this or `prompts_file`, not both |
 | `prompts_file` | null | `"your_prompts.jsonl"` | path to a real-prompts file, `.jsonl` / `.txt` / `.json` (prompts mode). Set this or `profile_path` |
 | `endpoint.base_url` | required | `"https://your-ws.cloud.databricks.com"` | workspace host, no trailing slash |
 | `endpoint.path` | required | `"/serving-endpoints/my-ep/invocations"` | the serving endpoint route. Model-serving uses `.../invocations` |
@@ -721,8 +721,8 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `shard_index` / `shard_total` | 0 / 1 | `0` / `3` | deterministic 1-of-n schedule split, one per client machine, then `merge` the outputs |
 | `pool_docs_per_bucket` | 40 | `40` | shared-prefix documents per size bucket (profile-mode cache structure) |
 | `pool_zipf_s` | 1.1 | `1.1` | document popularity skew. Higher concentrates traffic on hot documents |
-| `out_dir` | `results` | `"results/decagon"` | output root. Each run writes a timestamped subdirectory under it |
-| `title` / `label` | "" | `"decagon PT 250K"` | report title and the provenance label printed at the bottom of the report |
+| `out_dir` | `results` | `"results/agent"` | output root. Each run writes a timestamped subdirectory under it |
+| `title` / `label` | "" | `"PT stepped-load run"` | report title and the provenance label printed at the bottom of the report |
 | `max_output_tokens_cap` | 512 | `300` | ceiling on `max_tokens` per request. Reasoning models spend this budget thinking first |
 | `acceptance_targets` | null | `{"ttft_ms": {"p95": 900}}` | inline SLA targets (`ttft_ms`, `ttfg_ms`, `hard_timeouts`, `success_rate`, `interchunk_ms`). In prompts mode this is how the scorecard gets its targets |
 | `ttft_definition` | `first_content` | `"first_visible"` | `first_content` (first token of either kind) or `first_visible` (skip reasoning deltas). The SLA scorecard scores whichever is set |
@@ -770,7 +770,13 @@ docs/PRODUCTION_TESTING.md   step-by-step run plan
 
 ## Provenance and labels
 
-The bundled `configs/profile_decagon_20260723.json` is built to
-customer-stated figures from the 2026-07-23 call and says so in its label.
-When the exact production dataset lands, it replaces that config file and
-the label comes off. Nothing else in the harness changes.
+The bundled `configs/profile_agent_stated.json` is built to figures that
+were stated verbally rather than measured, and its label says so. When a
+profile derived from real logs replaces it, the label comes off. Nothing
+else in the harness changes.
+
+`configs/profile_agent_blended.json` is the other bundled shape. It blends two
+workload classes into one distribution, which is why its P90 points do not sit
+on a single curve through the P50 and P95 anchors. Its acceptance targets are
+illustrative, so replace them with the ones you agreed before scoring a run
+against them.

@@ -1,0 +1,60 @@
+{
+  "name": "agent_blended_classes",
+  "input_tokens": {
+    "p50": 10000,
+    "p95": 24000
+  },
+  "output_tokens": {
+    "p50": 40,
+    "p95": 90
+  },
+  "cache_fraction": {
+    "p50": 0.6,
+    "p95": 0.87
+  },
+  "provenance": "Two workload classes blended into one distribution, which is why the P90 points do not sit on a single curve through the P50 and P95 anchors.",
+  "label": "Blended across two workload classes. Run per-class profiles when the per-class quantiles are available.",
+  "doc_quantiles_full": {
+    "input_tokens": {
+      "p50": 10000,
+      "p90": 13000,
+      "p95": 24000,
+      "p99": 25000
+    },
+    "output_tokens": {
+      "p50": 40,
+      "p90": 70,
+      "p95": 90,
+      "p99": 165
+    },
+    "cache_fraction": {
+      "p50": 0.6,
+      "p90": 0.75,
+      "p95": 0.87,
+      "p99": 0.98
+    },
+    "note": "the full quantile ladder behind the anchors above. blending two classes is what makes the P90 points sit off the curve."
+  },
+  "acceptance_targets": {
+    "ttft_ms": {
+      "p50": 600,
+      "p90": 1000,
+      "p95": 1200,
+      "p99": 2000
+    },
+    "ttfg_ms": {
+      "p50": 1000,
+      "p90": 1500,
+      "p95": 2000,
+      "p99": 4000
+    },
+    "hard_timeouts": {
+      "ttft_s": 15,
+      "ttfg_s": 45,
+      "note": "requests over budget count as failures against SLA"
+    },
+    "success_rate": 0.999,
+    "priority": "TTFT and throughput, sensitive to interchunk stalls and timeouts",
+    "note": "illustrative targets. replace with the ones you agreed in writing."
+  }
+}

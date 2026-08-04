@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.4.0
+
+### Transport success is no longer reported as answer success
+
+A reasoning model that spends its whole token budget thinking returns
+HTTP 200, a well formed stream, a finish reason, and nothing a user could
+read. Every one of those counted as a success, so a run where not a single
+request produced a readable answer reported a 100 percent success rate.
+
+Measured on a real reasoning endpoint: 187 requests, zero errors, and 132 of
+them returned 200 with no visible content. The old report showed a green
+"meets every acceptance target" banner over it.
+
+Each request now records `visible_content_seen`, `stream_complete`,
+`reasoning_seen`, `truncated`, `parse_errors` and `max_tokens_requested`.
+The summary gains an `answers` block separating attempted, transport-ok, and
+answered, and both reports lead with it.
+
+- A response that returns 200 with no visible content counts against the
+  success rate.
+- Truncation does NOT count as a failure. This harness caps `max_tokens` at
+  the sampled output size on purpose, so ending on "length" is the expected
+  way to hit a target output length. It is reported as its own rate instead.
+- A target with no measurement behind it is no longer scored as a pass. The
+  green banner is downgraded when any scored target is unmeasured, and a run
+  where nothing was answered renders INVALID.
+- `report.md` now carries a verdict line. It had none, and it is the file
+  that gets pasted into email.
+- The SLA table renders "not measured" rather than a literal `None`.
+
+### TTFV percentiles say what they leave out
+
+When the SLA scores the first visible token, requests that never produced one
+carry no `ttfv_ms` and silently dropped out of the percentile. The report
+printed a clean p50 computed over the fastest subset. Percentile tables now
+carry `missing` and `of`, the reasoning note names the subset, and the
+scorecard cautions when more than 5 percent of successful requests never
+produced the token being scored.
+
+### Concurrency
+
+- `concurrency` is a config knob. A short sizing pass measures service time
+  and derives the arrival rate and pool size.
+- Achieved concurrency is measured by interval overlap and printed next to
+  what was asked for.
+- The rate is derived from service time measured WITHOUT load, and service
+  time rises under load, so this design overshoots. Both directions now warn.
+  Previously only under-delivery did, which let a run labeled "30 concurrent"
+  that actually held 65 go out clean.
+- `in_flight_max` is renamed `in_flight_max_sampled`. It is the highest of 41
+  samples across the middle of the run, not a true peak, and calling it
+  "peak" oversold it.
+- Sharded runs compare against their own share of the concurrency rather than
+  the unsharded total, which used to report every shard as falling short.
+
+### Added
+
+- `quickstart` subcommand: writes a runnable config from a host, an endpoint
+  and a profile, so getting to a first run does not mean hand-editing JSON.
+- `endpoint.auth_profile` reads `~/.databrickscfg`. PAT tokens are used
+  directly, OAuth profiles shell out to `databricks auth token`.
+- SLA targets say where they came from, and bundled illustrative targets are
+  flagged so they do not read as agreed numbers.
+
 ## 0.3.0
 
 ### Changed what the latency numbers mean (read this before comparing runs)

@@ -10,14 +10,14 @@ Only the distribution is extracted. No prompt text is read or stored, so a
 log export with token counts is enough and no customer content moves.
 
 Usage:
-  python3 scripts/profile_from_logs.py --input logs.jsonl --name decagon_real
+  python3 scripts/profile_from_logs.py --input logs.jsonl --name agent_real
   python3 scripts/profile_from_logs.py --input logs.csv \
-      --out configs/profile_decagon_real.json \
+      --out configs/profile_agent_real.json \
       --input-field prompt_tokens --output-field completion_tokens \
       --cached-field cached_tokens
 
 Verify the result with:
-  python3 -m traffic_replay sample --profile configs/profile_decagon_real.json
+  python3 -m traffic_replay sample --profile configs/profile_agent_real.json
 """
 from __future__ import annotations
 

@@ -1,24 +1,26 @@
 # Follow-up work
 
-## Scrub the customer name from the repo (do before any wider release)
+## Decide what to do about the customer name in git history
 
-The customer name appears throughout the repo from earlier commits. It is
-already public on `origin/main`, so this is a cleanup rather than a leak, but
-it should land before the project is pointed at a wider audience.
+The working tree is scrubbed. The git HISTORY is not, and it carries strictly
+more than the working tree ever did. Nine commits back to the initial commit
+reference the customer by name, and the old blobs additionally hold their
+serving topology, a third party's utilization figure attributed to them, and
+their stated rate anchors. The specifics are not repeated here, because this
+file is tracked and public and quoting them would undo the scrub it describes.
+Read the old blobs directly if you need the list.
 
-Where it currently appears:
+That history is on a public remote. Anyone running `git log -p`, opening a
+commit permalink, or cloning the repo sees all of it, so the working-tree
+scrub reduces exposure very little on its own.
 
-- `configs/profile_decagon_20260723.json`, `configs/profile_decagon_poc_doc_20260727.json`
-  (filenames and `provenance` / `label` text)
-- `configs/run_prompts.json`, `configs/run_pt_full.json` (profile paths)
-- `README.md` (several config path references and one example `out_dir`)
-- `scripts/profile_from_logs.py` (docstring example)
-- `tests/test_report_accuracy.py` (profile path)
+This is a decision for the repo owner, not something to do quietly. Removing
+it means `git filter-repo` plus a force push, plus a GitHub Support request to
+purge cached blob views, plus checking the fork network, since forks keep the
+old objects reachable after a rewrite.
 
-Both profile JSONs are also base64-embedded in the notebook payload by
-`scripts/pack_notebook.py`, so the customer's stated traffic figures ship
-inside the notebook. Rename the profiles to something neutral, update every
-reference, and re-run `python3 scripts/pack_notebook.py`.
+Until that decision is made and carried out, do not describe this repo as
+scrubbed.
 
 ## Record which serving config was read
 
@@ -31,8 +33,8 @@ mid-update endpoint reports NO served-entity rows at all and shows
 
 ## Document the dispatch-lag and connect_ms interaction
 
-Dispatch lag is stamped when the request is submitted, and the latency clock
-starts after the handshake, so offered arrivals reach the endpoint roughly
-`connect_ms` after the reported dispatch lag. Worth one sentence in the
-connection-setup line. Severity checked: no wrong number is printed, both
-figures are individually correct and labeled. Documentation only.
+Mostly answered by the wire-lateness work: `first_send_unix` is stamped
+before the handshake, so wire lateness covers dispatcher-to-wire. The
+residual is `connect_ms`, since arrival at the endpoint is roughly
+wire lateness plus the handshake. Both numbers are printed and labeled, so
+this is a wording question rather than a missing measurement.

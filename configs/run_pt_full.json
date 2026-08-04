@@ -1,5 +1,5 @@
 {
-  "profile_path": "configs/profile_decagon_poc_doc_20260727.json",
+  "profile_path": "configs/profile_agent_blended.json",
   "endpoint": {
     "base_url": "https://YOUR-WORKSPACE-HOST",
     "path": "/serving-endpoints/YOUR-PT-ENDPOINT/invocations",
@@ -15,7 +15,7 @@
   "cpt": 4.0,
   "calibrate_n": 12,
   "out_dir": "results/pt",
-  "title": "provisioned throughput replay, customer traffic shape",
-  "label": "Built to spoken 2026-07-23 figures. Exact production dataset pending. Raise rate_scale stepwise (0.1 -> 0.25 -> 0.5 -> 1.0) per the run plan in docs/PRODUCTION_TESTING.md. max_concurrency is sized for the final rate_scale step: 500 QPS at a ~2s p95 needs ~1000 in flight, so 2048 leaves headroom. Undersizing it makes the client the bottleneck and the report will say so. A single process bends near 270 requests/second, so the last rate_scale step needs the schedule sharded across machines, see PRODUCTION_TESTING.",
+  "title": "provisioned throughput replay, agent traffic shape",
+  "label": "Built to a profile of stated figures rather than a measured dataset. Replace the profile with one derived from your own logs. Raise rate_scale stepwise (0.1 -> 0.25 -> 0.5 -> 1.0) per the run plan in docs/PRODUCTION_TESTING.md. max_concurrency is sized for the final rate_scale step: 500 QPS at a ~2s p95 needs ~1000 in flight, so 2048 leaves headroom. Undersizing it makes the client the bottleneck and the report will say so. A single process bends near 270 requests/second, so the last rate_scale step needs the schedule sharded across machines, see PRODUCTION_TESTING.",
   "max_output_tokens_cap": 512
 }

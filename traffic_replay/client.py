@@ -34,6 +34,10 @@ class EndpointConfig:
     base_url: str                    # e.g. https://<workspace-host>
     path: str                        # e.g. /serving-endpoints/<name>/invocations
     auth_token_env: str = "DATABRICKS_TOKEN"
+    auth_profile: str | None = None   # a ~/.databrickscfg profile name. takes
+                                      # precedence over auth_token_env, and
+                                      # handles OAuth profiles by asking the
+                                      # Databricks CLI for a fresh token.
     model: str | None = None         # set for shared /chat/completions routes
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 120.0
@@ -76,6 +80,16 @@ class RequestResult:
     reasoning_tokens_source: str | None = None  # usage field it was read from
     reasoning_chunks: int = 0             # reasoning deltas seen in the stream
     connect_ms: float | None = None       # DNS + TCP + TLS setup time
+    # transport success (`ok`) is not answer success. a reasoning model that
+    # spends its whole token budget thinking returns HTTP 200, a well formed
+    # stream, and no answer. these fields carry the facts so metrics can
+    # apply the policy in one place.
+    stream_complete: bool = False    # saw [DONE] or a finish_reason
+    visible_content_seen: bool = False   # at least one visible delta
+    reasoning_seen: bool = False
+    truncated: bool = False          # finish_reason == "length"
+    parse_errors: int = 0            # unrecoverable SSE parse failures
+    max_tokens_requested: int | None = None
     first_send_unix: float | None = None  # when the FIRST attempt went out.
                                           # t_send_unix belongs to whichever
                                           # attempt produced this result, so a
@@ -190,7 +204,8 @@ class EndpointClient:
                                         f"http {resp.status}: {detail[:300]}",
                                         StreamState(), intended, chars_sent,
                                         attempt - 1, None, None, None,
-                                        connect_ms, first_send_unix)
+                                        connect_ms, first_send_unix,
+                                        max_tokens)
 
                 if include_usage and self._include_usage_supported is None:
                     self._include_usage_supported = True
@@ -232,7 +247,7 @@ class EndpointClient:
                                     200, ok, err, state, intended, chars_sent,
                                     attempt - 1, interchunk_max,
                                     ttfr_ms, ttfv_ms, connect_ms,
-                                    first_send_unix)
+                                    first_send_unix, max_tokens)
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
@@ -247,7 +262,8 @@ class EndpointClient:
                             None, None, None, None, False,
                             last_err or "exhausted retries", StreamState(),
                             intended, chars_sent, attempt - 1,
-                            None, None, None, None, first_send_unix)
+                            None, None, None, None, first_send_unix,
+                            max_tokens)
 
     @staticmethod
     def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
@@ -255,7 +271,8 @@ class EndpointClient:
                 intended, chars_sent, retries,
                 interchunk_max_ms=None,
                 ttfr_ms=None, ttfv_ms=None, connect_ms=None,
-                first_send_unix=None) -> RequestResult:
+                first_send_unix=None, max_tokens_requested=None
+                ) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
@@ -263,6 +280,12 @@ class EndpointClient:
             ttfb_ms=ttfb_ms, ttft_ms=ttft_ms, ttfr_ms=ttfr_ms,
             ttfv_ms=ttfv_ms, e2e_ms=e2e_ms, status=status,
             ok=ok, error=error, content_chunks=state.content_chunks,
+            stream_complete=bool(state.done or state.finish_reason),
+            visible_content_seen=bool(state.saw_first_visible),
+            reasoning_seen=bool(state.saw_first_reasoning),
+            truncated=(state.finish_reason == "length"),
+            parse_errors=len(state.errors),
+            max_tokens_requested=max_tokens_requested,
             interchunk_max_ms=interchunk_max_ms,
             finish_reason=state.finish_reason,
             prompt_tokens=u["prompt_tokens"],

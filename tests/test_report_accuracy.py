@@ -32,7 +32,7 @@ def test_report_matches_independent_recomputation():
             endpoint={"base_url": f"http://127.0.0.1:{port}",
                       "path": "/serving-endpoints/mock/invocations",
                       "auth_token_env": "NONE"},
-            profile_path="configs/profile_decagon_poc_doc_20260727.json",
+            profile_path="configs/profile_agent_blended.json",
             duration_s=8, qps_base=3.0, qps_burst=6.0, qps_min=1.0,
             qps_max=8.0, max_concurrency=6, calibrate_n=3,
             out_dir=os.path.join(d, "r"), title="accuracy",

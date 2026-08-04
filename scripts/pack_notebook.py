@@ -36,8 +36,16 @@ def collect() -> dict[str, str]:
     for pat in (
         "traffic_replay/*.py",
         "tests/test_*.py",
-        "configs/*.json",
-        "configs/*.jsonl",
+        # allowlist, NOT a glob. a user following the README writes their
+        # log-derived profile into configs/, and globbing would pack a real
+        # customer's traffic quantiles into a shareable notebook.
+        "configs/profile_agent_stated.json",
+        "configs/profile_agent_blended.json",
+        "configs/profile_validation_small.json",
+        "configs/prompts_example.jsonl",
+        "configs/run_smoke.json",
+        "configs/run_pt_full.json",
+        "configs/run_prompts.json",
         "scripts/run_tests_stdlib.py",
     ):
         for p in sorted(ROOT.glob(pat)):

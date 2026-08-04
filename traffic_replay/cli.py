@@ -124,6 +124,10 @@ def cmd_merge(args) -> int:
     if args.profile:
         acceptance = (prof.Profile.from_json(args.profile).extra or {}).get(
             "acceptance_targets")
+        # the run path stamps this; merge has to as well, or the scorecard
+        # credits "the run configuration" for numbers out of the profile.
+        if acceptance and "targets_are" not in acceptance:
+            acceptance = {**acceptance, "targets_are": "this profile"}
     try:
         out = merge_runs(args.out, args.inputs, title=args.title,
                          acceptance=acceptance, force=args.force)
@@ -145,6 +149,78 @@ def cmd_compare(args) -> int:
     return 0
 
 
+def cmd_quickstart(args) -> int:
+    """Write a run config from the few things a load test actually needs.
+
+    Everything else has a default that works, or is derived at run time from
+    the endpoint's measured service time. Nobody should have to compute an
+    arrival rate to say "hold 30 in flight".
+    """
+    path = args.endpoint
+    if not path.startswith("/"):
+        path = f"/serving-endpoints/{path}/invocations"
+    ep: dict = {"base_url": args.host.rstrip("/"), "path": path}
+    if args.auth_profile:
+        ep["auth_profile"] = args.auth_profile
+    else:
+        ep["auth_token_env"] = args.token_env
+    if args.model:
+        ep["model"] = args.model
+
+    cfg: dict = {
+        "profile_path": args.profile,
+        "endpoint": ep,
+        "concurrency": args.concurrency,
+        "duration_s": args.duration,
+        "out_dir": args.out_dir,
+        "title": args.title or f"{args.concurrency} concurrent, {args.endpoint}",
+        "label": args.label or (
+            "Describe the capacity this ran on. Shared pay-per-token is not a "
+            "performance claim for a dedicated endpoint."),
+    }
+    if args.max_output_tokens:
+        cfg["max_output_tokens_cap"] = args.max_output_tokens
+
+    # SLA targets. the whole reason to run this is "do we meet ours", so it
+    # has to be expressible here. without them the report falls back to the
+    # profile's, which on a bundled profile are illustrative.
+    ttft = {q: v for q, v in (("p50", args.ttft_p50), ("p90", args.ttft_p90),
+                              ("p95", args.ttft_p95), ("p99", args.ttft_p99))
+            if v}
+    ttfg = {q: v for q, v in (("p50", args.ttfg_p50), ("p90", args.ttfg_p90),
+                              ("p95", args.ttfg_p95), ("p99", args.ttfg_p99))
+            if v}
+    if ttft or ttfg or args.success_rate:
+        targets: dict = {"targets_are": "yours, passed on the command line"}
+        if ttft:
+            targets["ttft_ms"] = ttft
+        if ttfg:
+            targets["ttfg_ms"] = ttfg
+        if args.success_rate:
+            targets["success_rate"] = args.success_rate
+        cfg["acceptance_targets"] = targets
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(cfg, indent=2) + "\n")
+    print(f"wrote {out}")
+    print()
+    print("run it with:")
+    print(f"  python3 -m traffic_replay run --config {out}")
+    print()
+    print("the arrival rate and pool size are derived at run time from a short "
+          "sizing pass, and printed before the replay starts.")
+    if not args.auth_profile:
+        print(f"export {args.token_env} first, or pass --auth-profile to read "
+              "a ~/.databrickscfg profile instead.")
+    if "acceptance_targets" not in cfg:
+        print()
+        print("no SLA targets given, so the scorecard will fall back to the "
+              "profile's. pass --ttft-p95 and --ttfg-p95 (and the other "
+              "quantiles) to score against yours.")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="traffic_replay")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -159,6 +235,42 @@ def main(argv=None) -> int:
     s.add_argument("--duration", type=int, default=300)
     s.add_argument("--rate-scale", type=float, default=1.0)
     s.set_defaults(fn=cmd_schedule)
+
+    s = sub.add_parser("quickstart",
+                       help="write a run config from endpoint + concurrency")
+    s.add_argument("--host", required=True,
+                   help="workspace URL, e.g. https://my-ws.cloud.databricks.com")
+    s.add_argument("--endpoint", required=True,
+                   help="endpoint name, or a full /serving-endpoints/... path")
+    s.add_argument("--profile", required=True,
+                   help="traffic profile JSON describing your prompt shape")
+    s.add_argument("--concurrency", type=int, required=True,
+                   help="how many requests to hold in flight")
+    s.add_argument("--duration", type=int, default=240,
+                   help="seconds. 240 gives four stability windows")
+    s.add_argument("--auth-profile", default=None,
+                   help="a ~/.databrickscfg profile name (PAT or OAuth)")
+    s.add_argument("--token-env", default="DATABRICKS_TOKEN",
+                   help="env var holding a bearer token, if not using a profile")
+    s.add_argument("--model", default=None,
+                   help="only for shared /chat/completions routes")
+    s.add_argument("--max-output-tokens", type=int, default=None)
+    s.add_argument("--out-dir", default="results/quickstart")
+    s.add_argument("--title", default=None)
+    s.add_argument("--label", default=None)
+    s.add_argument("--ttft-p50", type=float, default=None,
+                   help="your TTFT target in ms. same for --ttft-p90/p95/p99")
+    s.add_argument("--ttft-p90", type=float, default=None)
+    s.add_argument("--ttft-p95", type=float, default=None)
+    s.add_argument("--ttft-p99", type=float, default=None)
+    s.add_argument("--ttfg-p50", type=float, default=None,
+                   help="your full-generation target in ms")
+    s.add_argument("--ttfg-p90", type=float, default=None)
+    s.add_argument("--ttfg-p95", type=float, default=None)
+    s.add_argument("--ttfg-p99", type=float, default=None)
+    s.add_argument("--success-rate", type=float, default=None)
+    s.add_argument("--out", default="configs/quickstart.json")
+    s.set_defaults(fn=cmd_quickstart)
 
     s = sub.add_parser("run", help="replay against a real endpoint")
     s.add_argument("--config", required=True)

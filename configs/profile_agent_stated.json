@@ -1,0 +1,17 @@
+{
+  "name": "agent_stated_figures",
+  "input_tokens": {
+    "p50": 10000,
+    "p95": 24000
+  },
+  "output_tokens": {
+    "p50": 40,
+    "p95": 90
+  },
+  "cache_fraction": {
+    "p50": 0.6,
+    "p95": 0.87
+  },
+  "provenance": "Built to figures stated verbally rather than measured from a dataset. Replace with a profile derived from your own logs via scripts/profile_from_logs.py.",
+  "label": "ASSUMPTION: built to spoken figures, not a measured dataset. The label comes off when a real log-derived profile replaces it."
+}

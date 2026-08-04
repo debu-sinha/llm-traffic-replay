@@ -55,12 +55,12 @@ agreed profile config (until the customer's exact dataset lands, the
 bundled profile carries its ASSUMPTION label and so does every report).
 
 1. Copy `configs/run_pt_full.json`, set base_url and the PT endpoint path.
-2. Agree the acceptance targets in writing before the first run (for this
-   engagement: TTFT p50 500 ms / p95 900 ms, full generation p50 700 ms /
-   p95 1500 ms, held across the burst schedule, per workload class). Ask for
-   the interchunk-stall threshold too. The moment they give a number, put it
+2. Agree the acceptance targets in writing before the first run, per
+   workload class and held across the burst schedule rather than on average.
+   Ask for the interchunk-stall threshold too. The moment they give a number, put it
    in the profile as `acceptance_targets.interchunk_ms` and the scorecard
-   counts breaches against the success rate.
+   counts breaches against the success rate. The targets in the bundled
+   profile are illustrative, so replace them with yours before the run.
 3. Step the load, one knob, in this order, reading the believability block
    between steps:
    - `rate_scale`: 0.1 -> 0.25 -> 0.5 -> 1.0

@@ -19,6 +19,69 @@ from . import __version__
 PCTS = (50, 90, 95, 99)
 
 
+def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
+    """How many requests were actually in flight, by interval overlap.
+
+    A load test is specified in concurrency, so the report has to say whether
+    that concurrency was reached. Overlap is exact for a successful request,
+    which has both a send time and a duration. Failures are excluded, since
+    the harness records when they were sent but not when they gave up, and a
+    rejected request occupies the endpoint for a moment rather than for its
+    share of the load.
+
+    That exclusion is the point rather than a gap: if the endpoint is
+    shedding, the concurrency of real work is what a reader needs, and it is
+    the number that falls below what was asked.
+    """
+    spans = [(_sent_at(r), _sent_at(r) + (r["e2e_ms"] or 0) / 1000.0)
+             for r in ok
+             if _sent_at(r) is not None and r.get("e2e_ms")]
+    if len(spans) < 2:
+        return None
+    starts = sorted(x[0] for x in spans)
+    ends = sorted(x[1] for x in spans)
+    lo, hi = starts[0], ends[-1]
+    if hi <= lo:
+        return None
+    # sample the middle of the run, so ramp up and drain do not drag it down
+    import bisect
+    obs = []
+    for k in range(41):
+        t = lo + (hi - lo) * (0.2 + 0.6 * k / 40.0)
+        obs.append(bisect.bisect_right(starts, t) - bisect.bisect_right(ends, t))
+    obs.sort()
+    med = float(obs[len(obs) // 2])
+    out = {
+        "in_flight_p50": med,
+        "in_flight_max_sampled": float(obs[-1]),
+        "measured_over": "successful requests only",
+        "sampling": "41 points across the middle 60 percent of the run, so "
+                    "the max is the highest sample, not a true peak",
+    }
+    if asked:
+        out["asked_for"] = asked
+        if med < asked * 0.8:
+            out["warning"] = (
+                f"the run asked to hold {asked} requests in flight and held "
+                f"about {med:.0f}. the endpoint was not carrying the "
+                "concurrency on the label, so read the error rate and the "
+                "stability card before treating this as a result for that "
+                "load level.")
+        elif med > asked * 1.25:
+            # the arrival rate is derived from UNLOADED service time. under
+            # load the service time rises and in-flight rises with it, so
+            # overshoot is the direction this design biases toward. warning
+            # on only the other direction let a run labeled "30 concurrent"
+            # that actually held 65 go out clean.
+            out["warning"] = (
+                f"the run asked to hold {asked} requests in flight and held "
+                f"about {med:.0f}. the arrival rate was derived from service "
+                "time measured without load, and service time rises under "
+                "load, so the run carried more than the label says. treat "
+                f"the load level as {med:.0f}, not {asked}.")
+    return out
+
+
 def _sent_at(r: dict) -> float | None:
     """When the client began sending this request.
 
@@ -43,11 +106,60 @@ def _pct_table(values: list[float | None]) -> dict:
     return out
 
 
+def _answered(r: dict) -> bool:
+    """Did this request actually produce an answer?
+
+    Transport success is not answer success. A reasoning model that spends
+    its whole token budget thinking returns HTTP 200, a well formed stream,
+    a finish reason, and nothing a user could read.
+
+    Truncation deliberately does NOT disqualify. This harness sets max_tokens
+    to the sampled output size on purpose, so finish_reason "length" is the
+    normal ending for a run hitting its target output length. Truncation is
+    reported as its own rate instead, because the thing that separates a
+    short answer from no answer is whether visible content appeared at all.
+    """
+    return bool(r.get("visible_content_seen")
+                and r.get("stream_complete")
+                and not r.get("parse_errors"))
+
+
+def _answer_block(ok: list[dict], attempted: int) -> dict | None:
+    """Answer completion, separately from transport success."""
+    if not any("visible_content_seen" in r for r in ok):
+        return None          # rows written before this was recorded
+    n_ok = len(ok)
+    complete = sum(1 for r in ok if _answered(r))
+    out = {
+        "attempted": attempted,
+        "transport_ok": n_ok,
+        "complete_answers": complete,
+        "no_visible_content": sum(
+            1 for r in ok if not r.get("visible_content_seen")),
+        "stream_incomplete": sum(
+            1 for r in ok if not r.get("stream_complete")),
+        "parse_errors": sum(1 for r in ok if r.get("parse_errors")),
+        "truncated": sum(1 for r in ok if r.get("truncated")),
+        "answer_rate": round(complete / attempted, 6) if attempted else None,
+        "note": "truncation is not counted as a failure. the harness caps "
+                "max_tokens at the sampled output size, so ending on "
+                "\"length\" is the expected way to hit a target output "
+                "length. producing no visible content is the failure.",
+    }
+    if complete == 0 and n_ok:
+        out["invalid"] = (
+            f"not one of the {n_ok} requests that returned HTTP 200 produced "
+            "visible content. there is no latency-to-answer in this run and "
+            "nothing here is a performance result.")
+    return out
+
+
 def summarize(results: list[dict], schedule_meta: dict | None = None,
               run_meta: dict | None = None,
               acceptance: dict | None = None,
               ttft_definition: str = "first_content",
-              pricing: dict | None = None) -> dict:
+              pricing: dict | None = None,
+              concurrency_target: int | None = None) -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
 
@@ -176,10 +288,21 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": run_meta or {},
     }
+    answers = _answer_block(ok, len(results))
+    if answers:
+        summary["answers"] = answers
     for fld in ("ttfr_ms", "ttfv_ms"):
         vals = [r.get(fld) for r in ok]
         if any(v is not None for v in vals):
             summary[fld] = _pct_table(vals)
+            # a reasoning model that runs out of max_tokens mid-thought
+            # returns a successful response with no visible token at all.
+            # those rows carry no ttfv, so the percentiles above describe
+            # only the requests that finished thinking soonest. that is the
+            # same survivorship the error path already guards against, and
+            # it is worse here because nothing failed.
+            summary[fld]["missing"] = sum(1 for v in vals if v is None)
+            summary[fld]["of"] = len(vals)
     reason_vals = [r.get("reasoning_tokens") for r in ok]
     if any(v is not None for v in reason_vals):
         total = sum(v for v in reason_vals if v)
@@ -292,6 +415,11 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 "than blocking the dispatcher."
 ),
         }
+
+    conc = _concurrency_block(ok, concurrency_target
+                              or (run_meta or {}).get("concurrency_target"))
+    if conc:
+        summary["concurrency"] = conc
 
     summary["drift"] = _drift_block(ok, failed)
 
@@ -635,8 +763,17 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
                                                 as SLA failures
       success_rate: 0.9999
     """
-    out: dict = {"targets_source": "profile acceptance_targets",
-                "ttft_definition": ttft_definition}
+    stated = acceptance.get("targets_are")
+    illustrative = bool(acceptance.get("note")
+                        and "illustrative" in str(acceptance["note"]).lower())
+    out: dict = {"targets_source": stated or "the run configuration",
+                 "ttft_definition": ttft_definition}
+    if illustrative:
+        out["targets_warning"] = (
+            f"these targets came from {out['targets_source']} and are "
+            "illustrative, so the pass and fail marks below score against "
+            "example numbers rather than yours. pass your own with "
+            "--ttft-p95 and --ttfg-p95, or put them in your profile.")
 
     def score(name, table_key, targets):
         rows = []
@@ -651,6 +788,15 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
 
     ttft_key = "ttft_ms" if ttft_definition == "first_content" else "ttfv_ms"
     score("ttft_vs_target", ttft_key, acceptance.get("ttft_ms"))
+    _miss = (summary.get(ttft_key) or {}).get("missing") or 0
+    _of = (summary.get(ttft_key) or {}).get("of") or 0
+    if _of and _miss / _of > 0.05:
+        out["coverage_warning"] = (
+            f"{_miss} of {_of} successful requests never produced the token "
+            f"this scores ({ttft_key}), so the marks below describe the "
+            f"{_of - _miss} that did. those are the fastest ones. raise the "
+            "output token budget until responses stop truncating, then "
+            "re-run.")
     score("ttfg_vs_target", "e2e_ms", acceptance.get("ttfg_ms"))
 
     hard = acceptance.get("hard_timeouts") or {}
@@ -671,6 +817,11 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
             inter_breaches += 1
         if over_time or over_inter:
             failing.add(idx)
+        # a request that came back 200 with nothing readable is not a
+        # success at any target. rows written before this was recorded
+        # do not carry the field, and are left alone.
+        if "visible_content_seen" in r and not _answered(r):
+            failing.add(idx)
     out["hard_timeout_breaches"] = timeouts
     if inter_cap is not None:
         out["interchunk_breaches"] = inter_breaches
@@ -682,7 +833,8 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
             "target": target_sr,
             "actual": round(actual_sr, 6),
             "met": actual_sr >= target_sr,
-            "note": "failures, hard-timeout breaches, and interchunk breaches "
+            "note": "failures, hard-timeout breaches, interchunk breaches, "
+                    "and responses that returned 200 with no visible content "
                     "count against it",
         }
     return out
@@ -753,6 +905,9 @@ def render_markdown(summary: dict, title: str) -> str:
     _cw = (s.get("client") or {}).get("warning")
     if _cw:
         cautions += [f"CAUTION (client saturation): {_cw}", ""]
+    _nw = (s.get("concurrency") or {}).get("warning")
+    if _nw:
+        cautions += [f"CAUTION (concurrency not reached): {_nw}", ""]
 
     lines = [
         f"# {title}",
@@ -817,6 +972,13 @@ def render_markdown(summary: dict, title: str) -> str:
             f"from ttft/ttfb/ttfg, do not subtract it again. a handshake is "
             f"several round trips, so it is not the per-request network cost "
             f"of a pooled production client, it is an upper bound on it")
+    cc = s.get("concurrency") or {}
+    if cc.get("in_flight_p50") is not None:
+        askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
+        lines.append(
+            f"- concurrency actually in flight: p50 {cc['in_flight_p50']:.0f}, "
+            f"high sample {cc['in_flight_max_sampled']:.0f}{askd} "
+            f"({cc['measured_over']})")
     lb = s.get("latency_basis")
     if lb:
         lines.append(f"- latency basis: {lb}")
@@ -869,18 +1031,40 @@ def render_markdown(summary: dict, title: str) -> str:
     if merge_note:
         lines += ["", merge_note]
 
+    a = s.get("answers")
+    if a:
+        lines += ["", "## answers",
+                  "", f"- attempted: {a['attempted']}",
+                  f"- returned HTTP 200: {a['transport_ok']}",
+                  f"- produced a readable answer: {a['complete_answers']} "
+                  f"({a['answer_rate']:.1%} of attempted)"
+                  if a.get("answer_rate") is not None else
+                  f"- produced a readable answer: {a['complete_answers']}",
+                  f"- returned 200 with no visible content: "
+                  f"{a['no_visible_content']}",
+                  f"- ended on the token cap: {a['truncated']}",
+                  "", a["note"]]
+        if a.get("invalid"):
+            lines += ["", f"INVALID: {a['invalid']}"]
+
     sla = s.get("sla")
     if sla:
-        _tgt_src = "run config" if mode == "prompts" else "profile config"
-        lines += ["", f"## SLA scorecard (targets from the {_tgt_src})",
-                  "", "| metric | quantile | target ms | actual ms | met |",
+        _tgt_src = sla.get("targets_source") or "the run configuration"
+        lines += ["", f"## SLA scorecard (targets from {_tgt_src})"]
+        if sla.get("targets_warning"):
+            lines += ["", f"CAUTION (targets): {sla['targets_warning']}"]
+        if sla.get("coverage_warning"):
+            lines += ["", f"CAUTION (coverage): {sla['coverage_warning']}"]
+        lines += ["", "| metric | quantile | target ms | actual ms | met |",
                   "|---|---|---|---|---|"]
         for name, key in (("TTFT", "ttft_vs_target"),
                           ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
                 met = {True: "yes", False: "NO", None: "-"}[r["met"]]
+                act = r["actual_ms"] if r["actual_ms"] is not None \
+                    else "not measured"
                 lines.append(f"| {name} | {r['quantile']} | {r['target_ms']} "
-                             f"| {r['actual_ms']} | {met} |")
+                             f"| {act} | {met} |")
         lines.append(f"| hard timeout breaches | - | - | "
                      f"{sla.get('hard_timeout_breaches', 0)} | "
                      f"{'yes' if not sla.get('hard_timeout_breaches') else 'NO'} |")
@@ -893,12 +1077,41 @@ def render_markdown(summary: dict, title: str) -> str:
             lines.append(f"| success rate | - | {sr['target']} | "
                          f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
 
+        # report.md is the file that gets pasted into an email, so it needs
+        # the same verdict the html shows. a target with no measurement
+        # behind it is not a pass.
+        _rows = [r for k in ("ttft_vs_target", "ttfg_vs_target")
+                 for r in (sla.get(k) or [])]
+        _miss_n = sum(1 for r in _rows if r["met"] is False)
+        _unmeas = sum(1 for r in _rows
+                      if r["met"] is None and r.get("target_ms") is not None)
+        if (s.get("answers") or {}).get("invalid"):
+            _verdict = "INVALID, see above. nothing here is a latency result"
+        elif _miss_n:
+            _verdict = (f"{_miss_n} acceptance target"
+                        f"{'s' if _miss_n != 1 else ''} missed")
+        elif _unmeas or sla.get("coverage_warning"):
+            _verdict = (f"not scored. {_unmeas} target"
+                        f"{'s' if _unmeas != 1 else ''} had no measurement "
+                        "behind them, which is not a pass")
+        else:
+            _verdict = "meets every acceptance target"
+        lines += ["", f"verdict: {_verdict}"]
+
     if s.get("ttfr_ms"):
         tft = s["ttft_ms"].get("p50")
-        tfv = (s.get("ttfv_ms") or {}).get("p50")
-        vis = (f"ttfv (first visible token) p50 {tfv:.0f} ms"
-               if tfv is not None else
-               "some requests emitted no visible content within max_tokens")
+        _v = s.get("ttfv_ms") or {}
+        tfv = _v.get("p50")
+        _miss, _of = _v.get("missing") or 0, _v.get("of") or 0
+        if tfv is None:
+            vis = "no request emitted visible content within max_tokens"
+        elif _miss:
+            vis = (f"ttfv (first visible token) p50 {tfv:.0f} ms, but over "
+                   f"only the {_of - _miss} of {_of} requests that produced "
+                   "visible content. the rest ran out of output tokens still "
+                   "reasoning, so that p50 is the fastest subset, not the run")
+        else:
+            vis = f"ttfv (first visible token) p50 {tfv:.0f} ms"
         lines += ["", "note: reasoning model detected. ttft (first token of "
                   f"either kind) p50 {tft:.0f} ms. {vis}. agree which "
                   "definition the SLA scores via ttft_definition in the run "
@@ -1082,11 +1295,14 @@ def render_html(summary: dict, title: str) -> str:
     if sla:
         rows = []
         misses = 0
+        unmeasured = 0
         for name, key in (("TTFT", "ttft_vs_target"), ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
                 met = r["met"]
                 if met is False:
                     misses += 1
+                elif met is None and r.get("target_ms") is not None:
+                    unmeasured += 1
                 cls = "yes" if met else ("no" if met is False else "na")
                 cell = {True: "PASS", False: "NO", None: "-"}[met]
                 rows.append(
@@ -1146,16 +1362,32 @@ def render_html(summary: dict, title: str) -> str:
         sla_html = (
             f"<div class='card'><h2>SLA scorecard "
             f"(TTFT scored on {defn})</h2>"
-            f"<div class='cap'>target and actual share each row's unit, shown "
-            f"in the metric name</div><table>"
+            f"<div class='cap'>targets from {esc(sla.get('targets_source') or 'the run configuration')}. "
+            f"target and actual share each row's unit, shown in the metric "
+            f"name</div>"
+            + (f"<div class='banner warn'>{esc(sla['targets_warning'])}</div>"
+               if sla.get("targets_warning") else "")
+            + (f"<div class='banner warn'>{esc(sla['coverage_warning'])}</div>"
+               if sla.get("coverage_warning") else "")
+            + "<table>"
             f"<tr><th class='lbl'>metric</th><th>target</th><th>actual</th>"
             f"<th>result</th></tr>{''.join(rows)}</table>{slanote}</div>")
-        if misses == 0:
-            banner = ("<div class='banner ok'>Meets every acceptance target"
-                      "</div>")
-        else:
+        # a target with no measurement behind it is not a pass. scoring it
+        # as one is how a run with zero readable answers rendered green.
+        invalid = (s.get("answers") or {}).get("invalid")
+        if invalid:
+            banner = f"<div class='banner bad'>INVALID: {esc(invalid)}</div>"
+        elif misses:
             banner = (f"<div class='banner bad'>{misses} acceptance "
                       f"target{'s' if misses != 1 else ''} missed</div>")
+        elif unmeasured or sla.get("coverage_warning"):
+            banner = ("<div class='banner warn'>Not scored: "
+                      f"{unmeasured} target{'s' if unmeasured != 1 else ''} "
+                      "had no measurement behind them. this is not a pass"
+                      "</div>")
+        else:
+            banner = ("<div class='banner ok'>Meets every acceptance target"
+                      "</div>")
 
     # ---- latency table ----
     lat = []
@@ -1252,6 +1484,13 @@ def render_html(summary: dict, title: str) -> str:
         bel.append(f"<li><b>Request params</b>: temperature "
                    f"{esc(str(rp.get('temperature')))}, max_tokens cap "
                    f"{esc(str(rp.get('max_output_tokens_cap')))}{extra}</li>")
+    cc = s.get("concurrency") or {}
+    if cc.get("in_flight_p50") is not None:
+        askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
+        bel.append(f"<li><b>Concurrency in flight</b>: p50 "
+                   f"{cc['in_flight_p50']:.0f}, peak "
+                   f"{cc['in_flight_max_sampled']:.0f}{askd} "
+                   f"({esc(cc['measured_over'])})</li>")
     lb = s.get("latency_basis")
     if lb:
         bel.append(f"<li><b>Latency basis</b>: {esc(lb)}</li>")
@@ -1356,6 +1595,9 @@ def render_html(summary: dict, title: str) -> str:
     cw = (s.get("client") or {}).get("warning")
     if cw:
         sample_banner += f"<div class='banner warn'>{esc(cw)}</div>"
+    nw = (s.get("concurrency") or {}).get("warning")
+    if nw:
+        sample_banner += f"<div class='banner warn'>{esc(nw)}</div>"
 
     drift = s.get("drift") or {}
     if drift.get("windows") or drift.get("drift_kind"):

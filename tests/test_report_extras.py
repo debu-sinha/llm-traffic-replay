@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import random
 
+from traffic_replay import __version__
 from traffic_replay.metrics import (_drift_block, render_html,
                                     render_markdown, summarize)
 
@@ -223,7 +224,9 @@ def test_report_states_which_harness_version_and_latency_basis():
     """A 0.2.x TTFT included connection setup and a 0.3.x TTFT does not, so a
     report has to say which it is before anyone puts two in one column."""
     s = summarize(_rows(120))
-    assert s["harness_version"].startswith("0.3")
+    # pinned to the package, not a literal, so a version bump does not
+    # need a test edit and cannot silently stop being stamped
+    assert s["harness_version"] == __version__
     assert "NOT included" in s["latency_basis"]
     assert "latency basis" in render_markdown(s, "v")
     assert "Latency basis" in render_html(s, "v")
@@ -747,3 +750,232 @@ def test_the_client_stamps_first_send_on_every_return_path():
                  intended=(0, 0, None, 0), chars_sent=2)
     assert r2.ok is False
     assert r2.first_send_unix is not None
+
+
+# ---- concurrency actually reached -----------------------------------------
+
+def _spans(n, start_rate, service_s, t0=1_000_000.0):
+    """Rows whose send times and durations produce a known overlap."""
+    return [{"ok": True, "scheduled_s": i / start_rate,
+             "t_send_unix": t0 + i / start_rate,
+             "first_send_unix": t0 + i / start_rate,
+             "ttft_ms": 100.0, "ttfb_ms": 1.0, "e2e_ms": service_s * 1000.0,
+             "connect_ms": 8.0, "dispatch_lag_ms": 4.0,
+             "prompt_tokens": 100, "completion_tokens": 10}
+            for i in range(n)]
+
+
+def test_concurrency_measures_actual_overlap():
+    """20 rps against a 1.5s service time is 30 in flight by construction."""
+    from traffic_replay.metrics import _concurrency_block
+    rows = _spans(600, start_rate=20.0, service_s=1.5)
+    c = _concurrency_block(rows, asked=30)
+    assert 28 <= c["in_flight_p50"] <= 32
+    assert "warning" not in c            # it reached what it asked for
+
+
+def test_concurrency_warns_when_the_load_never_arrived():
+    """The real failure: the endpoint sheds, so the run holds a fraction of
+    what was asked and every latency number describes the lighter load."""
+    from traffic_replay.metrics import _concurrency_block
+    rows = _spans(600, start_rate=20.0, service_s=0.15)   # only ~3 in flight
+    c = _concurrency_block(rows, asked=30)
+    assert c["in_flight_p50"] < 10
+    assert "asked to hold 30" in c["warning"]
+    assert "not carrying the concurrency on the label" in c["warning"]
+
+
+def test_concurrency_caution_renders_above_the_tables():
+    rows = _spans(600, start_rate=20.0, service_s=0.15)
+    s = summarize(rows, concurrency_target=30)
+    md = render_markdown(s, "conc")
+    assert md.index("CAUTION (concurrency not reached)") < md.index("| metric (ms) |")
+    assert "banner warn" in render_html(s, "conc")
+
+
+def test_concurrency_is_reported_even_when_it_was_reached():
+    rows = _spans(600, start_rate=20.0, service_s=1.5)
+    s = summarize(rows, concurrency_target=30)
+    assert "concurrency" in s
+    assert "concurrency actually in flight" in render_markdown(s, "c")
+    assert "Concurrency in flight" in render_html(s, "c")
+
+
+def test_no_concurrency_block_without_enough_rows():
+    from traffic_replay.metrics import _concurrency_block
+    assert _concurrency_block(_spans(1, 20.0, 1.0), asked=30) is None
+
+
+# ---- whose SLA targets are these ------------------------------------------
+
+def test_the_scorecard_names_where_its_targets_came_from():
+    rows = _rows(120)
+    s = summarize(rows, acceptance={"targets_are": "yours, passed on the "
+                                                   "command line",
+                                    "ttft_ms": {"p95": 900}})
+    assert s["sla"]["targets_source"] == "yours, passed on the command line"
+    assert "targets_warning" not in s["sla"]
+    assert "targets from yours" in render_markdown(s, "sla")
+
+
+def test_illustrative_targets_are_flagged_so_they_do_not_read_as_yours():
+    """A bundled profile ships example targets. Scoring MET and MISS against
+    them without saying so invites someone to act on placeholder numbers."""
+    rows = _rows(120)
+    s = summarize(rows, acceptance={"ttft_ms": {"p95": 900},
+                                    "note": "illustrative targets. replace "
+                                            "with the ones you agreed."})
+    assert "illustrative" in s["sla"]["targets_warning"]
+    md = render_markdown(s, "sla")
+    assert "CAUTION (targets)" in md
+    assert "banner warn" in render_html(s, "sla")
+
+
+def test_naming_the_source_does_not_suppress_the_illustrative_warning():
+    """The runner now stamps targets_are on every run. The warning used to be
+    conditional on that field being absent, so stamping it would have silently
+    retired the one thing stopping a reader from acting on example numbers."""
+    rows = _rows(120)
+    s = summarize(rows, acceptance={"targets_are": "this profile",
+                                    "ttft_ms": {"p95": 900},
+                                    "note": "illustrative targets. replace "
+                                            "with the ones you agreed."})
+    assert s["sla"]["targets_source"] == "this profile"
+    assert "illustrative" in s["sla"]["targets_warning"]
+    assert "CAUTION (targets)" in render_markdown(s, "sla")
+
+
+# ---- reasoning truncation makes ttfv a survivor number --------------------
+
+def _reasoning_rows(n_visible, n_truncated):
+    """Successful rows. The truncated ones ran out of output tokens while
+    still reasoning, so they carry a ttfr but never a ttfv."""
+    rows = []
+    for i in range(n_visible):
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 900.0,
+                     "ttfr_ms": 900.0, "ttfv_ms": 8000.0 + i,
+                     "e2e_ms": 13000.0, "finish_reason": "stop"})
+    for i in range(n_truncated):
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 900.0,
+                     "ttfr_ms": 900.0, "ttfv_ms": None,
+                     "e2e_ms": 23000.0, "finish_reason": "length"})
+    for i, r in enumerate(rows):
+        r["t_send_unix"] = 1_700_000_000.0 + i * 0.25
+        r["first_send_unix"] = r["t_send_unix"]
+    return rows
+
+
+def test_ttfv_percentiles_say_how_many_requests_they_leave_out():
+    s = summarize(_reasoning_rows(55, 132))
+    assert s["ttfv_ms"]["missing"] == 132
+    assert s["ttfv_ms"]["of"] == 187
+    note = render_markdown(s, "note")
+    assert "55 of 187" in note
+    assert "fastest subset" in note
+
+
+def test_scoring_first_visible_warns_when_most_requests_never_got_there():
+    """The scorecard grades TTFT against ttfv when the SLA scores the first
+    visible token. Marking MET or MISS off the 29% that finished thinking
+    would read as a verdict on the whole run."""
+    s = summarize(_reasoning_rows(55, 132),
+                  acceptance={"ttft_ms": {"p50": 500}},
+                  ttft_definition="first_visible")
+    w = s["sla"]["coverage_warning"]
+    assert "132 of 187" in w and "ttfv_ms" in w
+    assert "CAUTION (coverage)" in render_markdown(s, "sla")
+    assert "banner warn" in render_html(s, "sla")
+
+
+def test_no_coverage_warning_when_every_request_produced_visible_text():
+    s = summarize(_reasoning_rows(120, 0),
+                  acceptance={"ttft_ms": {"p50": 500}},
+                  ttft_definition="first_visible")
+    assert "coverage_warning" not in s["sla"]
+    assert s["ttfv_ms"]["missing"] == 0
+
+
+# ---- transport success is not answer success ------------------------------
+
+def _answer_rows(answered, silent, truncated_but_visible=0):
+    """Rows as the client now writes them. `silent` returned HTTP 200 with a
+    well formed stream and nothing readable, which is what a reasoning model
+    does when it spends the whole budget thinking."""
+    rows = []
+    for _ in range(answered):
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 900.0,
+                     "ttfv_ms": 950.0, "e2e_ms": 1200.0,
+                     "stream_complete": True, "visible_content_seen": True,
+                     "truncated": False, "parse_errors": 0,
+                     "finish_reason": "stop"})
+    for _ in range(truncated_but_visible):
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 900.0,
+                     "ttfv_ms": 950.0, "e2e_ms": 1200.0,
+                     "stream_complete": True, "visible_content_seen": True,
+                     "truncated": True, "parse_errors": 0,
+                     "finish_reason": "length"})
+    for _ in range(silent):
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 900.0,
+                     "ttfv_ms": None, "e2e_ms": 1200.0,
+                     "stream_complete": True, "visible_content_seen": False,
+                     "truncated": True, "parse_errors": 0,
+                     "finish_reason": "length"})
+    for i, r in enumerate(rows):
+        r["t_send_unix"] = 1_700_000_000.0 + i * 0.25
+        r["first_send_unix"] = r["t_send_unix"]
+    return rows
+
+
+def test_a_200_with_no_visible_content_is_not_a_successful_answer():
+    s = summarize(_answer_rows(answered=55, silent=132))
+    a = s["answers"]
+    assert a["transport_ok"] == 187
+    assert a["complete_answers"] == 55
+    assert a["no_visible_content"] == 132
+    assert a["answer_rate"] == round(55 / 187, 6)
+
+
+def test_silent_responses_count_against_the_success_rate():
+    """The defect this guards: 187 requests, zero errors, zero readable
+    answers, reported as a 100 percent success rate."""
+    s = summarize(_answer_rows(answered=0, silent=100),
+                  acceptance={"success_rate": 0.99})
+    assert s["sla"]["success_rate"]["actual"] == 0.0
+    assert s["sla"]["success_rate"]["met"] is False
+
+
+def test_truncation_alone_is_not_a_failure():
+    """The harness caps max_tokens at the sampled output size on purpose, so
+    finishing on "length" is how a run hits its target output length."""
+    s = summarize(_answer_rows(answered=0, silent=0, truncated_but_visible=50),
+                  acceptance={"success_rate": 0.99})
+    assert s["answers"]["truncated"] == 50
+    assert s["answers"]["complete_answers"] == 50
+    assert s["sla"]["success_rate"]["met"] is True
+
+
+def test_a_run_with_no_answers_at_all_renders_invalid_not_green():
+    s = summarize(_answer_rows(answered=0, silent=80),
+                  acceptance={"ttft_ms": {"p50": 500}},
+                  ttft_definition="first_visible")
+    assert "invalid" in s["answers"]
+    html = render_html(s, "no answers")
+    assert "INVALID" in html
+    assert "Meets every acceptance target" not in html
+    md = render_markdown(s, "no answers")
+    assert "verdict: INVALID" in md
+
+
+def test_an_unmeasured_target_is_not_scored_as_a_pass():
+    """met is None used to count as a pass, so a target with nothing behind
+    it rendered the green banner."""
+    # p75 is not one of the quantiles the summary computes, so this target
+    # has no measurement behind it while the run itself is healthy
+    s = summarize(_answer_rows(answered=40, silent=0),
+                  acceptance={"ttft_ms": {"p50": 5000, "p75": 5000}})
+    rows = [r for k in ("ttft_vs_target", "ttfg_vs_target")
+            for r in s["sla"][k]]
+    assert any(r["met"] is None for r in rows), "need an unmeasured row"
+    html = render_html(s, "partial")
+    assert "Meets every acceptance target" not in html
+    assert "not measured" in render_markdown(s, "partial")

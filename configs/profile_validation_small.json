@@ -1,8 +1,17 @@
 {
   "name": "validation_small",
-  "input_tokens":  {"p50": 2400, "p95": 7200},
-  "output_tokens": {"p50": 12,   "p95": 24},
-  "cache_fraction": {"p50": 0.60, "p95": 0.87},
-  "provenance": "Scaled-down profile for instrument validation and smoke tests. Same shape family as the customer profile, smaller sizes so runs are fast and cheap.",
+  "input_tokens": {
+    "p50": 2400,
+    "p95": 7200
+  },
+  "output_tokens": {
+    "p50": 12,
+    "p95": 24
+  },
+  "cache_fraction": {
+    "p50": 0.6,
+    "p95": 0.87
+  },
+  "provenance": "Scaled-down profile for instrument validation and smoke tests. Same shape family as the bundled agent profiles, smaller sizes so runs are fast and cheap.",
   "label": "VALIDATION/SMOKE ONLY: never quote latency from this profile as a production result."
 }

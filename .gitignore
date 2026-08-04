@@ -6,3 +6,13 @@ results/
 build/
 dist/
 .venv/
+
+# profiles built from real logs. the README writes these into configs/, and
+# pack_notebook globs configs/*.json into the notebook payload, so an
+# unignored one would ship a customer's traffic quantiles inside a shareable
+# artifact.
+configs/*_real.json
+configs/profile_real*.json
+
+# quickstart writes the workspace host and endpoint name here
+configs/quickstart.json

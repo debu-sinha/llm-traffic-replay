@@ -14,6 +14,6 @@
   "calibrate_n": 2,
   "max_output_tokens_cap": 300,
   "acceptance_targets": {"ttft_ms": {"p50": 1500, "p95": 3000}, "success_rate": 0.99},
-  "out_dir": "results/decagon_prompts",
-  "title": "decagon prompts-mode run"
+  "out_dir": "results/agent_prompts",
+  "title": "agent prompts-mode run"
 }

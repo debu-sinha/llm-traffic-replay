@@ -2,13 +2,12 @@
 
 ## Decide what to do about the customer name in git history
 
-The working tree is scrubbed. The git HISTORY is not, and it carries strictly
-more than the working tree ever did. Nine commits back to the initial commit
-reference the customer by name, and the old blobs additionally hold their
-serving topology, a third party's utilization figure attributed to them, and
-their stated rate anchors. The specifics are not repeated here, because this
-file is tracked and public and quoting them would undo the scrub it describes.
-Read the old blobs directly if you need the list.
+The working tree is scrubbed. Earlier history is not, and it carries
+customer-identifying and commercially sensitive material that the working
+tree never should have held. Neither the specifics nor where to find them
+are recorded here: this file is tracked and public, and a description
+precise enough to be useful is also precise enough to be a map. The owner
+knows what it is.
 
 That history is on a public remote. Anyone running `git log -p`, opening a
 commit permalink, or cloning the repo sees all of it, so the working-tree

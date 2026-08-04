@@ -101,25 +101,13 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     true_peak, _ = _sweep(spans, min(a for a, _ in spans),
                           max(b for _, b in spans))
 
-    events: list[tuple[float, int]] = []
-    for a, b in spans:
-        a2, b2 = max(a, lo), min(b, hi)
-        if b2 > a2:
-            events.append((a2, 1))
-            events.append((b2, -1))
-    if not events:
+    # the SAME edge-aware sweep, over the measurement window. an earlier
+    # version added the sweep and then used it only for the peak, leaving
+    # the percentiles on a loop that began at the first event, so leading
+    # and trailing idle time inside the window still went uncounted.
+    peak, held = _sweep(spans, lo, hi)
+    if not held:
         return None
-    events.sort()
-
-    cur = peak = 0
-    prev = events[0][0]
-    held: dict[int, float] = {}
-    for t, delta in events:
-        if t > prev:
-            held[cur] = held.get(cur, 0.0) + (t - prev)
-        cur += delta
-        peak = max(peak, cur)
-        prev = t
     total = sum(held.values())
     if total <= 0:
         return None
@@ -266,32 +254,58 @@ def _verdict(s: dict) -> tuple[str, str]:
         doubts.append("the load did not reach the endpoint on schedule")
     # the SLA rows score service time. if the caller waited materially
     # longer, a PASS on those rows describes the endpoint and not the user.
-    _u = (s.get("e2e_ms") or {}).get("p95")
-    _c = (s.get("e2e_corrected_ms") or {}).get("p95")
-    if _u and _c and _c > _u * 1.10:
-        doubts.append(
-            f"callers waited {_c:.0f} ms at p95 against {_u:.0f} ms of "
-            "endpoint time, so the targets above were scored on service "
-            "time rather than on what a caller experienced")
+    for _base, _corr, _name in (("e2e_ms", "e2e_corrected_ms", "end to end"),
+                                ("ttft_ms", "ttft_corrected_ms", "TTFT")):
+        _u = (s.get(_base) or {}).get("p95")
+        _c = (s.get(_corr) or {}).get("p95")
+        if _u and _c and _c > _u * 1.10:
+            doubts.append(
+                f"callers waited {_c:.0f} ms for {_name} at p95 against "
+                f"{_u:.0f} ms of endpoint time, so the targets above were "
+                "scored on service time rather than on what a caller "
+                "experienced")
+            break
     if (s.get("throughput") or {}).get("coverage_warning"):
         doubts.append("token usage was missing on many responses, so "
                       "throughput and cost cover a subset")
+    _cap = a.get("truncated_by_global_cap") or 0
+    _scored_n = a.get("scored") or 0
+    if _scored_n and _cap / _scored_n > 0.05:
+        doubts.append(
+            f"{_cap} of {_scored_n} responses were cut short by "
+            "max_output_tokens_cap rather than by their own target, so the "
+            "run did not reproduce the profile's output sizes and "
+            "end-to-end is correspondingly short")
     dk = (s.get("drift") or {}).get("drift_kind")
     if dk and dk not in ("stable",):
         doubts.append(f"latency was {dk} across the run")
     # a scored target on a quantile the sample cannot support is not a pass
     _samp = s.get("sample") or {}
     _weak = set(_samp.get("indicative_only") or [])
+    # the sample gate counts successful requests, but the SCORED metric can
+    # be missing on some of them. re-derive the floor from the number of
+    # values actually behind the table this target reads.
+    _need = {"p50": 20, "p90": 100, "p95": 200, "p99": 1000}
+    _defn = sla.get("ttft_definition") or "first_content"
+    _key = "ttft_ms" if _defn == "first_content" else "ttfv_ms"
+    _n_scored = (s.get(_key) or {}).get("n") or 0
+    if _n_scored:
+        _weak |= {q for q, need in _need.items() if _n_scored < need}
     _scored_weak = sorted({r["quantile"] for r in rows
                            if r["quantile"] in _weak})
     if _scored_weak:
         doubts.append(f"{', '.join(_scored_weak)} scored on "
                       f"{_samp.get('n')} requests, which cannot support "
                       f"{'that quantile' if len(_scored_weak) == 1 else 'those quantiles'}")
+    _had_targets = bool(rows or sla.get("success_rate"))
+    _lead = ("met every acceptance target, but " if _had_targets
+             else "no acceptance targets were given, and ")
     if doubts:
-        return "caution", ("met every acceptance target, but " +
-                           ", and ".join(doubts) + ". read those before "
-                           "quoting this run")
+        return "caution", (_lead + ", and ".join(doubts)
+                           + ". read those before quoting this run")
+    if not _had_targets:
+        return "caution", ("no acceptance targets were given, so nothing was "
+                           "scored. pass your own to get a verdict")
     return "ok", "meets every acceptance target"
 
 
@@ -477,7 +491,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # how many successful responses actually reported usage. a run where
     # only a tenth of them do would otherwise understate token throughput
     # and per-token cost tenfold with nothing said about it.
-    usage_n = sum(1 for r in ok if r.get("prompt_tokens") is not None)
+    usage_n = sum(1 for r in ok
+                  if r.get("prompt_tokens") is not None
+                  and r.get("completion_tokens") is not None)
     usage_coverage = (usage_n / len(ok)) if ok else None
 
     summary = {
@@ -1345,6 +1361,14 @@ def render_markdown(summary: dict, title: str) -> str:
     if merge_note:
         lines += ["", merge_note]
 
+    # report.md is the file that gets pasted into an email, so it shows the
+    # same verdict the html does, from the same function, whether or not
+    # acceptance targets were given.
+    _kind, _text = _verdict(s)
+    if _kind != "ok" or s.get("sla"):
+        _pre = "INVALID: " if _kind == "invalid" else ""
+        lines += ["", f"verdict: {_pre}{_text}"]
+
     a = s.get("answers")
     if a:
         lines += ["", "## answers",
@@ -1396,11 +1420,6 @@ def render_markdown(summary: dict, title: str) -> str:
             lines.append(f"| success rate | - | {sr['target']} | "
                          f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
 
-        # report.md is the file that gets pasted into an email, so it shows
-        # the same verdict the html does, from the same function.
-        _kind, _text = _verdict(s)
-        _pre = "INVALID: " if _kind == "invalid" else ""
-        lines += ["", f"verdict: {_pre}{_text}"]
 
     if s.get("ttfr_ms"):
         tft = s["ttft_ms"].get("p50")
@@ -1750,13 +1769,17 @@ def render_html(summary: dict, title: str) -> str:
             + "<table>"
             f"<tr><th class='lbl'>metric</th><th>target</th><th>actual</th>"
             f"<th>result</th></tr>{''.join(rows)}</table>{slanote}</div>")
-        # one shared verdict, so report.md and this page cannot disagree
-        vkind, vtext = _verdict(s)
+
+    # one shared verdict, so report.md and this page cannot disagree, and it
+    # renders whether or not acceptance targets were given. a run with no
+    # targets can still be INVALID or carry cautions worth seeing.
+    vkind, vtext = _verdict(s)
+    if vkind != "ok" or sla:
         vcls = {"invalid": "bad", "miss": "bad",
                 "caution": "warn", "ok": "ok"}[vkind]
         vpre = "INVALID: " if vkind == "invalid" else ""
-        cap = vtext[:1].upper() + vtext[1:] if not vpre else vtext
-        banner = f"<div class='banner {vcls}'>{vpre}{esc(cap)}</div>"
+        _cap = vtext[:1].upper() + vtext[1:] if not vpre else vtext
+        banner = f"<div class='banner {vcls}'>{vpre}{esc(_cap)}</div>"
 
     # ---- latency table ----
     lat = []

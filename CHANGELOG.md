@@ -35,9 +35,9 @@ it claimed.
 Enumerating failure modes kept leaving doors open. A run with an 8 percent
 error rate and one passing latency target printed "meets every acceptance
 target". Errors, a client-saturation warning, a concurrency warning, an
-unstable stability verdict, missing coverage on the scored metric, or fewer
-than 100 successful requests each downgrade the verdict to a caution naming
-the reason. Both reports render the same verdict from one function, having
+unstable stability verdict, missing coverage on the scored metric, or a
+sample too small to support the quantile a target is scored on, each
+downgrade the verdict to a caution naming the reason. Both reports render the same verdict from one function, having
 previously disagreed.
 
 ### Numbers that were wrong

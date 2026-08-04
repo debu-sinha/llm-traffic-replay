@@ -1289,3 +1289,93 @@ def test_idle_time_inside_the_window_counts_as_zero_in_flight():
     c = _concurrency_block(rows, None)
     assert c["in_flight_p50"] == 0.0, c
     assert c["in_flight_max"] == 1.0
+
+
+# ---- adversarial: every way a bad run tried to read green ---------------
+
+def _clean(n, **extra):
+    base = 1_700_000_000.0
+    out = []
+    for i in range(n):
+        r = {"ok": True, "phase": "replay", "ttft_ms": 50.0, "e2e_ms": 200.0,
+             "prompt_tokens": 100, "completion_tokens": 10,
+             "stream_complete": True, "visible_content_seen": True,
+             "truncated": False, "parse_errors": 0,
+             "t_send_unix": base + i * 0.1,
+             "first_send_unix": base + i * 0.1}
+        r.update(extra)
+        out.append(r)
+    return out
+
+
+def _v(s):
+    return [x for x in render_markdown(s, "x").splitlines()
+            if x.startswith("verdict:")][0]
+
+
+def test_sparse_concurrency_does_not_claim_a_load_it_never_held():
+    """The edge-aware sweep was added and then used only for the peak, so
+    the percentiles still began at the first event."""
+    from traffic_replay.metrics import _concurrency_block
+    T = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "e2e_ms": 1000.0,
+             "t_send_unix": T + t, "first_send_unix": T + t}
+            for t in (0.0, 4.5, 9.0)]
+    c = _concurrency_block(rows, None)
+    assert c["in_flight_p50"] == 0.0, c
+    # and a genuinely steady run still reads steady
+    steady = [{"ok": True, "phase": "replay", "e2e_ms": 5000.0,
+               "t_send_unix": T + i * 0.1,
+               "first_send_unix": T + i * 0.1} for i in range(100)]
+    assert _concurrency_block(steady, None)["in_flight_p50"] == 50.0
+
+
+def test_a_ttft_target_scored_on_service_time_is_caught():
+    """The caller-latency gate compared only end-to-end, so a TTFT target
+    could pass while the caller's first token was far later."""
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(300):
+        sched = i * 0.1
+        lag = 0.0 if i < 150 else 2.0
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 50.0,
+                     "e2e_ms": 30000.0, "scheduled_s": sched,
+                     "t_send_unix": base + sched + lag,
+                     "first_send_unix": base + sched + lag,
+                     "prompt_tokens": 100, "completion_tokens": 10,
+                     "stream_complete": True, "visible_content_seen": True,
+                     "truncated": False, "parse_errors": 0})
+    s = summarize(rows, acceptance={"ttft_ms": {"p95": 500}})
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    assert "callers waited" in _v(s)
+
+
+def test_usage_missing_only_on_the_output_side_is_still_partial():
+    """Coverage keyed on prompt_tokens alone, so a response reporting input
+    and not output counted as full coverage while halving throughput."""
+    rows = _clean(200)
+    for i, r in enumerate(rows):
+        if i % 2:
+            r.pop("completion_tokens")
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 5000}})
+    assert s["throughput"]["usage_coverage"] == 0.5
+    assert "Meets every acceptance target" not in render_html(s, "x")
+
+
+def test_a_run_clipped_by_the_global_cap_is_not_green():
+    """Truncation at a request's own target is the replay working. Truncation
+    by the global cap means the output distribution was never reproduced."""
+    rows = _clean(200, truncated=True, intended_output_tokens=200,
+                  max_tokens_requested=64)
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 5000}})
+    assert s["answers"]["truncated_by_global_cap"] == 200
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    assert "cut short by max_output_tokens_cap" in _v(s)
+
+
+def test_a_run_with_no_targets_still_gets_a_verdict():
+    """Both renderers computed the verdict inside the SLA branch, so a run
+    with no acceptance targets showed none at all."""
+    s = summarize(_clean(300))
+    assert "no acceptance targets" in _v(s)
+    assert "banner" in render_html(s, "x")

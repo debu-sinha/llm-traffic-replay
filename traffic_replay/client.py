@@ -21,6 +21,7 @@ from __future__ import annotations
 import http.client
 import json
 import ssl
+import threading
 import time
 import urllib.parse
 import uuid
@@ -122,6 +123,7 @@ class EndpointClient:
         self.token = token
         self._refresh = refresh
         self._refreshed = 0
+        self._lock = threading.Lock()
         u = urllib.parse.urlparse(cfg.base_url)
         self.scheme = u.scheme or "https"
         self.host = u.hostname
@@ -190,8 +192,9 @@ class EndpointClient:
                     "Accept": "text/event-stream",
                     "X-Request-Id": request_id,
                 }
-                if self.token:
-                    headers["Authorization"] = f"Bearer {self.token}"
+                tok_used = self.token
+                if tok_used:
+                    headers["Authorization"] = f"Bearer {tok_used}"
 
                 body = self._body(messages, max_tokens, include_usage)
                 t_send = time.monotonic()
@@ -210,23 +213,42 @@ class EndpointClient:
                     attempt -= 1
                     continue
 
-                if resp.status in (401, 403) and self._refresh \
-                        and self._refreshed < _MAX_TOKEN_REFRESH:
-                    # mint a new token and give this request another go. the
-                    # counter bounds it so a genuinely bad credential fails
-                    # the run instead of spinning.
+                if resp.status in (401, 403) and self._refresh:
                     detail = resp.read(2048).decode("utf-8", "replace")
                     # keep the real reason. falling out of the retry loop
                     # with "exhausted retries" hides an auth problem, which
                     # is the most common thing to get wrong.
                     last_err = f"http {resp.status}: {detail[:300]}"
-                    self._refreshed += 1
-                    fresh = self._refresh()
                     conn.close()
-                    if fresh and fresh != self.token:
-                        self.token = fresh
+                    # this is a concurrent load generator, so when a token
+                    # expires MANY requests fail at once. each of them must
+                    # get a retry against the new token, and only the first
+                    # of them should spend a refresh. comparing against the
+                    # token this request actually used, rather than against
+                    # the shared one, is what makes that true: a thread that
+                    # arrives after someone else refreshed simply retries.
+                    with self._lock:
+                        if self.token != tok_used:
+                            retry_auth = True          # someone refreshed
+                        elif self._refreshed < _MAX_TOKEN_REFRESH:
+                            self._refreshed += 1
+                            fresh = self._refresh()
+                            if fresh and fresh != self.token:
+                                self.token = fresh
+                                retry_auth = True
+                            else:
+                                retry_auth = False
+                        else:
+                            retry_auth = False
+                    if retry_auth:
                         attempt -= 1
                         continue
+                    return self._finish(
+                        request_id, scheduled_s, dispatch_lag_ms,
+                        t_send_unix, None, None, None, resp.status, False,
+                        last_err, StreamState(), intended, chars_sent,
+                        attempt - 1, None, None, None, connect_ms,
+                        first_send_unix, max_tokens)
 
                 if resp.status != 200:
                     detail = resp.read(2048).decode("utf-8", "replace")

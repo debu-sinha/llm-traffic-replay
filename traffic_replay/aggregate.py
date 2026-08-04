@@ -71,6 +71,10 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
               for d in dirs}
     meta = {
         "merged_from": [str(d) for d in dirs],
+        **({"endpoint_base_url": next(iter(endpoints))[0],
+            "endpoint_model": next(iter(endpoints))[1]}
+           if len(endpoints) == 1 else
+           {"endpoint_base_url": "MIXED", "endpoint_model": "MIXED"}),
         "endpoint_path": (next(iter(endpoints))[2] if len(endpoints) == 1
                           else "MIXED"),
         "label": f"merged from {len(dirs)} runs",

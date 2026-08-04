@@ -264,11 +264,6 @@ def cmd_benchmark(args) -> int:
 
     inp = _pair(args.input_tokens, "input-tokens")
     outp = _pair(args.output_tokens, "output-tokens")
-    # max_output_tokens_cap defaults to 512 and the per-request budget is the
-    # smaller of it and the sampled value, so without this a run asking for
-    # 2000 output tokens quietly got 512 and the preflight's advice to raise
-    # --output-tokens did nothing.
-    cfg["max_output_tokens_cap"] = max(int(outp["p95"] * 1.5), 512)
     if args.prompts:
         cfg["prompts_file"] = args.prompts
     elif args.profile:
@@ -289,6 +284,21 @@ def cmd_benchmark(args) -> int:
         pf.parent.mkdir(parents=True, exist_ok=True)
         pf.write_text(json.dumps(prof, indent=2) + "\n")
         cfg["profile_path"] = str(pf)
+
+    # the per-request budget is min(sampled_output, max_output_tokens_cap),
+    # and the cap defaults to 512, so a workload wanting more than that was
+    # silently clipped. size the cap from whatever actually decides the
+    # output distribution for THIS run, which is the given profile when one
+    # was passed and the flags otherwise.
+    _p95 = outp["p95"]
+    if args.profile:
+        try:
+            _p95 = float(json.loads(Path(args.profile).read_text())
+                         ["output_tokens"]["p95"])
+        except Exception:
+            pass
+    if not args.prompts:
+        cfg["max_output_tokens_cap"] = max(int(_p95 * 1.5), 512)
 
     ttft = {q: v for q, v in (("p50", args.ttft_p50), ("p90", args.ttft_p90),
                               ("p95", args.ttft_p95), ("p99", args.ttft_p99))

@@ -383,6 +383,14 @@ def run(rc: RunConfig, token_override: str | None = None,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
             "concurrency_target": _shard_concurrency(rc),
+            # identity of the thing under test. without these, compare and
+            # merge cannot tell two different providers apart when both sit
+            # behind the same route.
+            "endpoint_base_url": ecfg.base_url,
+            "endpoint_model": ecfg.model,
+            "profile_path": rc.profile_path,
+            "prompts_file": rc.prompts_file,
+            "seed": rc.seed,
         }
         acceptance = rc.acceptance_targets
     else:
@@ -394,6 +402,14 @@ def run(rc: RunConfig, token_override: str | None = None,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
             "concurrency_target": _shard_concurrency(rc),
+            # identity of the thing under test. without these, compare and
+            # merge cannot tell two different providers apart when both sit
+            # behind the same route.
+            "endpoint_base_url": ecfg.base_url,
+            "endpoint_model": ecfg.model,
+            "profile_path": rc.profile_path,
+            "prompts_file": rc.prompts_file,
+            "seed": rc.seed,
         }
         acceptance = (rc.acceptance_targets
                       or (p.extra or {}).get("acceptance_targets"))

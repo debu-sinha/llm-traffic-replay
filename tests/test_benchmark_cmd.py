@@ -119,3 +119,74 @@ def test_bad_extra_body_json_is_refused_before_the_run():
         assert "not valid JSON" in str(e)
     else:
         raise AssertionError("should have refused")
+
+
+# ---- provenance ---------------------------------------------------------
+
+def test_every_run_writes_a_manifest_that_can_trace_the_number():
+    """A latency figure with no record of which code, which traffic shape and
+    which endpoint produced it is an anecdote."""
+    import threading
+    import time
+    from traffic_replay.mock_server import serve
+    from traffic_replay.runner import RunConfig, run
+
+    d = _tmp()
+    srv = serve(0, d / "t.jsonl")
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+    try:
+        out = run(RunConfig(
+            profile_path="configs/profile_validation_small.json",
+            endpoint={"base_url": f"http://127.0.0.1:{port}",
+                      "path": "/serving-endpoints/mock/invocations",
+                      "auth_token_env": "UNUSED"},
+            duration_s=6, qps_base=5.0, qps_burst=5.0, qps_min=5.0,
+            qps_max=5.0, calibrate_n=4, max_output_tokens_cap=16,
+            capture_endpoint_metadata=False, out_dir=str(d / "r")),
+            quiet=True)
+    finally:
+        srv.shutdown()
+
+    m = json.loads((Path(out["out_dir"]) / "manifest.json").read_text())
+    assert m["harness_version"]
+    assert m["latency_basis"]
+    assert m["profile"] == "validation_small"
+    assert m["profile_sha256_16"], "the traffic shape must be pinned by hash"
+    assert m["seed"] == 7
+    assert m["endpoint_base_url"].startswith("http://127.0.0.1:")
+    assert m["python"] and m["numpy"]
+    assert m["input_mode"] == "profile"
+    # git state, so a number can be tied to the code that made it
+    assert "git_commit" in m and "git_dirty" in m
+
+
+def test_the_manifest_carries_no_token():
+    import threading
+    import time
+    from traffic_replay.mock_server import serve
+    from traffic_replay.runner import RunConfig, run
+
+    d = _tmp()
+    os.environ["TR_MANIFEST_TOKEN"] = "dapi-secret-value-here"
+    srv = serve(0, d / "t.jsonl")
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+    try:
+        out = run(RunConfig(
+            profile_path="configs/profile_validation_small.json",
+            endpoint={"base_url": f"http://127.0.0.1:{port}",
+                      "path": "/serving-endpoints/mock/invocations",
+                      "auth_token_env": "TR_MANIFEST_TOKEN"},
+            duration_s=4, qps_base=5.0, qps_burst=5.0, qps_min=5.0,
+            qps_max=5.0, calibrate_n=3, max_output_tokens_cap=16,
+            capture_endpoint_metadata=False, out_dir=str(d / "r")),
+            quiet=True)
+    finally:
+        srv.shutdown()
+        os.environ.pop("TR_MANIFEST_TOKEN", None)
+    raw = (Path(out["out_dir"]) / "manifest.json").read_text()
+    assert "dapi-secret-value-here" not in raw
+    assert "TR_MANIFEST_TOKEN" not in raw or "dapi" not in raw

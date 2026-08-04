@@ -1429,10 +1429,71 @@ def render_markdown(summary: dict, title: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _manifest(summary: dict, out: Path) -> dict:
+    """Everything needed to trace a number back to what produced it.
+
+    A latency figure with no record of which code, which traffic shape and
+    which endpoint made it is an anecdote. This is deliberately mechanical:
+    no judgment, no interpretation, just the state that would otherwise be
+    reconstructed from memory months later.
+
+    Nothing here can leak a credential. The host is recorded because a
+    result is meaningless without knowing where it ran, and callers who
+    treat the host as sensitive should scrub the manifest, which is exactly
+    why it sits in its own file.
+    """
+    import hashlib
+    import platform
+    import subprocess
+
+    def _git(*a):
+        try:
+            r = subprocess.run(["git", *a], cwd=str(Path(__file__).parent),
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    run = summary.get("run") or {}
+    prof_path = run.get("profile_path") or run.get("prompts_file")
+    prof_sha = None
+    if prof_path and Path(prof_path).exists():
+        prof_sha = hashlib.sha256(
+            Path(prof_path).read_bytes()).hexdigest()[:16]
+
+    dirty = _git("status", "--porcelain")
+    return {
+        "harness_version": summary.get("harness_version"),
+        "git_commit": _git("rev-parse", "HEAD"),
+        "git_dirty": bool(dirty) if dirty is not None else None,
+        "latency_basis": summary.get("latency_basis"),
+        "profile": run.get("profile"),
+        "profile_path": prof_path,
+        "profile_sha256_16": prof_sha,
+        "profile_provenance": run.get("profile_provenance"),
+        "input_mode": run.get("input_mode"),
+        "seed": run.get("seed"),
+        "endpoint_path": run.get("endpoint_path"),
+        "endpoint_base_url": run.get("endpoint_base_url"),
+        "endpoint_metadata": run.get("endpoint_metadata"),
+        "request_params": run.get("request_params"),
+        "concurrency_target": run.get("concurrency_target"),
+        "shard": run.get("shard"),
+        "schedule": summary.get("schedule"),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "numpy": getattr(np, "__version__", None),
+        "note": ("written by the harness, not by hand. a number quoted "
+                 "without this cannot be reproduced or audited."),
+    }
+
+
 def write_outputs(results: list[dict], summary: dict, out_dir: str | Path,
                   title: str) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    (out / "manifest.json").write_text(
+        json.dumps(_manifest(summary, out), indent=2) + "\n")
     with (out / "requests.jsonl").open("w") as f:
         for r in results:
             f.write(json.dumps(r, separators=(",", ":")) + "\n")

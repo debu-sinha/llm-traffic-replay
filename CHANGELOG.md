@@ -25,6 +25,46 @@ The new basis is the more representative one, but it isn't the old one. A
   both reports print the basis, so a saved report says which convention
   produced it.
 
+### Fixed: client saturation was invisible
+
+The generator is open loop: a dispatcher thread submits into a bounded thread
+pool without waiting for responses. `dispatch_lag_ms` was documented as the
+signal that the client had fallen behind, but `ThreadPoolExecutor.submit()`
+queues rather than blocking, and the lag is stamped before the submit, so it
+could never see a saturated pool.
+
+Measured against a deliberately slow endpoint, 8 requests/second offered into
+a pool of 2: dispatch lag p95 reported 5 ms while wire lateness p95 was
+76.9 seconds and the run delivered 2.0 of the 8.5 requests/second asked for. Endpoint latency stayed clean throughout, so the
+old claim that saturation is not blended into latency held. The claim that it
+surfaces as dispatch lag did not.
+
+Reports now carry `wire_lateness_ms`, computed from `first_send_unix` (the
+moment a request's FIRST attempt went out, so a retry cannot charge the
+endpoint's delay to the client) against when the schedule wanted it, and print
+a client-saturation caution above the tables when the run-average rate falls
+more than 20 percent below the schedule, or when wire lateness passes a
+second. Each case gets its own conclusion: a rate shortfall says the run
+delivered fewer requests per second than asked for, while a run that held its
+average but arrived late says the load arrived reshaped. Neither names a
+cause, because a full pool looks the same whether the client could not keep
+up or the endpoint back-pressured it, and the stability card is what
+separates them.
+
+Verified on a healthy run too, against an endpoint recording its own receive
+times so the arrival rate is checked server-side: 20 requests/second offered,
+20.7 observed by the endpoint, 1252 received against 1248 replay rows plus 4
+calibration. A rate ladder tracked the target within 1 percent (50 to 50.2,
+100 to 100.4, 200 to 200.6) and stayed silent, then bent at 400 where it
+delivered 272.6 and the caution fired.
+
+Re-run end to end after the measurement moved onto `first_send_unix`: a
+healthy run delivered 19.0 of 20 requests/second with wire lateness p95 of
+18 ms and no caution, and a saturated one (8 offered into a pool of 2)
+delivered 2.0 with wire lateness p95 of 76.9 seconds and the caution fired.
+Both `requests.jsonl` carry the new field, and it sits a handshake ahead of
+`t_send_unix` as intended.
+
 ### Added
 
 - **Sample size gate.** The report counts the requests behind the percentiles

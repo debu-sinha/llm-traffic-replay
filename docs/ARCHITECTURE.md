@@ -13,10 +13,12 @@
 **Standard library HTTP client, threads not asyncio.** One dependency
 (numpy) instead of an async stack. Blocking socket reads release the GIL,
 so hundreds of concurrent streams are fine. The cost is thread overhead at
-extreme concurrency. The mitigation is honest measurement (dispatch lag is
-reported per request) plus `shard` support to split a schedule across
-processes or machines when a single client saturates. For a single-node
-endpoint evaluation, the endpoint saturates long before the client does.
+extreme concurrency. The mitigation is honest measurement (wire lateness and
+the achieved rate are reported, and a shortfall raises a caution) plus `shard`
+support to split a schedule across processes or machines. Do not assume the
+endpoint saturates first: measured on a laptop-class machine against a 50 ms
+endpoint, a single process tracked its target rate within 1 percent to about
+200 requests/second and bent at around 270.
 
 **TTFT split: first token, reasoning, first visible.** Real servers send a
 role-only chunk immediately on connection, and timing off that byte would
@@ -89,8 +91,11 @@ produced it.
 - Stream ends with no content: recorded as a failure with reason, never a
   silent zero.
 - Non-200: status and first 300 chars of the body land in the result row.
-- Client saturation: visible as dispatch lag percentiles, not blended into
-  endpoint latency.
+- Client saturation: the pool queues rather than blocking the dispatcher, so
+  dispatch lag stays small. Wire lateness (when the client began sending a
+  request versus when the schedule wanted it) is the number that grows, and
+  the report raises a caution when the achieved rate falls short of the
+  schedule. Neither is ever blended into endpoint latency.
 - Cold cache at run start: warmup/calibration phase is logged separately
   (`phase` field) and excluded from the replay summary.
 - Mid-stream stalls: the widest interchunk gap is recorded per request. When

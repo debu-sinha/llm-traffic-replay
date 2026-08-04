@@ -133,3 +133,20 @@ def test_shards_disagreeing_on_prompt_count_do_not_claim_one():
     out = merge_runs(base / "pooled", [base / "a", base / "b"])
     summary = json.loads((out / "summary.json").read_text())
     assert "replay" not in summary
+
+
+def test_merged_run_does_not_report_wire_lateness():
+    """Shards start at different wall-clock times, so one schedule-vs-send
+    offset across pooled rows reads the gap between shards as lateness. The
+    real pooled artifact shows 3.3 s of exactly that."""
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 5)
+    _mkrun(base / "b", ep, [300] * 5)
+    out = merge_runs(base / "pooled", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["arrivals"]["wire_lateness_ms"]["n"] == 0
+    assert "client" not in summary
+    note = summary["arrivals"]["wire_lateness_note"]
+    assert "not computed for a merged run" in note
+    assert note in (out / "report.md").read_text()

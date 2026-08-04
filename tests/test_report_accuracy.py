@@ -73,9 +73,14 @@ def test_report_matches_independent_recomputation():
             assert approx(summ[key][q],
                           pct([r.get(key) for r in ok], int(q[1:]))), key
 
-    # throughput
-    t0 = min(r["t_send_unix"] for r in rep)
-    t1 = max(r["t_send_unix"] for r in rep)
+    # throughput. the run duration is measured from when the client began
+    # sending, not from the attempt that produced each result, so a retried
+    # row cannot stretch the window and understate the rate.
+    def sent(r):
+        v = r.get("first_send_unix")
+        return r["t_send_unix"] if v is None else v
+    t0 = min(sent(r) for r in rep)
+    t1 = max(sent(r) for r in rep)
     dmin = max(t1 - t0, 1e-9) / 60.0
     intok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
     outtok = sum(r["completion_tokens"] for r in ok

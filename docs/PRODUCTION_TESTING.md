@@ -39,7 +39,10 @@ endpoint exists or without spending its capacity.
      calibration
    - cached tokens: reported or NOT REPORTED, and if reported, WHICH field
      (this tells you what the PT run will be able to show)
-   - dispatch lag p95 in single-digit ms (the client is loafing at 6 QPS).
+   - wire lateness p95 in the tens of ms and no client-saturation caution
+     (the client is loafing at 6 QPS). Real healthy runs land between about
+     20 and 140 ms depending on prompt size, so read the caution rather than
+     a fixed number.
 
 **The latency numbers from stage 1 are not evidence of anything.** Shared
 pay-per-token capacity says nothing about a dedicated endpoint. The run
@@ -61,11 +64,15 @@ bundled profile carries its ASSUMPTION label and so does every report).
 3. Step the load, one knob, in this order, reading the believability block
    between steps:
    - `rate_scale`: 0.1 -> 0.25 -> 0.5 -> 1.0
-   - at each step: error rate first, then dispatch lag (client health),
+   - at each step: error rate first, then wire lateness and the achieved
+     rate against the schedule (is the client still delivering the load: the
+     report raises a caution at a 20 percent run-average shortfall or a wire
+     lateness p95 over one second),
      then achieved cache fraction, THEN latency percentiles.
 4. Two workload classes = two profile configs = two runs. Do not blend
    them into one table.
-5. If the client's dispatch lag p95 grows past ~100 ms at high rate_scale,
+5. If wire lateness p95 passes ~1 s at high rate_scale, or the report
+   raises the client-saturation caution,
    split the schedule across processes: `shard_index`/`shard_total` in two
    run configs on two machines, then pool their output dirs with
    `python3 -m traffic_replay merge`. To put Databricks PT next to another

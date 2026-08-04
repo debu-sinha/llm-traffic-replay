@@ -2,7 +2,7 @@
 
 Every latency table is printed WITH the context that decides whether it can
 be believed: achieved cache-hit distribution (endpoint-reported), achieved
-arrival rate vs scheduled, client dispatch lag, error rate, and token
+arrival rate vs scheduled, wire lateness, error rate, and token
 targeting error. A good p50 at the wrong cache rate is a fake result; this
 module makes the pairing unavoidable.
 """
@@ -17,6 +17,20 @@ import numpy as np
 from . import __version__
 
 PCTS = (50, 90, 95, 99)
+
+
+def _sent_at(r: dict) -> float | None:
+    """When the client began sending this request.
+
+    `t_send_unix` belongs to whichever attempt produced the result, so on a
+    retried row it carries the endpoint's delay. `first_send_unix` is the
+    first attempt, which is when the load was actually offered. Rows written
+    by an older harness only have the former.
+    """
+    v = r.get("first_send_unix")
+    if v is None:
+        v = r.get("t_send_unix")
+    return v
 
 
 def _pct_table(values: list[float | None]) -> dict:
@@ -60,15 +74,44 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             finish_reasons[fr] = finish_reasons.get(fr, 0) + 1
 
     # arrival honesty
+    #
+    # dispatch_lag_ms is stamped in the dispatcher thread just before the
+    # request is handed to the pool. ThreadPoolExecutor.submit() never
+    # blocks, it queues, so that number cannot see a saturated pool: it
+    # reports single-digit ms while requests sit in the queue for minutes.
+    # The number that matters is when the client began sending, which is
+    # first_send_unix, against when the schedule wanted it.
     lags = [r.get("dispatch_lag_ms") for r in results
             if r.get("dispatch_lag_ms") is not None]
+    wire = []
+    # every row carries first_send_unix, the moment its FIRST attempt went
+    # out. t_send_unix belongs to whichever attempt produced the result, so
+    # on a retried row it carries the endpoint's delay rather than saying
+    # when the load was offered. no row needs excluding once the honest
+    # stamp is available. older rows without the field fall back.
+    stamped = [r for r in results
+               if r.get("scheduled_s") is not None
+               and _sent_at(r) is not None]
+    if stamped:
+        # one offset, taken from the row that was earliest relative to its own
+        # schedule. minimizing the two series independently would subtract a
+        # constant no request experienced, and would let one slow first send
+        # zero out real lateness everywhere.
+        offset = min(_sent_at(r) - r["scheduled_s"] for r in stamped)
+        for r in stamped:
+            late = ((_sent_at(r) - r["scheduled_s"]) - offset) * 1000.0
+            wire.append(max(late, 0.0))
+    wire_note = None
+    if results and not stamped:
+        wire_note = ("wire lateness is not reported: no request carried both "
+                     "a scheduled time and a send time.")
     retried = sum(1 for r in results if r.get("retries"))
 
     dur = None
     if results:
-        t0 = min(r["t_send_unix"] for r in results)
-        t1 = max(r["t_send_unix"] for r in results)
-        dur = max(t1 - t0, 1e-9)
+        sent = [_sent_at(r) for r in results if _sent_at(r) is not None]
+        if sent:
+            dur = max(max(sent) - min(sent), 1e-9)
 
     # throughput in the customer's own vocabulary (tokens per minute)
     in_tok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
@@ -121,9 +164,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "arrivals": {
             "achieved_qps_overall": len(results) / dur if dur else None,
             "dispatch_lag_ms": _pct_table(lags),
-            "note": "dispatch lag is client lateness vs the schedule; "
-                    "sustained growth means the client, not the endpoint, "
-                    "is the bottleneck",
+            "wire_lateness_ms": _pct_table(wire),
+            **({"wire_lateness_note": wire_note} if wire_note else {}),
+            "note": "dispatch lag is how late the dispatcher handed the "
+                    "request to the pool. wire lateness is how late the "
+                    "client began sending the request, which is the one "
+                    "that grows when the client is the bottleneck, because a "
+                    "saturated pool queues rather than blocking the "
+                    "dispatcher.",
         },
         "schedule": schedule_meta or {},
         "run": run_meta or {},
@@ -168,6 +216,83 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     else:
         sample_warning = None
     summary["sample"] = {"n": n_ok, "warning": sample_warning}
+    # the client is part of the instrument. if it could not deliver the load
+    # it was asked for, the endpoint was never tested at that rate, and every
+    # latency number below describes a lighter load than the one on the label.
+    # NOT schedule_meta["rate_p50"]. that is the median of the rate curve, so
+    # on a bursty schedule it is the quiet rate rather than the offered one,
+    # and shard() does not rescale it, so every sharded run would read as a
+    # shortfall. the rows carry their own schedule, which is invariant to both.
+    # BOTH sides come from `stamped`. mixing populations makes the ratio the
+    # non-retry fraction, so a run with many endpoint-caused retries would
+    # read as a client shortfall, which is the mirror of the bug the retry
+    # exclusion exists to prevent.
+    # the RATIO is computed over `stamped`, so one outlier send cannot skew
+    # it. the PRINTED rates count every scheduled row, so "delivered" lines
+    # up with the achieved arrival rate in the believability block rather
+    # than being quietly scaled down by the retry fraction.
+    offered = None
+    all_sched = [r["scheduled_s"] for r in results
+                 if r.get("scheduled_s") is not None]
+    if len(all_sched) > 1:
+        span_all = max(all_sched) - min(all_sched)
+        if span_all > 0:
+            # n-1 intervals across n arrivals
+            offered = (len(all_sched) - 1) / span_all
+    # measure the achieved rate over the same population as wire lateness.
+    # a single retried request stamps its LAST attempt, which can stretch the
+    # run's apparent span by a read timeout and halve the apparent rate.
+    achieved = summary["arrivals"]["achieved_qps_overall"]
+    stretch = None
+    if len(stamped) > 1 and offered:
+        sends = [_sent_at(r) for r in stamped]
+        scheds = [r["scheduled_s"] for r in stamped]
+        span_send = max(sends) - min(sends)
+        span_sched = max(scheds) - min(scheds)
+        if span_send > 0 and span_sched > 0:
+            stretch = span_send / span_sched
+            achieved = offered / stretch
+    wire_p95 = (summary["arrivals"]["wire_lateness_ms"] or {}).get("p95")
+    short = bool(offered and achieved and achieved < offered * 0.8)
+    drifting = bool(wire_p95 and wire_p95 > 1000.0)
+    if short or drifting:
+        parts, conclusion = [], []
+        if short:
+            parts.append(
+                f"the schedule asked for about {offered:.1f} requests/second "
+                f"over the run and {achieved:.1f} was delivered")
+            conclusion.append(
+                "the run delivered fewer requests per second than the "
+                "schedule asked for, so these latency numbers describe a "
+                "lighter load than the one on the label")
+        if drifting:
+            lp = (f"{wire_p95 / 1000:.1f}s" if wire_p95 < 10_000
+                  else f"{wire_p95 / 1000:.0f}s")
+            parts.append(
+                f"95 percent of requests reached the endpoint within {lp} of "
+                f"their scheduled time, the rest later")
+            if not short:
+                conclusion.append(
+                    "the run-average rate stayed within 20 percent of the "
+                    "schedule, so the load did arrive, but it arrived "
+                    "reshaped: the instantaneous rate the endpoint saw is not "
+                    "the one the schedule describes")
+        summary["client"] = {
+            "offered_qps": offered, "achieved_qps": achieved,
+            "wire_lateness_p95_ms": wire_p95,
+            "warning": (
+                f"{'. '.join(parts)}. {'. '.join(conclusion)}. the offered "
+                "load did not reach the endpoint on schedule, either because "
+                "the client could not keep up or because the endpoint slowed "
+                "and back-pressured the pool. read the stability card to tell "
+                "them apart, since a client-side limit leaves endpoint latency "
+                "flat. if it is the client, raise max_concurrency, lower the "
+                "rate, or shard the schedule across machines. dispatch lag "
+                "stays small either way, because a full pool queues rather "
+                "than blocking the dispatcher."
+),
+        }
+
     summary["drift"] = _drift_block(ok, failed)
 
     # every report states which harness produced it and what the latency
@@ -578,6 +703,15 @@ def _err_cell(w: dict) -> str:
     return f"{w['errors']} ({w['error_rate'] * 100:.0f}%)"
 
 
+def _wire_p95(arr: dict) -> str:
+    """How late the client began sending, versus the schedule. Unlike
+    dispatch lag, this grows when the offered load is not being delivered."""
+    v = (arr.get("wire_lateness_ms") or {}).get("p95")
+    if v is None:
+        return "n/a"
+    return f"{v / 1000:.1f} s" if v >= 1000 else f"{v:.0f} ms"
+
+
 def _lag_p95(arr: dict) -> str:
     """Dispatch lag p95, where a measured 0.0 is a real value and a missing
     one is not. `or` would collapse the two."""
@@ -616,6 +750,9 @@ def render_markdown(summary: dict, title: str) -> str:
     _rw = (s.get("replay") or {}).get("warning")
     if _rw:
         cautions += [f"CAUTION (prompt replay): {_rw}", ""]
+    _cw = (s.get("client") or {}).get("warning")
+    if _cw:
+        cautions += [f"CAUTION (client saturation): {_cw}", ""]
 
     lines = [
         f"# {title}",
@@ -658,7 +795,10 @@ def render_markdown(summary: dict, title: str) -> str:
          "- output tokens: endpoint did not report completion_tokens"),
         f"- achieved arrival rate: {arr['achieved_qps_overall']:.2f} QPS "
         f"overall, dispatch lag p95 "
-        f"{_lag_p95(arr)} ms"
+        f"{_lag_p95(arr)} ms, wire lateness p95 "
+        f"{_wire_p95(arr)}"
+        + (f" ({arr['wire_lateness_note']})" if arr.get("wire_lateness_note")
+           else "")
         if arr.get("achieved_qps_overall") else "- arrivals: n/a",
         f"- arrival schedule: from trace {sched_src}"
         if sched_src != "synthetic" else "- arrival schedule: synthetic bursts",
@@ -1075,8 +1215,16 @@ def render_html(summary: dict, title: str) -> str:
         lag = (arr.get("dispatch_lag_ms") or {}).get("p95")
         bel.append(f"<li><b>Arrival honesty</b>: "
                    f"{num(arr['achieved_qps_overall'], 2)} requests/second "
-                   f"(QPS) overall, dispatch lag p95 {num(lag)} ms (client "
-                   f"lateness, not endpoint latency)</li>")
+                   f"(QPS) overall. Dispatch lag p95 {num(lag)} ms is how "
+                   f"late the dispatcher handed the request to the pool. "
+                   f"Wire lateness p95 {_wire_p95(arr)} is how late it "
+                   f"actually reached the endpoint, which is the one that "
+                   f"grows when the offered load is not being delivered: a "
+                   f"full pool queues rather than blocking the dispatcher. "
+                   f"Neither is endpoint latency."
+                   + (f" {esc(arr['wire_lateness_note'])}"
+                      if arr.get("wire_lateness_note") else "")
+                   + "</li>")
     conn = s.get("connect_ms") or {}
     if conn.get("n"):
         bel.append(f"<li><b>Connection setup</b> (DNS, TCP and TLS "
@@ -1205,6 +1353,9 @@ def render_html(summary: dict, title: str) -> str:
     rw = (s.get("replay") or {}).get("warning")
     if rw:
         sample_banner += f"<div class='banner warn'>{esc(rw)}</div>"
+    cw = (s.get("client") or {}).get("warning")
+    if cw:
+        sample_banner += f"<div class='banner warn'>{esc(cw)}</div>"
 
     drift = s.get("drift") or {}
     if drift.get("windows") or drift.get("drift_kind"):

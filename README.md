@@ -179,7 +179,8 @@ Outputs land in `results/<timestamp>/`:
 
 - `requests.jsonl`: every request: TTFT/TTFB/E2E ms, TCP/TLS `connect_ms`,
   endpoint-reported prompt/completion/cached tokens, intended sizes, document
-  id, dispatch lag, errors.
+  id, dispatch lag, errors, and `first_send_unix`. Wire lateness is derived
+  in the summary from `first_send_unix` against `scheduled_s`.
 - `summary.json`: percentile tables plus the believability block.
 - `report.html`: the readout to open in a browser or share. Stat cards, a
   color-coded SLA scorecard, units on every metric, and the believability
@@ -467,11 +468,16 @@ or a single-node Databricks cluster in that workspace with the run started
 from its driver (web terminal or a notebook `%sh` cell). Avoid laptops for
 measured runs: Wi-Fi jitter, VPNs, sleep states and cross-region paths all
 land in your TTFT tail and are indistinguishable from endpoint behavior
-after the fact. The believability block will expose a struggling client as
-dispatch lag, but the better plan is not to generate that noise at all.
-If dispatch lag p95 grows past ~100 ms at full rate_scale, split the
-schedule across two machines with `shard_index`/`shard_total` and pool the
-`requests.jsonl` files.
+after the fact. The believability block reports wire lateness and the
+achieved rate so a struggling client is visible, but the better plan is not
+to generate that noise at all.
+If wire lateness p95 grows past ~1 s at full rate_scale, or the report
+prints the client-saturation caution, split the schedule across two machines
+with `shard_index`/`shard_total` and pool the `requests.jsonl` files. As a
+rough anchor, a single process on a laptop-class machine tracked a target
+rate within 1 percent up to about 200 requests/second against a 50 ms
+endpoint, and bent at around 270. Your ceiling depends on prompt size and
+endpoint latency, so read the caution rather than trusting that number.
 
 ## Pooling and comparing runs
 
@@ -588,9 +594,17 @@ believed, and the report prints them together:
 - **Token targeting error**: text is generated through a calibrated
   characters-per-token ratio. Endpoint-reported token counts are the source
   of truth, and the residual error is printed.
-- **Dispatch lag**: how late the client fired versus the schedule. If the
-  client saturates, that's reported as client lag, not silently blended
-  into endpoint latency.
+- **Client keeping up**: the generator is open loop, so it does not slow down
+  when the endpoint does. Two numbers say whether it kept up. Dispatch lag is
+  how late the dispatcher handed a request to the pool. Wire lateness is how
+  late the client began sending, and it is the one to read:
+  a saturated pool queues rather than blocking the dispatcher, so dispatch lag
+  can sit in single-digit ms while requests wait minutes. When the run-average
+  rate falls more than 20 percent below the schedule, or wire lateness p95
+  passes one second, the report
+  says the offered load did not reach the endpoint on schedule, and points at
+  the stability card to separate a client limit from endpoint back-pressure. A
+  client-side limit leaves endpoint latency flat.
 - **Profile label**: runs built to stated (spoken) figures carry that
   label until the exact production dataset replaces the profile config.
 - **Interchunk max**: the widest gap between streamed content chunks per
@@ -700,7 +714,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `qps_min` / `qps_max` | 10 / 500 | `1` / `12` | hard floor and ceiling clamped on the rate curve |
 | `rate_scale` | 1.0 | `0.5` | uniform thinning that keeps the shape. Step it 0.1 to 1.0 to find where the endpoint bends |
 | `timestamps_file` | null | `"your_arrivals.txt"` | real arrival trace (one epoch/line, or JSONL `{"t": s}`) that replaces the synthetic schedule |
-| `max_concurrency` | 256 | `64` | in-flight request bound. Excess arrivals surface as dispatch lag, not fake latency |
+| `max_concurrency` | 256 | `64` | in-flight request bound. Set it above `qps * p95_latency_seconds` or the pool queues and the endpoint is never driven at the rate you asked for. Excess arrivals surface as wire lateness and a client-saturation caution, never as fake endpoint latency |
 | `seed` | 7 | `7` | root RNG seed. Same config plus same seed is the same experiment |
 | `cpt` | 4.0 | `4.0` | starting characters-per-token guess, recalibrated during warmup (profile mode only) |
 | `calibrate_n` | 12 | `8` | warmup requests run before the schedule. Also primes the endpoint cache |

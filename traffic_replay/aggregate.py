@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .metrics import summarize, write_outputs
+from .metrics import _pct_table, summarize, write_outputs
 
 
 def _load_summary(d: Path) -> dict:
@@ -80,6 +80,16 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     # drift buckets on absolute send time from the pooled minimum. shards that
     # ran at different times produce windows spanning the gap between them, so
     # a trend across pooled rows would describe the schedule, not the endpoint.
+    # same hazard as drift below: shards start at different wall-clock times,
+    # so a single schedule-vs-send offset across pooled rows reads the gap
+    # between shards as lateness.
+    summary["arrivals"]["wire_lateness_ms"] = _pct_table([])
+    summary["arrivals"]["wire_lateness_note"] = (
+        "wire lateness is not computed for a merged run, because pooled rows "
+        "come from separate runs and the offset between them would read as "
+        "lateness. read each run's own report. dispatch lag below is pooled "
+        "and still meaningful, since it is measured within each run.")
+    summary.pop("client", None)
     summary["drift"] = {
         "windows": [], "window_seconds": 60,
         "note": "stability over time is not computed for a merged run. the "
@@ -271,6 +281,9 @@ def compare_runs(out_dir, input_dirs) -> Path:
                   _cache_cell(s, "p95") for s in summ) + " |",
               scalar("dispatch lag p95 (ms)",
                      lambda s: ((s.get("arrivals") or {}).get("dispatch_lag_ms")
+                                or {}).get("p95")),
+              scalar("wire lateness p95 (ms)",
+                     lambda s: ((s.get("arrivals") or {}).get("wire_lateness_ms")
                                 or {}).get("p95")), ""])
 
     out = Path(out_dir)

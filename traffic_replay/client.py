@@ -3,7 +3,7 @@
 Standard library only (http.client), one connection per request, precise
 monotonic timing. Concurrency is provided by the runner's thread pool; a
 blocked socket read releases the GIL, so hundreds of in-flight requests are
-fine, and the runner MEASURES client-side dispatch lag rather than assuming
+fine, and the runner MEASURES client-side lateness rather than assuming
 the client kept up (see runner.py / metrics.py).
 
 Timing definitions, used consistently everywhere:
@@ -46,7 +46,10 @@ class EndpointConfig:
 class RequestResult:
     request_id: str
     scheduled_s: float
-    dispatch_lag_ms: float           # how late the client fired vs schedule
+    dispatch_lag_ms: float           # dispatcher lateness only. a full pool
+                                     # queues, so this does NOT see client
+                                     # saturation. metrics computes wire
+                                     # lateness from first_send_unix.
     t_send_unix: float
     ttfb_ms: float | None
     ttft_ms: float | None            # first content of either kind (back compat)
@@ -73,9 +76,15 @@ class RequestResult:
     reasoning_tokens_source: str | None = None  # usage field it was read from
     reasoning_chunks: int = 0             # reasoning deltas seen in the stream
     connect_ms: float | None = None       # DNS + TCP + TLS setup time
-    # note: a successful record carries the send time of the attempt
-    # that succeeded, a failed one carries the FIRST attempt's send
-    # time, so a retried failure buckets where it was asked for.
+    first_send_unix: float | None = None  # when the FIRST attempt went out.
+                                          # t_send_unix belongs to whichever
+                                          # attempt produced this result, so a
+                                          # retried row carries the endpoint's
+                                          # delay. this one always says when
+                                          # the load was actually offered.
+    # note: t_send_unix belongs to whichever attempt produced this record,
+    # so on any retried row it carries the endpoint's delay. first_send_unix
+    # below is the honest one for asking when the load was offered.
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -181,7 +190,7 @@ class EndpointClient:
                                         f"http {resp.status}: {detail[:300]}",
                                         StreamState(), intended, chars_sent,
                                         attempt - 1, None, None, None,
-                                        connect_ms)
+                                        connect_ms, first_send_unix)
 
                 if include_usage and self._include_usage_supported is None:
                     self._include_usage_supported = True
@@ -222,7 +231,8 @@ class EndpointClient:
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
                                     attempt - 1, interchunk_max,
-                                    ttfr_ms, ttfv_ms, connect_ms)
+                                    ttfr_ms, ttfv_ms, connect_ms,
+                                    first_send_unix)
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
@@ -236,14 +246,16 @@ class EndpointClient:
                             else time.time(),
                             None, None, None, None, False,
                             last_err or "exhausted retries", StreamState(),
-                            intended, chars_sent, attempt - 1)
+                            intended, chars_sent, attempt - 1,
+                            None, None, None, None, first_send_unix)
 
     @staticmethod
     def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
                 ttfb_ms, ttft_ms, e2e_ms, status, ok, error, state,
                 intended, chars_sent, retries,
                 interchunk_max_ms=None,
-                ttfr_ms=None, ttfv_ms=None, connect_ms=None) -> RequestResult:
+                ttfr_ms=None, ttfv_ms=None, connect_ms=None,
+                first_send_unix=None) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
@@ -266,6 +278,8 @@ class EndpointClient:
             reasoning_tokens_source=u["reasoning_tokens_source"],
             reasoning_chunks=state.reasoning_chunks,
             connect_ms=connect_ms,
+            first_send_unix=(first_send_unix if first_send_unix is not None
+                             else t_send_unix),
         )
 
 

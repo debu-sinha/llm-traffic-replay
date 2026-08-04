@@ -3,6 +3,8 @@ metadata in the report. These are the confidence features: they make a short
 or misleading run say so, and they record what was actually tested."""
 from __future__ import annotations
 
+import random
+
 from traffic_replay.metrics import (_drift_block, render_html,
                                     render_markdown, summarize)
 
@@ -495,3 +497,253 @@ def test_a_total_outage_card_does_not_claim_per_window_p95():
     s = summarize(fails)
     assert "window p95 in ms" not in render_html(s, "o")
     assert "| window |" not in render_markdown(s, "o")
+
+
+def _paced(n, offered_qps, service_s, pool, ttft=100.0, jitter=0.0):
+    """Rows shaped like a run where the pool can only serve `pool` at a time
+    and each request occupies a worker for `service_s`. Requests are stamped
+    when a worker frees up, which is what an open-loop client against a
+    saturated pool actually produces."""
+    rnd = random.Random(7)
+    rows, free = [], [0.0] * pool
+    for i in range(n):
+        want = i / offered_qps
+        svc = service_s * (1.0 + rnd.uniform(0, jitter)) if jitter else service_s
+        w = min(range(pool), key=lambda k: free[k])
+        actual = max(want, free[w])
+        free[w] = actual + svc
+        rows.append({"ok": True, "scheduled_s": want,
+                     "t_send_unix": 1_000_000.0 + actual,
+                     "ttft_ms": ttft, "ttfb_ms": 1.0, "e2e_ms": ttft * 2,
+                     "connect_ms": 8.0,
+                     # the dispatcher is fine, it just queues: this is the
+                     # number that stays small while the client is drowning
+                     "dispatch_lag_ms": 4.0,
+                     "prompt_tokens": 100, "completion_tokens": 10})
+    return rows
+
+
+def test_a_saturated_pool_shows_up_as_wire_lateness_not_dispatch_lag():
+    """ThreadPoolExecutor.submit() queues instead of blocking, so the
+    dispatcher never notices a full pool. Measured on a real run: dispatch
+    lag p95 of 5 ms while requests reached the endpoint 92 seconds late."""
+    rows = _paced(240, offered_qps=8.0, service_s=1.0, pool=2)
+    s = summarize(rows)
+    arr = s["arrivals"]
+    assert arr["dispatch_lag_ms"]["p95"] < 10           # dispatcher looks fine
+    assert arr["wire_lateness_ms"]["p95"] > 10_000      # reality
+    assert s["client"]["warning"] is not None
+    # states the observation, not a cause it cannot know
+    assert "did not reach the endpoint on schedule" in s["client"]["warning"]
+    assert "read the stability card to tell them apart" in s["client"]["warning"]
+
+
+def test_the_caution_is_above_the_tables_in_both_formats():
+    rows = _paced(240, offered_qps=8.0, service_s=1.0, pool=2)
+    s = summarize(rows)
+    md = render_markdown(s, "sat")
+    assert md.index("CAUTION (client saturation)") < md.index("| metric (ms) |")
+    assert "banner warn" in render_html(s, "sat")
+
+
+def test_a_client_that_keeps_up_is_not_warned():
+    """The negative control. Verified against a real 20 rps run that the
+    endpoint itself confirmed receiving at 20.7 rps: no caution."""
+    rows = _paced(1200, offered_qps=20.0, service_s=0.06, pool=64)
+    s = summarize(rows)
+    assert s["arrivals"]["wire_lateness_ms"]["p95"] < 1000
+    assert "client" not in s
+
+
+def test_wire_lateness_is_reported_even_when_nothing_is_wrong():
+    rows = _paced(600, offered_qps=20.0, service_s=0.06, pool=64)
+    s = summarize(rows)
+    md = render_markdown(s, "ok")
+    assert "wire lateness p95" in md
+    assert s["arrivals"]["wire_lateness_ms"]["n"] == 600
+
+
+def test_a_rate_shortfall_alone_is_enough_to_warn():
+    """Isolates the shortfall arm: sends stay close to schedule for most of
+    the run, so p95 lateness stays under a second and the drifting arm cannot
+    fire, but the run still takes far longer than it was asked to."""
+    rows = []
+    for i in range(400):
+        want = i / 10.0
+        # on time for 96 percent of the run, then a hard stall at the end
+        actual = want if i < 384 else want + 40.0
+        rows.append({"ok": True, "scheduled_s": want,
+                     "t_send_unix": 1_000_000.0 + actual, "ttft_ms": 100.0,
+                     "ttfb_ms": 1.0, "e2e_ms": 200.0, "connect_ms": 8.0,
+                     "dispatch_lag_ms": 4.0, "prompt_tokens": 100,
+                     "completion_tokens": 10})
+    s = summarize(rows)
+    assert s["arrivals"]["wire_lateness_ms"]["p95"] < 1000     # drifting silent
+    assert s["client"]["achieved_qps"] < s["client"]["offered_qps"] * 0.8
+    # states what the span statistic supports, not "never"
+    assert "fewer requests per second than the" in s["client"]["warning"]
+
+
+def test_a_late_but_complete_run_does_not_claim_a_shortfall():
+    """The drifting arm alone. The run average held, so the total load did
+    arrive, and saying it was never driven at the rate would contradict the
+    achieved figure printed two keys away."""
+    # a transient stall that recovers, which is the real shape this arm
+    # exists for: total load arrives, but not when the schedule wanted it
+    rows = []
+    for i in range(600):
+        want = i / 20.0
+        late = 4.0 if 200 <= i < 320 else 0.0     # 20 percent of the run
+        rows.append({"ok": True, "scheduled_s": want,
+                     "t_send_unix": 1_000_000.0 + want + late,
+                     "ttft_ms": 100.0, "ttfb_ms": 1.0, "e2e_ms": 200.0,
+                     "connect_ms": 8.0, "dispatch_lag_ms": 4.0,
+                     "prompt_tokens": 100, "completion_tokens": 10})
+    s = summarize(rows)
+    c = s["client"]
+    assert c["achieved_qps"] >= c["offered_qps"] * 0.8      # no shortfall
+    assert "fewer requests per second" not in c["warning"]
+    assert "arrived reshaped" in c["warning"]
+
+
+def test_heavy_retries_are_not_reported_as_a_client_shortfall():
+    """offered and achieved must come from one population. Mixing them makes
+    the ratio the non-retry fraction, so an endpoint dropping connections
+    would read as a slow client, which is backwards."""
+    for frac in (0.2, 0.3, 0.5):
+        rows = _paced(400, offered_qps=20.0, service_s=0.04, pool=64)
+        for i, r in enumerate(rows):
+            if i % int(1 / frac) == 0:
+                r["retries"] = 1
+        s = summarize(rows)
+        assert "client" not in s, f"false shortfall at retry fraction {frac}"
+
+
+def test_a_healthy_run_with_jittery_service_times_stays_silent():
+    """The negative control with zero variance proves too little. Real service
+    times are heavy tailed, and that is the shape most likely to produce a
+    false positive against the 1s threshold."""
+    rows = _paced(1200, offered_qps=20.0, service_s=0.06, pool=64, jitter=4.0)
+    s = summarize(rows)
+    assert s["arrivals"]["wire_lateness_ms"]["p95"] < 1000
+    assert "client" not in s
+
+
+def test_the_printed_rates_reconcile_with_the_arrival_bullet():
+    """The caution's 'delivered' figure and the believability block's achieved
+    arrival rate describe the same run, so they must not disagree because a
+    chunk of rows retried in the middle."""
+    rows = []
+    for i in range(500):
+        want = i / 20.0
+        rows.append({"ok": True, "scheduled_s": want,
+                     "t_send_unix": 1_000_000.0 + want * 1.6,
+                     "ttft_ms": 100.0, "ttfb_ms": 1.0, "e2e_ms": 200.0,
+                     "connect_ms": 8.0, "dispatch_lag_ms": 4.0,
+                     "prompt_tokens": 100, "completion_tokens": 10})
+    for r in rows[200:400]:
+        r["retries"] = 1                    # 40 percent, mid-run
+    s = summarize(rows)
+    c = s["client"]
+    assert c["offered_qps"] > 19.0          # the true offered rate, not 12
+    bullet = s["arrivals"]["achieved_qps_overall"]
+    assert abs(c["achieved_qps"] - bullet) / bullet < 0.15
+
+
+def test_a_retried_row_is_timed_from_its_first_attempt():
+    """t_send_unix belongs to whichever attempt produced the result, so on a
+    retry it carries the endpoint's delay. first_send_unix says when the load
+    was actually offered, and that is what client lateness must be built on.
+    No row needs excluding once the honest stamp exists."""
+    rows = _paced(200, offered_qps=20.0, service_s=0.04, pool=64)
+    for r in rows:
+        r["first_send_unix"] = r["t_send_unix"]
+    # a request that failed, retried, then came back 120s later
+    rows[10]["retries"] = 1
+    rows[10]["t_send_unix"] += 120.0          # contaminated
+    # first_send_unix left alone: it still says when the load went out
+    s = summarize(rows)
+    assert s["arrivals"]["wire_lateness_ms"]["n"] == len(rows)   # nothing dropped
+    assert s["arrivals"]["wire_lateness_ms"]["p95"] < 1000       # not blamed on the client
+    assert "client" not in s
+
+
+def test_every_retry_shape_is_timed_honestly():
+    """The three client return paths (non-200, empty stream, exhausted) all
+    carry first_send_unix, so none of them can inject endpoint delay into
+    client lateness."""
+    rows = _paced(300, offered_qps=20.0, service_s=0.04, pool=64)
+    for r in rows:
+        r["first_send_unix"] = r["t_send_unix"]
+    for i, (status, ok) in enumerate([(503, False), (200, False), (None, False)]):
+        r = rows[50 + i * 50]
+        r["retries"] = 1
+        r["status"] = status
+        r["ok"] = ok
+        r["t_send_unix"] += 130.0             # every one carries endpoint delay
+    s = summarize(rows)
+    assert s["arrivals"]["wire_lateness_ms"]["p95"] < 1000
+    assert "client" not in s
+
+
+def test_rows_without_the_field_fall_back_to_t_send_unix():
+    """A requests.jsonl written by an older harness has no first_send_unix.
+    It should still produce a wire-lateness series rather than an empty one."""
+    rows = _paced(120, offered_qps=20.0, service_s=0.04, pool=64)
+    for r in rows:
+        r.pop("first_send_unix", None)
+    s = summarize(rows)
+    assert s["arrivals"]["wire_lateness_ms"]["n"] == len(rows)
+
+
+def test_the_client_stamps_first_send_on_every_return_path():
+    """Drives the real EndpointClient rather than hand-built dicts, so
+    deleting first_send_unix from any _finish call fails here. Covers the
+    non-200 path and the exhausted-retry path."""
+    import json as _json
+    import threading
+    import time as _time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from traffic_replay.client import EndpointClient, EndpointConfig
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *a): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = b'{"error":"nope"}'
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _time.sleep(0.2)
+    try:
+        cfg = EndpointConfig(base_url=f"http://127.0.0.1:{port}",
+                             path="/serving-endpoints/x/invocations")
+        c = EndpointClient(cfg, token=None)
+        r = c.send([{"role": "user", "content": "hi"}], 8, "r1",
+                   scheduled_s=0.0, dispatch_lag_ms=0.0,
+                   intended=(0, 0, None, 0), chars_sent=2)
+        assert r.ok is False and r.status == 503          # the non-200 path
+        assert r.first_send_unix is not None
+        # strictly earlier: the stamp is taken before the handshake, while
+        # t_send_unix is taken after. equality means the call site dropped it
+        # and _finish fell back to t_send_unix.
+        assert r.first_send_unix < r.t_send_unix
+    finally:
+        srv.shutdown(); srv.server_close()
+
+    # exhausted-retry path: nothing listening at all
+    cfg2 = EndpointConfig(base_url="http://127.0.0.1:1",
+                          path="/serving-endpoints/x/invocations",
+                          max_retries=1)
+    c2 = EndpointClient(cfg2, token=None)
+    r2 = c2.send([{"role": "user", "content": "hi"}], 8, "r2",
+                 scheduled_s=0.0, dispatch_lag_ms=0.0,
+                 intended=(0, 0, None, 0), chars_sent=2)
+    assert r2.ok is False
+    assert r2.first_send_unix is not None

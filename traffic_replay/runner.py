@@ -5,11 +5,20 @@ Two input modes share the same dispatch and measurement path:
                 shape (sizes, cache structure).
   prompts mode  (prompts_file): the user's real prompts, replayed verbatim.
 
-Pacing: each request has an absolute scheduled time. A dispatcher thread
-sleeps until each timestamp and submits the request to a bounded thread
-pool. If the pool is saturated, the submit itself is late; that lateness is
-recorded per request as dispatch_lag_ms and summarized, so client
-saturation is visible in the report instead of silently polluting latency.
+Pacing: open loop. Each request has an absolute scheduled time, and the
+dispatcher thread sleeps until that timestamp and submits into a bounded
+thread pool. It never waits for a response before firing the next request,
+so a slow endpoint does not throttle the offered rate. That is the point: a
+closed-loop generator quietly reduces load as the endpoint slows, and you
+never find the knee.
+
+Two different lateness numbers come out of this, and they answer different
+questions. dispatch_lag_ms is stamped in the dispatcher just before the
+submit, so it sees the dispatcher falling behind but NOT a saturated pool,
+because ThreadPoolExecutor.submit() queues rather than blocking. Wire
+lateness, computed in metrics from first_send_unix against the schedule, is
+when the client began sending, and it grows under either. Read wire lateness
+to decide whether the client kept up.
 
 Warmup/calibration: the first `calibrate_n` requests run at low rate before
 the schedule proper. In profile mode their endpoint-reported prompt_tokens

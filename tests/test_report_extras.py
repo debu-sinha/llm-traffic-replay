@@ -930,7 +930,7 @@ def test_a_200_with_no_visible_content_is_not_a_successful_answer():
     s = summarize(_answer_rows(answered=55, silent=132))
     a = s["answers"]
     assert a["transport_ok"] == 187
-    assert a["complete_answers"] == 55
+    assert a["answered"] == 55
     assert a["no_visible_content"] == 132
     assert a["answer_rate"] == round(55 / 187, 6)
 
@@ -950,7 +950,7 @@ def test_truncation_alone_is_not_a_failure():
     s = summarize(_answer_rows(answered=0, silent=0, truncated_but_visible=50),
                   acceptance={"success_rate": 0.99})
     assert s["answers"]["truncated"] == 50
-    assert s["answers"]["complete_answers"] == 50
+    assert s["answers"]["answered"] == 50
     assert s["sla"]["success_rate"]["met"] is True
 
 

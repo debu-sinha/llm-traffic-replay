@@ -214,7 +214,7 @@ def _verdict(s: dict) -> tuple[str, str]:
     floor = (sla.get("success_rate") or {}).get("target") or 0.99
     if rate is not None and rate < floor:
         n = a.get("judged") or a.get("attempted") or 0
-        bad = n - (a.get("complete_answers") or 0)
+        bad = n - (a.get("answered") or 0)
         return "miss", (
             f"{bad} of {n} requests did not produce a readable answer "
             f"({rate:.1%} answered). latency figures describe only the ones "
@@ -291,7 +291,7 @@ def _answer_block(ok: list[dict], attempted: int) -> dict | None:
         "attempted": attempted,
         "transport_ok": len(ok),
         "scored": n_ok,
-        "complete_answers": complete,
+        "answered": complete,
         "no_visible_content": sum(
             1 for r in scored if not r.get("visible_content_seen")),
         "stream_incomplete": sum(
@@ -305,12 +305,24 @@ def _answer_block(ok: list[dict], attempted: int) -> dict | None:
         # they are unmeasurable rather than unanswered, and counting them
         # would fail a merged 0.3.0 shard for having old-format rows.
         "judged": n_ok + max(0, attempted - len(ok)),
+        # a row whose budget was cut by the global cap rather than by its own
+        # sampled target is a different animal: "length" there means the run
+        # did NOT reach the output size the profile asked for, which shortens
+        # end-to-end and caps output throughput.
+        "truncated_by_global_cap": sum(
+            1 for r in scored
+            if r.get("truncated") and r.get("max_tokens_requested")
+            and r.get("intended_output_tokens")
+            and r["max_tokens_requested"] < r["intended_output_tokens"]),
         "answer_rate": (round(complete / (n_ok + max(0, attempted - len(ok))),
                               6)
                         if (n_ok + max(0, attempted - len(ok))) else None),
         "answer_rate_of_transport_ok": (round(complete / n_ok, 6)
                                         if n_ok else None),
-        "note": "truncation is not counted as a failure. the harness caps "
+        "note": "answered means visible content arrived and the stream "
+                "finished cleanly. it does NOT mean the answer was complete "
+                "or correct: most generations stop at the requested output "
+                "length. truncation is not counted as a failure. the harness caps "
                 "max_tokens at the sampled output size, so ending on "
                 "\"length\" is the expected way to hit a target output "
                 "length. producing no visible content is the failure.",
@@ -1235,15 +1247,18 @@ def render_markdown(summary: dict, title: str) -> str:
         lines += ["", "## answers",
                   "", f"- attempted: {a['attempted']}",
                   f"- returned HTTP 200: {a['transport_ok']}",
-                  f"- produced a readable answer: {a['complete_answers']} "
+                  f"- started a readable answer: {a['answered']} "
                   f"({a['answer_rate']:.1%} of the {a.get('judged')} judged)"
                   if a.get("answer_rate") is not None else
-                  f"- produced a readable answer: {a['complete_answers']}",
+                  f"- produced a readable answer: {a['answered']}",
                   f"- returned 200 with no visible content: "
                   f"{a['no_visible_content']}",
                   f"- stream never terminated: {a['stream_incomplete']}",
                   f"- unrecoverable parse errors: {a['parse_errors']}",
-                  f"- ended on the token cap: {a['truncated']}",
+                  f"- stopped at the requested output length: "
+                  f"{a['truncated']}",
+                  f"- cut short by the global token cap: "
+                  f"{a['truncated_by_global_cap']}",
                   "", a["note"]]
         if a.get("invalid"):
             lines += ["", f"INVALID: {a['invalid']}"]
@@ -1526,12 +1541,24 @@ def render_html(summary: dict, title: str) -> str:
         note_bits = []
         ttft_rows = sla.get("ttft_vs_target") or []
         if ttft_rows and all(r["actual_ms"] is None for r in ttft_rows):
-            fix = (" Raise <code>max_output_tokens_cap</code>, or set "
-                   "<code>ttft_definition</code> to <code>first_content</code>,"
-                   " to get a number."
+            # in profile mode the per-request budget is
+            # min(sampled_output_tokens, max_output_tokens_cap), so telling
+            # someone to raise the cap is advice that cannot work: the
+            # sampled value is the smaller one and still wins. name the knob
+            # that actually binds for the mode this run used.
+            _mode = ((s.get("run") or {}).get("input_mode") or "profile")
+            _knob = ("the profile's <code>output_tokens</code> quantiles "
+                     "(raising <code>max_output_tokens_cap</code> alone will "
+                     "not help, the per-request budget is the smaller of the "
+                     "two)"
+                     if _mode == "profile" else
+                     "<code>max_output_tokens_cap</code>")
+            fix = (f" Raise {_knob}, or set <code>ttft_definition</code> to "
+                   "<code>first_content</code>, to get a number."
                    if defn != "first_content" else
-                   " Raise <code>max_output_tokens_cap</code> so requests reach "
-                   "that token.")
+                   f" Raise {_knob} so requests reach that token."
+                   " On a reasoning-only model no budget may be enough, and"
+                   " the mode is the decision rather than the budget.")
             note_bits.append(
                 f"TTFT actual is <b>-</b> because it is scored on "
                 f"<b>{defn}</b> and no request emitted that token within "

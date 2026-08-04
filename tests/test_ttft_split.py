@@ -173,7 +173,7 @@ def test_a_reasoning_only_stream_is_not_counted_as_a_successful_answer():
 
     s = out["summary"]
     a = s["answers"]
-    assert a["complete_answers"] == 0
+    assert a["answered"] == 0
     assert a["no_visible_content"] == len(replay)
     assert a["stream_incomplete"] == 0, "the streams DID terminate cleanly"
     assert "invalid" in a

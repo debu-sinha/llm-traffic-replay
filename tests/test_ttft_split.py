@@ -111,3 +111,75 @@ def test_reasoning_split_end_to_end():
     assert abs(scored["p50"] - s["ttfv_ms"]["p50"]) < 0.6   # scored the ttfv table
     report = (Path(out["out_dir"]) / "report.md").read_text()
     assert "reasoning model detected" in report
+
+
+# ---- the real client path, on a stream that never produces an answer -----
+def test_a_reasoning_only_stream_is_not_counted_as_a_successful_answer():
+    """End to end through the real client, not hand-written rows.
+
+    The mock emits the reasoning channel and then stops on "length" with no
+    visible delta, which is exactly what a reasoning model does when the
+    token budget runs out mid-thought. Every request returns HTTP 200 with a
+    well formed stream and a finish reason.
+
+    This exists because every other test of these fields builds the row dict
+    by hand. If the saw_first_visible derivation in sse.py or the
+    stream_complete derivation in client.py drifts, those tests all still
+    pass and this one does not.
+    """
+    wd = Path(tempfile.mkdtemp(prefix="reasononly-"))
+    port = 8894
+    srv = serve(port, wd / "truth.jsonl", reasoning_tokens=6, reasoning_only=1,
+                per_token_ms=3.0, ttft_base_ms=25.0, ms_per_1k_uncached=5.0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    time.sleep(0.3)
+    prof = wd / "prof.json"
+    prof.write_text(json.dumps({
+        "name": "reasoning_only_test",
+        "input_tokens": {"p50": 800, "p95": 2000},
+        "output_tokens": {"p50": 16, "p95": 24},
+        "cache_fraction": {"p50": 0.30, "p95": 0.60},
+    }))
+    try:
+        rc = RunConfig(
+            profile_path=str(prof),
+            endpoint={"base_url": f"http://127.0.0.1:{port}",
+                      "path": "/serving-endpoints/mock/invocations",
+                      "auth_token_env": "NO_TOKEN"},
+            duration_s=6, qps_base=4.0, qps_burst=8.0, qps_min=1.0,
+            qps_max=12.0, max_concurrency=16, cpt=4.0, calibrate_n=4,
+            out_dir=str(wd / "out"), title="reasoning only", label="MOCK",
+            max_output_tokens_cap=12,
+            acceptance_targets={"ttft_ms": {"p50": 100000},
+                                "success_rate": 0.99})
+        out = run(rc, quiet=True)
+    finally:
+        srv.shutdown()
+
+    rows = [json.loads(x) for x in
+            (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
+    replay = [r for r in rows if r.get("phase") == "replay"]
+    assert replay, "no replay rows"
+
+    # the transport was fine on every one of them
+    assert all(r["ok"] for r in replay)
+    assert all(r["status"] == 200 for r in replay)
+    # and the client derived the answer facts correctly from the real stream
+    assert all(r["stream_complete"] for r in replay)
+    assert all(r["reasoning_seen"] for r in replay)
+    assert not any(r["visible_content_seen"] for r in replay)
+    assert all(r["truncated"] for r in replay)
+    assert all(r["parse_errors"] == 0 for r in replay)
+
+    s = out["summary"]
+    a = s["answers"]
+    assert a["complete_answers"] == 0
+    assert a["no_visible_content"] == len(replay)
+    assert a["stream_incomplete"] == 0, "the streams DID terminate cleanly"
+    assert "invalid" in a
+    assert s["sla"]["success_rate"]["met"] is False
+
+    md = (Path(out["out_dir"]) / "report.md").read_text()
+    assert "verdict: INVALID" in md
+    html = (Path(out["out_dir"]) / "report.html").read_text()
+    assert "Meets every acceptance target" not in html

@@ -106,6 +106,59 @@ def _pct_table(values: list[float | None]) -> dict:
     return out
 
 
+def _verdict(s: dict) -> tuple[str, str]:
+    """The run's verdict, as (kind, sentence). kind is one of
+    invalid / miss / unscored / ok.
+
+    Both renderers call this. They used to each compute their own, and they
+    disagreed: the html counted the success-rate, hard-timeout and interchunk
+    rows while the markdown counted only the latency rows, so report.md could
+    print "meets every acceptance target" over a run the html called a miss.
+    report.md is the file people paste into email, so it was the wrong one to
+    have drifting.
+    """
+    sla = s.get("sla") or {}
+    a = s.get("answers") or {}
+    rows = [r for k in ("ttft_vs_target", "ttfg_vs_target")
+            for r in (sla.get(k) or [])]
+    misses = sum(1 for r in rows if r["met"] is False)
+    if sla.get("hard_timeout_breaches"):
+        misses += 1
+    if sla.get("interchunk_breaches"):
+        misses += 1
+    if (sla.get("success_rate") or {}).get("met") is False:
+        misses += 1
+    unmeasured = sum(1 for r in rows
+                     if r["met"] is None and r.get("target_ms") is not None)
+
+    if a.get("invalid"):
+        return "invalid", a["invalid"]
+
+    # answers gate the banner on their own. an SLA block with no success_rate
+    # key has no row that a collapse in readable answers can miss, so without
+    # this a run that answered 29 percent of the time rendered green.
+    rate = a.get("answer_rate")
+    floor = (sla.get("success_rate") or {}).get("target") or 0.99
+    if rate is not None and rate < floor:
+        n = a.get("scored") or a.get("transport_ok") or 0
+        bad = n - (a.get("complete_answers") or 0)
+        return "miss", (
+            f"{bad} of {n} requests returned HTTP 200 without a readable "
+            f"answer ({rate:.1%} answered). latency figures describe only the "
+            "ones that answered")
+    if misses:
+        return "miss", (f"{misses} acceptance target"
+                        f"{'s' if misses != 1 else ''} missed")
+    if unmeasured:
+        return "unscored", (
+            f"not scored. {unmeasured} target"
+            f"{'s' if unmeasured != 1 else ''} had no measurement behind "
+            "them, which is not a pass")
+    if sla.get("coverage_warning"):
+        return "unscored", ("not scored. see the coverage caution above")
+    return "ok", "meets every acceptance target"
+
+
 def _answered(r: dict) -> bool:
     """Did this request actually produce an answer?
 
@@ -126,31 +179,41 @@ def _answered(r: dict) -> bool:
 
 def _answer_block(ok: list[dict], attempted: int) -> dict | None:
     """Answer completion, separately from transport success."""
-    if not any("visible_content_seen" in r for r in ok):
+    scored = [r for r in ok if "visible_content_seen" in r]
+    if not scored:
         return None          # rows written before this was recorded
-    n_ok = len(ok)
-    complete = sum(1 for r in ok if _answered(r))
+    n_ok = len(scored)
+    complete = sum(1 for r in scored if _answered(r))
     out = {
         "attempted": attempted,
-        "transport_ok": n_ok,
+        "transport_ok": len(ok),
+        "scored": n_ok,
         "complete_answers": complete,
         "no_visible_content": sum(
-            1 for r in ok if not r.get("visible_content_seen")),
+            1 for r in scored if not r.get("visible_content_seen")),
         "stream_incomplete": sum(
-            1 for r in ok if not r.get("stream_complete")),
-        "parse_errors": sum(1 for r in ok if r.get("parse_errors")),
-        "truncated": sum(1 for r in ok if r.get("truncated")),
-        "answer_rate": round(complete / attempted, 6) if attempted else None,
+            1 for r in scored if not r.get("stream_complete")),
+        "parse_errors": sum(1 for r in scored if r.get("parse_errors")),
+        "truncated": sum(1 for r in scored if r.get("truncated")),
+        "answer_rate": round(complete / n_ok, 6) if n_ok else None,
         "note": "truncation is not counted as a failure. the harness caps "
                 "max_tokens at the sampled output size, so ending on "
                 "\"length\" is the expected way to hit a target output "
                 "length. producing no visible content is the failure.",
     }
     if complete == 0 and n_ok:
+        # name the counter that actually drove it. asserting "produced no
+        # visible content" when the real cause was a stream that never
+        # terminated puts a false statement next to a zero counter.
+        cause = max((("returned no visible content", out["no_visible_content"]),
+                     ("never terminated their stream", out["stream_incomplete"]),
+                     ("hit unrecoverable parse errors", out["parse_errors"])),
+                    key=lambda kv: kv[1])
         out["invalid"] = (
             f"not one of the {n_ok} requests that returned HTTP 200 produced "
-            "visible content. there is no latency-to-answer in this run and "
-            "nothing here is a performance result.")
+            f"a readable answer. most of them {cause[0]} ({cause[1]} of "
+            f"{n_ok}). there is no latency-to-answer in this run and nothing "
+            "here is a performance result.")
     return out
 
 
@@ -1042,6 +1105,8 @@ def render_markdown(summary: dict, title: str) -> str:
                   f"- produced a readable answer: {a['complete_answers']}",
                   f"- returned 200 with no visible content: "
                   f"{a['no_visible_content']}",
+                  f"- stream never terminated: {a['stream_incomplete']}",
+                  f"- unrecoverable parse errors: {a['parse_errors']}",
                   f"- ended on the token cap: {a['truncated']}",
                   "", a["note"]]
         if a.get("invalid"):
@@ -1077,26 +1142,11 @@ def render_markdown(summary: dict, title: str) -> str:
             lines.append(f"| success rate | - | {sr['target']} | "
                          f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
 
-        # report.md is the file that gets pasted into an email, so it needs
-        # the same verdict the html shows. a target with no measurement
-        # behind it is not a pass.
-        _rows = [r for k in ("ttft_vs_target", "ttfg_vs_target")
-                 for r in (sla.get(k) or [])]
-        _miss_n = sum(1 for r in _rows if r["met"] is False)
-        _unmeas = sum(1 for r in _rows
-                      if r["met"] is None and r.get("target_ms") is not None)
-        if (s.get("answers") or {}).get("invalid"):
-            _verdict = "INVALID, see above. nothing here is a latency result"
-        elif _miss_n:
-            _verdict = (f"{_miss_n} acceptance target"
-                        f"{'s' if _miss_n != 1 else ''} missed")
-        elif _unmeas or sla.get("coverage_warning"):
-            _verdict = (f"not scored. {_unmeas} target"
-                        f"{'s' if _unmeas != 1 else ''} had no measurement "
-                        "behind them, which is not a pass")
-        else:
-            _verdict = "meets every acceptance target"
-        lines += ["", f"verdict: {_verdict}"]
+        # report.md is the file that gets pasted into an email, so it shows
+        # the same verdict the html does, from the same function.
+        _kind, _text = _verdict(s)
+        _pre = "INVALID: " if _kind == "invalid" else ""
+        lines += ["", f"verdict: {_pre}{_text}"]
 
     if s.get("ttfr_ms"):
         tft = s["ttft_ms"].get("p50")
@@ -1372,22 +1422,13 @@ def render_html(summary: dict, title: str) -> str:
             + "<table>"
             f"<tr><th class='lbl'>metric</th><th>target</th><th>actual</th>"
             f"<th>result</th></tr>{''.join(rows)}</table>{slanote}</div>")
-        # a target with no measurement behind it is not a pass. scoring it
-        # as one is how a run with zero readable answers rendered green.
-        invalid = (s.get("answers") or {}).get("invalid")
-        if invalid:
-            banner = f"<div class='banner bad'>INVALID: {esc(invalid)}</div>"
-        elif misses:
-            banner = (f"<div class='banner bad'>{misses} acceptance "
-                      f"target{'s' if misses != 1 else ''} missed</div>")
-        elif unmeasured or sla.get("coverage_warning"):
-            banner = ("<div class='banner warn'>Not scored: "
-                      f"{unmeasured} target{'s' if unmeasured != 1 else ''} "
-                      "had no measurement behind them. this is not a pass"
-                      "</div>")
-        else:
-            banner = ("<div class='banner ok'>Meets every acceptance target"
-                      "</div>")
+        # one shared verdict, so report.md and this page cannot disagree
+        vkind, vtext = _verdict(s)
+        vcls = {"invalid": "bad", "miss": "bad",
+                "unscored": "warn", "ok": "ok"}[vkind]
+        vpre = "INVALID: " if vkind == "invalid" else ""
+        cap = vtext[:1].upper() + vtext[1:] if not vpre else vtext
+        banner = f"<div class='banner {vcls}'>{vpre}{esc(cap)}</div>"
 
     # ---- latency table ----
     lat = []
@@ -1488,7 +1529,7 @@ def render_html(summary: dict, title: str) -> str:
     if cc.get("in_flight_p50") is not None:
         askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
         bel.append(f"<li><b>Concurrency in flight</b>: p50 "
-                   f"{cc['in_flight_p50']:.0f}, peak "
+                   f"{cc['in_flight_p50']:.0f}, high sample "
                    f"{cc['in_flight_max_sampled']:.0f}{askd} "
                    f"({esc(cc['measured_over'])})</li>")
     lb = s.get("latency_basis")

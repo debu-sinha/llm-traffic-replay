@@ -90,6 +90,14 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "lateness. read each run's own report. dispatch lag below is pooled "
         "and still meaningful, since it is measured within each run.")
     summary.pop("client", None)
+    # concurrency is interval overlap across pooled rows. shards that never
+    # ran at the same time have no overlap, so a merged run would report a
+    # p50 of 0 in flight. same reason wire lateness and drift are blanked.
+    if summary.pop("concurrency", None) is not None:
+        summary["concurrency_note"] = (
+            "concurrency in flight is not computed for a merged run, because "
+            "it is measured by interval overlap and shards that ran at "
+            "different times do not overlap. read each run's own report.")
     summary["drift"] = {
         "windows": [], "window_seconds": 60,
         "note": "stability over time is not computed for a merged run. the "

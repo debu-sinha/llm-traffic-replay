@@ -979,3 +979,89 @@ def test_an_unmeasured_target_is_not_scored_as_a_pass():
     html = render_html(s, "partial")
     assert "Meets every acceptance target" not in html
     assert "not measured" in render_markdown(s, "partial")
+
+
+# ---- the two renderers must not disagree about the verdict ---------------
+
+def _mixed(silent, good):
+    r = [{"ok": True, "phase": "replay", "ttft_ms": 100.0, "ttfr_ms": 100.0,
+          "ttfv_ms": None, "e2e_ms": 200.0, "stream_complete": True,
+          "visible_content_seen": False, "truncated": True,
+          "parse_errors": 0, "finish_reason": "length"} for _ in range(silent)]
+    r += [{"ok": True, "phase": "replay", "ttft_ms": 100.0, "ttfr_ms": 100.0,
+           "ttfv_ms": 110.0, "e2e_ms": 200.0, "stream_complete": True,
+           "visible_content_seen": True, "truncated": False,
+           "parse_errors": 0, "finish_reason": "stop"} for _ in range(good)]
+    for i, x in enumerate(r):
+        x["t_send_unix"] = 1_700_000_000.0 + i * 0.25
+        x["first_send_unix"] = x["t_send_unix"]
+    return r
+
+
+def _md_verdict(s):
+    return [l for l in render_markdown(s, "x").splitlines()
+            if l.startswith("verdict:")][0]
+
+
+def test_an_answer_collapse_is_not_green_without_a_success_rate_target():
+    """success_rate is optional, and configs/run_pt_full.json omits it. With
+    no success-rate row there was nothing for a collapse in readable answers
+    to miss, so 55 of 187 answered still rendered the green banner."""
+    s = summarize(_mixed(132, 55),
+                  acceptance={"ttft_ms": {"p50": 5000},
+                              "ttfg_ms": {"p50": 5000}})
+    assert s["answers"]["answer_rate"] < 0.30
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    assert "132 of 187" in _md_verdict(s)
+
+
+def test_markdown_and_html_agree_on_the_verdict():
+    """They each used to compute their own. The html counted the success-rate
+    row and the markdown did not, so report.md, the file people paste into
+    email, called a failing run a pass."""
+    for silent, good, acc in (
+            (132, 55, {"ttft_ms": {"p50": 5000}, "success_rate": 0.99}),
+            (132, 55, {"ttft_ms": {"p50": 5000}, "ttfg_ms": {"p50": 5000}}),
+            (0, 187, {"ttft_ms": {"p50": 5000}, "success_rate": 0.99}),
+            (187, 0, {"ttft_ms": {"p50": 5000}})):
+        s = summarize(_mixed(silent, good), acceptance=acc)
+        green_html = "Meets every acceptance target" in render_html(s, "x")
+        green_md = _md_verdict(s) == "verdict: meets every acceptance target"
+        assert green_html == green_md, (silent, good, acc, _md_verdict(s))
+
+
+def test_a_success_rate_miss_reaches_the_markdown_verdict():
+    s = summarize(_mixed(0, 100), acceptance={"success_rate": 0.99})
+    s["sla"]["success_rate"] = {"target": 0.99, "actual": 0.5, "met": False}
+    assert "missed" in _md_verdict(s) or "without a readable" in _md_verdict(s)
+
+
+def test_the_invalid_sentence_names_the_counter_that_drove_it():
+    """It used to assert every request produced no visible content, which is
+    false when the real cause was a stream that never terminated, and it sat
+    directly under a no_visible_content of 0."""
+    rows = _mixed(0, 60)
+    for r in rows:
+        r["stream_complete"] = False
+    s = summarize(rows, acceptance={"ttft_ms": {"p50": 5000}})
+    inv = s["answers"]["invalid"]
+    assert s["answers"]["no_visible_content"] == 0
+    assert "never terminated their stream" in inv
+    assert "60 of 60" in inv
+
+
+def test_old_rows_are_not_retroactively_failed_by_the_answers_block():
+    """Merging a 0.3.0 run dir with a 0.4.0 one used to report answer_rate
+    0.5 next to a success rate of 1.0, because the guard was all-or-nothing
+    while the SLA block guards per row."""
+    new = _mixed(0, 50)
+    old = [{"ok": True, "phase": "replay", "ttft_ms": 100.0, "e2e_ms": 200.0,
+            "finish_reason": "stop",
+            "t_send_unix": 1_700_000_100.0 + i * 0.25,
+            "first_send_unix": 1_700_000_100.0 + i * 0.25} for i in range(50)]
+    s = summarize(new + old, acceptance={"success_rate": 0.99})
+    a = s["answers"]
+    assert a["scored"] == 50, "only rows carrying the field are scored"
+    assert a["transport_ok"] == 100
+    assert a["answer_rate"] == 1.0
+    assert s["sla"]["success_rate"]["met"] is True

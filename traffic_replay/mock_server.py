@@ -36,6 +36,11 @@ DEFAULTS = {
     "ms_per_1k_uncached": 40.0,
     "per_token_ms": 4.0,
     "reasoning_tokens": 0,
+    # emit the reasoning channel and then stop on "length" without ever
+    # sending a visible delta. that is what a reasoning model does when the
+    # token budget runs out mid-thought, and it is the shape that used to be
+    # counted as a success.
+    "reasoning_only": 0,
     "cache_capacity_chains": 4096,
     "cache_ttl_s": 900.0,
 }
@@ -147,6 +152,22 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                                    "finish_reason": None}]})
             if reasoning_n:
                 time.sleep(params["per_token_ms"] / 1000.0)
+            if int(params.get("reasoning_only", 0)):
+                usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": reasoning_n,
+                    "total_tokens": prompt_tokens + reasoning_n,
+                    "prompt_tokens_details": {"cached_tokens": cached_tokens},
+                    "completion_tokens_details": {
+                        "reasoning_tokens": reasoning_n},
+                }
+                emit({"choices": [{"delta": {}, "finish_reason": "length"}],
+                      "usage": usage})
+                data = b"data: [DONE]\n\n"
+                self.wfile.write(
+                    f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                return
             t_first_content = time.monotonic()
             emit({"choices": [{"delta": {"content": "The"},
                                "finish_reason": None}]})

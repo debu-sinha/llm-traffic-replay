@@ -103,7 +103,7 @@ Commands below use `python3`, which is what a stock macOS or Linux box has.
 If your `python` already points at 3.10+ (a venv or conda env), `python`
 works too.
 
-## Quickstart (no endpoint needed, about 60 seconds)
+## Try it with no endpoint (about 60 seconds)
 
 Run every command from the repository root (the directory holding this file).
 Don't `cd` into `traffic_replay/`, that is the package, and both
@@ -129,6 +129,44 @@ error p50 ~2 ms, p95 < 5 ms. If it doesn't PASS on your machine, don't
 trust any number the harness produces there.
 
 ## Run against a real endpoint
+
+### The short way: `quickstart`
+
+`quickstart` writes a runnable config from a host, an endpoint name and a
+profile, so a first run doesn't mean hand-editing JSON:
+
+```bash
+python3 -m traffic_replay quickstart \
+  --host https://your-workspace.cloud.databricks.com \
+  --endpoint your-endpoint-name \
+  --profile configs/profile_agent_stated.json \
+  --concurrency 30 \
+  --duration 300 \
+  --ttft-p95 900 --ttfg-p95 1500 --success-rate 0.99 \
+  --out configs/my_run.json
+
+python3 -m traffic_replay run --config configs/my_run.json
+```
+
+`--concurrency` is the one worth knowing about. Load tests are specified in
+concurrency, not in requests per second, so the harness measures service time
+in a short sizing pass and derives the arrival rate and pool size from it.
+Two things follow from that, and both are printed:
+
+- The rate comes from service time measured **without** load. Service time
+  rises under load, so the run tends to carry more than the number on the
+  label. The report measures what was actually in flight and cautions in
+  either direction, so read the measured value, not the flag you passed.
+- The sizing requests are tagged `phase: "sizing"` and never reach the
+  summary, but they are real billed traffic.
+
+Auth: pass `--auth-profile <name>` to read a profile out of
+`~/.databrickscfg` instead of exporting a token. A PAT profile is used
+directly; an OAuth profile shells out to `databricks auth token`. If the
+profile doesn't resolve, the run says so on stderr and falls back to the
+environment variable rather than running unauthenticated.
+
+### The long way: edit the config
 
 Open `configs/run_smoke.json` and fill in the two `YOUR-...` placeholders,
 your workspace host and the endpoint path:
@@ -704,6 +742,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `endpoint.path` | required | `"/serving-endpoints/my-ep/invocations"` | the serving endpoint route. Model-serving uses `.../invocations` |
 | `endpoint.auth_token_env` | `DATABRICKS_TOKEN` | `"DATABRICKS_TOKEN"` | env var the bearer token is read from. Never put the token in the config |
 | `endpoint.model` | null | `"databricks-meta-llama-3-3-70b-instruct"` | set only for shared `/chat/completions` routes that need a model field; leave null for a dedicated `.../invocations` endpoint |
+| `endpoint.auth_profile` | null | `"my-workspace"` | profile in `~/.databrickscfg` to read the token from, instead of an env var. PAT profiles are used directly, OAuth profiles call `databricks auth token`. Falls back to `auth_token_env` with a message on stderr if it can't resolve |
 | `endpoint.connect_timeout_s` | 10 | `10` | TCP/TLS connect timeout. Raise on a slow/cold endpoint |
 | `endpoint.read_timeout_s` | 120 | `120` | per-read socket timeout while streaming. Raise for long generations |
 | `endpoint.temperature` | 0.0 | `0.0` | request temperature. Keep 0 for repeatable benchmarks |
@@ -714,6 +753,7 @@ Run configs are plain JSON deserialized into `RunConfig`
 | `qps_min` / `qps_max` | 10 / 500 | `1` / `12` | hard floor and ceiling clamped on the rate curve |
 | `rate_scale` | 1.0 | `0.5` | uniform thinning that keeps the shape. Step it 0.1 to 1.0 to find where the endpoint bends |
 | `timestamps_file` | null | `"your_arrivals.txt"` | real arrival trace (one epoch/line, or JSONL `{"t": s}`) that replaces the synthetic schedule |
+| `concurrency` | null | `30` | target in-flight requests. When set, a sizing pass measures service time and derives the arrival rate and pool size, overriding `qps_base`, `qps_burst`, `qps_min`, `qps_max` and `rate_scale`. The rate is derived from unloaded service time, so the run usually carries more than this number. The report measures what was actually held and cautions either way |
 | `max_concurrency` | 256 | `64` | in-flight request bound. Set it above `qps * p95_latency_seconds` or the pool queues and the endpoint is never driven at the rate you asked for. Excess arrivals surface as wire lateness and a client-saturation caution, never as fake endpoint latency |
 | `seed` | 7 | `7` | root RNG seed. Same config plus same seed is the same experiment |
 | `cpt` | 4.0 | `4.0` | starting characters-per-token guess, recalibrated during warmup (profile mode only) |
@@ -734,9 +774,12 @@ Profile JSON fields: `name`, then `input_tokens`, `output_tokens`, and
 `provenance` records where the numbers came from, and `label` is printed on
 every report built from this profile. An optional `acceptance_targets`
 object (ttft_ms, ttfg_ms, hard_timeouts, success_rate, interchunk_ms) drives
-the SLA scorecard. Without it, no scorecard is printed. Auth is never stored in any config.
-The token comes from the environment variable at run time or, in a
-notebook, from the ambient workspace context.
+the SLA scorecard. Without it, no scorecard is printed.
+
+Auth is never stored in any config. The token is read at run time from the
+environment variable `auth_token_env` names, or from the `~/.databrickscfg`
+profile `auth_profile` names, or in a notebook from the ambient workspace
+context.
 
 ## Architecture
 

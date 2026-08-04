@@ -149,6 +149,187 @@ def cmd_compare(args) -> int:
     return 0
 
 
+def _pair(text, what):
+    """Parse "10000" or "10000,24000" into a p50/p95 pair.
+
+    A single value gets a p95 2.4x above it, which is roughly the spread of
+    the agent traffic this was built for. Someone who knows their real p95
+    passes both. Nobody should have to author a JSON file to say how big
+    their prompts are.
+    """
+    parts = [x.strip() for x in str(text).split(",") if x.strip()]
+    try:
+        vals = [float(x) for x in parts]
+    except ValueError:
+        raise SystemExit(f"--{what} wants a number or two, got {text!r}")
+    if not vals:
+        raise SystemExit(f"--{what} is empty")
+    p50 = vals[0]
+    p95 = vals[1] if len(vals) > 1 else p50 * 2.4
+    if p95 <= p50:
+        raise SystemExit(f"--{what} needs p95 above p50, got {p50} and {p95}")
+    return {"p50": p50, "p95": p95}
+
+
+def _preflight(cfg: dict) -> dict:
+    """Send a couple of real requests and report what the endpoint does.
+
+    This exists because the ways this tool produces a confidently wrong
+    number are nearly all visible in two requests: auth that does not work,
+    a model that spends its whole token budget reasoning, an endpoint that
+    does not report usage, or one that does not report cached tokens. Better
+    to find them in ten seconds than in a five minute run.
+    """
+    from .client import EndpointClient, EndpointConfig
+    from .runner import _token
+    from .textgen import TextMaterializer
+
+    ecfg = EndpointConfig(**cfg["endpoint"])
+    tok = _token(ecfg)
+    client = EndpointClient(ecfg, tok)
+    mat = TextMaterializer(cpt=4.0)
+    ip = cfg["_input_tokens"]
+    out: dict = {"auth": bool(tok)}
+    rows = []
+    for i in range(2):
+        msgs = mat.messages(f"preflight{i}", i, int(ip["p50"]),
+                            int(ip["p95"]), 200)
+        res = client.send(msgs, 512, f"preflight-{i}", scheduled_s=0.0,
+                          dispatch_lag_ms=0.0, intended=(0, 0, None, -1),
+                          chars_sent=0)
+        rows.append(res)
+    ok = [r for r in rows if r.ok]
+    out["reachable"] = len(ok)
+    out["attempted"] = len(rows)
+    if not ok:
+        out["error"] = (rows[0].error or "no response")[:200]
+        return out
+    out["usage_reported"] = any(r.prompt_tokens for r in ok)
+    out["cache_reported"] = any(r.cached_tokens is not None for r in ok)
+    out["reasoning"] = any(r.reasoning_chunks for r in ok)
+    out["visible"] = any(r.ttfv_ms is not None for r in ok)
+    out["truncated"] = any(r.finish_reason == "length" for r in ok)
+    return out
+
+
+def cmd_benchmark(args) -> int:
+    """One command from an endpoint URL to a report.
+
+    The previous path was: author a profile JSON, run quickstart, edit the
+    config, run it. Three of those four steps are things a person should not
+    have to do to answer "does this endpoint meet my latency target".
+    """
+    from .runner import RunConfig, run
+
+    path = args.endpoint
+    if not path.startswith("/"):
+        path = f"/serving-endpoints/{path}/invocations"
+    ep: dict = {"base_url": args.host.rstrip("/"), "path": path}
+    if args.auth_profile:
+        ep["auth_profile"] = args.auth_profile
+    else:
+        ep["auth_token_env"] = args.token_env
+    if args.model:
+        ep["model"] = args.model
+    if args.extra_body:
+        try:
+            ep["extra_body"] = json.loads(args.extra_body)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"--extra-body is not valid JSON: {e}")
+
+    cfg: dict = {
+        "endpoint": ep,
+        "concurrency": args.concurrency,
+        "duration_s": args.duration,
+        "out_dir": args.out_dir,
+        "title": args.title or f"{args.concurrency} concurrent, {args.endpoint}",
+        "label": args.label or (
+            "Describe the capacity this ran on. Shared pay-per-token is not "
+            "a performance claim for a dedicated endpoint."),
+    }
+
+    inp = _pair(args.input_tokens, "input-tokens")
+    if args.prompts:
+        cfg["prompts_file"] = args.prompts
+    elif args.profile:
+        cfg["profile_path"] = args.profile
+    else:
+        prof = {
+            "name": "from_command_line",
+            "input_tokens": inp,
+            "output_tokens": _pair(args.output_tokens, "output-tokens"),
+            "cache_fraction": _pair(args.cache_hit_rate, "cache-hit-rate"),
+            "provenance": ("figures passed on the command line, not measured "
+                           "from logs. build one from your own traffic with "
+                           "scripts/profile_from_logs.py when you can."),
+            "label": ("Traffic shape stated on the command line rather than "
+                      "measured."),
+        }
+        pf = Path(args.out_dir) / "profile.json"
+        pf.parent.mkdir(parents=True, exist_ok=True)
+        pf.write_text(json.dumps(prof, indent=2) + "\n")
+        cfg["profile_path"] = str(pf)
+
+    ttft = {q: v for q, v in (("p50", args.ttft_p50), ("p90", args.ttft_p90),
+                              ("p95", args.ttft_p95), ("p99", args.ttft_p99))
+            if v}
+    ttfg = {q: v for q, v in (("p50", args.ttfg_p50), ("p90", args.ttfg_p90),
+                              ("p95", args.ttfg_p95), ("p99", args.ttfg_p99))
+            if v}
+    if ttft or ttfg or args.success_rate:
+        t: dict = {"targets_are": "yours, passed on the command line"}
+        if ttft:
+            t["ttft_ms"] = ttft
+        if ttfg:
+            t["ttfg_ms"] = ttfg
+        if args.success_rate:
+            t["success_rate"] = args.success_rate
+        cfg["acceptance_targets"] = t
+
+    cfg["_input_tokens"] = inp
+    if not args.skip_preflight:
+        print("[preflight] sending 2 requests to see what this endpoint does")
+        pf_res = _preflight(cfg)
+        if not pf_res.get("reachable"):
+            print(f"[preflight] FAILED: {pf_res.get('error', 'no response')}")
+            print("[preflight] check the host, the endpoint name and the "
+                  "token before running a load test against it.")
+            return 2
+        print(f"[preflight] {pf_res['reachable']}/{pf_res['attempted']} "
+              "responded")
+        if not pf_res.get("usage_reported"):
+            print("[preflight] WARNING: no token usage reported, so token "
+                  "throughput and per-token cost will be blank")
+        if not pf_res.get("cache_reported"):
+            print("[preflight] note: no cached-token field, so achieved "
+                  "cache cannot be reported and latency cannot be judged "
+                  "against a cache target")
+        if pf_res.get("reasoning"):
+            print("[preflight] this is a REASONING model. it emits thinking "
+                  "tokens before the answer, and they count against "
+                  "max_tokens.")
+            if not pf_res.get("visible"):
+                print("[preflight] and it produced NO visible answer within "
+                      "512 tokens. at your output budget it will produce "
+                      "none either. raise --output-tokens, or turn reasoning "
+                      "down with --extra-body, before trusting any latency "
+                      "number from this endpoint.")
+            if "ttft_definition" not in cfg:
+                cfg["ttft_definition"] = "first_visible"
+                print("[preflight] scoring TTFT on the first VISIBLE token, "
+                      "which is what a user-facing SLA describes.")
+    cfg.pop("_input_tokens", None)
+
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    saved = Path(args.out_dir) / "run-config.json"
+    saved.write_text(json.dumps(cfg, indent=2) + "\n")
+    out = run(RunConfig(**cfg))
+    print()
+    print(f"config saved to {saved}, rerun it with:")
+    print(f"  python3 -m traffic_replay run --config {saved}")
+    return 0
+
+
 def cmd_quickstart(args) -> int:
     """Write a run config from the few things a load test actually needs.
 
@@ -235,6 +416,55 @@ def main(argv=None) -> int:
     s.add_argument("--duration", type=int, default=300)
     s.add_argument("--rate-scale", type=float, default=1.0)
     s.set_defaults(fn=cmd_schedule)
+
+    s = sub.add_parser(
+        "benchmark",
+        help="one command: endpoint in, report out (start here)")
+    s.add_argument("--host", required=True,
+                   help="workspace URL, e.g. https://my-ws.cloud.databricks.com")
+    s.add_argument("--endpoint", required=True,
+                   help="endpoint name, or a full /serving-endpoints/... path")
+    s.add_argument("--concurrency", type=int, default=10,
+                   help="how many requests to hold in flight (default 10)")
+    s.add_argument("--duration", type=int, default=300,
+                   help="seconds. 300 gives five stability windows")
+    s.add_argument("--input-tokens", default="10000",
+                   help="prompt size as p50 or p50,p95. default 10000")
+    s.add_argument("--output-tokens", default="200",
+                   help="answer size as p50 or p50,p95. default 200")
+    s.add_argument("--cache-hit-rate", default="0.3,0.7",
+                   help="prompt-cache reuse as p50 or p50,p95, 0 to 1")
+    s.add_argument("--prompts", default=None,
+                   help="JSONL of your real prompts, instead of synthetic text")
+    s.add_argument("--profile", default=None,
+                   help="an existing profile JSON, instead of the flags above")
+    s.add_argument("--auth-profile", default=None,
+                   help="a ~/.databrickscfg profile name (PAT or OAuth)")
+    s.add_argument("--token-env", default="DATABRICKS_TOKEN",
+                   help="env var holding a bearer token, if not using a profile")
+    s.add_argument("--model", default=None,
+                   help="only for shared /chat/completions routes")
+    s.add_argument("--extra-body", default=None,
+                   help='JSON merged into each request, e.g. '
+                        '\'{"reasoning_effort": "none"}\'')
+    s.add_argument("--ttft-p50", type=float, default=None,
+                   help="your TTFT target in ms. same for --ttft-p90/p95/p99")
+    s.add_argument("--ttft-p90", type=float, default=None)
+    s.add_argument("--ttft-p95", type=float, default=None)
+    s.add_argument("--ttft-p99", type=float, default=None)
+    s.add_argument("--ttfg-p50", type=float, default=None,
+                   help="your full-generation target in ms")
+    s.add_argument("--ttfg-p90", type=float, default=None)
+    s.add_argument("--ttfg-p95", type=float, default=None)
+    s.add_argument("--ttfg-p99", type=float, default=None)
+    s.add_argument("--success-rate", type=float, default=None,
+                   help="fraction 0-1, e.g. 0.99")
+    s.add_argument("--out-dir", default="results/benchmark")
+    s.add_argument("--title", default=None)
+    s.add_argument("--label", default=None)
+    s.add_argument("--skip-preflight", action="store_true",
+                   help="skip the 2-request endpoint check. not recommended")
+    s.set_defaults(fn=cmd_benchmark)
 
     s = sub.add_parser("quickstart",
                        help="write a run config from endpoint + concurrency")

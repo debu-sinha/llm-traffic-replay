@@ -130,7 +130,59 @@ trust any number the harness produces there.
 
 ## Run against a real endpoint
 
-### The short way: `quickstart`
+### Start here: one command
+
+You need a host, an endpoint name, and a rough idea of your token sizes.
+Nothing else, no JSON to author:
+
+```bash
+python3 -m traffic_replay benchmark \
+  --host https://your-workspace.cloud.databricks.com \
+  --endpoint your-endpoint-name \
+  --auth-profile your-databrickscfg-profile \
+  --input-tokens 10000,24000 \
+  --output-tokens 40,90 \
+  --cache-hit-rate 0.6,0.87 \
+  --concurrency 30 --duration 300 \
+  --ttft-p95 900 --ttfg-p95 1500 --success-rate 0.99
+```
+
+Each size takes `p50` or `p50,p95`. Pass one number and the p95 is set 2.4x
+above it. Pass `--prompts your.jsonl` to replay your real prompts instead of
+synthetic text, or `--profile` to use a profile you already built.
+
+Before the load starts it sends two requests and tells you what the endpoint
+actually does. That check exists because nearly every way this tool can hand
+you a confidently wrong number is visible in two requests:
+
+```
+[preflight] sending 2 requests to see what this endpoint does
+[preflight] 2/2 responded
+[preflight] this is a REASONING model. it emits thinking tokens before the
+            answer, and they count against max_tokens.
+[preflight] and it produced NO visible answer within 512 tokens. at your
+            output budget it will produce none either. raise --output-tokens,
+            or turn reasoning down with --extra-body, before trusting any
+            latency number from this endpoint.
+[preflight] scoring TTFT on the first VISIBLE token, which is what a
+            user-facing SLA describes.
+```
+
+It also warns when the endpoint reports no token usage (throughput and cost
+will be blank) or no cached-token field (achieved cache cannot be reported).
+For a reasoning model, turn thinking down and run again:
+
+```bash
+  --extra-body '{"reasoning_effort": "none"}'
+```
+
+The run writes `run-config.json` next to the results, so the same experiment
+reruns with `python3 -m traffic_replay run --config <that file>`.
+
+### The lower-level way: `quickstart`
+
+`quickstart` writes a config without running it, which is what you want when
+you plan to edit it or check it into a repo.
 
 `quickstart` writes a runnable config from a host, an endpoint name and a
 profile, so a first run doesn't mean hand-editing JSON:

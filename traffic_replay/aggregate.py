@@ -48,14 +48,21 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         _require_run_dir(d, "requests.jsonl")
     endpoints, rows = set(), []
     for d in dirs:
-        ep = (_load_summary(d).get("run") or {}).get("endpoint_path")
-        if ep:
-            endpoints.add(ep)
+        run = _load_summary(d).get("run") or {}
+        # identity is host plus model plus route. comparing the route alone
+        # pooled two different providers whenever both served
+        # /v1/chat/completions, which is most of them.
+        ident = (run.get("endpoint_base_url"), run.get("endpoint_model"),
+                 run.get("endpoint_path"))
+        if any(x is not None for x in ident):
+            endpoints.add(ident)
         rows += _replay_rows(d)
     if len(endpoints) > 1 and not force:
+        _shown = sorted(
+            " ".join(str(x) for x in ident if x) for ident in endpoints)
         raise ValueError(
-            "refusing to merge runs with different endpoint paths: "
-            f"{sorted(endpoints)}. pass force=True to override.")
+            "refusing to merge runs from different endpoints. identity is "
+            f"host, model and route: {_shown}. pass force=True to override.")
     # prompts-mode shards each cycled the same prompt file, so the pooled
     # cache fraction is still replay behavior. carry the fields summarize()
     # needs, otherwise the merged report shows the cache number with no note.
@@ -64,8 +71,8 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
               for d in dirs}
     meta = {
         "merged_from": [str(d) for d in dirs],
-        "endpoint_path": sorted(endpoints)[0] if len(endpoints) == 1
-        else "MIXED",
+        "endpoint_path": (next(iter(endpoints))[2] if len(endpoints) == 1
+                          else "MIXED"),
         "label": f"merged from {len(dirs)} runs",
         **({"input_mode": "prompts", "prompts_count": counts.pop()}
            if modes == {"prompts"} and len(counts) == 1
@@ -90,6 +97,17 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "lateness. read each run's own report. dispatch lag below is pooled "
         "and still meaningful, since it is measured within each run.")
     summary.pop("client", None)
+    # corrected latency is computed against one schedule offset. pooling rows
+    # from runs that started at different wall-clock times makes that offset
+    # meaningless: two 200 ms runs an hour apart would report a corrected p95
+    # of an hour. same reason wire lateness is blanked.
+    for k in ("ttft_corrected_ms", "e2e_corrected_ms",
+              "latency_correction_note"):
+        summary.pop(k, None)
+    summary["latency_correction_note"] = (
+        "caller-experienced latency is not computed for a merged run, "
+        "because it measures against each run's own schedule and pooled "
+        "rows come from different ones. read each run's own report.")
     # concurrency is interval overlap across pooled rows. shards that never
     # ran at the same time have no overlap, so a merged run would report a
     # p50 of 0 in flight. same reason wire lateness and drift are blanked.

@@ -1233,3 +1233,59 @@ def test_a_retried_request_occupies_a_worker_for_its_whole_life():
                                 "first_send_unix": T + 2.2,
                                 "t_send_unix": T + 2.2}], None)
     assert solo["in_flight_max"] >= 2
+
+
+# ---- a PASS on service time is not a PASS for the caller ----------------
+
+def test_a_service_time_pass_is_downgraded_when_callers_waited():
+    """The SLA rows score service time. If the client queued the work, a row
+    can read PASS while the person who asked waited ten seconds."""
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(300):
+        sched = i * 0.1
+        lag = 0.0 if i < 150 else 10.0
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 50.0,
+                     "e2e_ms": 200.0, "scheduled_s": sched,
+                     "t_send_unix": base + sched + lag,
+                     "first_send_unix": base + sched + lag,
+                     "prompt_tokens": 100, "completion_tokens": 10})
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 1500}})
+    assert s["sla"]["ttfg_vs_target"][0]["met"] is True   # service time passes
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    md = [x for x in render_markdown(s, "x").splitlines()
+          if x.startswith("verdict:")][0]
+    assert "callers waited" in md
+
+
+def test_missing_token_usage_is_shown_and_downgrades_the_verdict():
+    """Coverage was computed and then never rendered, so a run reporting
+    usage on half its responses printed confident throughput and cost."""
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(200):
+        r = {"ok": True, "phase": "replay", "ttft_ms": 50.0, "e2e_ms": 200.0,
+             "t_send_unix": base + i * 0.1, "first_send_unix": base + i * 0.1}
+        if i % 2 == 0:
+            r["prompt_tokens"] = 100
+            r["completion_tokens"] = 10
+        rows.append(r)
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 1500}})
+    assert s["throughput"]["usage_coverage"] == 0.5
+    assert s["throughput"]["coverage_warning"]
+    md = render_markdown(s, "x")
+    assert "CAUTION (token usage)" in md
+    assert "Meets every acceptance target" not in render_html(s, "x")
+
+
+def test_idle_time_inside_the_window_counts_as_zero_in_flight():
+    """The sweep used to start at the first event, so a sparse run reported
+    a concurrency it held only a third of the time."""
+    from traffic_replay.metrics import _concurrency_block
+    T = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "e2e_ms": 1000.0,
+             "t_send_unix": T + i * 3.0,
+             "first_send_unix": T + i * 3.0} for i in range(6)]
+    c = _concurrency_block(rows, None)
+    assert c["in_flight_p50"] == 0.0, c
+    assert c["in_flight_max"] == 1.0

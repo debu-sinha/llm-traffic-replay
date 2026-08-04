@@ -164,9 +164,23 @@ def _pair(text, what):
         raise SystemExit(f"--{what} wants a number or two, got {text!r}")
     if not vals:
         raise SystemExit(f"--{what} is empty")
+    if len(vals) > 2:
+        raise SystemExit(f"--{what} takes p50 or p50,p95, got {text!r}")
     p50 = vals[0]
-    p95 = vals[1] if len(vals) > 1 else p50 * 2.4
-    if p95 <= p50:
+    frac = "rate" in what or "fraction" in what
+    if len(vals) > 1:
+        p95 = vals[1]
+    elif frac:
+        # a fraction has no room for a 2.4x tail. move it most of the way to
+        # 1 instead, which is the shape a cache-reuse distribution actually
+        # has, and keeps it a legal probability.
+        p95 = p50 + (1.0 - p50) * 0.65
+    else:
+        p95 = p50 * 2.4
+    if frac and not (0.0 <= p50 < p95 < 1.0):
+        raise SystemExit(
+            f"--{what} needs 0 <= p50 < p95 < 1, got {p50} and {p95}")
+    if not frac and p95 <= p50:
         raise SystemExit(f"--{what} needs p95 above p50, got {p50} and {p95}")
     return {"p50": p50, "p95": p95}
 
@@ -249,6 +263,12 @@ def cmd_benchmark(args) -> int:
     }
 
     inp = _pair(args.input_tokens, "input-tokens")
+    outp = _pair(args.output_tokens, "output-tokens")
+    # max_output_tokens_cap defaults to 512 and the per-request budget is the
+    # smaller of it and the sampled value, so without this a run asking for
+    # 2000 output tokens quietly got 512 and the preflight's advice to raise
+    # --output-tokens did nothing.
+    cfg["max_output_tokens_cap"] = max(int(outp["p95"] * 1.5), 512)
     if args.prompts:
         cfg["prompts_file"] = args.prompts
     elif args.profile:
@@ -257,7 +277,7 @@ def cmd_benchmark(args) -> int:
         prof = {
             "name": "from_command_line",
             "input_tokens": inp,
-            "output_tokens": _pair(args.output_tokens, "output-tokens"),
+            "output_tokens": outp,
             "cache_fraction": _pair(args.cache_hit_rate, "cache-hit-rate"),
             "provenance": ("figures passed on the command line, not measured "
                            "from logs. build one from your own traffic with "

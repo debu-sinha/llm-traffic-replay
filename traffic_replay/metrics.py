@@ -80,7 +80,10 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
             return None, {}
         ev.sort()
         c = pk = 0
-        prev_t = ev[0][0]
+        # start at the window edge, not the first event, so idle time inside
+        # the window counts as the zero it was. a six second window holding
+        # one one-second request is p50 0, not p50 1.
+        prev_t = w_lo if w_lo is not None else ev[0][0]
         acc: dict[int, float] = {}
         for t, d in ev:
             if t > prev_t:
@@ -88,6 +91,8 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
             c += d
             pk = max(pk, c)
             prev_t = t
+        if w_hi is not None and w_hi > prev_t:
+            acc[c] = acc.get(c, 0.0) + (w_hi - prev_t)
         return pk, acc
 
     # the peak is taken over the WHOLE run, since a burst during ramp up is
@@ -259,6 +264,18 @@ def _verdict(s: dict) -> tuple[str, str]:
         doubts.append("the run did not hold the concurrency on its label")
     if (s.get("client") or {}).get("warning"):
         doubts.append("the load did not reach the endpoint on schedule")
+    # the SLA rows score service time. if the caller waited materially
+    # longer, a PASS on those rows describes the endpoint and not the user.
+    _u = (s.get("e2e_ms") or {}).get("p95")
+    _c = (s.get("e2e_corrected_ms") or {}).get("p95")
+    if _u and _c and _c > _u * 1.10:
+        doubts.append(
+            f"callers waited {_c:.0f} ms at p95 against {_u:.0f} ms of "
+            "endpoint time, so the targets above were scored on service "
+            "time rather than on what a caller experienced")
+    if (s.get("throughput") or {}).get("coverage_warning"):
+        doubts.append("token usage was missing on many responses, so "
+                      "throughput and cost cover a subset")
     dk = (s.get("drift") or {}).get("drift_kind")
     if dk and dk not in ("stable",):
         doubts.append(f"latency was {dk} across the run")
@@ -425,7 +442,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             # generator reports a healthy tail. the corrected figure adds
             # the wait, which is what a caller who asked at the scheduled
             # moment actually experienced.
-            r["_queue_wait_ms"] = max(late, 0.0)
+            r["queue_wait_ms"] = max(late, 0.0)
     wire_note = None
     if results and not stamped:
         wire_note = ("wire lateness is not reported: no request carried both "
@@ -441,7 +458,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     send_span = None
     if results:
         sent = [_sent_at(r) for r in results if _sent_at(r) is not None]
-        done = [_sent_at(r) + (r.get("e2e_ms") or 0) / 1000.0
+        done = [(r.get("t_send_unix") or _sent_at(r))
+                + (r.get("e2e_ms") or 0) / 1000.0
                 for r in results if _sent_at(r) is not None]
         if sent:
             dur = max(max(done) - min(sent), 1e-9)
@@ -538,10 +556,10 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # service time is the endpoint's, corrected is the user's.
     for base_f, corr_f in (("ttft_ms", "ttft_corrected_ms"),
                            ("e2e_ms", "e2e_corrected_ms")):
-        vals = [(r[base_f] + r["_queue_wait_ms"])
+        vals = [(r[base_f] + r["queue_wait_ms"])
                 for r in ok
                 if r.get(base_f) is not None
-                and r.get("_queue_wait_ms") is not None]
+                and r.get("queue_wait_ms") is not None]
         if vals:
             summary[corr_f] = _pct_table(vals)
     if "e2e_corrected_ms" in summary:
@@ -1173,6 +1191,9 @@ def render_markdown(summary: dict, title: str) -> str:
     # into a ticket, and a caution printed below the numbers is one nobody
     # reads. same rule the comparison report follows.
     cautions: list[str] = []
+    _cw = (s.get("throughput") or {}).get("coverage_warning")
+    if _cw:
+        cautions += [f"CAUTION (token usage): {_cw}", ""]
     _sw = (s.get("sample") or {}).get("warning")
     if _sw:
         cautions += [f"CAUTION (sample size): {_sw}", ""]
@@ -1497,6 +1518,7 @@ def _manifest(summary: dict, out: Path) -> dict:
         "seed": run.get("seed"),
         "endpoint_path": run.get("endpoint_path"),
         "endpoint_base_url": run.get("endpoint_base_url"),
+        "endpoint_model": run.get("endpoint_model"),
         "endpoint_metadata": run.get("endpoint_metadata"),
         "request_params": run.get("request_params"),
         "concurrency_target": run.get("concurrency_target"),

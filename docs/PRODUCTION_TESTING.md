@@ -48,6 +48,77 @@ endpoint exists or without spending its capacity.
 pay-per-token capacity says nothing about a dedicated endpoint. The run
 config's label says this and the label prints in the report. Leave it in.
 
+## Stage 1b: is this a reasoning model? (do this before Stage 2)
+
+Skip this and every number downstream can be wrong in the same direction.
+
+A reasoning model emits its thinking on a separate channel before the answer.
+Those tokens are billed as output tokens and they count against `max_tokens`.
+If the budget runs out mid-thought, the endpoint returns HTTP 200, a well
+formed stream, and a finish reason, with nothing a user could read. That is a
+successful request by every transport measure and a failed one by every
+measure that matters.
+
+Run a short probe first:
+
+```bash
+python3 -m traffic_replay quickstart \
+  --host https://<workspace>.cloud.databricks.com \
+  --endpoint <endpoint> --profile <your profile> \
+  --concurrency 2 --duration 60 --out configs/probe.json
+python3 -m traffic_replay run --config configs/probe.json
+```
+
+Then read the `answers` block in `report.md`, not the latency table:
+
+- `produced a readable answer` well below `returned HTTP 200` means the model
+  is spending your output budget on reasoning. Stop. The latency numbers
+  describe only the requests that finished thinking, which are the fastest
+  ones, and the report says so.
+- `reasoning model detected` in the report means TTFT and TTFV are different
+  numbers. TTFT is the first token of any kind, including thinking. TTFV is
+  the first token a user could see. A user-facing SLA describes TTFV, so set
+  `"ttft_definition": "first_visible"` in the run config or the scorecard
+  scores the wrong one.
+
+### Turning thinking off
+
+If production runs without thinking, the request has to say so, and the flag
+that works is model-specific. Put it in `endpoint.extra_body`:
+
+```json
+"extra_body": {"reasoning_effort": "none"}
+```
+
+Verify it took effect rather than assuming. Some endpoints accept a flag and
+ignore it silently, which is worse than rejecting it, because the config
+looks correct. On one Databricks-hosted reasoning model, measured with a real
+10,000 token prompt:
+
+| setting | reasoning emitted | visible output |
+|---|---|---|
+| `reasoning_effort: "none"` | none | yes |
+| `thinking: {"type": "disabled"}` | more than the default | yes |
+| `enable_thinking: false` | unchanged | none |
+
+Two of the three flags most people reach for first did nothing. The check
+that catches it is the `answers` block plus `reasoning tokens` in the report,
+not the absence of an error.
+
+### Raising the budget is not the fix
+
+Giving the model more room buys a longer think, not a faster answer. Measured
+on the same endpoint and prompt shape:
+
+| output budget | produced an answer | end-to-end p50 |
+|---|---|---|
+| 40 / 90 | 0 of 535 | 1.5 s |
+| 1,200 / 2,000 | 55 of 187 | 13.6 s |
+| 4,000 / 8,000 | 31 of 72 | 28.1 s |
+
+If a sub-second first-token target matters, the decision is the model or the
+mode, not the token budget.
+
 ## Stage 2: provisioned throughput endpoint, stepped load
 
 Purpose: the real measurement. Requires the dedicated endpoint and an
@@ -105,6 +176,30 @@ log reduced to per-request token counts and repeat structure):
 
 ## Interpreting the readout honestly
 
+- Transport success is not answer success. Read the `answers` block before
+  the latency table. A run can be 100 percent HTTP 200 and 0 percent useful,
+  and that is the shape a reasoning model fails in.
+- The harness hits a target output length by setting `max_tokens` to the
+  sampled value, so every request ends on `length` by construction and
+  `completion_tokens` equals what was asked for. That is deliberate, it is
+  how output size is controlled, and it has one consequence worth stating in
+  any deck: you measured the time to generate N tokens, where N came from the
+  profile, NOT the model's natural answer length. If the model would have
+  produced more, end-to-end understates production. Check the natural length
+  once with a generous cap and a small sample, and if it sits well above the
+  profile's p50, say so next to the number.
+- Comparing two model configurations needs the cache controlled. The prefix
+  pool is seeded, so two runs with the same `seed` send the same leading
+  tokens, and the second one inherits a prompt cache the first one warmed.
+  Either use a different seed per arm, or run the pair in both orders and
+  check the conclusion survives. Quote the achieved cache fraction for each
+  arm either way, since that is the number that shows whether it happened.
+- `concurrency` overrides `rate_scale`, so the stepping procedure above and
+  the concurrency knob are alternatives, not a pair. Step one or the other.
+- Concurrency is derived from service time measured without load, and service
+  time rises under load, so a run tends to hold more than the number on the
+  label. Read the measured in-flight figure, not the flag you passed. The
+  report cautions in both directions.
 - Quote latency WITH its achieved cache fraction and arrival rate. The
   believability block exists so those travel together. Keep them together
   in any slide that quotes the number.

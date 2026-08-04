@@ -20,43 +20,80 @@ PCTS = (50, 90, 95, 99)
 
 
 def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
-    """How many requests were actually in flight, by interval overlap.
+    """How many requests were actually in flight, by exact interval overlap.
 
-    A load test is specified in concurrency, so the report has to say whether
-    that concurrency was reached. Overlap is exact for a successful request,
-    which has both a send time and a duration. Failures are excluded, since
-    the harness records when they were sent but not when they gave up, and a
-    rejected request occupies the endpoint for a moment rather than for its
-    share of the load.
+    Overlap is exact for a successful request, which has both a send time and
+    a duration. Failures are excluded, since the harness records when they
+    were sent but not when they gave up, and a rejected request occupies the
+    endpoint for a moment rather than for its share of the load.
 
     That exclusion is the point rather than a gap: if the endpoint is
     shedding, the concurrency of real work is what a reader needs, and it is
     the number that falls below what was asked.
+
+    Every start and end is swept, so the maximum is a true peak rather than
+    the highest of a fixed number of samples. An earlier version sampled 41
+    points and called the result a peak, which understated it whenever the
+    peak fell between two samples. The percentiles are time weighted, which
+    is the right statistic for occupancy: a level held for one second out of
+    sixty should not count the same as one held for thirty.
     """
     spans = [(_sent_at(r), _sent_at(r) + (r["e2e_ms"] or 0) / 1000.0)
              for r in ok
-             if _sent_at(r) is not None and r.get("e2e_ms")]
+             if _sent_at(r) is not None and r.get("e2e_ms") is not None]
+    spans = [(a, b) for a, b in spans if b > a]
     if len(spans) < 2:
         return None
-    starts = sorted(x[0] for x in spans)
-    ends = sorted(x[1] for x in spans)
-    lo, hi = starts[0], ends[-1]
-    if hi <= lo:
+    lo_all = min(a for a, _ in spans)
+    hi_all = max(b for _, b in spans)
+    if hi_all <= lo_all:
         return None
-    # sample the middle of the run, so ramp up and drain do not drag it down
-    import bisect
-    obs = []
-    for k in range(41):
-        t = lo + (hi - lo) * (0.2 + 0.6 * k / 40.0)
-        obs.append(bisect.bisect_right(starts, t) - bisect.bisect_right(ends, t))
-    obs.sort()
-    med = float(obs[len(obs) // 2])
+    # ramp up and drain are real but they are not the load level under test,
+    # so the percentiles describe the middle of the run.
+    lo = lo_all + (hi_all - lo_all) * 0.2
+    hi = lo_all + (hi_all - lo_all) * 0.8
+    if hi <= lo:
+        lo, hi = lo_all, hi_all
+
+    events: list[tuple[float, int]] = []
+    for a, b in spans:
+        a2, b2 = max(a, lo), min(b, hi)
+        if b2 > a2:
+            events.append((a2, 1))
+            events.append((b2, -1))
+    if not events:
+        return None
+    events.sort()
+
+    cur = peak = 0
+    prev = events[0][0]
+    held: dict[int, float] = {}
+    for t, delta in events:
+        if t > prev:
+            held[cur] = held.get(cur, 0.0) + (t - prev)
+        cur += delta
+        peak = max(peak, cur)
+        prev = t
+    total = sum(held.values())
+    if total <= 0:
+        return None
+
+    def _tw(q: float) -> float:
+        run = 0.0
+        for level in sorted(held):
+            run += held[level]
+            if run >= total * q:
+                return float(level)
+        return float(max(held))
+
+    med = _tw(0.5)
     out = {
         "in_flight_p50": med,
-        "in_flight_max_sampled": float(obs[-1]),
+        "in_flight_p95": _tw(0.95),
+        "in_flight_max": float(peak),
         "measured_over": "successful requests only",
-        "sampling": "41 points across the middle 60 percent of the run, so "
-                    "the max is the highest sample, not a true peak",
+        "method": "exact interval overlap, time-weighted over the middle 60 "
+                  "percent of the run. the maximum is a true peak",
     }
     if asked:
         out["asked_for"] = asked
@@ -1040,7 +1077,8 @@ def render_markdown(summary: dict, title: str) -> str:
         askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
         lines.append(
             f"- concurrency actually in flight: p50 {cc['in_flight_p50']:.0f}, "
-            f"high sample {cc['in_flight_max_sampled']:.0f}{askd} "
+            f"p95 {cc['in_flight_p95']:.0f}, peak "
+            f"{cc['in_flight_max']:.0f}{askd} "
             f"({cc['measured_over']})")
     lb = s.get("latency_basis")
     if lb:
@@ -1529,8 +1567,8 @@ def render_html(summary: dict, title: str) -> str:
     if cc.get("in_flight_p50") is not None:
         askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
         bel.append(f"<li><b>Concurrency in flight</b>: p50 "
-                   f"{cc['in_flight_p50']:.0f}, high sample "
-                   f"{cc['in_flight_max_sampled']:.0f}{askd} "
+                   f"{cc['in_flight_p50']:.0f}, p95 {cc['in_flight_p95']:.0f}, peak "
+                   f"{cc['in_flight_max']:.0f}{askd} "
                    f"({esc(cc['measured_over'])})</li>")
     lb = s.get("latency_basis")
     if lb:

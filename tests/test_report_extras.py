@@ -6,8 +6,8 @@ from __future__ import annotations
 import random
 
 from traffic_replay import __version__
-from traffic_replay.metrics import (_drift_block, render_html,
-                                    render_markdown, summarize)
+from traffic_replay.metrics import (_concurrency_block, _drift_block,
+                                    render_html, render_markdown, summarize)
 
 
 def _rows(n, base_ttft=100.0, t0=0.0, dt=1.0):
@@ -1065,3 +1065,40 @@ def test_old_rows_are_not_retroactively_failed_by_the_answers_block():
     assert a["transport_ok"] == 100
     assert a["answer_rate"] == 1.0
     assert s["sla"]["success_rate"]["met"] is True
+
+
+# ---- concurrency is measured exactly, not sampled ------------------------
+
+def test_a_brief_spike_reaches_the_reported_peak():
+    """The old implementation took 41 samples across the run and called the
+    highest one the peak. A spike shorter than the gap between samples was
+    invisible. This builds a run that sits at 2 in flight and spikes to 12
+    for 40 ms, which 41 samples over 100 seconds would miss."""
+    base = 1_700_000_000.0
+    rows = []
+    # steady background: 2 in flight across 100 seconds
+    for i in range(100):
+        rows.append({"ok": True, "phase": "replay", "e2e_ms": 2000.0,
+                     "t_send_unix": base + i, "first_send_unix": base + i})
+    # a 40 ms spike of 10 extra requests, right in the middle of the run
+    for i in range(10):
+        rows.append({"ok": True, "phase": "replay", "e2e_ms": 40.0,
+                     "t_send_unix": base + 50.0,
+                     "first_send_unix": base + 50.0})
+    c = _concurrency_block(rows, None)
+    assert c["in_flight_max"] >= 12, c
+    # and the spike is brief, so it must not drag the time-weighted median
+    assert c["in_flight_p50"] <= 3, c
+
+
+def test_concurrency_percentiles_are_time_weighted():
+    """A level held briefly must not count the same as one held throughout."""
+    base = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "e2e_ms": 100_000.0,
+             "t_send_unix": base, "first_send_unix": base} for _ in range(4)]
+    rows += [{"ok": True, "phase": "replay", "e2e_ms": 10.0,
+              "t_send_unix": base + 50.0, "first_send_unix": base + 50.0}
+             for _ in range(20)]
+    c = _concurrency_block(rows, None)
+    assert c["in_flight_p50"] == 4, c
+    assert c["in_flight_max"] >= 24, c

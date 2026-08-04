@@ -1102,3 +1102,50 @@ def test_concurrency_percentiles_are_time_weighted():
     c = _concurrency_block(rows, None)
     assert c["in_flight_p50"] == 4, c
     assert c["in_flight_max"] >= 24, c
+
+
+# ---- rate conventions and observation windows ---------------------------
+
+def test_the_arrival_rate_uses_the_send_span_not_the_drain():
+    """Throughput is divided by the observation interval, which runs to the
+    last completion. The arrival rate must not be: charging it for the drain
+    understates the load that was actually offered."""
+    base = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "ttft_ms": 50.0, "e2e_ms": 5000.0,
+             "prompt_tokens": 100, "completion_tokens": 10,
+             "scheduled_s": i * 0.1,
+             "t_send_unix": base + i * 0.1,
+             "first_send_unix": base + i * 0.1} for i in range(100)]
+    s = summarize(rows)
+    # sent at exactly 10 per second
+    assert abs(s["arrivals"]["achieved_qps_overall"] - 10.0) < 1e-6
+    # 1000 output tokens over a 14.9s observation interval, not 9.9s
+    expected = 1000 / (14.9 / 60.0)
+    assert abs(s["throughput"]["output_tokens_per_min"] - expected) < 1.0
+
+
+def test_truncation_by_the_global_cap_is_counted_separately():
+    """Ending on length at your own sampled target means the replay worked.
+    Ending on it because the global cap bound first means the run never
+    reproduced the profile's output distribution."""
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(40):          # hit their own target, healthy
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 50.0,
+                     "e2e_ms": 100.0, "stream_complete": True,
+                     "visible_content_seen": True, "truncated": True,
+                     "parse_errors": 0, "finish_reason": "length",
+                     "intended_output_tokens": 64, "max_tokens_requested": 64,
+                     "t_send_unix": base + i, "first_send_unix": base + i})
+    for i in range(10):          # cap bound first, distribution not reproduced
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 50.0,
+                     "e2e_ms": 100.0, "stream_complete": True,
+                     "visible_content_seen": True, "truncated": True,
+                     "parse_errors": 0, "finish_reason": "length",
+                     "intended_output_tokens": 200,
+                     "max_tokens_requested": 64,
+                     "t_send_unix": base + 40 + i,
+                     "first_send_unix": base + 40 + i})
+    a = summarize(rows)["answers"]
+    assert a["truncated"] == 50
+    assert a["truncated_by_global_cap"] == 10

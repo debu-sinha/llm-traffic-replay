@@ -414,12 +414,17 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # drain. with a 99 second send window and 60 second generations that is
     # about 61 percent high.
     dur = None
+    send_span = None
     if results:
         sent = [_sent_at(r) for r in results if _sent_at(r) is not None]
         done = [_sent_at(r) + (r.get("e2e_ms") or 0) / 1000.0
                 for r in results if _sent_at(r) is not None]
         if sent:
             dur = max(max(done) - min(sent), 1e-9)
+            # the ARRIVAL rate belongs on the send span. dividing it by the
+            # observation interval above would charge it for the drain and
+            # understate the load that was actually offered.
+            send_span = max(max(sent) - min(sent), 1e-9)
 
     # throughput in the customer's own vocabulary (tokens per minute)
     in_tok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
@@ -484,7 +489,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                     "vs length)",
         },
         "arrivals": {
-            "achieved_qps_overall": len(results) / dur if dur else None,
+            "achieved_qps_overall": ((len(results) - 1) / send_span
+                                     if send_span and len(results) > 1
+                                     else None),
             "dispatch_lag_ms": _pct_table(lags),
             "wire_lateness_ms": _pct_table(wire),
             **({"wire_lateness_note": wire_note} if wire_note else {}),

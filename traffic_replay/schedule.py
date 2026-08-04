@@ -86,7 +86,11 @@ def shard(schedule: dict, index: int, total: int) -> dict:
     if not (0 <= index < total):
         raise ValueError("need 0 <= index < total")
     ts = schedule["timestamps"]
-    return {**schedule, "timestamps": ts[index::total]}
+    # rates and counts describe the WHOLE run. passing them through unchanged
+    # made a shard's own summary.json report the unsharded request count, so
+    # anyone opening it read a shortfall that was not there.
+    return {**schedule, "timestamps": ts[index::total],
+            "shard": (index, total)}
 
 
 def schedule_report(sched: dict) -> dict:
@@ -94,9 +98,20 @@ def schedule_report(sched: dict) -> dict:
     if r.size == 0:
         return {"seconds": 0, "requests": 0,
                 "source": sched.get("source", "synthetic")}
+    sh = sched.get("shard")
+    n_req = (len(sched["timestamps"]) if sh
+             else int(np.asarray(sched["counts"]).sum()))
+    out_extra = {}
+    if sh:
+        out_extra = {
+            "shard": f"{sh[0] + 1}/{sh[1]}",
+            "rates_describe": ("the whole run, not this shard. this shard "
+                               f"takes 1 arrival in {sh[1]}"),
+        }
     return {
+        **out_extra,
         "seconds": int(len(r)),
-        "requests": int(np.asarray(sched["counts"]).sum()),
+        "requests": n_req,
         "rate_min": float(r.min()),
         "rate_p50": float(np.percentile(r, 50)),
         "rate_p95": float(np.percentile(r, 95)),

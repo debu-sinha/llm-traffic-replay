@@ -313,6 +313,21 @@ def run(rc: RunConfig, token_override: str | None = None,
     results: list[dict] = list(sizing_rows)
 
     # ---- calibration / warmup pass (sequential, low rate) --------------
+    # calibration consumes the first calibrate_n scheduled arrivals, so a
+    # schedule shorter than that leaves nothing to replay and the report
+    # says "0 total" on a run that really did send requests. sharding makes
+    # this easier to hit, since n is per shard while calibrate_n is per
+    # process.
+    if rc.calibrate_n >= n:
+        raise ValueError(
+            f"calibrate_n is {rc.calibrate_n} but the schedule only has {n} "
+            f"arrivals, so calibration would consume all of them and the "
+            f"replay would measure nothing. lower calibrate_n below {n}, or "
+            f"raise duration_s or the arrival rate."
+            + (f" note this is shard {rc.shard_index + 1} of "
+               f"{rc.shard_total}, which gets every {rc.shard_total}th "
+               "arrival, so its schedule is that much shorter."
+               if rc.shard_total > 1 else ""))
     calib_n = min(rc.calibrate_n, n)
     chars_total = 0
     ptok_total = 0

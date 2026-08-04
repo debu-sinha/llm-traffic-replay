@@ -180,14 +180,20 @@ log reduced to per-request token counts and repeat structure):
   the latency table. A run can be 100 percent HTTP 200 and 0 percent useful,
   and that is the shape a reasoning model fails in.
 - The harness hits a target output length by setting `max_tokens` to the
-  sampled value, so every request ends on `length` by construction and
-  `completion_tokens` equals what was asked for. That is deliberate, it is
-  how output size is controlled, and it has one consequence worth stating in
-  any deck: you measured the time to generate N tokens, where N came from the
-  profile, NOT the model's natural answer length. If the model would have
-  produced more, end-to-end understates production. Check the natural length
-  once with a generous cap and a small sample, and if it sits well above the
-  profile's p50, say so next to the number.
+  sampled value, so a request that would run longer ends on `length` with
+  `completion_tokens` equal to what was asked for. Requests whose natural
+  answer is shorter than their sampled target end on `stop` below it, so the
+  mix of the two tells you where the model's own answer length sits relative
+  to the profile. Either way you measured the time to generate N tokens,
+  where N came from the profile, NOT the model's natural answer length. If
+  the model would have produced more, end-to-end understates production.
+  Check the natural length once with a generous cap and a small sample, and
+  if it sits well above the profile's p50, say so next to the number.
+- Watch `cut short by the global token cap` in the answers block. Ending on
+  `length` at your own sampled target means the replay worked. Ending on it
+  because `max_output_tokens_cap` bound first means the run never reproduced
+  the profile's output distribution, which shortens end-to-end and caps
+  output throughput.
 - Comparing two model configurations needs the cache controlled. The prefix
   pool is seeded, so two runs with the same `seed` send the same leading
   tokens, and the second one inherits a prompt cache the first one warmed.

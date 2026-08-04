@@ -117,7 +117,8 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
     from .prefix_pool import PrefixPool as _PP
 
     probe_n = max(4, min(rc.calibrate_n, 8))
-    client = EndpointClient(ecfg, token)
+    client = EndpointClient(ecfg, token,
+                            refresh=lambda: _token(ecfg))
     if rc.prompts_file:
         from .prompts import load_prompts
         msgs_list = load_prompts(rc.prompts_file)
@@ -236,7 +237,8 @@ def run(rc: RunConfig, token_override: str | None = None,
 
     ecfg = EndpointConfig(**rc.endpoint)
     token = token_override or _token(ecfg)
-    client = EndpointClient(ecfg, token)
+    client = EndpointClient(ecfg, token,
+                            refresh=lambda: _token(ecfg))
     req_params = {"temperature": ecfg.temperature,
                   "max_output_tokens_cap": rc.max_output_tokens_cap,
                   "extra_body": ecfg.extra_body or {}}

@@ -190,3 +190,100 @@ def test_the_manifest_carries_no_token():
     raw = (Path(out["out_dir"]) / "manifest.json").read_text()
     assert "dapi-secret-value-here" not in raw
     assert "TR_MANIFEST_TOKEN" not in raw or "dapi" not in raw
+
+
+# ---- an expired token must not read as an endpoint failure --------------
+
+def test_an_expired_token_is_refreshed_rather_than_failing_the_run():
+    """Measured for real: a 90 second run lost 171 of 281 requests to
+    'http 403: Invalid Token' when the OAuth token expired mid-run. Every
+    one of those read as an endpoint failure."""
+    import http.server
+    import threading
+
+    state = {"calls": 0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            state["calls"] += 1
+            auth = self.headers.get("Authorization", "")
+            if "fresh" not in auth:          # the first token is expired
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b'{"error":"Invalid Token"}')
+                return
+            body = (b'data: {"choices":[{"delta":{"content":"hi"},'
+                    b'"finish_reason":null}]}\n\n'
+                    b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+                    b'data: [DONE]\n\n')
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    from traffic_replay.client import EndpointClient, EndpointConfig
+    try:
+        cfg = EndpointConfig(base_url=f"http://127.0.0.1:{port}",
+                             path="/invocations", auth_token_env="UNUSED")
+        client = EndpointClient(cfg, "expired-token",
+                                refresh=lambda: "fresh-token")
+        res = client.send([{"role": "user", "content": "x"}], 16, "r1",
+                          scheduled_s=0.0, dispatch_lag_ms=0.0,
+                          intended=(0, 0, None, -1), chars_sent=1)
+    finally:
+        srv.shutdown()
+
+    assert res.ok, f"should have recovered, got {res.status}: {res.error}"
+    assert res.status == 200
+    assert client.token == "fresh-token"
+
+
+def test_a_genuinely_bad_credential_still_fails_the_run():
+    """Refreshing must be bounded, or a bad credential spins forever."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b'{"error":"nope"}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    from traffic_replay.client import EndpointClient, EndpointConfig
+    try:
+        cfg = EndpointConfig(base_url=f"http://127.0.0.1:{port}",
+                             path="/invocations", auth_token_env="UNUSED",
+                             max_retries=0)
+        n = {"i": 0}
+
+        def _always_new():
+            n["i"] += 1
+            return f"token-{n['i']}"
+
+        client = EndpointClient(cfg, "bad", refresh=_always_new)
+        res = client.send([{"role": "user", "content": "x"}], 16, "r1",
+                          scheduled_s=0.0, dispatch_lag_ms=0.0,
+                          intended=(0, 0, None, -1), chars_sent=1)
+    finally:
+        srv.shutdown()
+
+    assert not res.ok
+    assert n["i"] <= 6, "refresh must be bounded"
+    # and the reason the user sees names auth, not "exhausted retries"
+    assert "401" in (res.error or ""), res.error

@@ -38,9 +38,20 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     is the right statistic for occupancy: a level held for one second out of
     sixty should not count the same as one held for thirty.
     """
-    spans = [(_sent_at(r), _sent_at(r) + (r["e2e_ms"] or 0) / 1000.0)
-             for r in ok
-             if _sent_at(r) is not None and r.get("e2e_ms") is not None]
+    # a retried row starts at its FIRST attempt but e2e_ms belongs to the
+    # attempt that succeeded, so pairing them put the span up to
+    # (connect_timeout + read_timeout) x retries before the request was
+    # actually on the wire. the request occupied a worker for the whole
+    # stretch, so the span runs from the first send to the end of the
+    # attempt that finished.
+    spans = []
+    for r in ok:
+        start = _sent_at(r)
+        if start is None or r.get("e2e_ms") is None:
+            continue
+        last = r.get("t_send_unix")
+        end = (last if last is not None else start) + r["e2e_ms"] / 1000.0
+        spans.append((start, max(end, start)))
     spans = [(a, b) for a, b in spans if b > a]
     if len(spans) < 2:
         return None
@@ -402,6 +413,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         for r in stamped:
             late = ((_sent_at(r) - r["scheduled_s"]) - offset) * 1000.0
             wire.append(max(late, 0.0))
+            # coordinated omission. the latency clock starts when a worker
+            # actually sends, so a request that sat in the client queue for
+            # a minute still reports whatever the endpoint took once it
+            # finally went out. that is the classic way a saturated load
+            # generator reports a healthy tail. the corrected figure adds
+            # the wait, which is what a caller who asked at the scheduled
+            # moment actually experienced.
+            r["_queue_wait_ms"] = max(late, 0.0)
     wire_note = None
     if results and not stamped:
         wire_note = ("wire lateness is not reported: no request carried both "
@@ -508,6 +527,25 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     answers = _answer_block(ok, len(results))
     if answers:
         summary["answers"] = answers
+    # latency as the caller experienced it, including time the request spent
+    # waiting on the client side. reported alongside the service-time view
+    # rather than replacing it, because they answer different questions:
+    # service time is the endpoint's, corrected is the user's.
+    for base_f, corr_f in (("ttft_ms", "ttft_corrected_ms"),
+                           ("e2e_ms", "e2e_corrected_ms")):
+        vals = [(r[base_f] + r["_queue_wait_ms"])
+                for r in ok
+                if r.get(base_f) is not None
+                and r.get("_queue_wait_ms") is not None]
+        if vals:
+            summary[corr_f] = _pct_table(vals)
+    if "e2e_corrected_ms" in summary:
+        summary["latency_correction_note"] = (
+            "corrected figures measure from the moment the schedule wanted "
+            "the request, so they include time it waited on the client. an "
+            "SLA a user feels is the corrected one. a run whose corrected "
+            "and uncorrected numbers differ was not driving the load it "
+            "claimed, and the client block above says so.")
     for fld in ("ttfr_ms", "ttfv_ms"):
         vals = [r.get(fld) for r in ok]
         if any(v is not None for v in vals):
@@ -1197,6 +1235,21 @@ def render_markdown(summary: dict, title: str) -> str:
             f"p95 {cc['in_flight_p95']:.0f}, peak "
             f"{cc['in_flight_max']:.0f}{askd} "
             f"({cc['measured_over']})")
+    if s.get("e2e_corrected_ms"):
+        c1 = s.get("ttft_corrected_ms") or {}
+        c2 = s["e2e_corrected_ms"]
+        lines += ["", "### latency as the caller experienced it", "",
+                  "Includes time the request waited on the client, so these "
+                  "are what someone asking at the scheduled moment actually "
+                  "waited.", "",
+                  "| metric | p50 | p95 | p99 |", "|---|---|---|---|"]
+        if c1.get("p50") is not None:
+            lines.append(f"| TTFT corrected | {c1['p50']:.0f} | "
+                         f"{c1['p95']:.0f} | {c1['p99']:.0f} |")
+        lines.append(f"| end-to-end corrected | {c2['p50']:.0f} | "
+                     f"{c2['p95']:.0f} | {c2['p99']:.0f} |")
+        lines += ["", s["latency_correction_note"]]
+
     lb = s.get("latency_basis")
     if lb:
         lines.append(f"- latency basis: {lb}")

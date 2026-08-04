@@ -1149,3 +1149,63 @@ def test_truncation_by_the_global_cap_is_counted_separately():
     a = summarize(rows)["answers"]
     assert a["truncated"] == 50
     assert a["truncated_by_global_cap"] == 10
+
+
+# ---- coordinated omission and retry occupancy ---------------------------
+
+def test_client_queue_wait_is_reported_as_experienced_latency():
+    """The classic way a saturated load generator reports a healthy tail.
+    The latency clock starts when a worker gets around to sending, so a
+    request that sat in the client queue for ten seconds still reports
+    whatever the endpoint took once it finally went out."""
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(50):
+        sched = i * 0.1
+        lag = 0.0 if i < 25 else 10.0      # client falls 10s behind halfway
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 50.0,
+                     "e2e_ms": 200.0, "scheduled_s": sched,
+                     "t_send_unix": base + sched + lag,
+                     "first_send_unix": base + sched + lag})
+    s = summarize(rows)
+    # the endpoint really did take 200 ms every time
+    assert s["e2e_ms"]["p95"] == 200.0
+    # but a caller asking on schedule waited far longer
+    assert s["e2e_corrected_ms"]["p95"] > 9000
+    assert "e2e_corrected_ms" in s and "latency_correction_note" in s
+    assert "caller experienced" in render_markdown(s, "x")
+
+
+def test_no_correction_is_reported_when_the_client_kept_up():
+    base = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "ttft_ms": 50.0, "e2e_ms": 200.0,
+             "scheduled_s": i * 0.1,
+             "t_send_unix": base + i * 0.1,
+             "first_send_unix": base + i * 0.1} for i in range(50)]
+    s = summarize(rows)
+    assert s["e2e_corrected_ms"]["p95"] == s["e2e_ms"]["p95"]
+
+
+def test_a_retried_request_occupies_a_worker_for_its_whole_life():
+    """first_send_unix is the first attempt, e2e_ms belongs to the attempt
+    that succeeded. Pairing them put the span before the request was on the
+    wire and understated occupancy."""
+    from traffic_replay.metrics import _concurrency_block
+    T = 1_700_000_000.0
+    retried = {"ok": True, "phase": "replay", "e2e_ms": 300.0, "retries": 1,
+               "first_send_unix": T, "t_send_unix": T + 2.0}
+    filler = [{"ok": True, "phase": "replay", "e2e_ms": 300.0,
+               "first_send_unix": T + i * 0.05,
+               "t_send_unix": T + i * 0.05} for i in range(1, 60)]
+    c = _concurrency_block([retried] + filler, None)
+    assert c is not None
+    # the retried row must still be in flight at T+2.1, which it would not
+    # be if its span ended at T+0.3
+    solo = _concurrency_block([retried,
+                               {"ok": True, "phase": "replay", "e2e_ms": 10.0,
+                                "first_send_unix": T + 2.1,
+                                "t_send_unix": T + 2.1},
+                               {"ok": True, "phase": "replay", "e2e_ms": 10.0,
+                                "first_send_unix": T + 2.2,
+                                "t_send_unix": T + 2.2}], None)
+    assert solo["in_flight_max"] >= 2

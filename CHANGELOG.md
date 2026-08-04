@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.4.1
+
+### One command from an endpoint URL to a report
+
+`benchmark` takes a host, an endpoint name and rough token sizes. Sizes take
+`p50` or `p50,p95`, so `--input-tokens 10000,24000` replaces authoring a
+profile JSON. It writes the derived profile and the exact run config next to
+the results.
+
+Before any load it sends two requests and says what the endpoint does:
+whether auth works, whether token usage and cached tokens are reported, and
+whether this is a reasoning model. On a reasoning model that produced no
+visible answer inside 512 tokens it says so, warns that the configured
+output budget will produce none either, and scores TTFT on the first visible
+token. Verified against a live reasoning endpoint.
+
+### Latency as the caller experienced it
+
+The latency clock starts when a worker sends, so a request that waited in
+the client queue reported only what the endpoint took once it went out. That
+is how a saturated load generator reports a healthy tail. Measured against
+an endpoint taking 200 ms every time with the client 10 seconds behind: e2e
+p95 read 200 ms while a caller asking on schedule waited 10,200 ms.
+
+Every request carries `queue_wait_ms`, and the summary carries
+`ttft_corrected_ms` and `e2e_corrected_ms` measured from intended arrival.
+Both views are reported. Service time belongs to the endpoint, corrected
+belongs to the user, and a run where they disagree was not driving the load
+it claimed.
+
+### A green verdict now requires evidence
+
+Enumerating failure modes kept leaving doors open. A run with an 8 percent
+error rate and one passing latency target printed "meets every acceptance
+target". Errors, a client-saturation warning, a concurrency warning, an
+unstable stability verdict, missing coverage on the scored metric, or fewer
+than 100 successful requests each downgrade the verdict to a caution naming
+the reason. Both reports render the same verdict from one function, having
+previously disagreed.
+
+### Numbers that were wrong
+
+- Throughput divided token totals by the send window while counting
+  generations that finished during the drain. About 61 percent high for a 99
+  second window with 60 second generations. It now divides by the
+  observation interval, and the arrival rate stays on the send span.
+- Achieved arrival rate used `n/span` while the offered rate used
+  `(n-1)/span`, so the two disagreed on an identical schedule.
+- Token-targeting error was `abs(median(ratio) - 1)`, which cancels
+  symmetric error: half the requests at 0.5x and half at 1.5x reported 0
+  percent. It is the median absolute error now.
+- `answer_rate` was labelled "of attempted" while computed over requests
+  that returned HTTP 200, so a run losing 8 of 100 printed "100.0% of
+  attempted".
+- Concurrency anchored its window on completion times, so one straggler
+  stretched the span into its own drain and collapsed the reported
+  concurrency to 1. The window is bounded by send times, the peak is a true
+  peak over the whole run, and a retried row spans its whole occupancy.
+- `calibrate_n` at or above the schedule length consumed every arrival and
+  reported "0 requests" on a run that really sent some. It raises now.
+- A shard's schedule block reported the whole run's request count.
+- Missing token usage was silently summed as zero. Coverage is reported and
+  warns below 99 percent.
+
+### Provenance
+
+Each run writes `manifest.json`: harness version and latency basis, git
+commit and dirty flag, profile name, path, provenance and content hash,
+seed, endpoint base URL, model and metadata, request parameters, schedule,
+and Python, numpy and platform versions. Run metadata previously omitted the
+base URL and model, which let `compare` and `merge` pool two providers
+sitting behind the same route.
+
+### Also
+
+- `complete_answers` renamed `answered`. Most generations stop at the
+  requested output length, so the old name told anyone reading
+  `summary.json` that truncated answers were complete.
+- `truncated_by_global_cap` separates truncation at a request's own sampled
+  target, which means the replay worked, from truncation by the global cap,
+  which means the run never reproduced the profile's output distribution.
+- The report no longer tells profile-mode users to raise
+  `max_output_tokens_cap`, which cannot work because the per-request budget
+  is the smaller of that and the sampled value.
+- Tests bind ephemeral ports, so both runners can run at once.
+
 ## 0.4.0
 
 ### Transport success is no longer reported as answer success
@@ -49,9 +135,9 @@ produced the token being scored.
   time rises under load, so this design overshoots. Both directions now warn.
   Previously only under-delivery did, which let a run labeled "30 concurrent"
   that actually held 65 go out clean.
-- `in_flight_max` is renamed `in_flight_max_sampled`. It is the highest of 41
-  samples across the middle of the run, not a true peak, and calling it
-  "peak" oversold it.
+- Achieved concurrency is measured by an exact event sweep. An earlier
+  version of this entry described a 41-sample approximation, which 0.4.1
+  replaced.
 - Sharded runs compare against their own share of the concurrency rather than
   the unsharded total, which used to report every shard as falling short.
 

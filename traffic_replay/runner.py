@@ -391,7 +391,6 @@ def run(rc: RunConfig, token_override: str | None = None,
             "endpoint_base_url": ecfg.base_url,
             "endpoint_model": ecfg.model,
             "profile_path": rc.profile_path,
-            "prompts_file": rc.prompts_file,
             "seed": rc.seed,
         }
         acceptance = rc.acceptance_targets

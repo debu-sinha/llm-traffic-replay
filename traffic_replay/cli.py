@@ -164,8 +164,11 @@ def _pair(text, what):
         raise SystemExit(f"--{what} wants a number or two, got {text!r}")
     if not vals:
         raise SystemExit(f"--{what} is empty")
+    import math
     if len(vals) > 2:
         raise SystemExit(f"--{what} takes p50 or p50,p95, got {text!r}")
+    if any(not math.isfinite(v) for v in vals):
+        raise SystemExit(f"--{what} needs finite numbers, got {text!r}")
     p50 = vals[0]
     frac = "rate" in what or "fraction" in what
     if len(vals) > 1:
@@ -200,15 +203,20 @@ def _preflight(cfg: dict) -> dict:
 
     ecfg = EndpointConfig(**cfg["endpoint"])
     tok = _token(ecfg)
-    client = EndpointClient(ecfg, tok)
+    client = EndpointClient(ecfg, tok, refresh=lambda: _token(ecfg))
     mat = TextMaterializer(cpt=4.0)
     ip = cfg["_input_tokens"]
-    out: dict = {"auth": bool(tok)}
+    # probe at the budget the run will actually use. probing at a fixed 512
+    # and then stating what happens "at your output budget" was an
+    # extrapolation presented as a measurement, in the one place a customer
+    # decides whether to keep testing an endpoint.
+    budget = int(cfg.get("max_output_tokens_cap") or 512)
+    out: dict = {"auth": bool(tok), "budget": budget}
     rows = []
     for i in range(2):
         msgs = mat.messages(f"preflight{i}", i, int(ip["p50"]),
                             int(ip["p95"]), 200)
-        res = client.send(msgs, 512, f"preflight-{i}", scheduled_s=0.0,
+        res = client.send(msgs, budget, f"preflight-{i}", scheduled_s=0.0,
                           dispatch_lag_ms=0.0, intended=(0, 0, None, -1),
                           chars_sent=0)
         rows.append(res)
@@ -339,11 +347,11 @@ def cmd_benchmark(args) -> int:
                   "tokens before the answer, and they count against "
                   "max_tokens.")
             if not pf_res.get("visible"):
-                print("[preflight] and it produced NO visible answer within "
-                      "512 tokens. at your output budget it will produce "
-                      "none either. raise --output-tokens, or turn reasoning "
-                      "down with --extra-body, before trusting any latency "
-                      "number from this endpoint.")
+                print(f"[preflight] and it produced NO visible answer within "
+                      f"{pf_res['budget']} tokens, which is the budget this "
+                      "run will use. raise --output-tokens, or turn "
+                      "reasoning down with --extra-body, before trusting any "
+                      "latency number from this endpoint.")
             if "ttft_definition" not in cfg:
                 cfg["ttft_definition"] = "first_visible"
                 print("[preflight] scoring TTFT on the first VISIBLE token, "
@@ -354,6 +362,9 @@ def cmd_benchmark(args) -> int:
     saved = Path(args.out_dir) / "run-config.json"
     saved.write_text(json.dumps(cfg, indent=2) + "\n")
     out = run(RunConfig(**cfg))
+    print()
+    print(f"report: {Path(out['out_dir']) / 'report.html'}")
+    print(f"        {Path(out['out_dir']) / 'report.md'}")
     print()
     print(f"config saved to {saved}, rerun it with:")
     print(f"  python3 -m traffic_replay run --config {saved}")

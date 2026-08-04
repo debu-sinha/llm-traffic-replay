@@ -1379,3 +1379,32 @@ def test_a_run_with_no_targets_still_gets_a_verdict():
     s = summarize(_clean(300))
     assert "no acceptance targets" in _v(s)
     assert "banner" in render_html(s, "x")
+
+
+def test_a_run_whose_stability_was_never_established_is_not_green():
+    """Absence of a stability verdict was reading as a passing one. Three
+    shapes reach it: a run too short to window, a run where no window carries
+    a usable sample, and a merged run where drift is blanked by design."""
+    s = summarize(_clean(400), acceptance={"ttfg_ms": {"p95": 5000}})
+    assert (s.get("drift") or {}).get("drift_kind") is None
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    assert "stability over the run was not established" in _v(s)
+
+
+def test_a_success_rate_target_needs_enough_requests_to_miss_it():
+    """Two requests cannot demonstrate a 99 percent success rate."""
+    s = summarize(_clean(2), acceptance={"success_rate": 0.99})
+    assert "cannot demonstrate it" in _v(s)
+    assert "at least 99" in _v(s)
+
+
+def test_the_arrival_rate_counts_only_rows_it_measured_the_span_over():
+    """A half-stamped input would otherwise report double the true rate."""
+    base = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "ttft_ms": 50.0, "e2e_ms": 200.0,
+             "t_send_unix": base + i * 0.1,
+             "first_send_unix": base + i * 0.1} for i in range(100)]
+    rows += [{"ok": True, "phase": "replay", "ttft_ms": 50.0,
+              "e2e_ms": 200.0} for _ in range(100)]      # no send stamp
+    s = summarize(rows)
+    assert abs(s["arrivals"]["achieved_qps_overall"] - 10.0) < 0.2

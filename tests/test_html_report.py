@@ -34,6 +34,12 @@ def _summary(met_p95, label="run", n=250):
         "arrivals": {"achieved_qps_overall": 2.0,
                      "dispatch_lag_ms": {"p95": 5}},
         "token_targeting": {"finish_reasons": {"stop": n}},
+        # a green banner now requires stability to have been established,
+        # so the passing fixture has to represent a run long enough to judge
+        "drift": {"drift_kind": "stable", "windows": [
+            {"window": w, "n": 80, "attempts": 80, "errors": 0,
+             "ttft_p95": 180, "e2e_p95": 450, "counted": True}
+            for w in (0, 1, 2)]},
         "run": {"input_mode": "profile", "endpoint_path": "/e",
                 "label": label,
                 "request_params": {"temperature": 0.0,

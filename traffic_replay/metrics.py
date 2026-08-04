@@ -276,9 +276,16 @@ def _verdict(s: dict) -> tuple[str, str]:
             "max_output_tokens_cap rather than by their own target, so the "
             "run did not reproduce the profile's output sizes and "
             "end-to-end is correspondingly short")
-    dk = (s.get("drift") or {}).get("drift_kind")
-    if dk and dk not in ("stable",):
+    _drift = s.get("drift") or {}
+    dk = _drift.get("drift_kind")
+    if dk and dk != "stable":
         doubts.append(f"latency was {dk} across the run")
+    elif not dk:
+        # no verdict at all: too short to window, no window with a usable
+        # sample, or a merged run where drift is blanked by construction.
+        # not knowing whether latency held is not the same as it holding.
+        doubts.append("stability over the run was not established"
+                      + (f" ({_drift['note']})" if _drift.get("note") else ""))
     # a scored target on a quantile the sample cannot support is not a pass
     _samp = s.get("sample") or {}
     _weak = set(_samp.get("indicative_only") or [])
@@ -293,6 +300,15 @@ def _verdict(s: dict) -> tuple[str, str]:
         _weak |= {q for q, need in _need.items() if _n_scored < need}
     _scored_weak = sorted({r["quantile"] for r in rows
                            if r["quantile"] in _weak})
+    _sr = sla.get("success_rate") or {}
+    if _sr.get("target") is not None:
+        _n_all = (s.get("requests_total") or 0)
+        _floor = 1.0 / max(1e-9, 1.0 - float(_sr["target"]))
+        if _n_all < _floor:
+            doubts.append(
+                f"a {_sr['target']} success rate was scored on {_n_all} "
+                f"requests, which cannot demonstrate it. it needs at least "
+                f"{int(_floor)}")
     if _scored_weak:
         doubts.append(f"{', '.join(_scored_weak)} scored on "
                       f"{_samp.get('n')} requests, which cannot support "
@@ -547,8 +563,10 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                     "vs length)",
         },
         "arrivals": {
-            "achieved_qps_overall": ((len(results) - 1) / send_span
-                                     if send_span and len(results) > 1
+            # count the rows the span was measured over, not every row. a
+            # half-stamped input would otherwise report double the rate.
+            "achieved_qps_overall": ((len(sent) - 1) / send_span
+                                     if send_span and len(sent) > 1
                                      else None),
             "dispatch_lag_ms": _pct_table(lags),
             "wire_lateness_ms": _pct_table(wire),
@@ -810,7 +828,14 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
             }
         return {"windows": [], "note": "no successful requests"}
     failed = failed or []
+    # a row with no send stamp cannot be placed in a window. failures were
+    # already filtered for it; successes were not, and a pooled or
+    # hand-built input without the field raised a KeyError here.
+    ok = [r for r in ok if r.get("t_send_unix") is not None]
     everything = ok + [f for f in failed if f.get("t_send_unix") is not None]
+    if not everything:
+        return {"windows": [], "note": "no request carried a send time, so "
+                                       "stability cannot be judged"}
     t0 = min(r["t_send_unix"] for r in everything)
     buckets: dict[int, list] = {}
     errs: dict[int, int] = {}

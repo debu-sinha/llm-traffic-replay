@@ -16,3 +16,9 @@ configs/profile_real*.json
 
 # quickstart writes the workspace host and endpoint name here
 configs/quickstart.json
+
+# benchmark and quickstart write the workspace host and endpoint name into
+# these, wherever --out-dir points
+run-config.json
+**/run-config.json
+**/profile.json

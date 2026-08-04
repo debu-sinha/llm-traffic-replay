@@ -101,6 +101,12 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "lateness. read each run's own report. dispatch lag below is pooled "
         "and still meaningful, since it is measured within each run.")
     summary.pop("client", None)
+    # summarize() stamps queue_wait_ms on each row against one schedule
+    # offset. across runs that started at different times that number is
+    # meaningless, and leaving it on the rows would contradict the note
+    # below in the same output directory.
+    for _r in rows:
+        _r.pop("queue_wait_ms", None)
     # corrected latency is computed against one schedule offset. pooling rows
     # from runs that started at different wall-clock times makes that offset
     # meaningless: two 200 ms runs an hour apart would report a corrected p95

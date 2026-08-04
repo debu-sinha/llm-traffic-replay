@@ -262,10 +262,15 @@ def _verdict(s: dict) -> tuple[str, str]:
     dk = (s.get("drift") or {}).get("drift_kind")
     if dk and dk not in ("stable",):
         doubts.append(f"latency was {dk} across the run")
-    n_ok = (s.get("ttft_ms") or {}).get("n") or 0
-    if n_ok and n_ok < 100:
-        doubts.append(f"only {n_ok} successful requests, so the tail is "
-                      "indicative only")
+    # a scored target on a quantile the sample cannot support is not a pass
+    _samp = s.get("sample") or {}
+    _weak = set(_samp.get("indicative_only") or [])
+    _scored_weak = sorted({r["quantile"] for r in rows
+                           if r["quantile"] in _weak})
+    if _scored_weak:
+        doubts.append(f"{', '.join(_scored_weak)} scored on "
+                      f"{_samp.get('n')} requests, which cannot support "
+                      f"{'that quantile' if len(_scored_weak) == 1 else 'those quantiles'}")
     if doubts:
         return "caution", ("met every acceptance target, but " +
                            ", and ".join(doubts) + ". read those before "
@@ -583,17 +588,34 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 summary["throughput"]["reasoning_tokens_per_min"] = \
                     ctotal / dur_min
     n_ok = len(ok)
+    # a quantile needs enough observations ABOVE it to be an estimate rather
+    # than an anecdote. at n=100 there is a 37 percent chance of drawing no
+    # sample at all beyond the true p99, so the old "100 is fine for p99"
+    # threshold was not defensible. the rule here is roughly ten
+    # observations past the quantile: n >= 10/(1-q).
+    _need = {"p50": 20, "p90": 100, "p95": 200, "p99": 1000}
+    _unsupported = [q for q, need in _need.items() if n_ok < need]
     if n_ok == 0:
         sample_warning = ("no successful requests, so there are no latency "
                           "numbers to read. check the failures block")
-    elif n_ok < 30:
-        sample_warning = ("very small sample: treat p95/p99 as indicative "
-                          "only, run more requests for a stable tail")
-    elif n_ok < 100:
-        sample_warning = "small sample: p99 is unstable below ~100 requests"
+    elif _unsupported:
+        sample_warning = (
+            f"{n_ok} successful requests supports "
+            + (", ".join(q for q in _need if q not in _unsupported)
+               or "no quantile")
+            + ". " + ", ".join(_unsupported) + " "
+            + ("is" if len(_unsupported) == 1 else "are")
+            + " indicative only, since a quantile needs roughly ten "
+            "observations past it to be an estimate. "
+            + f"reach {min(_need[q] for q in _unsupported)} for the next one")
     else:
         sample_warning = None
-    summary["sample"] = {"n": n_ok, "warning": sample_warning}
+    summary["sample"] = {
+        "n": n_ok,
+        "supports": [q for q in _need if q not in _unsupported],
+        "indicative_only": _unsupported,
+        "warning": sample_warning,
+    }
     # the client is part of the instrument. if it could not deliver the load
     # it was asked for, the endpoint was never tested at that rate, and every
     # latency number below describes a lighter load than the one on the label.

@@ -17,10 +17,34 @@ def _rows(n, base_ttft=100.0, t0=0.0, dt=1.0):
              "completion_tokens": 10} for i in range(n)]
 
 
-def test_small_n_warning_thresholds():
-    assert "very small" in summarize(_rows(10))["sample"]["warning"]
-    assert "small sample" in summarize(_rows(50))["sample"]["warning"]
-    assert summarize(_rows(150))["sample"]["warning"] is None
+def test_the_sample_gate_names_which_quantiles_it_supports():
+    """A quantile needs roughly ten observations past it to be an estimate.
+    At n=100 there is a 37 percent chance of drawing nothing at all beyond
+    the true p99, so the old "100 is enough for p99" rule was not
+    defensible."""
+    tiny = summarize(_rows(10))["sample"]
+    assert tiny["supports"] == []
+    assert "p99" in tiny["indicative_only"]
+
+    mid = summarize(_rows(150))["sample"]
+    assert mid["supports"] == ["p50", "p90"]
+    assert mid["indicative_only"] == ["p95", "p99"]
+    assert "p95, p99 are indicative only" in mid["warning"]
+
+    big = summarize(_rows(1200))["sample"]
+    assert big["supports"] == ["p50", "p90", "p95", "p99"]
+    assert big["warning"] is None
+
+
+def test_a_target_on_an_unsupportable_quantile_is_not_a_pass():
+    """Scoring a p99 target on 150 requests and calling it met would be a
+    verdict the sample cannot carry."""
+    s = summarize(_rows(150), acceptance={"ttft_ms": {"p99": 100000}})
+    assert s["sla"]["ttft_vs_target"][0]["met"] is True
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    md = [x for x in render_markdown(s, "x").splitlines()
+          if x.startswith("verdict:")][0]
+    assert "p99" in md and "cannot support" in md
 
 
 def test_drift_flag_rises_with_a_rising_tail():

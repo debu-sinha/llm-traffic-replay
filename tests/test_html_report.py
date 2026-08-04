@@ -116,3 +116,31 @@ def test_html_escapes_structured_payloads():
     assert "<img src=x onerror=alert(1)>" not in h
     assert "</script><b>evil</b>" not in h
     assert "<i>field</i>" not in h
+
+
+def test_the_html_carries_the_same_facts_as_the_markdown():
+    """The html is the artifact the README sends people to, and the preflight
+    tells customers to go read the answers block. Answer counts, caller
+    latency and cap-driven truncation were markdown-only."""
+    from traffic_replay.metrics import summarize, render_markdown
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(300):
+        sched = i * 0.1
+        lag = 0.0 if i < 150 else 10.0
+        rows.append({"ok": True, "phase": "replay", "ttft_ms": 50.0,
+                     "e2e_ms": 200.0, "scheduled_s": sched,
+                     "t_send_unix": base + sched + lag,
+                     "first_send_unix": base + sched + lag,
+                     "stream_complete": True, "visible_content_seen": True,
+                     "truncated": True, "parse_errors": 0,
+                     "intended_output_tokens": 64,
+                     "max_tokens_requested": 64})
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 1500}})
+    html = render_html(s, "x")
+    md = render_markdown(s, "x")
+    for phrase in ("cut short by the global", "stopped at the requested",
+                   "caller experienced"):
+        assert phrase in md, f"markdown lost {phrase}"
+        assert phrase in html, f"html is missing {phrase}"
+    assert "Answers" in html

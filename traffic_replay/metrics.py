@@ -2025,10 +2025,61 @@ def render_html(summary: dict, title: str) -> str:
                if detail else "")
             + "</table></div>")
 
+    # the html is the artifact the README sends people to, so it must carry
+    # the same facts the markdown does. answer counts, caller-experienced
+    # latency and cap-driven truncation were markdown-only, which is exactly
+    # the set the preflight tells a customer to go and read.
+    ans_html = ""
+    a = s.get("answers")
+    if a:
+        rate = (f"{a['answer_rate']:.1%}" if a.get("answer_rate") is not None
+                else "n/a")
+        rows_a = [("attempted", a.get("attempted")),
+                  ("returned HTTP 200", a.get("transport_ok")),
+                  ("started a readable answer",
+                   f"{a.get('answered')} ({rate} of "
+                   f"{a.get('judged')} judged)"),
+                  ("returned 200 with no visible content",
+                   a.get("no_visible_content")),
+                  ("stream never terminated", a.get("stream_incomplete")),
+                  ("unrecoverable parse errors", a.get("parse_errors")),
+                  ("stopped at the requested output length",
+                   a.get("truncated")),
+                  ("cut short by the global token cap",
+                   a.get("truncated_by_global_cap"))]
+        ans_html = (
+            "<div class='card'><h2>Answers</h2><table>"
+            + "".join(f"<tr><td class='lbl'>{esc(k)}</td>"
+                      f"<td>{esc(str(v))}</td></tr>" for k, v in rows_a)
+            + f"</table><div class='cap'>{esc(a.get('note') or '')}</div>"
+            + (f"<div class='banner bad'>{esc(a['invalid'])}</div>"
+               if a.get("invalid") else "")
+            + "</div>")
+
+    corr_html = ""
+    if s.get("e2e_corrected_ms"):
+        c1 = s.get("ttft_corrected_ms") or {}
+        c2 = s["e2e_corrected_ms"]
+        r_ = []
+        if c1.get("p50") is not None:
+            r_.append(("TTFT corrected (ms)", c1))
+        r_.append(("end-to-end corrected (ms)", c2))
+        corr_html = (
+            "<div class='card'><h2>Latency as the caller experienced it</h2>"
+            "<div class='cap'>Includes time the request waited on the "
+            "client.</div><table><tr><th class='lbl'>metric</th><th>p50</th>"
+            "<th>p95</th><th>p99</th></tr>"
+            + "".join(f"<tr><td class='lbl'>{esc(n)}</td>"
+                      f"<td>{num(t['p50'])}</td><td>{num(t['p95'])}</td>"
+                      f"<td>{num(t['p99'])}</td></tr>" for n, t in r_)
+            + "</table><div class='cap'>"
+            + esc(s.get("latency_correction_note") or "") + "</div></div>")
+
     body = (
         f"<div class='wrap'><h1>{esc(title)}</h1>"
         f"<div class='sub'>{sub}</div>{sample_banner}{banner}{stats}"
-        f"{em_html}{sla_html}{lat_html}{drift_html}{believe}{cost_html}"
+        f"{em_html}{ans_html}{sla_html}{lat_html}{corr_html}"
+        f"{drift_html}{believe}{cost_html}"
         f"{extra_cards}{note_html}{label_html}"
         f"<div class='foot'>llm-traffic-replay report</div></div>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"

@@ -34,15 +34,51 @@ def cmd_schedule(args) -> int:
     return 0
 
 
+_EXIT = {"ok": 0, "caution": 0, "miss": 1, "invalid": 2}
+
+
+def _finish(out, fail_on: str = "miss", fmt: str = "text") -> int:
+    """Print the result and turn the verdict into an exit code.
+
+    Two things were wrong before. A run that missed every acceptance target
+    exited 0, so the harness could not gate anything. And the default output
+    was `json.dumps(summary)[:4000]`, which is a JSON document sliced mid
+    structure, so the first thing a user saw was invalid JSON.
+    """
+    from .metrics import _verdict
+    d = Path(out["out_dir"])
+    if fmt == "json":
+        print(json.dumps(out["summary"], indent=2))
+    else:
+        # report.md already says exactly this, and it is the artifact people
+        # paste into email, so the terminal and the file cannot disagree.
+        md = d / "report.md"
+        if md.exists():
+            print(md.read_text().rstrip())
+    print()
+    print(f"open in a browser: {d / 'report.html'}")
+    print(f"full outputs:      {d}")
+
+    kind, text = _verdict(out["summary"])
+    code = _EXIT.get(kind, 0)
+    if fail_on == "none":
+        code = 0
+    elif fail_on == "caution" and kind == "caution":
+        code = 1
+    print()
+    print(f"{kind.upper()}: {text}")
+    if code:
+        print(f"exiting {code}. pass --fail-on none to always exit 0.")
+    return code
+
+
 def cmd_run(args) -> int:
     from .runner import RunConfig, run
     cfg = json.loads(Path(args.config).read_text())
     rc = RunConfig(**cfg)
     out = run(rc)
-    print(json.dumps(out["summary"], indent=2)[:4000])
-    print(f"\nopen in a browser: {out['out_dir']}/report.html")
-    print(f"full outputs:      {out['out_dir']}")
-    return 0
+    return _finish(out, getattr(args, "fail_on", "miss"),
+                   getattr(args, "format", "text"))
 
 
 def cmd_validate(args) -> int:
@@ -362,13 +398,12 @@ def cmd_benchmark(args) -> int:
     saved = Path(args.out_dir) / "run-config.json"
     saved.write_text(json.dumps(cfg, indent=2) + "\n")
     out = run(RunConfig(**cfg))
-    print()
-    print(f"report: {Path(out['out_dir']) / 'report.html'}")
-    print(f"        {Path(out['out_dir']) / 'report.md'}")
+    code = _finish(out, getattr(args, "fail_on", "miss"),
+                   getattr(args, "format", "text"))
     print()
     print(f"config saved to {saved}, rerun it with:")
     print(f"  python3 -m traffic_replay run --config {saved}")
-    return 0
+    return code
 
 
 def cmd_quickstart(args) -> int:
@@ -505,6 +540,12 @@ def main(argv=None) -> int:
     s.add_argument("--label", default=None)
     s.add_argument("--skip-preflight", action="store_true",
                    help="skip the 2-request endpoint check. not recommended")
+    s.add_argument("--fail-on", choices=("none", "miss", "caution"),
+                   default="miss",
+                   help="exit non-zero on this verdict or worse. miss=1, "
+                        "invalid=2. use none to always exit 0")
+    s.add_argument("--format", choices=("text", "json"), default="text",
+                   help="text prints the report, json prints summary.json")
     s.set_defaults(fn=cmd_benchmark)
 
     s = sub.add_parser("quickstart",
@@ -545,6 +586,12 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("run", help="replay against a real endpoint")
     s.add_argument("--config", required=True)
+    s.add_argument("--fail-on", choices=("none", "miss", "caution"),
+                   default="miss",
+                   help="exit non-zero on this verdict or worse. miss=1, "
+                        "invalid=2. use none to always exit 0")
+    s.add_argument("--format", choices=("text", "json"), default="text",
+                   help="text prints the report, json prints summary.json")
     s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("validate", help="instrument self-test vs bundled mock")

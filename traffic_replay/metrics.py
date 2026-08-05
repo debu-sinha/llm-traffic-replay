@@ -607,6 +607,26 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                     f"{_np['ttft_p50_less_rtt']:.0f} ms and say why")
         summary["network_path"] = _np
 
+    # time per output token, after the first. this is the metric the serving
+    # docs use to reason about generation length: latency is roughly
+    # TTFT + TPOT * output_tokens, so TPOT is what says whether a longer
+    # answer still fits the budget. every other serving benchmark reports
+    # it, under this name or as time-between-tokens.
+    tpot = []
+    for r in ok:
+        n_out = r.get("completion_tokens")
+        t, e = r.get("ttft_ms"), r.get("e2e_ms")
+        if n_out and n_out > 1 and t is not None and e is not None and e >= t:
+            tpot.append((e - t) / (n_out - 1))
+    if tpot:
+        summary["tpot_ms"] = _pct_table(tpot)
+        summary["tpot_note"] = (
+            "time per output token after the first, (e2e - ttft) / "
+            "(output_tokens - 1). latency for a longer answer is roughly "
+            "ttft + tpot * output_tokens, so this is the number that says "
+            "whether a longer generation still fits the budget. computed "
+            f"over the {len(tpot)} requests that produced more than one token")
+
     answers = _answer_block(ok, len(results))
     if answers:
         summary["answers"] = answers
@@ -1361,6 +1381,16 @@ def render_markdown(summary: dict, title: str) -> str:
             f"p95 {cc['in_flight_p95']:.0f}, peak "
             f"{cc['in_flight_max']:.0f}{askd} "
             f"({cc['measured_over']})")
+    tp = s.get("tpot_ms") or {}
+    if tp.get("n"):
+        lines.append(
+            f"- time per output token (TPOT): p50 {tp['p50']:.1f} / p95 "
+            f"{tp['p95']:.1f} ms. latency for a longer answer is roughly "
+            f"ttft + tpot x output_tokens, so a {tp['p50']:.1f} ms TPOT puts "
+            f"a 500-token answer near "
+            f"{(s.get('ttft_ms') or {}).get('p50', 0) + tp['p50'] * 500:.0f} "
+            "ms")
+
     if s.get("e2e_corrected_ms"):
         c1 = s.get("ttft_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]

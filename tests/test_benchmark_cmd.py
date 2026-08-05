@@ -287,3 +287,59 @@ def test_a_genuinely_bad_credential_still_fails_the_run():
     assert n["i"] <= 6, "refresh must be bounded"
     # and the reason the user sees names auth, not "exhausted retries"
     assert "401" in (res.error or ""), res.error
+
+
+# ---- the verdict has to move the exit code, or it gates nothing ----------
+
+def _summary_dir(kind):
+    """A finished run directory whose verdict is the requested kind."""
+    import tempfile
+    from traffic_replay.metrics import summarize, write_outputs
+    base = 1_700_000_000.0
+    rows = [{"ok": True, "phase": "replay", "ttft_ms": 100.0, "e2e_ms": 200.0,
+             "prompt_tokens": 100, "completion_tokens": 10,
+             "stream_complete": True, "visible_content_seen": True,
+             "truncated": False, "parse_errors": 0,
+             "t_send_unix": base + i * 0.3,
+             "first_send_unix": base + i * 0.3} for i in range(300)]
+    if kind == "invalid":
+        for r in rows:
+            r["visible_content_seen"] = False
+    target = 1 if kind == "miss" else 100000
+    s = summarize(rows, acceptance={"ttft_ms": {"p50": target}},
+                  run_meta={"label": "t"})
+    d = Path(tempfile.mkdtemp(prefix="exit-"))
+    write_outputs(rows, s, d, "t")
+    return {"out_dir": str(d), "summary": s}
+
+
+def test_a_missed_target_exits_nonzero():
+    """It exited 0 no matter what, so the harness could not gate a build."""
+    from traffic_replay.cli import _finish
+    assert _finish(_summary_dir("miss")) == 1
+
+
+def test_a_run_with_no_readable_answers_exits_two():
+    from traffic_replay.cli import _finish
+    assert _finish(_summary_dir("invalid")) == 2
+
+
+def test_fail_on_none_always_exits_zero():
+    from traffic_replay.cli import _finish
+    assert _finish(_summary_dir("miss"), fail_on="none") == 0
+    assert _finish(_summary_dir("invalid"), fail_on="none") == 0
+
+
+def test_the_terminal_prints_the_report_not_sliced_json():
+    """The old default was json.dumps(summary)[:4000], a JSON document cut
+    mid-structure, so the first thing a user saw was invalid JSON."""
+    import contextlib
+    import io
+    from traffic_replay.cli import _finish
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _finish(_summary_dir("miss"))
+    out = buf.getvalue()
+    assert "requests:" in out          # the report, not a JSON blob
+    assert "MISS:" in out
+    assert not out.lstrip().startswith("{")

@@ -270,15 +270,9 @@ def _preflight(cfg: dict) -> dict:
     return out
 
 
-def cmd_benchmark(args) -> int:
-    """One command from an endpoint URL to a report.
-
-    The previous path was: author a profile JSON, run quickstart, edit the
-    config, run it. Three of those four steps are things a person should not
-    have to do to answer "does this endpoint meet my latency target".
-    """
-    from .runner import RunConfig, run
-
+def _benchmark_config(args) -> dict:
+    """Build a run config from the flags. Shared by benchmark and sweep, so
+    the two cannot drift on how a profile or a target is interpreted."""
     path = args.endpoint
     if not path.startswith("/"):
         path = f"/serving-endpoints/{path}/invocations"
@@ -361,6 +355,19 @@ def cmd_benchmark(args) -> int:
         cfg["acceptance_targets"] = t
 
     cfg["_input_tokens"] = inp
+    return cfg
+
+
+def cmd_benchmark(args) -> int:
+    """One command from an endpoint URL to a report.
+
+    The previous path was: author a profile JSON, run quickstart, edit the
+    config, run it. Three of those four steps are things a person should not
+    have to do to answer "does this endpoint meet my latency target".
+    """
+    from .runner import RunConfig, run
+
+    cfg = _benchmark_config(args)
     if not args.skip_preflight:
         print("[preflight] sending 2 requests to see what this endpoint does")
         pf_res = _preflight(cfg)
@@ -404,6 +411,171 @@ def cmd_benchmark(args) -> int:
     print(f"config saved to {saved}, rerun it with:")
     print(f"  python3 -m traffic_replay run --config {saved}")
     return code
+
+
+def _rungs(spec: str) -> list[float]:
+    """Parse "1:32" into a geometric ladder, or "2,5,10" into exactly those.
+
+    Geometric rather than linear because the interesting region is
+    multiplicative: the difference between 1 and 2 requests per second
+    matters as much as the difference between 16 and 32, and a linear ladder
+    spends most of its rungs past the knee.
+    """
+    spec = str(spec).strip()
+    try:
+        if ":" in spec:
+            parts = spec.split(":")
+            if len(parts) not in (2, 3):
+                raise ValueError
+            lo, hi = float(parts[0]), float(parts[1])
+            n = int(parts[2]) if len(parts) == 3 else 6
+            if not (0 < lo < hi) or n < 2:
+                raise ValueError
+            step = (hi / lo) ** (1.0 / (n - 1))
+            return [round(lo * step ** i, 3) for i in range(n)]
+        vals = [float(x) for x in spec.split(",") if x.strip()]
+        if not vals or any(v <= 0 for v in vals):
+            raise ValueError
+        return sorted(vals)
+    except ValueError:
+        raise SystemExit(
+            f"--rate wants lo:hi, lo:hi:rungs, or a comma list, got {spec!r}")
+
+
+def cmd_sweep(args) -> int:
+    """Climb a rate ladder and report the highest rung that stayed valid.
+
+    The axis is arrival rate, not concurrency, and that is a deliberate
+    choice rather than a convenience. An open-loop generator cannot hold a
+    concurrency: Little's law says in-flight is arrival rate times service
+    time, and service time rises under load, so fixing the rate means the
+    concurrency moves. Every sweep in this category picks a concurrency axis
+    because it is closed loop underneath, and pays for it with coordinated
+    omission. We offer a rate, which is the thing we actually control, and
+    report the concurrency each rung turned out to hold, which is the thing
+    the customer wants to hear back.
+    """
+    import copy
+    import time as _time
+    from .metrics import _verdict
+    from .runner import RunConfig, run
+
+    rates = _rungs(args.rate)
+    base = _benchmark_config(args)
+    # the ladder sets its own rate on every rung, and _input_tokens is a
+    # preflight-only key that RunConfig does not accept.
+    base.pop("concurrency", None)
+    base.pop("_input_tokens", None)
+
+    out_root = Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    print(f"[sweep] {len(rates)} rungs: "
+          + ", ".join(f"{r:g}" for r in rates) + " requests/second")
+    print(f"[sweep] {args.duration}s each"
+          + (f", {args.cooldown}s cooldown between them"
+             if args.cooldown else ""))
+    print()
+
+    rungs: list[dict] = []
+    for i, rate in enumerate(rates):
+        cfg = copy.deepcopy(base)
+        cfg.update(qps_base=rate, qps_burst=rate, qps_min=rate,
+                   qps_max=rate, rate_scale=1.0,
+                   duration_s=args.duration,
+                   out_dir=str(out_root / f"rate_{rate:g}"),
+                   title=f"{rate:g} requests/second")
+        # the pool has to be able to hold what the rate implies, or the
+        # client becomes the bottleneck and measures itself.
+        cfg["max_concurrency"] = max(64, int(rate * 30))
+        print(f"[sweep] rung {i + 1}/{len(rates)}: {rate:g} rps")
+        out = run(RunConfig(**cfg), quiet=False)
+        kind, text = _verdict(out["summary"])
+        s = out["summary"]
+        cc = s.get("concurrency") or {}
+        rungs.append({
+            "rate": rate, "kind": kind, "text": text,
+            "dir": out["out_dir"],
+            "held": cc.get("in_flight_p50"),
+            "achieved_rps": (s.get("arrivals") or {}).get(
+                "achieved_qps_overall"),
+            "err": s.get("error_rate"),
+            "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
+            "ttft_p95": (s.get("ttft_ms") or {}).get("p95"),
+            "e2e_p50": (s.get("e2e_ms") or {}).get("p50"),
+        })
+        print(f"[sweep] rung {i + 1}: {kind.upper()} {text[:90]}")
+        print()
+        if kind in ("miss", "invalid") and not args.no_early_stop:
+            print(f"[sweep] stopping: rung {i + 1} did not hold. pass "
+                  "--no-early-stop to climb the whole ladder anyway.")
+            break
+        if args.cooldown and i + 1 < len(rates):
+            _time.sleep(args.cooldown)
+
+    return _sweep_report(rungs, out_root, args)
+
+
+def _sweep_report(rungs: list[dict], out_root: Path, args) -> int:
+    """One table, and one sentence naming the highest rung that held."""
+    def _n(v, d=0):
+        return "-" if v is None else f"{v:,.{d}f}"
+
+    hdr = ("| rate asked | achieved | held | error | TTFT p50 | TTFT p95 "
+           "| E2E p50 | verdict |")
+    rows = [hdr, "|---|---|---|---|---|---|---|---|"]
+    for r in rungs:
+        rows.append(
+            f"| {r['rate']:g} rps | {_n(r['achieved_rps'], 1)} | "
+            f"{_n(r['held'])} | {(r['err'] or 0):.1%} | "
+            f"{_n(r['ttft_p50'])} | {_n(r['ttft_p95'])} | "
+            f"{_n(r['e2e_p50'])} | {r['kind'].upper()} |")
+
+    # the ceiling is the highest rung that STAYED VALID, never the highest
+    # one we managed to submit. every sweep in this category anchors on the
+    # latter and reports a top rung its own error rate disqualifies.
+    good = [r for r in rungs if r["kind"] in ("ok", "caution")]
+    if good:
+        best = good[-1]
+        head = (f"Highest rate that held: {best['rate']:g} requests/second, "
+                f"which carried about {_n(best['held'])} concurrent.")
+        def _sentence(t: str) -> str:
+            t = t.strip()
+            return t if t.endswith(".") else t + "."
+
+        if best["kind"] == "caution":
+            head += " Read it with care: " + _sentence(best["text"])
+        nxt = next((r for r in rungs if r["rate"] > best["rate"]), None)
+        if nxt:
+            head += (f" The next rung, {nxt['rate']:g} rps, "
+                     f"{nxt['kind']}ed: " + _sentence(nxt["text"]))
+        else:
+            head += (" That was the top of the ladder, so the real ceiling "
+                     "may be higher. Raise --rate to find it.")
+    else:
+        _t = rungs[0]["text"].strip()
+        head = ("No rung held. The lowest rate tested "
+                f"({rungs[0]['rate']:g} rps) already "
+                f"{rungs[0]['kind']}ed: "
+                + (_t if _t.endswith(".") else _t + "."))
+
+    body = "\n".join([f"# Rate ladder: {args.endpoint}",
+                      "", head, "",
+                      "\n".join(rows), "",
+                      "The axis is arrival rate because that is what an "
+                      "open-loop generator controls. Concurrency is reported "
+                      "as measured, not as asked for: in-flight is arrival "
+                      "rate times service time, and service time rises under "
+                      "load, so it is an outcome rather than an input.", "",
+                      "Per-rung reports:", ""]
+                     + [f"- {r['rate']:g} rps: `{r['dir']}/report.html`"
+                        for r in rungs])
+    path = out_root / "sweep.md"
+    path.write_text(body + "\n")
+    print()
+    print(body)
+    print()
+    print(f"written to {path}")
+    return 0 if good else 1
 
 
 def cmd_quickstart(args) -> int:
@@ -547,6 +719,49 @@ def main(argv=None) -> int:
     s.add_argument("--format", choices=("text", "json"), default="text",
                    help="text prints the report, json prints summary.json")
     s.set_defaults(fn=cmd_benchmark)
+
+    s = sub.add_parser(
+        "sweep",
+        help="climb a rate ladder and report the highest rate that held")
+    s.add_argument("--host", required=True)
+    s.add_argument("--endpoint", required=True)
+    s.add_argument("--rate", default="1:32",
+                   help="lo:hi, lo:hi:rungs, or a comma list. requests per "
+                        "second. geometric by default, since the interesting "
+                        "region is multiplicative")
+    s.add_argument("--duration", type=int, default=120,
+                   help="seconds per rung")
+    s.add_argument("--cooldown", type=int, default=30,
+                   help="seconds between rungs, so a sliding request quota "
+                        "refills and each rung starts from the same place")
+    s.add_argument("--no-early-stop", action="store_true",
+                   help="climb every rung even after one fails")
+    s.add_argument("--input-tokens", default="10000")
+    s.add_argument("--output-tokens", default="200")
+    s.add_argument("--cache-hit-rate", default="0.3,0.7")
+    s.add_argument("--prompts", default=None)
+    s.add_argument("--profile", default=None)
+    s.add_argument("--auth-profile", default=None)
+    s.add_argument("--token-env", default="DATABRICKS_TOKEN")
+    s.add_argument("--model", default=None)
+    s.add_argument("--extra-body", default=None)
+    s.add_argument("--ttft-p50", type=float, default=None)
+    s.add_argument("--ttft-p90", type=float, default=None)
+    s.add_argument("--ttft-p95", type=float, default=None)
+    s.add_argument("--ttft-p99", type=float, default=None)
+    s.add_argument("--ttfg-p50", type=float, default=None)
+    s.add_argument("--ttfg-p90", type=float, default=None)
+    s.add_argument("--ttfg-p95", type=float, default=None)
+    s.add_argument("--ttfg-p99", type=float, default=None)
+    s.add_argument("--success-rate", type=float, default=None)
+    s.add_argument("--out-dir", default="results/sweep")
+    s.add_argument("--title", default=None)
+    s.add_argument("--label", default=None)
+    s.add_argument("--concurrency", type=int, default=None,
+                   help=argparse.SUPPRESS)
+    s.add_argument("--skip-preflight", action="store_true",
+                   default=True, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_sweep)
 
     s = sub.add_parser("quickstart",
                        help="write a run config from endpoint + concurrency")

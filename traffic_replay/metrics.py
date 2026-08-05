@@ -268,6 +268,12 @@ def _verdict(s: dict) -> tuple[str, str]:
     if (s.get("throughput") or {}).get("coverage_warning"):
         doubts.append("token usage was missing on many responses, so "
                       "throughput and cost cover a subset")
+    _npw = (s.get("network_path") or {})
+    if _npw.get("warning"):
+        doubts.append(
+            f"{_npw['rtt_ms']:.0f} ms of the TTFT is the round trip to the "
+            f"endpoint ({_npw['share_of_ttft_p50']:.1%} of p50), so the "
+            "client is measuring its own distance as well as the endpoint")
     _cap = a.get("truncated_by_global_cap") or 0
     _scored_n = a.get("scored") or 0
     if _scored_n and _cap / _scored_n > 0.05:
@@ -581,6 +587,26 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": run_meta or {},
     }
+    # how much of the latency below is the width of the network. one round
+    # trip is in every figure: the request goes out, the first token comes
+    # back. a run generated from the wrong region folds that in silently.
+    _np = (run_meta or {}).get("network_path")
+    if _np and _np.get("rtt_ms") is not None:
+        _t = (summary.get("ttft_ms") or {}).get("p50")
+        _np = dict(_np)
+        if _t:
+            _np["share_of_ttft_p50"] = round(_np["rtt_ms"] / _t, 4)
+            _np["ttft_p50_less_rtt"] = round(_t - _np["rtt_ms"], 1)
+            if _np["rtt_ms"] / _t > 0.05:
+                _np["warning"] = (
+                    f"{_np['rtt_ms']:.0f} ms of the {_t:.0f} ms TTFT p50 is "
+                    f"the round trip to {_np['endpoint_host']}, which is "
+                    f"{_np['rtt_ms'] / _t:.1%} of it. the client is not near "
+                    "the endpoint. run the generator where the traffic "
+                    "actually originates, or quote "
+                    f"{_np['ttft_p50_less_rtt']:.0f} ms and say why")
+        summary["network_path"] = _np
+
     answers = _answer_block(ok, len(results))
     if answers:
         summary["answers"] = answers
@@ -1232,6 +1258,9 @@ def render_markdown(summary: dict, title: str) -> str:
     # into a ticket, and a caution printed below the numbers is one nobody
     # reads. same rule the comparison report follows.
     cautions: list[str] = []
+    _nw = (s.get("network_path") or {}).get("warning")
+    if _nw:
+        cautions += [f"CAUTION (network distance): {_nw}", ""]
     _cw = (s.get("throughput") or {}).get("coverage_warning")
     if _cw:
         cautions += [f"CAUTION (token usage): {_cw}", ""]
@@ -1303,6 +1332,19 @@ def render_markdown(summary: dict, title: str) -> str:
         "here means the tail has survivorship bias, read with care)"
         if s.get("requests_retried") else "- connection retries: none",
     ]
+    npth = s.get("network_path") or {}
+    if npth.get("rtt_ms") is not None:
+        _sh = npth.get("share_of_ttft_p50")
+        lines.append(
+            f"- network distance: {npth['rtt_ms']:.0f} ms round trip from "
+            f"{npth.get('client_egress_ip') or 'this client'} to "
+            f"{npth['endpoint_host']} ({', '.join(npth['endpoint_ips'][:3])})"
+            + (f". that is {_sh:.1%} of TTFT p50, leaving "
+               f"{npth['ttft_p50_less_rtt']:.0f} ms of endpoint time"
+               if _sh else "")
+            + ". one round trip is inside every latency figure above, "
+              "because the request has to arrive and the first token has to "
+              "come back")
     conn = s.get("connect_ms") or {}
     if conn.get("n"):
         lines.append(
@@ -1564,6 +1606,7 @@ def _manifest(summary: dict, out: Path) -> dict:
         "endpoint_base_url": run.get("endpoint_base_url"),
         "endpoint_model": run.get("endpoint_model"),
         "endpoint_metadata": run.get("endpoint_metadata"),
+        "network_path": run.get("network_path"),
         "request_params": run.get("request_params"),
         "concurrency_target": run.get("concurrency_target"),
         "shard": run.get("shard"),
@@ -1829,6 +1872,17 @@ def render_html(summary: dict, title: str) -> str:
 
     # ---- believability panel ----
     bel = []
+    npth = s.get("network_path") or {}
+    if npth.get("rtt_ms") is not None:
+        _sh = npth.get("share_of_ttft_p50")
+        bel.append(
+            f"<li><b>Network distance</b>: {num(npth['rtt_ms'])} ms round "
+            f"trip to {esc(npth['endpoint_host'])} "
+            f"({esc(', '.join(npth['endpoint_ips'][:3]))})"
+            + (f", which is {_sh:.1%} of TTFT p50 and leaves "
+               f"{num(npth['ttft_p50_less_rtt'])} ms of endpoint time"
+               if _sh else "")
+            + ". One round trip sits inside every latency figure above</li>")
     if has(ach):
         bel.append(f"<li><b>Achieved cache fraction</b> (endpoint-reported, "
                    f"0-1, share of prompt tokens served from cache): "
@@ -2015,6 +2069,10 @@ def render_html(summary: dict, title: str) -> str:
     nw = (s.get("concurrency") or {}).get("warning")
     if nw:
         sample_banner += f"<div class='banner warn'>{esc(nw)}</div>"
+
+    _netw = (s.get("network_path") or {}).get("warning")
+    if _netw:
+        sample_banner += f"<div class='banner warn'>{esc(_netw)}</div>"
 
     drift = s.get("drift") or {}
     if drift.get("windows") or drift.get("drift_kind"):

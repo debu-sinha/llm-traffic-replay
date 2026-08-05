@@ -77,6 +77,7 @@ class RunConfig:
     acceptance_targets: dict | None = None  # SLA targets (either mode)
     pricing: dict | None = None              # DBU cost rates (see metrics)
     capture_endpoint_metadata: bool = True   # read serving-endpoint config
+    measure_network_path: bool = True        # time the round trip to it
     ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
 
@@ -242,6 +243,18 @@ def run(rc: RunConfig, token_override: str | None = None,
     req_params = {"temperature": ecfg.temperature,
                   "max_output_tokens_cap": rc.max_output_tokens_cap,
                   "extra_body": ecfg.extra_body or {}}
+    # where the client sits relative to the endpoint. this is cheap, and
+    # without it a run generated from the wrong region silently folds a
+    # round trip into every latency number it prints.
+    net_path = None
+    if rc.measure_network_path:
+        from .netpath import measure_network_path
+        net_path = measure_network_path(ecfg.base_url)
+        if net_path and not quiet:
+            print(f"[runner] network: {net_path['rtt_ms']:.0f} ms round trip "
+                  f"to {net_path['endpoint_host']} "
+                  f"({', '.join(net_path['endpoint_ips'][:2])})")
+
     endpoint_meta = None
     if rc.capture_endpoint_metadata:
         from .endpoint_meta import fetch_endpoint_metadata
@@ -383,6 +396,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "prompts_file": rc.prompts_file, "prompts_count": m,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
+            "network_path": net_path,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
             "concurrency_target": _shard_concurrency(rc),
             # identity of the thing under test. without these, compare and
@@ -401,6 +415,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "profile_label": p.label, "cpt_final": mat.cpt,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
+            "network_path": net_path,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
             "concurrency_target": _shard_concurrency(rc),
             # identity of the thing under test. without these, compare and

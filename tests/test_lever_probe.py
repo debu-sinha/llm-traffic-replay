@@ -81,3 +81,45 @@ def test_an_errored_probe_does_not_break_the_report():
                  "verdict": "error", "detail": "connection reset"}])
     assert "error" in out
     assert "none of them produced an answer" in out
+
+
+# ---- refusing a run we already know is void -----------------------------
+
+class _Args:
+    force = False
+
+
+def test_it_refuses_and_hands_back_the_working_command():
+    """Found by following our own guide as a new user. The preflight said the
+    model could not answer, printed the exact flag that fixes it, then ran the
+    full five minute test anyway and came back INVALID with 1,872 requests and
+    zero readable answers."""
+    import contextlib
+    import io
+    from traffic_replay.cli import _refuse
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = _refuse([{"name": "reasoning_effort=none",
+                         "extra": {"reasoning_effort": "none"},
+                         "verdict": "works", "detail": "answered"}], _Args())
+    out = buf.getvalue()
+    assert code == 3
+    assert "STOPPING before the load starts" in out
+    assert """--extra-body '{"reasoning_effort": "none"}'""" in out
+    assert "--force" in out
+
+
+def test_when_nothing_works_it_refuses_and_says_what_to_change():
+    import contextlib
+    import io
+    from traffic_replay.cli import _refuse
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = _refuse([{"name": "reasoning_effort=minimal",
+                         "extra": {"reasoning_effort": "minimal"},
+                         "verdict": "ignored", "detail": "no answer"}], _Args())
+    out = buf.getvalue()
+    assert code == 3
+    assert "no reasoning control helped" in out
+    assert "--output-tokens" in out
+    assert "wrong model for an output budget this size" in out

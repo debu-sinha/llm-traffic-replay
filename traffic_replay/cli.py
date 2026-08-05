@@ -145,7 +145,11 @@ def cmd_validate(args) -> int:
                 "localhost network+parse overhead, so small positive is "
                 "expected and honest",
     }
-    print(json.dumps(rep, indent=2))
+    # the verdict is the point of this command. dumping the full report
+    # above it buried the answer under 16 lines of JSON, which is what a
+    # first-time user meets on step one of the guide.
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(rep, indent=2))
     ok = rep["ttft_error_ms"]["p95"] < args.tolerance_ms
     print(f"VALIDATE: {'PASS' if ok else 'FAIL'} "
           f"(ttft error p95 {rep['ttft_error_ms']['p95']:.1f} ms "
@@ -441,6 +445,34 @@ def _print_lever_report(levers: list[dict], budget: int) -> None:
               "--output-tokens and re-run the preflight to find out which.")
 
 
+def _refuse(levers: list[dict], args) -> int:
+    """Stop before a run we have already shown will produce nothing.
+
+    Found by following our own guide as a new user: the preflight said the
+    model could not answer at the configured budget, printed the exact flag
+    that fixes it, and then ran the full five minute test anyway. It came
+    back INVALID with 1,872 requests and zero readable answers. Knowing the
+    answer and spending the money anyway is the worst of both.
+    """
+    works = [x for x in levers if x["verdict"] == "works"]
+    print("[preflight] STOPPING before the load starts. this run would have "
+          "produced no readable answers, so it would cost you time and "
+          "tokens for a verdict we can already give you.")
+    print()
+    if works:
+        flag = json.dumps(works[0]["extra"])
+        print("  re-run with the control that worked:")
+        print()
+        print(f"    --extra-body '{flag}'")
+    else:
+        print("  no reasoning control helped at this budget. either raise")
+        print("  --output-tokens well above what you asked for, or this is")
+        print("  the wrong model for an output budget this size.")
+    print()
+    print("  or pass --force to run it anyway and see the INVALID report.")
+    return 3
+
+
 def cmd_benchmark(args) -> int:
     """One command from an endpoint URL to a report.
 
@@ -480,9 +512,14 @@ def cmd_benchmark(args) -> int:
                       "from this endpoint.")
                 if not args.no_lever_probe:
                     print()
-                    _print_lever_report(
-                        _probe_reasoning_levers(cfg, budget=512), 512)
+                    levers = _probe_reasoning_levers(cfg, budget=512)
+                    _print_lever_report(levers, 512)
                     print()
+                    if not args.force:
+                        # we have just proved this run cannot produce an
+                        # answer. running it anyway spends the user's time
+                        # and money to arrive at a verdict we already know.
+                        return _refuse(levers, args)
             if "ttft_definition" not in cfg:
                 cfg["ttft_definition"] = "first_visible"
                 print("[preflight] scoring TTFT on the first VISIBLE token, "
@@ -803,6 +840,9 @@ def main(argv=None) -> int:
     s.add_argument("--no-lever-probe", action="store_true",
                    help="skip trying reasoning controls when the endpoint "
                         "produces no readable answer")
+    s.add_argument("--force", action="store_true",
+                   help="run even when the preflight has shown the run will "
+                        "produce no readable answers")
     s.add_argument("--fail-on", choices=("none", "miss", "caution"),
                    default="miss",
                    help="exit non-zero on this verdict or worse. miss=1, "
@@ -853,6 +893,8 @@ def main(argv=None) -> int:
     s.add_argument("--skip-preflight", action="store_true",
                    default=True, help=argparse.SUPPRESS)
     s.add_argument("--no-lever-probe", action="store_true",
+                   default=True, help=argparse.SUPPRESS)
+    s.add_argument("--force", action="store_true",
                    default=True, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_sweep)
 
@@ -908,6 +950,8 @@ def main(argv=None) -> int:
     s.add_argument("--workdir", default="results/validation")
     s.add_argument("--tolerance-ms", type=float, default=60.0)
     s.add_argument("--quiet", action="store_true")
+    s.add_argument("--format", choices=("text", "json"), default="text",
+                   help="json prints the full comparison report")
     s.set_defaults(fn=cmd_validate)
 
     s = sub.add_parser("merge", help="pool sharded run outputs into one")

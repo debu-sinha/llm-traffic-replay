@@ -371,6 +371,11 @@ def run(rc: RunConfig, token_override: str | None = None,
     idx0 = calib_n
     t0 = time.monotonic() + 0.25
     inflight: list = []
+    # the dispatcher submits every request and only then collects, so
+    # completions have to report themselves through a callback or the line
+    # would sit at zero until the last arrival went out.
+    from .progress import Progress
+    prog = Progress(n - idx0, float(rc.duration_s), enabled=not quiet)
     with ThreadPoolExecutor(max_workers=rc.max_concurrency) as ex:
         for i in range(idx0, n):
             target = t0 + (ts[i] - ts[idx0])
@@ -383,12 +388,21 @@ def run(rc: RunConfig, token_override: str | None = None,
             msgs, max_out, intended, chars = make_request(i, rid)
             fut = ex.submit(client.send, msgs, max_out, rid,
                             float(ts[i]), lag_ms, intended, chars)
+            # the callback runs on the worker thread the moment the request
+            # finishes, which is what lets the in-flight gauge be live
+            # rather than a count of what has been handed to the pool.
+            fut.add_done_callback(
+                lambda f: prog.done(f.result()) if not f.cancelled() else None)
+            prog.sent()
             inflight.append(fut)
+            prog.paint()
 
         for fut in as_completed(inflight):
             d = dataclasses.asdict(fut.result())
             d["phase"] = "replay"
             results.append(d)
+            prog.paint()
+    prog.finish()
 
     if prompts_mode:
         meta = {

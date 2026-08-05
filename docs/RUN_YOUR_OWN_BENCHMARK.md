@@ -77,10 +77,11 @@ those count against `max_tokens`. With a small output budget the model can
 spend the entire budget thinking and return HTTP 200 with nothing readable.
 Every request looks successful and no answer ever arrives.
 
-**You don't need to know which models these are.** Before any load starts,
-the tool sends two requests, tells you what the endpoint does, and if it
-can't answer at your budget it tries each known reasoning control and
-prints the one that works:
+**You don't need to know which models these are, and you won't waste a run
+finding out.** Before any load starts, the tool sends two requests. If the
+endpoint can't answer at your budget it tries each known reasoning control,
+tells you which one works, and then stops rather than spending your time and
+tokens on a run it has already shown will produce nothing:
 
 ```
 [preflight] this is a REASONING model. it emits thinking tokens before the
@@ -89,10 +90,21 @@ prints the one that works:
 [preflight]   reasoning_effort=none    WORKS   answered, finish stop, 109 tokens
 [preflight]   thinking.type=disabled   ignored accepted, still no visible answer
 [preflight] use this: --extra-body '{"reasoning_effort": "none"}'
+
+[preflight] STOPPING before the load starts. this run would have produced no
+readable answers, so it would cost you time and tokens for a verdict we can
+already give you.
+
+  re-run with the control that worked:
+
+    --extra-body '{"reasoning_effort": "none"}'
 ```
 
-Add that flag and re-run. The flag differs by model, and some models accept
-one and silently ignore it, which is why the tool tests rather than assumes.
+Add that flag to the command from step 2 and run it again. The flag differs
+by model, and some models accept one and silently ignore it, which is why the
+tool tests rather than assumes. If nothing works it says so and tells you the
+choice is a bigger output budget or a different model. Pass `--force` to run
+anyway.
 
 ## 5. Reading the result
 

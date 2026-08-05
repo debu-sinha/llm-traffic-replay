@@ -358,6 +358,89 @@ def _benchmark_config(args) -> dict:
     return cfg
 
 
+# the controls that turn reasoning down, in the order worth trying. every
+# vendor spells this differently and several accept a flag and then ignore
+# it, so the only way to know is to send one of each and look at what came
+# back. measured: GLM-5.2 accepts reasoning_effort=none, Kimi K2.7 rejects
+# that same value with "it is a thinking-only model" and wants minimal.
+_REASONING_LEVERS = (
+    ("reasoning_effort=none", {"reasoning_effort": "none"}),
+    ("reasoning_effort=minimal", {"reasoning_effort": "minimal"}),
+    ("reasoning_effort=low", {"reasoning_effort": "low"}),
+    ("thinking.type=disabled", {"thinking": {"type": "disabled"}}),
+    ("enable_thinking=false", {"enable_thinking": False}),
+)
+
+
+def _probe_reasoning_levers(cfg: dict, budget: int) -> list[dict]:
+    """Send one request per control and report what each one did.
+
+    This runs only when the endpoint has already proven it produces no
+    readable answer at the configured budget, which is a run the user cannot
+    use. A handful of requests to turn "turn reasoning down somehow" into
+    "use this exact flag" is a good trade at that point.
+
+    The real prompt shape is used, not a short one. A one-line prompt gives
+    a different and much rosier answer, which is a mistake worth not
+    repeating.
+    """
+    import copy
+    from .client import EndpointClient, EndpointConfig
+    from .runner import _token
+    from .textgen import TextMaterializer
+
+    ip = cfg["_input_tokens"]
+    mat = TextMaterializer(cpt=4.0)
+    msgs = mat.messages("lever", 7, int(ip["p50"]), int(ip["p95"]), 200)
+    out = []
+    for name, extra in _REASONING_LEVERS:
+        ec = copy.deepcopy(cfg["endpoint"])
+        ec["extra_body"] = {**(ec.get("extra_body") or {}), **extra}
+        ecfg = EndpointConfig(**ec)
+        client = EndpointClient(ecfg, _token(ecfg))
+        try:
+            r = client.send(msgs, budget, f"lever-{name}", scheduled_s=0.0,
+                            dispatch_lag_ms=0.0, intended=(0, 0, None, -1),
+                            chars_sent=0)
+        except Exception as e:  # never let a probe break the run
+            out.append({"name": name, "extra": extra, "verdict": "error",
+                        "detail": str(e)[:160]})
+            continue
+        if not r.ok:
+            # a refusal is the most useful answer of all: it usually names
+            # the reason, and it rules the flag out for good.
+            out.append({"name": name, "extra": extra, "verdict": "rejected",
+                        "detail": (r.error or "")[:220]})
+        elif r.ttfv_ms is not None:
+            out.append({"name": name, "extra": extra, "verdict": "works",
+                        "detail": f"answered, finish {r.finish_reason}, "
+                                  f"{r.completion_tokens} tokens"})
+        else:
+            out.append({"name": name, "extra": extra, "verdict": "ignored",
+                        "detail": f"accepted, still no visible answer within "
+                                  f"{budget} tokens"})
+    return out
+
+
+def _print_lever_report(levers: list[dict], budget: int) -> None:
+    works = [x for x in levers if x["verdict"] == "works"]
+    print("[preflight] trying the reasoning controls this endpoint might "
+          "accept, one request each:")
+    for x in levers:
+        mark = {"works": "WORKS", "rejected": "rejected",
+                "ignored": "ignored", "error": "error"}[x["verdict"]]
+        print(f"[preflight]   {x['name']:24s} {mark:9s} {x['detail'][:96]}")
+    if works:
+        best = works[0]
+        flag = json.dumps(best["extra"])
+        print(f"[preflight] use this: --extra-body '{flag}'")
+    else:
+        print(f"[preflight] none of them produced an answer within {budget} "
+              "tokens. this model needs a bigger output budget, or it is "
+              "the wrong model for a budget this size. raise "
+              "--output-tokens and re-run the preflight to find out which.")
+
+
 def cmd_benchmark(args) -> int:
     """One command from an endpoint URL to a report.
 
@@ -393,8 +476,13 @@ def cmd_benchmark(args) -> int:
                 print(f"[preflight] and it produced NO visible answer within "
                       f"{pf_res['budget']} tokens, which is the budget this "
                       "run will use. raise --output-tokens, or turn "
-                      "reasoning down with --extra-body, before trusting any "
-                      "latency number from this endpoint.")
+                      "reasoning down, before trusting any latency number "
+                      "from this endpoint.")
+                if not args.no_lever_probe:
+                    print()
+                    _print_lever_report(
+                        _probe_reasoning_levers(cfg, budget=512), 512)
+                    print()
             if "ttft_definition" not in cfg:
                 cfg["ttft_definition"] = "first_visible"
                 print("[preflight] scoring TTFT on the first VISIBLE token, "
@@ -712,6 +800,9 @@ def main(argv=None) -> int:
     s.add_argument("--label", default=None)
     s.add_argument("--skip-preflight", action="store_true",
                    help="skip the 2-request endpoint check. not recommended")
+    s.add_argument("--no-lever-probe", action="store_true",
+                   help="skip trying reasoning controls when the endpoint "
+                        "produces no readable answer")
     s.add_argument("--fail-on", choices=("none", "miss", "caution"),
                    default="miss",
                    help="exit non-zero on this verdict or worse. miss=1, "
@@ -760,6 +851,8 @@ def main(argv=None) -> int:
     s.add_argument("--concurrency", type=int, default=None,
                    help=argparse.SUPPRESS)
     s.add_argument("--skip-preflight", action="store_true",
+                   default=True, help=argparse.SUPPRESS)
+    s.add_argument("--no-lever-probe", action="store_true",
                    default=True, help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_sweep)
 

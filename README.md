@@ -130,6 +130,8 @@ trust any number the harness produces there.
 
 ## Run against a real endpoint
 
+Handing this to someone else? [docs/RUN_YOUR_OWN_BENCHMARK.md](docs/RUN_YOUR_OWN_BENCHMARK.md) is a one-page version they can follow without reading the rest of this.
+
 ### Start here: one command
 
 You need a host, an endpoint name, and a rough idea of your token sizes.

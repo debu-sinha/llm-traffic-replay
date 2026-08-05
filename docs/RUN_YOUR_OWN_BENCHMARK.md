@@ -102,11 +102,34 @@ already give you.
     --extra-body '{"reasoning_effort": "none"}'
 ```
 
-Add that flag to the command from step 2 and run it again. The flag differs
-by model, and some models accept one and silently ignore it, which is why the
-tool tests rather than assumes. If nothing works it says so and tells you the
-choice is a bigger output budget or a different model. Pass `--force` to run
-anyway.
+Add that flag to the command from step 2. In full, that is:
+
+```bash
+python3 -m traffic_replay benchmark \
+  --host https://<your-workspace>.cloud.databricks.com \
+  --endpoint <your-endpoint-name> \
+  --extra-body '{"reasoning_effort": "none"}' \
+  --input-tokens 10000,24000 \
+  --output-tokens 40,90 \
+  --cache-hit-rate 0.6,0.87 \
+  --concurrency 10 --duration 300 \
+  --ttft-p50 500 --ttft-p95 900 \
+  --ttfg-p50 700 --ttfg-p95 1500 \
+  --success-rate 0.99
+```
+
+`--extra-body` takes any JSON and merges it into every request, so it also
+carries things like `top_p` or `stop` if you need them.
+
+The flag differs by model, which is why the tool tests rather than assumes.
+Two examples measured on Databricks: GLM-5.2 accepts
+`reasoning_effort: "none"`, and Kimi K2.7 rejects that exact value and wants
+`"minimal"`. Both silently ignore `thinking` and `enable_thinking`.
+
+If nothing works the tool says so, and the choice is a bigger
+`--output-tokens` budget or a different model. Reasoning tokens come out of
+the same budget as the answer, so a model that thinks for 4,000 tokens cannot
+answer inside 90 no matter which flag you set. Pass `--force` to run anyway.
 
 ## 5. Reading the result
 

@@ -32,7 +32,6 @@ import hashlib
 import json
 import math
 import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -40,7 +39,8 @@ from pathlib import Path
 import numpy as np
 
 from . import profile as prof
-from .client import EndpointClient, EndpointConfig
+from .client import (EndpointClient, EndpointConfig,
+                     validate_bearer_transport)
 from .metrics import summarize, write_outputs
 from .prefix_pool import PrefixPool
 from .schedule import load_trace, make_schedule, schedule_report, shard
@@ -495,13 +495,19 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
         rate_scale=1.0, max_concurrency=pool_size)
 
 
-def _token_from_profile(name: str) -> str | None:
+class AuthProfileError(RuntimeError):
+    """A named Databricks profile could not be resolved safely."""
+
+
+def _token_from_profile(name: str, endpoint_base_url: str) -> str:
     """Resolve a ~/.databrickscfg profile to a bearer token.
 
     A PAT profile stores the token directly. An OAuth profile stores no
     usable bearer token, so the Databricks CLI is asked to mint one, which
-    also refreshes it if it has expired. Returns None if neither works, and
-    the caller falls back to the environment variable.
+    also refreshes it if it has expired. Before either token is read, the
+    profile's configured origin is normalized and required to match the
+    request endpoint. Named profiles fail closed: there is no environment
+    fallback for a typo, an unavailable CLI, or a host mismatch.
     """
     import configparser
     import json as _json
@@ -510,36 +516,63 @@ def _token_from_profile(name: str) -> str | None:
 
     cfg_path = Path(os.environ.get("DATABRICKS_CONFIG_FILE",
                                    Path.home() / ".databrickscfg"))
-    parser = configparser.ConfigParser()
-    if cfg_path.exists():
-        parser.read(cfg_path)
-        if parser.has_section(name) or name == "DEFAULT":
-            sect = parser[name]
-            tok = sect.get("token")
-            # a PAT is usable as-is. an OAuth profile has auth_type set and
-            # either no token or a stale one, so prefer the CLI there.
-            if tok and not sect.get("auth_type"):
-                return tok
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        read = parser.read(cfg_path)
+    except (OSError, configparser.Error) as exc:
+        raise AuthProfileError(
+            f"could not read Databricks config {cfg_path}: {exc}") from exc
+    if not read:
+        raise AuthProfileError(f"Databricks config not found: {cfg_path}")
+    if not (parser.has_section(name) or name == "DEFAULT"):
+        raise AuthProfileError(f"Databricks auth profile {name!r} does not exist")
+
+    sect = parser[name]
+    profile_host = (sect.get("host") or "").strip()
+    if not profile_host:
+        raise AuthProfileError(
+            f"Databricks auth profile {name!r} has no configured host")
+    try:
+        profile_origin = validate_bearer_transport(profile_host)
+        endpoint_origin = validate_bearer_transport(endpoint_base_url)
+    except ValueError as exc:
+        raise AuthProfileError(str(exc)) from exc
+    if profile_origin != endpoint_origin:
+        def _display(origin):
+            scheme, host, port = origin
+            default = 443 if scheme == "https" else 80
+            return f"{scheme}://{host}" + (f":{port}" if port != default else "")
+        raise AuthProfileError(
+            f"Databricks auth profile {name!r} is bound to "
+            f"{_display(profile_origin)}, not {_display(endpoint_origin)}")
+
+    tok = sect.get("token")
+    # a PAT is usable as-is. an OAuth profile has auth_type set and either no
+    # token or a stale one, so prefer the CLI there.
+    if tok and not sect.get("auth_type"):
+        return tok
     try:
         out = subprocess.run(["databricks", "auth", "token", "-p", name],
                              capture_output=True, text=True, timeout=60)
         if out.returncode == 0:
-            return _json.loads(out.stdout).get("access_token") or None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return None
+            cli_token = _json.loads(out.stdout).get("access_token")
+            if cli_token:
+                return cli_token
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise AuthProfileError(
+            f"Databricks auth profile {name!r} could not mint a token: {exc}") \
+            from exc
+    raise AuthProfileError(
+        f"Databricks auth profile {name!r} did not resolve to a token")
 
 
 def _token(cfg: EndpointConfig) -> str | None:
     if cfg.auth_profile:
-        tok = _token_from_profile(cfg.auth_profile)
-        if tok:
-            return tok
-        # falling through silently means a typo runs unauthenticated and
-        # surfaces later as a wall of 401s or "sizing got no response"
-        print(f"auth profile {cfg.auth_profile!r} did not resolve to a token, "
-              f"falling back to ${cfg.auth_token_env}", file=sys.stderr)
-    return os.environ.get(cfg.auth_token_env) or None
+        return _token_from_profile(cfg.auth_profile, cfg.base_url)
+    tok = os.environ.get(cfg.auth_token_env) or None
+    if tok:
+        validate_bearer_transport(cfg.base_url)
+    return tok
 
 
 def run(rc: RunConfig, token_override: str | None = None,
@@ -562,7 +595,10 @@ def run(rc: RunConfig, token_override: str | None = None,
     sizing_local = _shard_concurrency(rc)
     load_mode = "sizing_concurrency" if sizing_requested is not None \
         else "fixed_rate"
-    token = token_override or _token(ecfg)
+    if token_override is not None and ecfg.auth_profile:
+        raise AuthProfileError(
+            "token_override cannot be combined with a named auth_profile")
+    token = token_override if token_override is not None else _token(ecfg)
     client = EndpointClient(ecfg, token,
                             refresh=lambda: _token(ecfg))
     req_params = {"temperature": ecfg.temperature,

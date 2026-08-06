@@ -19,13 +19,14 @@ and automatically retried without it for endpoints that reject the field.
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import ssl
 import threading
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from .sse import StreamState, parse_sse_line, update_state, extract_usage
 
@@ -91,21 +92,86 @@ class RequestResult:
     truncated: bool = False          # finish_reason == "length"
     parse_errors: int = 0            # unrecoverable SSE parse failures
     max_tokens_requested: int | None = None
-    first_send_unix: float | None = None  # when the FIRST attempt went out.
+    first_send_unix: float | None = None  # when the FIRST HTTP request began.
                                           # t_send_unix belongs to whichever
                                           # attempt produced this result, so a
                                           # retried row carries the endpoint's
-                                          # delay. this one always says when
-                                          # the load was actually offered.
-    # note: t_send_unix belongs to whichever attempt produced this record,
-    # so on any retried row it carries the endpoint's delay. first_send_unix
-    # below is the honest one for asking when the load was offered.
+                                          # delay. connection setup is tracked
+                                          # separately by first_attempt_unix.
+    first_attempt_unix: float | None = None  # before the first DNS/TCP/TLS try
+    connection_attempts: int = 0
+    request_attempts: int = 0             # calls that may have emitted a POST
+    retry_reasons: list[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
 
 
 _MAX_TOKEN_REFRESH = 5
+
+
+class UnsafeBearerTransport(ValueError):
+    """A bearer credential would cross an untrusted cleartext transport."""
+
+
+def normalized_origin(value: str) -> tuple[str, str, int]:
+    """Return a canonical HTTP(S) origin for credential binding.
+
+    Host names are case-folded, IDNA-normalized, and stripped of a terminal
+    dot. Explicit default ports compare equal to implicit ones. Userinfo is
+    rejected because it makes security-sensitive URL review needlessly
+    ambiguous (and is never needed for a serving endpoint).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("endpoint base_url must be a non-empty URL")
+    u = urllib.parse.urlsplit(value.strip())
+    scheme = u.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError("endpoint base_url must use an explicit http or https scheme")
+    if u.username is not None or u.password is not None:
+        raise ValueError("endpoint base_url must not contain userinfo")
+    if u.hostname is None:
+        raise ValueError("endpoint base_url must contain a host")
+    try:
+        port = u.port or (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"endpoint base_url has an invalid port: {exc}") from exc
+    raw_host = u.hostname.rstrip(".").lower()
+    if not raw_host:
+        raise ValueError("endpoint base_url must contain a host")
+    try:
+        # IPv6 literals contain ':' and are not IDNA names.
+        host = (str(ipaddress.ip_address(raw_host)) if ":" in raw_host
+                else raw_host.encode("idna").decode("ascii"))
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("endpoint base_url contains an invalid host") from exc
+    return scheme, host, port
+
+
+def _is_explicit_loopback(host: str) -> bool:
+    """True only for literal loopback addresses or the exact localhost name.
+
+    We intentionally do not resolve arbitrary DNS names: allowing a hostname
+    merely because it currently resolves to loopback would permit DNS
+    rebinding to turn an approved test URL into a credential sink.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_bearer_transport(base_url: str) -> tuple[str, str, int]:
+    """Validate where a bearer token may be sent and return its origin."""
+    origin = normalized_origin(base_url)
+    scheme, host, _ = origin
+    if scheme != "https" and not _is_explicit_loopback(host):
+        raise UnsafeBearerTransport(
+            "refusing to send a bearer token over cleartext HTTP; use HTTPS "
+            "or an explicit loopback host for a local test")
+    return origin
 
 
 class EndpointClient:
@@ -124,10 +190,12 @@ class EndpointClient:
         self._refresh = refresh
         self._refreshed = 0
         self._lock = threading.Lock()
-        u = urllib.parse.urlparse(cfg.base_url)
-        self.scheme = u.scheme or "https"
-        self.host = u.hostname
-        self.port = u.port or (443 if self.scheme == "https" else 80)
+        self.scheme, self.host, self.port = normalized_origin(cfg.base_url)
+        # A refresh callback means this is a bearer-auth flow even when the
+        # initial token is absent or expired. Reject its transport before the
+        # first unauthenticated probe rather than waiting until a token exists.
+        if token or refresh is not None:
+            validate_bearer_transport(cfg.base_url)
         self._ssl = ssl.create_default_context() if self.scheme == "https" else None
         self._include_usage_supported: bool | None = None  # learned
 
@@ -169,21 +237,24 @@ class EndpointClient:
         attempt = 0
         include_usage = self._include_usage_supported is not False
         last_err: str | None = None
-        # when every attempt fails we still have to say WHEN the request was
-        # attempted. stamping the moment of final failure puts it up to
-        # (connect_timeout_s + read_timeout_s) * retries later, which buckets
-        # it into the wrong window and can invent a trailing window of errors.
+        # Connection start and HTTP send are different events. In particular,
+        # a DNS/TCP/TLS failure did not put a request on the wire and must not
+        # be recorded as though it did.
+        first_attempt_unix: float | None = None
         first_send_unix: float | None = None
+        last_send_unix: float | None = None
+        connection_attempts = 0
+        request_attempts = 0
+        retry_reasons: list[str] = []
 
         while attempt <= self.cfg.max_retries:
             attempt += 1
             conn = None
             try:
                 conn = self._connect()
-                # stamp before the handshake, so a failure during DNS, TCP or
-                # TLS is still placed in the window it was asked for.
-                if first_send_unix is None:
-                    first_send_unix = time.time()
+                connection_attempts += 1
+                if first_attempt_unix is None:
+                    first_attempt_unix = time.time()
                 t_conn0 = time.monotonic()
                 conn.connect()
                 connect_ms = (time.monotonic() - t_conn0) * 1000.0
@@ -194,11 +265,18 @@ class EndpointClient:
                 }
                 tok_used = self.token
                 if tok_used:
+                    # Constructor validation covers the normal path. Recheck
+                    # here as a defense against a caller mutating client.token.
+                    validate_bearer_transport(self.cfg.base_url)
                     headers["Authorization"] = f"Bearer {tok_used}"
 
                 body = self._body(messages, max_tokens, include_usage)
                 t_send = time.monotonic()
                 t_send_unix = time.time()
+                last_send_unix = t_send_unix
+                if first_send_unix is None:
+                    first_send_unix = t_send_unix
+                request_attempts += 1
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
                 conn.sock.settimeout(self.cfg.read_timeout_s)
                 resp = conn.getresponse()
@@ -210,6 +288,7 @@ class EndpointClient:
                     resp.read()
                     self._include_usage_supported = False
                     include_usage = False
+                    retry_reasons.append("stream_options_rejected")
                     attempt -= 1
                     continue
 
@@ -234,21 +313,34 @@ class EndpointClient:
                             self._refreshed += 1
                             fresh = self._refresh()
                             if fresh and fresh != self.token:
-                                self.token = fresh
-                                retry_auth = True
+                                try:
+                                    validate_bearer_transport(self.cfg.base_url)
+                                except UnsafeBearerTransport as exc:
+                                    # Do not install the token: the next loop
+                                    # must never get a chance to emit it.
+                                    last_err = str(exc)
+                                    retry_auth = False
+                                else:
+                                    self.token = fresh
+                                    retry_auth = True
                             else:
                                 retry_auth = False
                         else:
                             retry_auth = False
                     if retry_auth:
+                        retry_reasons.append("auth_token_refreshed")
                         attempt -= 1
                         continue
                     return self._finish(
                         request_id, scheduled_s, dispatch_lag_ms,
                         t_send_unix, None, None, None, resp.status, False,
                         last_err, StreamState(), intended, chars_sent,
-                        attempt - 1, None, None, None, connect_ms,
-                        first_send_unix, max_tokens)
+                        len(retry_reasons), None, None, None, connect_ms,
+                        first_send_unix, max_tokens,
+                        first_attempt_unix=first_attempt_unix,
+                        connection_attempts=connection_attempts,
+                        request_attempts=request_attempts,
+                        retry_reasons=retry_reasons)
 
                 if resp.status != 200:
                     detail = resp.read(2048).decode("utf-8", "replace")
@@ -257,9 +349,13 @@ class EndpointClient:
                                         resp.status, False,
                                         f"http {resp.status}: {detail[:300]}",
                                         StreamState(), intended, chars_sent,
-                                        attempt - 1, None, None, None,
+                                        len(retry_reasons), None, None, None,
                                         connect_ms, first_send_unix,
-                                        max_tokens)
+                                        max_tokens,
+                                        first_attempt_unix=first_attempt_unix,
+                                        connection_attempts=connection_attempts,
+                                        request_attempts=request_attempts,
+                                        retry_reasons=retry_reasons)
 
                 if include_usage and self._include_usage_supported is None:
                     self._include_usage_supported = True
@@ -299,25 +395,35 @@ class EndpointClient:
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
-                                    attempt - 1, interchunk_max,
+                                    len(retry_reasons), interchunk_max,
                                     ttfr_ms, ttfv_ms, connect_ms,
-                                    first_send_unix, max_tokens)
+                                    first_send_unix, max_tokens,
+                                    first_attempt_unix=first_attempt_unix,
+                                    connection_attempts=connection_attempts,
+                                    request_attempts=request_attempts,
+                                    retry_reasons=retry_reasons)
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"{type(exc).__name__}: {exc}"
+                if attempt <= self.cfg.max_retries:
+                    retry_reasons.append("connection_error")
                 continue
             finally:
                 if conn is not None:
                     conn.close()
 
         return self._finish(request_id, scheduled_s, dispatch_lag_ms,
-                            first_send_unix if first_send_unix is not None
-                            else time.time(),
+                            last_send_unix if last_send_unix is not None
+                            else (first_attempt_unix or time.time()),
                             None, None, None, None, False,
                             last_err or "exhausted retries", StreamState(),
-                            intended, chars_sent, attempt - 1,
+                            intended, chars_sent, len(retry_reasons),
                             None, None, None, None, first_send_unix,
-                            max_tokens)
+                            max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons)
 
     @staticmethod
     def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
@@ -325,7 +431,9 @@ class EndpointClient:
                 intended, chars_sent, retries,
                 interchunk_max_ms=None,
                 ttfr_ms=None, ttfv_ms=None, connect_ms=None,
-                first_send_unix=None, max_tokens_requested=None
+                first_send_unix=None, max_tokens_requested=None, *,
+                first_attempt_unix=None, connection_attempts=0,
+                request_attempts=0, retry_reasons=None
                 ) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
@@ -355,8 +463,11 @@ class EndpointClient:
             reasoning_tokens_source=u["reasoning_tokens_source"],
             reasoning_chunks=state.reasoning_chunks,
             connect_ms=connect_ms,
-            first_send_unix=(first_send_unix if first_send_unix is not None
-                             else t_send_unix),
+            first_send_unix=first_send_unix,
+            first_attempt_unix=first_attempt_unix,
+            connection_attempts=connection_attempts,
+            request_attempts=request_attempts,
+            retry_reasons=list(retry_reasons or []),
         )
 
 

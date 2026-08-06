@@ -451,7 +451,11 @@ def test_retry_exhausted_failures_keep_their_original_send_time():
     # the whole call spanned at least two sleeps, so a final-failure stamp
     # would sit well after the first send
     assert after - before > 0.25
-    assert r.t_send_unix < before + 0.15
+    assert r.first_send_unix < before + 0.15
+    assert r.t_send_unix > r.first_send_unix
+    assert r.connection_attempts == 3
+    assert r.request_attempts == 3
+    assert r.retry_reasons == ["connection_error", "connection_error"]
 
 
 def test_a_total_outage_actually_renders_its_verdict():
@@ -723,11 +727,9 @@ def test_rows_without_the_field_fall_back_to_t_send_unix():
     assert s["arrivals"]["wire_lateness_ms"]["n"] == len(rows)
 
 
-def test_the_client_stamps_first_send_on_every_return_path():
-    """Drives the real EndpointClient rather than hand-built dicts, so
-    deleting first_send_unix from any _finish call fails here. Covers the
-    non-200 path and the exhausted-retry path."""
-    import json as _json
+def test_the_client_distinguishes_connection_attempts_from_http_sends():
+    """Drives the real EndpointClient rather than hand-built dicts. A response
+    proves an HTTP send occurred; a connection refusal proves one did not."""
     import threading
     import time as _time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -757,10 +759,8 @@ def test_the_client_stamps_first_send_on_every_return_path():
                    intended=(0, 0, None, 0), chars_sent=2)
         assert r.ok is False and r.status == 503          # the non-200 path
         assert r.first_send_unix is not None
-        # strictly earlier: the stamp is taken before the handshake, while
-        # t_send_unix is taken after. equality means the call site dropped it
-        # and _finish fell back to t_send_unix.
-        assert r.first_send_unix < r.t_send_unix
+        assert r.first_attempt_unix <= r.first_send_unix
+        assert r.request_attempts == 1
     finally:
         srv.shutdown(); srv.server_close()
 
@@ -773,7 +773,9 @@ def test_the_client_stamps_first_send_on_every_return_path():
                  scheduled_s=0.0, dispatch_lag_ms=0.0,
                  intended=(0, 0, None, 0), chars_sent=2)
     assert r2.ok is False
-    assert r2.first_send_unix is not None
+    assert r2.first_attempt_unix is not None
+    assert r2.first_send_unix is None
+    assert r2.request_attempts == 0
 
 
 # ---- concurrency actually reached -----------------------------------------

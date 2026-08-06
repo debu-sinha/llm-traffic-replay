@@ -79,7 +79,7 @@ def test_a_pat_profile_resolves_without_shelling_out():
     old = os.environ.get("DATABRICKS_CONFIG_FILE")
     os.environ["DATABRICKS_CONFIG_FILE"] = str(d / "cfg")
     try:
-        assert _token_from_profile("work") == "dapi-not-real"
+        assert _token_from_profile("work", "https://x") == "dapi-not-real"
     finally:
         if old is None:
             os.environ.pop("DATABRICKS_CONFIG_FILE", None)
@@ -98,14 +98,17 @@ def test_the_env_var_still_works_when_no_profile_is_set():
         os.environ.pop("TR_TEST_TOKEN", None)
 
 
-def test_an_unresolvable_profile_falls_back_to_the_env_var():
-    """A typo in the profile name must not silently run unauthenticated."""
+def test_an_unresolvable_profile_fails_closed_without_env_fallback():
+    """A typo must not repurpose an unrelated environment credential."""
     import os
+    import pytest
+    from traffic_replay.runner import AuthProfileError
     os.environ["TR_TEST_TOKEN"] = "fallback"
     try:
         cfg = EndpointConfig(base_url="https://x", path="/p",
                              auth_profile="no-such-profile-here",
                              auth_token_env="TR_TEST_TOKEN")
-        assert _token(cfg) == "fallback"
+        with pytest.raises(AuthProfileError, match="does not exist"):
+            _token(cfg)
     finally:
         os.environ.pop("TR_TEST_TOKEN", None)

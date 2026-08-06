@@ -34,10 +34,15 @@ def test_rate_scale_thins_volume_preserving_shape():
 
 def test_shard_partitions_exactly():
     s = make_schedule(duration_s=60, seed=11)
-    parts = [shard(s, i, 3)["timestamps"] for i in range(3)]
+    sharded = [shard(s, i, 3) for i in range(3)]
+    parts = [part["timestamps"] for part in sharded]
     together = np.sort(np.concatenate(parts))
     assert np.array_equal(together, s["timestamps"])
     assert abs(len(parts[0]) - len(parts[1])) <= 1
+    indices = np.concatenate([part["global_indices"] for part in sharded])
+    assert np.array_equal(np.sort(indices), np.arange(len(s["timestamps"])))
+    assert all(part["total_requests"] == len(s["timestamps"])
+               for part in sharded)
 
 
 def test_load_trace_replaces_synthetic(tmp_path_factory=None):

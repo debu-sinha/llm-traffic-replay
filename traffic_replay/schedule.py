@@ -82,14 +82,22 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
 
 
 def shard(schedule: dict, index: int, total: int) -> dict:
-    """Deterministic 1-of-n split for multi-process clients."""
-    if not (0 <= index < total):
+    """Deterministic 1-of-n split, retaining global workload indices."""
+    if not isinstance(total, int) or total <= 0 or not isinstance(index, int) \
+            or not (0 <= index < total):
         raise ValueError("need 0 <= index < total")
     ts = schedule["timestamps"]
+    existing = np.asarray(schedule.get("global_indices",
+                                       np.arange(len(ts))), dtype=int)
+    if len(existing) != len(ts):
+        raise ValueError("global_indices must align with timestamps")
     # rates and counts describe the WHOLE run. passing them through unchanged
     # made a shard's own summary.json report the unsharded request count, so
     # anyone opening it read a shortfall that was not there.
-    return {**schedule, "timestamps": ts[index::total],
+    chosen = np.arange(index, len(ts), total)
+    return {**schedule, "timestamps": ts[chosen],
+            "global_indices": existing[chosen],
+            "total_requests": int(schedule.get("total_requests", len(ts))),
             "shard": (index, total)}
 
 

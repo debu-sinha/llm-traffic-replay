@@ -75,6 +75,10 @@ def _finish(out, fail_on: str = "miss", fmt: str = "text") -> int:
 def cmd_run(args) -> int:
     from .runner import RunConfig, run
     cfg = json.loads(Path(args.config).read_text())
+    if cfg.get("concurrency") is not None and cfg.get("sizing_concurrency") is None:
+        print("warning: config field 'concurrency' is legacy; it is treated as "
+              "'sizing_concurrency', which derives a fixed open-loop rate and "
+              "does not hold concurrency.", file=sys.stderr)
     rc = RunConfig(**cfg)
     out = run(rc)
     return _finish(out, getattr(args, "fail_on", "miss"),
@@ -217,14 +221,16 @@ def _pair(text, what):
         # a fraction has no room for a 2.4x tail. move it most of the way to
         # 1 instead, which is the shape a cache-reuse distribution actually
         # has, and keeps it a legal probability.
-        p95 = p50 + (1.0 - p50) * 0.65
+        p95 = (p50 if p50 in (0.0, 1.0)
+               else p50 + (1.0 - p50) * 0.65)
     else:
         p95 = p50 * 2.4
-    if frac and not (0.0 <= p50 < p95 < 1.0):
+    if frac and not (0.0 <= p50 <= p95 <= 1.0):
         raise SystemExit(
-            f"--{what} needs 0 <= p50 < p95 < 1, got {p50} and {p95}")
-    if not frac and p95 <= p50:
-        raise SystemExit(f"--{what} needs p95 above p50, got {p50} and {p95}")
+            f"--{what} needs 0 <= p50 <= p95 <= 1, got {p50} and {p95}")
+    if not frac and not (p95 >= p50 > 0):
+        raise SystemExit(f"--{what} needs p95 above p50 (or equal for a "
+                         f"constant) and p50 > 0, got {p50} and {p95}")
     return {"p50": p50, "p95": p95}
 
 
@@ -238,45 +244,60 @@ def _preflight(cfg: dict) -> dict:
     to find them in ten seconds than in a five minute run.
     """
     from .client import EndpointClient, EndpointConfig
-    from .runner import _token
-    from .textgen import TextMaterializer
+    from .runner import RunConfig, _representative_plans, _token
 
-    ecfg = EndpointConfig(**cfg["endpoint"])
+    clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    rc = RunConfig(**clean)
+    ecfg = EndpointConfig(**rc.endpoint)
     tok = _token(ecfg)
     client = EndpointClient(ecfg, tok, refresh=lambda: _token(ecfg))
-    mat = TextMaterializer(cpt=4.0)
-    ip = cfg["_input_tokens"]
-    # probe at the budget the run will actually use. probing at a fixed 512
-    # and then stating what happens "at your output budget" was an
-    # extrapolation presented as a measurement, in the one place a customer
-    # decides whether to keep testing an endpoint.
-    budget = int(cfg.get("max_output_tokens_cap") or 512)
-    out: dict = {"auth": bool(tok), "budget": budget}
+    plans = _representative_plans(rc)
+    out: dict = {"auth": bool(tok),
+                 "budgets": [p["max_output"] for p in plans],
+                 "representatives": [p["representative"] for p in plans]}
     rows = []
-    for i in range(2):
-        msgs = mat.messages(f"preflight{i}", i, int(ip["p50"]),
-                            int(ip["p95"]), 200)
-        res = client.send(msgs, budget, f"preflight-{i}", scheduled_s=0.0,
-                          dispatch_lag_ms=0.0, intended=(0, 0, None, -1),
-                          chars_sent=0)
-        rows.append(res)
-    ok = [r for r in rows if r.ok]
-    out["reachable"] = len(ok)
+    for plan in plans:
+        try:
+            res = client.send(
+                plan["messages"], plan["max_output"], plan["request_id"],
+                scheduled_s=0.0, dispatch_lag_ms=0.0,
+                intended=plan["intended"], chars_sent=plan["chars"])
+            rows.append(res)
+        except Exception as exc:
+            rows.append(exc)
+    reached = [r for r in rows
+               if not isinstance(r, Exception) and r.status == 200]
+    out["reachable"] = len(reached)
     out["attempted"] = len(rows)
-    if not ok:
-        out["error"] = (rows[0].error or "no response")[:200]
+    if not reached:
+        first = rows[0]
+        out["error"] = ((str(first) if isinstance(first, Exception)
+                         else first.error) or "no response")[:200]
         return out
-    out["usage_reported"] = any(r.prompt_tokens for r in ok)
-    out["cache_reported"] = any(r.cached_tokens is not None for r in ok)
-    out["reasoning"] = any(r.reasoning_chunks for r in ok)
-    out["visible"] = any(r.ttfv_ms is not None for r in ok)
-    out["truncated"] = any(r.finish_reason == "length" for r in ok)
+    out["usage_reported"] = all(r.prompt_tokens is not None for r in reached)
+    out["cache_reported"] = all(r.cached_tokens is not None for r in reached)
+    out["reasoning"] = any(r.reasoning_seen or r.reasoning_chunks for r in reached)
+    readable = [bool(r.visible_content_seen and r.stream_complete
+                     and not r.parse_errors) for r in reached]
+    out["readable"] = sum(readable)
+    out["visible"] = len(reached) == len(rows) and all(readable)
+    out["truncated"] = any(r.finish_reason == "length" for r in reached)
+    failed_index = next((i for i, r in enumerate(rows)
+                         if isinstance(r, Exception) or r.status != 200
+                         or not (r.visible_content_seen and r.stream_complete
+                                 and not r.parse_errors)), None)
+    if failed_index is not None:
+        out["failed_probe_index"] = failed_index
+    budget_index = failed_index if failed_index is not None else len(plans) - 1
+    out["budget"] = plans[budget_index]["max_output"]
     return out
 
 
 def _benchmark_config(args) -> dict:
     """Build a run config from the flags. Shared by benchmark and sweep, so
     the two cannot drift on how a profile or a target is interpreted."""
+    if args.prompts and args.profile:
+        raise SystemExit("set --prompts or --profile, not both")
     path = args.endpoint
     if not path.startswith("/"):
         path = f"/serving-endpoints/{path}/invocations"
@@ -293,20 +314,46 @@ def _benchmark_config(args) -> dict:
         except json.JSONDecodeError as e:
             raise SystemExit(f"--extra-body is not valid JSON: {e}")
 
+    sizing = getattr(args, "sizing_concurrency", None)
+    legacy = (getattr(args, "legacy_concurrency", None)
+              if hasattr(args, "legacy_concurrency")
+              else getattr(args, "concurrency", None))
+    if sizing is not None and legacy is not None:
+        raise SystemExit("use --sizing-concurrency or legacy --concurrency, not both")
+    if legacy is not None:
+        print("warning: --concurrency is now --sizing-concurrency. it derives "
+              "one fixed open-loop rate; it does not hold concurrency.",
+              file=sys.stderr)
+        sizing = legacy
+    if sizing is None and getattr(args, "cmd", "benchmark") == "benchmark":
+        sizing = 10
+
+    default_title = (f"open-loop rate sized from {sizing} concurrent, "
+                     f"{args.endpoint}" if sizing is not None
+                     else f"fixed-rate workload, {args.endpoint}")
     cfg: dict = {
         "endpoint": ep,
-        "concurrency": args.concurrency,
+        "sizing_concurrency": sizing,
         "duration_s": args.duration,
         "out_dir": args.out_dir,
-        "title": args.title or f"{args.concurrency} concurrent, {args.endpoint}",
+        "title": args.title or default_title,
         "label": args.label or (
             "Describe the capacity this ran on. Shared pay-per-token is not "
             "a performance claim for a dedicated endpoint."),
     }
+    if getattr(args, "max_concurrency", None) is not None:
+        cfg["max_concurrency"] = args.max_concurrency
+    if getattr(args, "max_pending_requests", None) is not None:
+        cfg["max_pending_requests"] = args.max_pending_requests
 
     inp = _pair(args.input_tokens, "input-tokens")
     outp = _pair(args.output_tokens, "output-tokens")
     if args.prompts:
+        try:
+            from .prompts import load_prompts
+            load_prompts(args.prompts)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"invalid --prompts {args.prompts!r}: {exc}")
         cfg["prompts_file"] = args.prompts
     elif args.profile:
         cfg["profile_path"] = args.profile
@@ -335,12 +382,15 @@ def _benchmark_config(args) -> dict:
     _p95 = outp["p95"]
     if args.profile:
         try:
-            _p95 = float(json.loads(Path(args.profile).read_text())
-                         ["output_tokens"]["p95"])
-        except Exception:
-            pass
-    if not args.prompts:
-        cfg["max_output_tokens_cap"] = max(int(_p95 * 1.5), 512)
+            from .profile import Profile
+            _p95 = float(Profile.from_json(args.profile).output_tokens["p95"])
+        except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+            raise SystemExit(f"invalid --profile {args.profile!r}: {exc}")
+    # Keep enough headroom above p95 that the cap is a safety guard rather
+    # than the distribution itself. There is deliberately no hidden 512-token
+    # floor: preflight and replay must use the workload's configured budget.
+    import math
+    cfg["max_output_tokens_cap"] = max(1, int(math.ceil(_p95 * 1.5)))
 
     ttft = {q: v for q, v in (("p50", args.ttft_p50), ("p90", args.ttft_p90),
                               ("p95", args.ttft_p95), ("p99", args.ttft_p99))
@@ -348,17 +398,23 @@ def _benchmark_config(args) -> dict:
     ttfg = {q: v for q, v in (("p50", args.ttfg_p50), ("p90", args.ttfg_p90),
                               ("p95", args.ttfg_p95), ("p99", args.ttfg_p99))
             if v}
-    if ttft or ttfg or args.success_rate:
+    for name, targets in (("ttft", ttft), ("ttfg", ttfg)):
+        if any(not math.isfinite(float(v)) or float(v) <= 0
+               for v in targets.values()):
+            raise SystemExit(f"--{name} targets must be positive and finite")
+    if args.success_rate is not None and (
+            not math.isfinite(float(args.success_rate))
+            or not (0 < args.success_rate <= 1)):
+        raise SystemExit("--success-rate must be in (0, 1]")
+    if ttft or ttfg or args.success_rate is not None:
         t: dict = {"targets_are": "yours, passed on the command line"}
         if ttft:
             t["ttft_ms"] = ttft
         if ttfg:
             t["ttfg_ms"] = ttfg
-        if args.success_rate:
+        if args.success_rate is not None:
             t["success_rate"] = args.success_rate
         cfg["acceptance_targets"] = t
-
-    cfg["_input_tokens"] = inp
     return cfg
 
 
@@ -372,11 +428,24 @@ _REASONING_LEVERS = (
     ("reasoning_effort=minimal", {"reasoning_effort": "minimal"}),
     ("reasoning_effort=low", {"reasoning_effort": "low"}),
     ("thinking.type=disabled", {"thinking": {"type": "disabled"}}),
+    ("chat_template_kwargs.enable_thinking=false",
+     {"chat_template_kwargs": {"enable_thinking": False}}),
     ("enable_thinking=false", {"enable_thinking": False}),
 )
 
 
-def _probe_reasoning_levers(cfg: dict, budget: int) -> list[dict]:
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    out = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _probe_reasoning_levers(cfg: dict, budget: int,
+                            probe_index: int = 1) -> list[dict]:
     """Send one request per control and report what each one did.
 
     This runs only when the endpoint has already proven it produces no
@@ -390,32 +459,37 @@ def _probe_reasoning_levers(cfg: dict, budget: int) -> list[dict]:
     """
     import copy
     from .client import EndpointClient, EndpointConfig
-    from .runner import _token
-    from .textgen import TextMaterializer
+    from .runner import RunConfig, _representative_plans, _token
 
-    ip = cfg["_input_tokens"]
-    mat = TextMaterializer(cpt=4.0)
-    msgs = mat.messages("lever", 7, int(ip["p50"]), int(ip["p95"]), 200)
+    clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    rc = RunConfig(**clean)
+    plans = _representative_plans(rc)
+    plan = plans[min(max(probe_index, 0), len(plans) - 1)]
+    # The caller passes the exact failed budget. Keep it explicit so a future
+    # refactor cannot reintroduce a probe-only 512-token floor.
+    budget = int(budget)
     out = []
     for name, extra in _REASONING_LEVERS:
         ec = copy.deepcopy(cfg["endpoint"])
-        ec["extra_body"] = {**(ec.get("extra_body") or {}), **extra}
+        ec["extra_body"] = _deep_merge(ec.get("extra_body") or {}, extra)
         ecfg = EndpointConfig(**ec)
-        client = EndpointClient(ecfg, _token(ecfg))
+        client = EndpointClient(ecfg, _token(ecfg),
+                                refresh=lambda: _token(ecfg))
         try:
-            r = client.send(msgs, budget, f"lever-{name}", scheduled_s=0.0,
-                            dispatch_lag_ms=0.0, intended=(0, 0, None, -1),
-                            chars_sent=0)
+            r = client.send(
+                plan["messages"], budget, f"lever-{name}", scheduled_s=0.0,
+                dispatch_lag_ms=0.0, intended=plan["intended"],
+                chars_sent=plan["chars"])
         except Exception as e:  # never let a probe break the run
             out.append({"name": name, "extra": extra, "verdict": "error",
                         "detail": str(e)[:160]})
             continue
-        if not r.ok:
+        if r.status != 200:
             # a refusal is the most useful answer of all: it usually names
             # the reason, and it rules the flag out for good.
             out.append({"name": name, "extra": extra, "verdict": "rejected",
                         "detail": (r.error or "")[:220]})
-        elif r.ttfv_ms is not None:
+        elif r.visible_content_seen and r.stream_complete and not r.parse_errors:
             out.append({"name": name, "extra": extra, "verdict": "works",
                         "detail": f"answered, finish {r.finish_reason}, "
                                   f"{r.completion_tokens} tokens"})
@@ -473,6 +547,51 @@ def _refuse(levers: list[dict], args) -> int:
     return 3
 
 
+def _check_preflight(cfg: dict, args) -> int | None:
+    """Run the shared benchmark/sweep gate; return an exit code on refusal."""
+    print("[preflight] sending 2 representative workload requests")
+    pf_res = _preflight(cfg)
+    if pf_res.get("reachable") != pf_res.get("attempted"):
+        print(f"[preflight] FAILED: {pf_res.get('reachable', 0)}/"
+              f"{pf_res.get('attempted', 2)} reached HTTP 200: "
+              f"{pf_res.get('error', 'one or more requests failed')}")
+        print("[preflight] check the host, endpoint, token and workload "
+              "before running a load test.")
+        return 2
+    print(f"[preflight] {pf_res['reachable']}/{pf_res['attempted']} "
+          "reached HTTP 200 at effective budgets "
+          + ", ".join(str(x) for x in pf_res["budgets"]))
+    if not pf_res.get("usage_reported"):
+        print("[preflight] WARNING: at least one response reported no token "
+              "usage, so throughput and per-token cost may be incomplete")
+    if not pf_res.get("cache_reported"):
+        print("[preflight] note: at least one response had no cached-token "
+              "field, so achieved cache coverage may be incomplete")
+    if pf_res.get("reasoning"):
+        print("[preflight] this endpoint emitted reasoning-channel content; "
+              "those tokens count against max_tokens.")
+        if "ttft_definition" not in cfg:
+            cfg["ttft_definition"] = "first_visible"
+            print("[preflight] scoring TTFT on the first VISIBLE token.")
+
+    if pf_res.get("readable") != pf_res.get("attempted"):
+        print(f"[preflight] only {pf_res.get('readable', 0)}/"
+              f"{pf_res['attempted']} produced a complete readable answer. "
+              "This gate uses visible content + clean stream completion, not "
+              "a provider-specific reasoning schema.")
+        levers: list[dict] = []
+        if not getattr(args, "no_lever_probe", False):
+            print()
+            levers = _probe_reasoning_levers(
+                cfg, budget=pf_res["budget"],
+                probe_index=pf_res.get("failed_probe_index", 1))
+            _print_lever_report(levers, pf_res["budget"])
+            print()
+        if not getattr(args, "force", False):
+            return _refuse(levers, args)
+    return None
+
+
 def cmd_benchmark(args) -> int:
     """One command from an endpoint URL to a report.
 
@@ -484,47 +603,9 @@ def cmd_benchmark(args) -> int:
 
     cfg = _benchmark_config(args)
     if not args.skip_preflight:
-        print("[preflight] sending 2 requests to see what this endpoint does")
-        pf_res = _preflight(cfg)
-        if not pf_res.get("reachable"):
-            print(f"[preflight] FAILED: {pf_res.get('error', 'no response')}")
-            print("[preflight] check the host, the endpoint name and the "
-                  "token before running a load test against it.")
-            return 2
-        print(f"[preflight] {pf_res['reachable']}/{pf_res['attempted']} "
-              "responded")
-        if not pf_res.get("usage_reported"):
-            print("[preflight] WARNING: no token usage reported, so token "
-                  "throughput and per-token cost will be blank")
-        if not pf_res.get("cache_reported"):
-            print("[preflight] note: no cached-token field, so achieved "
-                  "cache cannot be reported and latency cannot be judged "
-                  "against a cache target")
-        if pf_res.get("reasoning"):
-            print("[preflight] this is a REASONING model. it emits thinking "
-                  "tokens before the answer, and they count against "
-                  "max_tokens.")
-            if not pf_res.get("visible"):
-                print(f"[preflight] and it produced NO visible answer within "
-                      f"{pf_res['budget']} tokens, which is the budget this "
-                      "run will use. raise --output-tokens, or turn "
-                      "reasoning down, before trusting any latency number "
-                      "from this endpoint.")
-                if not args.no_lever_probe:
-                    print()
-                    levers = _probe_reasoning_levers(cfg, budget=512)
-                    _print_lever_report(levers, 512)
-                    print()
-                    if not args.force:
-                        # we have just proved this run cannot produce an
-                        # answer. running it anyway spends the user's time
-                        # and money to arrive at a verdict we already know.
-                        return _refuse(levers, args)
-            if "ttft_definition" not in cfg:
-                cfg["ttft_definition"] = "first_visible"
-                print("[preflight] scoring TTFT on the first VISIBLE token, "
-                      "which is what a user-facing SLA describes.")
-    cfg.pop("_input_tokens", None)
+        refused = _check_preflight(cfg, args)
+        if refused is not None:
+            return refused
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     saved = Path(args.out_dir) / "run-config.json"
@@ -548,18 +629,24 @@ def _rungs(spec: str) -> list[float]:
     """
     spec = str(spec).strip()
     try:
+        import math
         if ":" in spec:
             parts = spec.split(":")
             if len(parts) not in (2, 3):
                 raise ValueError
             lo, hi = float(parts[0]), float(parts[1])
             n = int(parts[2]) if len(parts) == 3 else 6
-            if not (0 < lo < hi) or n < 2:
+            if not (math.isfinite(lo) and math.isfinite(hi)
+                    and 0 < lo < hi) or n < 2:
                 raise ValueError
             step = (hi / lo) ** (1.0 / (n - 1))
-            return [round(lo * step ** i, 3) for i in range(n)]
+            vals = [round(lo * step ** i, 3) for i in range(n)]
+            if len(set(vals)) != len(vals):
+                raise ValueError
+            return vals
         vals = [float(x) for x in spec.split(",") if x.strip()]
-        if not vals or any(v <= 0 for v in vals):
+        if (not vals or any(not math.isfinite(v) or v <= 0 for v in vals)
+                or len(set(vals)) != len(vals)):
             raise ValueError
         return sorted(vals)
     except ValueError:
@@ -585,41 +672,67 @@ def cmd_sweep(args) -> int:
     from .metrics import _verdict
     from .runner import RunConfig, run
 
+    if args.duration <= 0:
+        raise SystemExit("--duration must be a positive number of seconds")
+    if args.cooldown < 0:
+        raise SystemExit("--cooldown cannot be negative")
     rates = _rungs(args.rate)
     base = _benchmark_config(args)
-    # the ladder sets its own rate on every rung, and _input_tokens is a
-    # preflight-only key that RunConfig does not accept.
-    base.pop("concurrency", None)
-    base.pop("_input_tokens", None)
+    # The ladder controls arrival rate directly. It must not also run the
+    # unloaded concurrency-sizing pass, which would overwrite every rung.
+    base.pop("sizing_concurrency", None)
 
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
+    if not args.skip_preflight:
+        refused = _check_preflight(base, args)
+        if refused is not None:
+            return refused
+    (out_root / "sweep-base-config.json").write_text(
+        json.dumps(base, indent=2) + "\n")
+
+    nominal = (len(rates) * args.duration
+               + max(0, len(rates) - 1) * args.cooldown)
     print(f"[sweep] {len(rates)} rungs: "
           + ", ".join(f"{r:g}" for r in rates) + " requests/second")
-    print(f"[sweep] {args.duration}s each"
+    print(f"[sweep] {args.duration}s of offered load each"
           + (f", {args.cooldown}s cooldown between them"
              if args.cooldown else ""))
+    print(f"[sweep] nominal scheduled time {nominal}s if every rung runs; "
+          "preflight, calibration, response drain and report writing are extra")
     print()
 
     rungs: list[dict] = []
+    sweep_started = _time.monotonic()
     for i, rate in enumerate(rates):
         cfg = copy.deepcopy(base)
         cfg.update(qps_base=rate, qps_burst=rate, qps_min=rate,
                    qps_max=rate, rate_scale=1.0,
                    duration_s=args.duration,
                    out_dir=str(out_root / f"rate_{rate:g}"),
-                   title=f"{rate:g} requests/second")
-        # the pool has to be able to hold what the rate implies, or the
-        # client becomes the bottleneck and measures itself.
-        cfg["max_concurrency"] = max(64, int(rate * 30))
+                   title=(args.title or f"{args.endpoint} rate sweep")
+                         + f" @ {rate:g} requests/second")
+        rung_root = Path(cfg["out_dir"])
+        rung_root.mkdir(parents=True, exist_ok=True)
+        (rung_root / "run-config.json").write_text(
+            json.dumps(cfg, indent=2) + "\n")
         print(f"[sweep] rung {i + 1}/{len(rates)}: {rate:g} rps")
-        out = run(RunConfig(**cfg), quiet=False)
-        kind, text = _verdict(out["summary"])
-        s = out["summary"]
+        rung_started = _time.monotonic()
+        try:
+            out = run(RunConfig(**cfg), quiet=False)
+            kind, verdict_text = _verdict(out["summary"])
+            s = out["summary"]
+            out_dir = out["out_dir"]
+        except Exception as exc:
+            kind = "invalid"
+            verdict_text = (f"rung failed before a report: "
+                            f"{type(exc).__name__}: {exc}")
+            s = {}
+            out_dir = str(rung_root)
         cc = s.get("concurrency") or {}
         rungs.append({
-            "rate": rate, "kind": kind, "text": text,
-            "dir": out["out_dir"],
+            "rate": rate, "kind": kind, "text": verdict_text,
+            "dir": out_dir,
             "held": cc.get("in_flight_p50"),
             "achieved_rps": (s.get("arrivals") or {}).get(
                 "achieved_qps_overall"),
@@ -627,16 +740,18 @@ def cmd_sweep(args) -> int:
             "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
             "ttft_p95": (s.get("ttft_ms") or {}).get("p95"),
             "e2e_p50": (s.get("e2e_ms") or {}).get("p50"),
+            "wall_s": _time.monotonic() - rung_started,
         })
-        print(f"[sweep] rung {i + 1}: {kind.upper()} {text[:90]}")
+        print(f"[sweep] rung {i + 1}: {kind.upper()} {verdict_text[:90]}")
         print()
-        if kind in ("miss", "invalid") and not args.no_early_stop:
-            print(f"[sweep] stopping: rung {i + 1} did not hold. pass "
+        if kind != "ok" and not args.no_early_stop:
+            print(f"[sweep] stopping: rung {i + 1} was not an unqualified OK. pass "
                   "--no-early-stop to climb the whole ladder anyway.")
             break
         if args.cooldown and i + 1 < len(rates):
             _time.sleep(args.cooldown)
 
+    args._sweep_wall_s = _time.monotonic() - sweep_started
     return _sweep_report(rungs, out_root, args)
 
 
@@ -658,7 +773,9 @@ def _sweep_report(rungs: list[dict], out_root: Path, args) -> int:
     # the ceiling is the highest rung that STAYED VALID, never the highest
     # one we managed to submit. every sweep in this category anchors on the
     # latter and reports a top rung its own error rate disqualifies.
-    good = [r for r in rungs if r["kind"] in ("ok", "caution")]
+    # A caution explicitly says evidence was undermined (sample size,
+    # delivery, cache, etc.). It is not a proven capacity point.
+    good = [r for r in rungs if r["kind"] == "ok"]
     if good:
         best = good[-1]
         head = (f"Highest rate that held: {best['rate']:g} requests/second, "
@@ -667,8 +784,6 @@ def _sweep_report(rungs: list[dict], out_root: Path, args) -> int:
             t = t.strip()
             return t if t.endswith(".") else t + "."
 
-        if best["kind"] == "caution":
-            head += " Read it with care: " + _sentence(best["text"])
         nxt = next((r for r in rungs if r["rate"] > best["rate"]), None)
         if nxt:
             head += (f" The next rung, {nxt['rate']:g} rps, "
@@ -685,6 +800,11 @@ def _sweep_report(rungs: list[dict], out_root: Path, args) -> int:
 
     body = "\n".join([f"# Rate ladder: {args.endpoint}",
                       "", head, "",
+                      (f"Sweep command wall time: "
+                       f"{getattr(args, '_sweep_wall_s', 0.0):.1f}s. Per-rung "
+                       "wall time includes setup and response drain; the "
+                       "configured duration is offered-load schedule time."),
+                      "",
                       "\n".join(rows), "",
                       "The axis is arrival rate because that is what an "
                       "open-loop generator controls. Concurrency is reported "
@@ -721,13 +841,21 @@ def cmd_quickstart(args) -> int:
     if args.model:
         ep["model"] = args.model
 
+    sizing = getattr(args, "sizing_concurrency", None)
+    legacy = getattr(args, "legacy_concurrency", None)
+    if legacy is not None:
+        print("warning: --concurrency is now --sizing-concurrency. it derives "
+              "one fixed open-loop rate; it does not hold concurrency.",
+              file=sys.stderr)
+        sizing = legacy
     cfg: dict = {
         "profile_path": args.profile,
         "endpoint": ep,
-        "concurrency": args.concurrency,
+        "sizing_concurrency": sizing,
         "duration_s": args.duration,
         "out_dir": args.out_dir,
-        "title": args.title or f"{args.concurrency} concurrent, {args.endpoint}",
+        "title": args.title or (
+            f"open-loop rate sized from {sizing} concurrent, {args.endpoint}"),
         "label": args.label or (
             "Describe the capacity this ran on. Shared pay-per-token is not a "
             "performance claim for a dedicated endpoint."),
@@ -762,8 +890,9 @@ def cmd_quickstart(args) -> int:
     print("run it with:")
     print(f"  python3 -m traffic_replay run --config {out}")
     print()
-    print("the arrival rate and pool size are derived at run time from a short "
-          "sizing pass, and printed before the replay starts.")
+    print("a fixed open-loop arrival rate and pool size are derived at run "
+          "time from a short unloaded sizing pass. concurrency is measured, "
+          "not held.")
     if not args.auth_profile:
         print(f"export {args.token_env} first, or pass --auth-profile to read "
               "a ~/.databrickscfg profile instead.")
@@ -797,8 +926,11 @@ def main(argv=None) -> int:
                    help="workspace URL, e.g. https://my-ws.cloud.databricks.com")
     s.add_argument("--endpoint", required=True,
                    help="endpoint name, or a full /serving-endpoints/... path")
-    s.add_argument("--concurrency", type=int, default=10,
-                   help="how many requests to hold in flight (default 10)")
+    s.add_argument("--sizing-concurrency", type=int, default=None,
+                   help="unloaded concurrency used to derive one fixed "
+                        "open-loop rate (default 10); it is not held")
+    s.add_argument("--concurrency", dest="legacy_concurrency", type=int,
+                   default=None, help=argparse.SUPPRESS)
     s.add_argument("--duration", type=int, default=300,
                    help="seconds. 300 gives five stability windows")
     s.add_argument("--input-tokens", default="10000",
@@ -833,6 +965,10 @@ def main(argv=None) -> int:
     s.add_argument("--success-rate", type=float, default=None,
                    help="fraction 0-1, e.g. 0.99")
     s.add_argument("--out-dir", default="results/benchmark")
+    s.add_argument("--max-concurrency", type=int, default=None,
+                   help="worker bound; sizing derives it when omitted")
+    s.add_argument("--max-pending-requests", type=int, default=None,
+                   help="bound on running plus queued client requests")
     s.add_argument("--title", default=None)
     s.add_argument("--label", default=None)
     s.add_argument("--skip-preflight", action="store_true",
@@ -886,16 +1022,18 @@ def main(argv=None) -> int:
     s.add_argument("--ttfg-p99", type=float, default=None)
     s.add_argument("--success-rate", type=float, default=None)
     s.add_argument("--out-dir", default="results/sweep")
+    s.add_argument("--max-concurrency", type=int, default=256,
+                   help="fixed worker bound reused unchanged at every rung")
+    s.add_argument("--max-pending-requests", type=int, default=None,
+                   help="bound on running plus queued client requests")
     s.add_argument("--title", default=None)
     s.add_argument("--label", default=None)
-    s.add_argument("--concurrency", type=int, default=None,
-                   help=argparse.SUPPRESS)
     s.add_argument("--skip-preflight", action="store_true",
-                   default=True, help=argparse.SUPPRESS)
+                   help="skip the representative endpoint gate")
     s.add_argument("--no-lever-probe", action="store_true",
-                   default=True, help=argparse.SUPPRESS)
+                   help="do not probe known reasoning controls")
     s.add_argument("--force", action="store_true",
-                   default=True, help=argparse.SUPPRESS)
+                   help="run despite a preflight with no readable answer")
     s.set_defaults(fn=cmd_sweep)
 
     s = sub.add_parser("quickstart",
@@ -906,8 +1044,11 @@ def main(argv=None) -> int:
                    help="endpoint name, or a full /serving-endpoints/... path")
     s.add_argument("--profile", required=True,
                    help="traffic profile JSON describing your prompt shape")
-    s.add_argument("--concurrency", type=int, required=True,
-                   help="how many requests to hold in flight")
+    cg = s.add_mutually_exclusive_group(required=True)
+    cg.add_argument("--sizing-concurrency", type=int,
+                    help="unloaded concurrency used to derive a fixed rate")
+    cg.add_argument("--concurrency", dest="legacy_concurrency", type=int,
+                    help=argparse.SUPPRESS)
     s.add_argument("--duration", type=int, default=240,
                    help="seconds. 240 gives four stability windows")
     s.add_argument("--auth-profile", default=None,

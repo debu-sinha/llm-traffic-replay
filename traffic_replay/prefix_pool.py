@@ -26,7 +26,6 @@ from dataclasses import dataclass
 import numpy as np
 
 DEFAULT_BUCKETS = (0, 2_000, 6_000, 12_000, 30_000, 200_000)
-TOP_BUCKET_DOC_TOKENS = 40_000  # cap document size for memory sanity
 
 
 @dataclass
@@ -42,13 +41,27 @@ class PrefixPool:
                  docs_per_bucket: int = 40, zipf_s: float = 1.1,
                  seed: int = 11):
         self.edges = tuple(bucket_edges)
+        if (len(self.edges) < 2
+                or any(not np.isfinite(x) for x in self.edges)
+                or any(b <= a for a, b in zip(self.edges, self.edges[1:]))
+                or self.edges[0] != 0):
+            raise ValueError("bucket_edges must start at 0 and increase")
+        if not isinstance(docs_per_bucket, int) or docs_per_bucket <= 0:
+            raise ValueError("docs_per_bucket must be a positive integer")
+        if not np.isfinite(zipf_s) or zipf_s <= 0:
+            raise ValueError("zipf_s must be positive and finite")
         self.zipf_s = zipf_s
         self.rng = np.random.default_rng(seed)
         self.doc_len: dict[int, int] = {}
         self.buckets: dict[int, list[int]] = {}
         did = 0
         for b in range(len(self.edges) - 1):
-            hi = min(self.edges[b + 1], TOP_BUCKET_DOC_TOKENS)
+            # TextMaterializer creates documents lazily, so silently clipping
+            # the final bucket to 40K saved no up-front memory. It did make a
+            # requested 100K prefix into a 40K payload while the result still
+            # claimed the original target. Size documents to the declared
+            # bucket edge and reject out-of-range requests instead.
+            hi = int(self.edges[b + 1])
             ids = []
             for _ in range(docs_per_bucket):
                 self.doc_len[did] = hi
@@ -61,9 +74,14 @@ class PrefixPool:
         self._weights = w / w.sum()
 
     def bucket_of(self, want: int) -> int:
+        if want < 0 or want > self.edges[-1]:
+            raise ValueError(
+                f"prefix target {want} is outside pool range 0..{self.edges[-1]}")
         for b in range(len(self.edges) - 1):
             if self.edges[b] <= want < self.edges[b + 1]:
                 return b
+        if want == self.edges[-1]:
+            return len(self.edges) - 2
         return len(self.edges) - 2
 
     def assign(self, prefix_tokens: np.ndarray) -> Assignment:
@@ -79,7 +97,13 @@ class PrefixPool:
             bucket = self.buckets[b]
             doc = int(self.rng.choice(bucket, p=self._weights))
             ids[i] = doc
-            actual[i] = min(self.doc_len[doc], int(want))
+            # bucket_of guarantees the selected document can satisfy this
+            # prefix. Never silently substitute a smaller cache structure.
+            if int(want) > self.doc_len[doc]:  # defensive for custom buckets
+                raise ValueError(
+                    f"prefix target {want} exceeds document {doc} length "
+                    f"{self.doc_len[doc]}")
+            actual[i] = int(want)
         return Assignment(doc_id=ids, prefix_tokens=actual)
 
     def structure_report(self, a: Assignment, input_tokens: np.ndarray) -> dict:

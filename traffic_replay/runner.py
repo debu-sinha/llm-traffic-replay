@@ -28,6 +28,8 @@ prompts mode the text is fixed, so the warmup only primes the endpoint.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import math
 import os
 import sys
@@ -35,8 +37,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import numpy as np
+
 from . import profile as prof
-from .client import EndpointClient, EndpointConfig, new_request_id
+from .client import EndpointClient, EndpointConfig
 from .metrics import summarize, write_outputs
 from .prefix_pool import PrefixPool
 from .schedule import load_trace, make_schedule, schedule_report, shard
@@ -55,18 +59,20 @@ class RunConfig:
     qps_max: float = 500.0
     rate_scale: float = 1.0
     max_concurrency: int = 256
-    concurrency: int | None = None    # "hold N requests in flight". when set,
-                                      # a short sizing pass measures service
-                                      # time and the arrival rate and pool are
-                                      # derived from it, overriding qps_* and
-                                      # max_concurrency. load tests are
-                                      # specified this way; the harness does
-                                      # the arithmetic.
+    max_pending_requests: int | None = None  # running + queued client work
+    sizing_concurrency: int | None = None
+                                      # derives a FIXED open-loop arrival rate
+                                      # from unloaded service time. It is a
+                                      # sizing hint, not a held concurrency.
+    concurrency: int | None = None    # legacy alias; normalized above at run
     seed: int = 7
     cpt: float = 4.0
     calibrate_n: int = 12
     shard_index: int = 0
     shard_total: int = 1
+    run_id: str | None = None         # required/shared across multiple shards
+    start_at_unix: float | None = None  # required/shared absolute replay epoch
+    start_tolerance_s: float = 0.5    # refuse a stale synchronized start
     timestamps_file: str | None = None  # real arrival trace replaces synthetic
     pool_docs_per_bucket: int = 40      # cache-pool shape knobs (profile mode)
     pool_zipf_s: float = 1.1
@@ -80,101 +86,410 @@ class RunConfig:
     measure_network_path: bool = True        # time the round trip to it
     ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
+    def __post_init__(self) -> None:
+        if bool(self.profile_path) == bool(self.prompts_file):
+            raise ValueError("set exactly one of profile_path or prompts_file")
+        if not isinstance(self.endpoint, dict):
+            raise ValueError("endpoint must be an object")
+        if not str(self.endpoint.get("base_url") or "").strip() \
+                or not str(self.endpoint.get("path") or "").strip():
+            raise ValueError("endpoint needs non-empty base_url and path")
+        from urllib.parse import urlparse
+        parsed = urlparse(str(self.endpoint["base_url"]))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("endpoint base_url must be an http(s) URL with a host")
+        if not str(self.endpoint["path"]).startswith("/"):
+            raise ValueError("endpoint path must start with /")
+        extra_body = self.endpoint.get("extra_body")
+        if extra_body is not None and not isinstance(extra_body, dict):
+            raise ValueError("endpoint extra_body must be an object")
+        try:
+            json.dumps(extra_body or {})
+        except (TypeError, ValueError) as exc:
+            raise ValueError("endpoint extra_body must be JSON-serializable") from exc
+        for timeout_name in ("connect_timeout_s", "read_timeout_s"):
+            timeout = self.endpoint.get(timeout_name)
+            if timeout is not None and (
+                    not math.isfinite(float(timeout)) or float(timeout) <= 0):
+                raise ValueError(f"endpoint {timeout_name} must be positive and finite")
+        retries = self.endpoint.get("max_retries")
+        if retries is not None and (
+                not isinstance(retries, int) or isinstance(retries, bool)
+                or retries < 0):
+            raise ValueError("endpoint max_retries must be a non-negative integer")
+        temperature = self.endpoint.get("temperature")
+        if temperature is not None and not math.isfinite(float(temperature)):
+            raise ValueError("endpoint temperature must be finite")
+        if self.sizing_concurrency is not None and self.concurrency is not None:
+            raise ValueError("set sizing_concurrency, not both it and legacy concurrency")
+        if self.sizing_concurrency is None and self.concurrency is not None:
+            self.sizing_concurrency = self.concurrency
+            self.concurrency = None
+        if self.sizing_concurrency is not None \
+                and (not isinstance(self.sizing_concurrency, int)
+                     or self.sizing_concurrency <= 0):
+            raise ValueError("sizing_concurrency must be a positive integer")
+        if not isinstance(self.duration_s, int) or self.duration_s <= 0:
+            raise ValueError("duration_s must be a positive integer")
+        rates = (self.qps_base, self.qps_burst, self.qps_min, self.qps_max)
+        if any(not math.isfinite(float(x)) or float(x) <= 0 for x in rates):
+            raise ValueError("qps_base/qps_burst/qps_min/qps_max must be positive and finite")
+        if self.qps_min > self.qps_max:
+            raise ValueError("qps_min cannot exceed qps_max")
+        if not (self.qps_min <= self.qps_base <= self.qps_max):
+            raise ValueError("qps_base must be between qps_min and qps_max")
+        if not (self.qps_min <= self.qps_burst <= self.qps_max):
+            raise ValueError("qps_burst must be between qps_min and qps_max")
+        if not math.isfinite(float(self.rate_scale)) \
+                or not (0 < self.rate_scale <= 1):
+            raise ValueError("rate_scale must be in (0, 1]")
+        if not isinstance(self.max_concurrency, int) or self.max_concurrency <= 0:
+            raise ValueError("max_concurrency must be a positive integer")
+        if self.max_pending_requests is not None and (
+                not isinstance(self.max_pending_requests, int)
+                or self.max_pending_requests <= 0):
+            raise ValueError("max_pending_requests must be a positive integer")
+        if not math.isfinite(float(self.cpt)) or self.cpt <= 0:
+            raise ValueError("cpt must be positive and finite")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool) \
+                or self.seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if not isinstance(self.calibrate_n, int) or self.calibrate_n < 0:
+            raise ValueError("calibrate_n must be a non-negative integer")
+        if not isinstance(self.shard_total, int) or self.shard_total <= 0 \
+                or not isinstance(self.shard_index, int) \
+                or not (0 <= self.shard_index < self.shard_total):
+            raise ValueError("need 0 <= shard_index < shard_total")
+        if not isinstance(self.pool_docs_per_bucket, int) \
+                or self.pool_docs_per_bucket <= 0:
+            raise ValueError("pool_docs_per_bucket must be a positive integer")
+        if not math.isfinite(float(self.pool_zipf_s)) or self.pool_zipf_s <= 0:
+            raise ValueError("pool_zipf_s must be positive and finite")
+        if not isinstance(self.max_output_tokens_cap, int) \
+                or self.max_output_tokens_cap <= 0:
+            raise ValueError("max_output_tokens_cap must be a positive integer")
+        if self.ttft_definition not in ("first_content", "first_visible"):
+            raise ValueError("ttft_definition must be first_content or first_visible")
+        if self.acceptance_targets is not None \
+                and not isinstance(self.acceptance_targets, dict):
+            raise ValueError("acceptance_targets must be an object")
+        if self.pricing is not None and not isinstance(self.pricing, dict):
+            raise ValueError("pricing must be an object")
+        if not math.isfinite(float(self.start_tolerance_s)) \
+                or self.start_tolerance_s < 0:
+            raise ValueError("start_tolerance_s must be non-negative and finite")
+        if self.start_at_unix is not None \
+                and not math.isfinite(float(self.start_at_unix)):
+            raise ValueError("start_at_unix must be finite")
+        if self.shard_total > 1:
+            if not isinstance(self.run_id, str) or not self.run_id.strip():
+                raise ValueError("sharded runs require one shared non-empty run_id")
+            if self.start_at_unix is None:
+                raise ValueError("sharded runs require one shared start_at_unix")
+
 
 def _shard_concurrency(rc) -> int | None:
-    """Concurrency this shard is responsible for.
+    """Exact quotient/remainder share of the open-loop sizing hint.
 
-    Sizing derives one rate for the whole target concurrency, then `shard()`
-    hands each worker every Nth arrival. A shard therefore offers rate/N and
-    holds about concurrency/N, so comparing its measured in-flight against
-    the unsharded number reports every shard as falling short.
+    A share may legitimately be zero when the global hint is smaller than the
+    shard count. Inflating every shard to one changes the requested total.
     """
-    if not rc.concurrency:
+    target = rc.sizing_concurrency
+    if target is None:
         return None
-    return max(1, int(round(rc.concurrency / max(1, rc.shard_total))))
+    q, r = divmod(target, rc.shard_total)
+    return q + (1 if rc.shard_index < r else 0)
+
+
+def _file_identity(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return f"unreadable:{path}"
+
+
+def _resolved_run_id(rc: RunConfig) -> str:
+    """Stable identity shared by an unsharded run and all of its shards."""
+    if rc.run_id:
+        return rc.run_id
+    material = {
+        "seed": rc.seed,
+        "profile": _file_identity(rc.profile_path),
+        "prompts": _file_identity(rc.prompts_file),
+        "endpoint_path": rc.endpoint.get("path"),
+        "endpoint_model": rc.endpoint.get("model"),
+        "extra_body": rc.endpoint.get("extra_body") or {},
+        "cpt": rc.cpt,
+        "pool_docs_per_bucket": rc.pool_docs_per_bucket,
+        "pool_zipf_s": rc.pool_zipf_s,
+    }
+    raw = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return "auto-" + hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _stable_request_id(run_id: str, global_index: int,
+                       namespace: str = "replay") -> str:
+    return hashlib.sha256(
+        f"{run_id}:{namespace}:{global_index}".encode()).hexdigest()[:16]
+
+
+def _payload_hash(ecfg: EndpointConfig, messages: list[dict],
+                  max_tokens: int) -> str:
+    """Hash the deterministic logical body, excluding learned wire fallback."""
+    owned = {"messages", "max_tokens", "temperature", "stream", "model",
+             "stream_options"}
+    body = {k: v for k, v in (ecfg.extra_body or {}).items() if k not in owned}
+    body.update(messages=messages, max_tokens=int(max_tokens),
+                temperature=ecfg.temperature, stream=True)
+    if ecfg.model:
+        body["model"] = ecfg.model
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+class _PreparedWorkload:
+    """One globally indexed workload, identical before and after sharding."""
+
+    def __init__(self, rc: RunConfig, total_n: int):
+        if total_n <= 0:
+            raise ValueError("workload needs at least one request")
+        self.rc = rc
+        self.total_n = total_n
+        self.prompts_mode = bool(rc.prompts_file)
+        self.profile = None
+        self.prompt_msgs = None
+        self.mat = None
+        if self.prompts_mode:
+            from .prompts import load_prompts
+            self.prompt_msgs = load_prompts(rc.prompts_file)
+        else:
+            self.profile = prof.Profile.from_json(rc.profile_path)
+            self.mat = TextMaterializer(cpt=rc.cpt)
+            self.draw = prof.sample(self.profile, total_n, seed=rc.seed)
+            self.pool = PrefixPool(
+                seed=rc.seed + 4, docs_per_bucket=rc.pool_docs_per_bucket,
+                zipf_s=rc.pool_zipf_s)
+            self.assignment = self.pool.assign(self.draw["prefix_tokens"])
+
+    @property
+    def prompts_count(self) -> int | None:
+        return len(self.prompt_msgs) if self.prompt_msgs is not None else None
+
+    def set_cpt(self, cpt: float) -> None:
+        if not self.prompts_mode:
+            self.mat = TextMaterializer(cpt=cpt)
+
+    def plan(self, global_index: int, request_id: str) -> dict:
+        if not 0 <= global_index < self.total_n:
+            raise IndexError(f"global workload index {global_index} out of range")
+        if self.prompts_mode:
+            prompt_index = global_index % len(self.prompt_msgs)
+            messages = self.prompt_msgs[prompt_index]
+            chars = sum(len(x["content"]) for x in messages)
+            return {
+                "messages": messages,
+                "max_output": self.rc.max_output_tokens_cap,
+                "intended": (0, 0, None, prompt_index),
+                "chars": chars,
+                "global_index": global_index,
+                "prompt_index": prompt_index,
+                "sample_index": None,
+                "construction": None,
+            }
+
+        i = global_index
+        input_tokens = int(self.draw["input_tokens"][i])
+        prefix_tokens = int(self.assignment.prefix_tokens[i])
+        # Assignment is the concrete cache structure. Keep total input fixed
+        # even if a custom pool ever returns a shorter prefix.
+        suffix_tokens = input_tokens - prefix_tokens
+        if suffix_tokens < 0:
+            raise ValueError("constructed prefix exceeds sampled input target")
+        doc_id = int(self.assignment.doc_id[i])
+        messages = self.mat.messages(
+            request_id, doc_id, prefix_tokens,
+            self.pool.doc_len.get(doc_id, 0), suffix_tokens)
+        chars = sum(len(x["content"]) for x in messages)
+        cache_fraction = prefix_tokens / input_tokens if input_tokens else 0.0
+        return {
+            "messages": messages,
+            "max_output": min(int(self.draw["output_tokens"][i]),
+                              self.rc.max_output_tokens_cap),
+            "intended": (input_tokens, int(self.draw["output_tokens"][i]),
+                         cache_fraction, doc_id),
+            "chars": chars,
+            "global_index": global_index,
+            "prompt_index": None,
+            "sample_index": global_index,
+            "construction": self.mat.construction_report(messages, input_tokens),
+        }
+
+
+def _representative_plans(rc: RunConfig) -> list[dict]:
+    """Concrete p50/p95 profile requests, or the first two real prompts."""
+    run_id = _resolved_run_id(rc)
+    if rc.prompts_file:
+        from .prompts import load_prompts
+        messages = load_prompts(rc.prompts_file)
+        plans = []
+        for i in range(2):
+            prompt_index = i % len(messages)
+            msgs = messages[prompt_index]
+            plans.append({
+                "messages": msgs, "max_output": rc.max_output_tokens_cap,
+                "intended": (0, 0, None, prompt_index),
+                "chars": sum(len(x["content"]) for x in msgs),
+                "global_index": i, "prompt_index": prompt_index,
+                "sample_index": None, "construction": None,
+                "request_id": _stable_request_id(run_id, i, "preflight"),
+                "representative": f"prompt {prompt_index}",
+            })
+        return plans
+
+    p = prof.Profile.from_json(rc.profile_path)
+    mat = TextMaterializer(cpt=rc.cpt)
+    inputs = np.asarray([
+        int(round(float(p.input_tokens["p50"]))),
+        int(round(float(p.input_tokens["p95"])))], dtype=int)
+    outputs = np.asarray([
+        int(round(float(p.output_tokens["p50"]))),
+        int(round(float(p.output_tokens["p95"])))], dtype=int)
+    cache = np.asarray([
+        float(p.cache_fraction["p50"]),
+        float(p.cache_fraction["p95"])], dtype=float)
+    wanted_prefix = np.round(inputs * cache).astype(int)
+    pool = PrefixPool(seed=rc.seed + 4,
+                      docs_per_bucket=rc.pool_docs_per_bucket,
+                      zipf_s=rc.pool_zipf_s)
+    assignment = pool.assign(wanted_prefix)
+    plans = []
+    for i, quantile in enumerate(("p50", "p95")):
+        rid = _stable_request_id(run_id, i, "preflight")
+        prefix = int(assignment.prefix_tokens[i])
+        suffix = int(inputs[i]) - prefix
+        doc_id = int(assignment.doc_id[i])
+        msgs = mat.messages(rid, doc_id, prefix,
+                            pool.doc_len.get(doc_id, 0), suffix)
+        plans.append({
+            "messages": msgs,
+            "max_output": min(int(outputs[i]), rc.max_output_tokens_cap),
+            "intended": (int(inputs[i]), int(outputs[i]),
+                         prefix / int(inputs[i]), doc_id),
+            "chars": sum(len(x["content"]) for x in msgs),
+            "global_index": i, "prompt_index": None, "sample_index": i,
+            "construction": mat.construction_report(msgs, int(inputs[i])),
+            "request_id": rid, "representative": quantile,
+        })
+    return plans
+
+
+def _annotate_result(res, phase: str, plan: dict, body_hash: str) -> dict:
+    row = dataclasses.asdict(res)
+    row.update(phase=phase, global_index=plan["global_index"],
+               sample_index=plan["sample_index"],
+               prompt_index=plan["prompt_index"],
+               request_body_sha256=body_hash)
+    if plan["construction"]:
+        row.update(
+            constructed_target_chars=plan["construction"]["target_chars"],
+            constructed_actual_chars=plan["construction"]["actual_chars"],
+            constructed_error_chars=plan["construction"]["error_chars"])
+    return row
+
+
+def _exception_result(request_id: str, phase: str, plan: dict,
+                      body_hash: str, error: str,
+                      scheduled_s: float = 0.0,
+                      dispatch_lag_ms: float = 0.0) -> dict:
+    intended = plan["intended"]
+    row = {
+        "request_id": request_id, "scheduled_s": scheduled_s,
+        "dispatch_lag_ms": dispatch_lag_ms, "t_send_unix": None,
+        "first_send_unix": None, "ttfb_ms": None, "ttft_ms": None,
+        "ttfr_ms": None, "ttfv_ms": None, "e2e_ms": None,
+        "status": None, "ok": False, "error": error,
+        "content_chunks": 0, "interchunk_max_ms": None,
+        "finish_reason": None, "prompt_tokens": None,
+        "completion_tokens": None, "cached_tokens": None,
+        "cached_tokens_source": None,
+        "intended_input_tokens": intended[0],
+        "intended_output_tokens": intended[1],
+        "intended_cache_fraction": intended[2], "doc_id": intended[3],
+        "chars_sent": plan["chars"], "retries": 0,
+        "reasoning_tokens": None, "reasoning_tokens_source": None,
+        "reasoning_chunks": 0, "connect_ms": None,
+        "stream_complete": False, "visible_content_seen": False,
+        "reasoning_seen": False, "truncated": False, "parse_errors": 0,
+        "max_tokens_requested": plan["max_output"],
+    }
+    row.update(phase=phase, global_index=plan["global_index"],
+               sample_index=plan["sample_index"],
+               prompt_index=plan["prompt_index"],
+               request_body_sha256=body_hash)
+    if plan["construction"]:
+        row.update(
+            constructed_target_chars=plan["construction"]["target_chars"],
+            constructed_actual_chars=plan["construction"]["actual_chars"],
+            constructed_error_chars=plan["construction"]["error_chars"])
+    return row
 
 
 def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
-                          quiet: bool) -> "RunConfig":
-    """Turn "hold N in flight" into an arrival rate and a pool size.
+                          quiet: bool, run_id: str) -> "RunConfig":
+    """Derive a fixed open-loop rate from an unloaded concurrency hint.
 
-    Load tests are specified in concurrency, the generator is specified in
-    arrival rate, and converting between them needs the endpoint's service
-    time, which nobody knows before measuring. So measure it: send a few
-    requests sequentially, take the median and p95 end-to-end, then set
-
-        rate = concurrency / e2e_p50
-        pool = rate * e2e_p95 * headroom
-
-    Sizing the pool off p95 rather than p50 matters. At p50 the pool is right
-    half the time and queues the other half, and a queued request is one the
-    endpoint never saw on schedule.
+    This does not hold concurrency. It measures unloaded service time once,
+    computes ``rate = sizing_concurrency / e2e_p50``, and leaves that rate
+    fixed while the endpoint slows or speeds up under load.
     """
     import numpy as _np
 
     from .client import EndpointClient
-    from .textgen import TextMaterializer as _TM
-    from . import profile as _prof
-    from .prefix_pool import PrefixPool as _PP
 
     probe_n = max(4, min(rc.calibrate_n, 8))
     client = EndpointClient(ecfg, token,
                             refresh=lambda: _token(ecfg))
-    if rc.prompts_file:
-        from .prompts import load_prompts
-        msgs_list = load_prompts(rc.prompts_file)
-        def _mk(i):
-            m = msgs_list[i % len(msgs_list)]
-            return m, rc.max_output_tokens_cap, (0, 0, None, i % len(msgs_list)), \
-                sum(len(x["content"]) for x in m)
-    else:
-        p = _prof.Profile.from_json(rc.profile_path)
-        mat = _TM(cpt=rc.cpt)
-        pool = _PP(seed=rc.seed + 4, docs_per_bucket=rc.pool_docs_per_bucket,
-                   zipf_s=rc.pool_zipf_s)
-        draw = _prof.sample(p, probe_n, seed=rc.seed)
-        assign = pool.assign(draw["prefix_tokens"])
-        def _mk(i):
-            m = mat.messages(f"size-{i}", int(assign.doc_id[i]),
-                             int(assign.prefix_tokens[i]),
-                             pool.doc_len.get(int(assign.doc_id[i]), 0),
-                             int(draw["suffix_tokens"][i]))
-            return (m, min(int(draw["output_tokens"][i]),
-                           rc.max_output_tokens_cap),
-                    (int(draw["input_tokens"][i]),
-                     int(draw["output_tokens"][i]),
-                     float(draw["cache_target_fraction"][i]),
-                     int(assign.doc_id[i])),
-                    sum(len(x["content"]) for x in m))
+    workload = _PreparedWorkload(rc, probe_n)
 
     e2e = []
     for i in range(probe_n):
-        msgs, max_out, intended, chars = _mk(i)
-        res = client.send(msgs, max_out, new_request_id(), scheduled_s=0.0,
-                          dispatch_lag_ms=0.0, intended=intended,
-                          chars_sent=chars)
-        d = dataclasses.asdict(res)
-        d["phase"] = "sizing"
+        rid = _stable_request_id(run_id, i, "sizing")
+        plan = workload.plan(i, rid)
+        body_hash = _payload_hash(ecfg, plan["messages"], plan["max_output"])
+        try:
+            res = client.send(
+                plan["messages"], plan["max_output"], rid, scheduled_s=0.0,
+                dispatch_lag_ms=0.0, intended=plan["intended"],
+                chars_sent=plan["chars"])
+            d = _annotate_result(res, "sizing", plan, body_hash)
+        except Exception as exc:
+            d = _exception_result(
+                rid, "sizing", plan, body_hash,
+                f"unexpected worker exception: {type(exc).__name__}: {exc}")
         out_rows.append(d)
-        if res.ok and res.e2e_ms:
-            e2e.append(res.e2e_ms)
+        if d.get("ok") and d.get("e2e_ms"):
+            e2e.append(d["e2e_ms"])
 
     if not e2e:
         raise RuntimeError(
             "sizing pass got no successful response, so the arrival rate for "
-            f"concurrency {rc.concurrency} cannot be derived. check auth and "
+            f"sizing_concurrency {rc.sizing_concurrency} cannot be derived. "
+            "check auth and "
             "the endpoint path, or set qps_base and max_concurrency directly.")
 
     p50 = float(_np.percentile(e2e, 50)) / 1000.0
     p95 = float(_np.percentile(e2e, 95)) / 1000.0
-    rate = rc.concurrency / max(p50, 1e-3)
-    pool_size = max(rc.concurrency * 2,
+    rate = rc.sizing_concurrency / max(p50, 1e-3)
+    pool_size = max(rc.sizing_concurrency * 2,
                     int(math.ceil(rate * p95 * 1.5)))
     if not quiet:
         print(f"[runner] sizing from {len(e2e)} probe requests: e2e p50 "
               f"{p50 * 1000:.0f} ms, p95 {p95 * 1000:.0f} ms")
-        print(f"[runner] to hold {rc.concurrency} in flight: offering "
-              f"{rate:.2f} rps, pool {pool_size}")
+        print(f"[runner] sizing hint {rc.sizing_concurrency}: offering a fixed "
+              f"{rate:.2f} rps with pool {pool_size}; concurrency is measured, "
+              "not held")
     return dataclasses.replace(
         rc, qps_base=rate, qps_burst=rate, qps_min=rate, qps_max=rate,
         rate_scale=1.0, max_concurrency=pool_size)
@@ -235,8 +550,18 @@ def run(rc: RunConfig, token_override: str | None = None,
     if not prompts_mode and not rc.profile_path:
         raise ValueError("set profile_path (synthetic shape) or "
                          "prompts_file (real prompt text)")
+    if rc.start_at_unix is not None \
+            and time.time() > rc.start_at_unix + rc.start_tolerance_s:
+        raise ValueError(
+            f"start_at_unix is stale by {time.time() - rc.start_at_unix:.3f}s; "
+            "use a future shared start and synchronize shard clocks")
 
     ecfg = EndpointConfig(**rc.endpoint)
+    run_id = _resolved_run_id(rc)
+    sizing_requested = rc.sizing_concurrency
+    sizing_local = _shard_concurrency(rc)
+    load_mode = "sizing_concurrency" if sizing_requested is not None \
+        else "fixed_rate"
     token = token_override or _token(ecfg)
     client = EndpointClient(ecfg, token,
                             refresh=lambda: _token(ecfg))
@@ -261,10 +586,12 @@ def run(rc: RunConfig, token_override: str | None = None,
         endpoint_meta = fetch_endpoint_metadata(ecfg.base_url, ecfg.path,
                                                 token, timeout=5.0)
 
-    # ---- sizing pass, only when the caller asked for a concurrency --------
+    # ---- optional unloaded sizing pass -----------------------------------
     sizing_rows: list[dict] = []
-    if rc.concurrency:
-        rc = _size_for_concurrency(rc, ecfg, token, sizing_rows, quiet)
+    if rc.sizing_concurrency is not None:
+        rc = _size_for_concurrency(
+            rc, ecfg, token, sizing_rows, quiet, run_id)
+    derived_qps = rc.qps_base if sizing_requested is not None else None
 
     # arrival schedule is shared by both modes
     if rc.timestamps_file:
@@ -274,46 +601,20 @@ def run(rc: RunConfig, token_override: str | None = None,
             duration_s=rc.duration_s, qps_base=rc.qps_base,
             qps_burst=rc.qps_burst, qps_min=rc.qps_min, qps_max=rc.qps_max,
             rate_scale=rc.rate_scale, seed=rc.seed + 16)
+    total_n = len(sched["timestamps"])
+    if total_n == 0:
+        raise RuntimeError("schedule produced zero arrivals; "
+                           "raise rate_scale or duration")
+    sched["global_indices"] = np.arange(total_n, dtype=int)
+    sched["total_requests"] = total_n
     if rc.shard_total > 1:
         sched = shard(sched, rc.shard_index, rc.shard_total)
     ts = sched["timestamps"]
+    global_indices = sched.get("global_indices")
     n = len(ts)
-    if n == 0:
-        raise RuntimeError("schedule produced zero arrivals; "
-                           "raise rate_scale or duration")
-
-    if prompts_mode:
-        from .prompts import load_prompts
-        prompt_msgs = load_prompts(rc.prompts_file)
-        m = len(prompt_msgs)
-
-        def make_request(i, rid):
-            msgs = prompt_msgs[i % m]
-            chars = sum(len(x["content"]) for x in msgs)
-            # no synthetic target: intended input/output 0, cache unset
-            return msgs, rc.max_output_tokens_cap, (0, 0, None, i % m), chars
-    else:
-        p = prof.Profile.from_json(rc.profile_path)
-        mat = TextMaterializer(cpt=rc.cpt)
-        pool = PrefixPool(seed=rc.seed + 4,
-                          docs_per_bucket=rc.pool_docs_per_bucket,
-                          zipf_s=rc.pool_zipf_s)
-        draw = prof.sample(p, n, seed=rc.seed)
-        assign = pool.assign(draw["prefix_tokens"])
-
-        def make_request(i, rid):
-            msgs = mat.messages(rid, int(assign.doc_id[i]),
-                                int(assign.prefix_tokens[i]),
-                                pool.doc_len.get(int(assign.doc_id[i]), 0),
-                                int(draw["suffix_tokens"][i]))
-            chars = sum(len(x["content"]) for x in msgs)
-            max_out = min(int(draw["output_tokens"][i]),
-                          rc.max_output_tokens_cap)
-            intended = (int(draw["input_tokens"][i]),
-                        int(draw["output_tokens"][i]),
-                        float(draw["cache_target_fraction"][i]),
-                        int(assign.doc_id[i]))
-            return msgs, max_out, intended, chars
+    workload = _PreparedWorkload(rc, total_n)
+    m = workload.prompts_count
+    p = workload.profile
 
     if not quiet:
         if prompts_mode:
@@ -328,82 +629,139 @@ def run(rc: RunConfig, token_override: str | None = None,
     results: list[dict] = list(sizing_rows)
 
     # ---- calibration / warmup pass (sequential, low rate) --------------
-    # calibration consumes the first calibrate_n scheduled arrivals, so a
-    # schedule shorter than that leaves nothing to replay and the report
-    # says "0 total" on a run that really did send requests. sharding makes
-    # this easier to hit, since n is per shard while calibrate_n is per
-    # process.
-    if rc.calibrate_n >= n:
-        raise ValueError(
-            f"calibrate_n is {rc.calibrate_n} but the schedule only has {n} "
-            f"arrivals, so calibration would consume all of them and the "
-            f"replay would measure nothing. lower calibrate_n below {n}, or "
-            f"raise duration_s or the arrival rate."
-            + (f" note this is shard {rc.shard_index + 1} of "
-               f"{rc.shard_total}, which gets every {rc.shard_total}th "
-               "arrival, so its schedule is that much shorter."
-               if rc.shard_total > 1 else ""))
-    calib_n = min(rc.calibrate_n, n)
+    # Calibration is extra traffic, not arrivals removed from the measured
+    # schedule. Every shard uses the same global indices so cpt calibration
+    # cannot change replay bodies merely because the workload was partitioned.
+    calib_n = min(rc.calibrate_n, total_n)
     chars_total = 0
     ptok_total = 0
     for i in range(calib_n):
-        rid = new_request_id()
-        msgs, max_out, intended, chars = make_request(i, rid)
-        res = client.send(msgs, max_out, rid, scheduled_s=0.0,
-                          dispatch_lag_ms=0.0, intended=intended,
-                          chars_sent=chars)
-        d = dataclasses.asdict(res)
-        d["phase"] = "calibration"
+        body_rid = _stable_request_id(run_id, i, "calibration")
+        rid = _stable_request_id(
+            run_id, i, f"calibration-shard-{rc.shard_index}")
+        # Identical calibration bodies give every shard the same cpt update;
+        # the transport request id remains shard-unique for tracing.
+        plan = workload.plan(i, body_rid)
+        body_hash = _payload_hash(ecfg, plan["messages"], plan["max_output"])
+        try:
+            res = client.send(
+                plan["messages"], plan["max_output"], rid, scheduled_s=0.0,
+                dispatch_lag_ms=0.0, intended=plan["intended"],
+                chars_sent=plan["chars"])
+            d = _annotate_result(res, "calibration", plan, body_hash)
+        except Exception as exc:
+            d = _exception_result(
+                rid, "calibration", plan, body_hash,
+                f"unexpected worker exception: {type(exc).__name__}: {exc}")
         results.append(d)
-        if res.ok and res.prompt_tokens:
-            chars_total += chars
-            ptok_total += res.prompt_tokens
+        if d.get("ok") and d.get("prompt_tokens"):
+            chars_total += plan["chars"]
+            ptok_total += d["prompt_tokens"]
 
     # recalibrate chars/token only in profile mode (real prompts are fixed)
     if not prompts_mode and ptok_total:
-        new_cpt = calibrate_cpt(mat.cpt, chars_total, ptok_total)
+        old_cpt = workload.mat.cpt
+        new_cpt = calibrate_cpt(old_cpt, chars_total, ptok_total)
         if not quiet:
-            print(f"[runner] cpt calibrated {mat.cpt:.2f} -> {new_cpt:.2f} "
+            print(f"[runner] cpt calibrated {old_cpt:.2f} -> {new_cpt:.2f} "
                   f"(from {ptok_total} reported prompt tokens)")
-        mat = TextMaterializer(cpt=new_cpt)
+        workload.set_cpt(new_cpt)
 
     # ---- paced replay ----------------------------------------------------
-    idx0 = calib_n
-    t0 = time.monotonic() + 0.25
-    inflight: list = []
-    # the dispatcher submits every request and only then collects, so
-    # completions have to report themselves through a callback or the line
-    # would sit at zero until the last arrival went out.
+    if rc.start_at_unix is not None:
+        until_start = rc.start_at_unix - time.time()
+        if until_start < -rc.start_tolerance_s:
+            raise RuntimeError(
+                f"shared start_at_unix became stale by {-until_start:.3f}s "
+                "during setup; choose a later start and verify shard clocks")
+        t0 = time.monotonic() + until_start
+    else:
+        t0 = time.monotonic() + 0.25
+
     from .progress import Progress
-    prog = Progress(n - idx0, float(rc.duration_s), enabled=not quiet)
+    prog = Progress(n, float(rc.duration_s), enabled=not quiet)
+    pending_limit = (rc.max_pending_requests
+                     if rc.max_pending_requests is not None
+                     else max(rc.max_concurrency * 2, rc.max_concurrency + 1))
+
+    def _progress_done(fut):
+        if fut.cancelled():
+            prog.done(None)
+            return
+        try:
+            prog.done(fut.result())
+        except Exception:
+            # Collection below persists the exception as an error row. A
+            # callback must never re-raise on a worker thread.
+            prog.done(None)
+
+    def _collect(fut, context):
+        rid, plan, body_hash, scheduled_s, lag_ms = context
+        try:
+            return _annotate_result(fut.result(), "replay", plan, body_hash)
+        except Exception as exc:
+            return _exception_result(
+                rid, "replay", plan, body_hash,
+                f"unexpected worker exception: {type(exc).__name__}: {exc}",
+                scheduled_s=scheduled_s, dispatch_lag_ms=lag_ms)
+
+    pending: dict = {}
     with ThreadPoolExecutor(max_workers=rc.max_concurrency) as ex:
-        for i in range(idx0, n):
-            target = t0 + (ts[i] - ts[idx0])
+        for local_i in range(n):
+            target = t0 + float(ts[local_i])
             now = time.monotonic()
             if target > now:
                 time.sleep(target - now)
             lag_ms = max((time.monotonic() - target) * 1000.0, 0.0)
 
-            rid = new_request_id()
-            msgs, max_out, intended, chars = make_request(i, rid)
-            fut = ex.submit(client.send, msgs, max_out, rid,
-                            float(ts[i]), lag_ms, intended, chars)
-            # the callback runs on the worker thread the moment the request
-            # finishes, which is what lets the in-flight gauge be live
-            # rather than a count of what has been handed to the pool.
-            fut.add_done_callback(
-                lambda f: prog.done(f.result()) if not f.cancelled() else None)
+            # Keep both our bookkeeping and ThreadPoolExecutor's private queue
+            # bounded. Completed work is drained without blocking the paced
+            # dispatcher; if the bound is still full, record an explicit
+            # client-side rejection instead of silently accumulating memory.
+            for done in [f for f in pending if f.done()]:
+                results.append(_collect(done, pending.pop(done)))
+
+            global_i = int(global_indices[local_i])
+            rid = _stable_request_id(run_id, global_i)
+            plan = workload.plan(global_i, rid)
+            body_hash = _payload_hash(
+                ecfg, plan["messages"], plan["max_output"])
             prog.sent()
-            inflight.append(fut)
+            if len(pending) >= pending_limit:
+                results.append(_exception_result(
+                    rid, "replay", plan, body_hash,
+                    f"client pending limit {pending_limit} reached; request "
+                    "was not sent", scheduled_s=float(ts[local_i]),
+                    dispatch_lag_ms=lag_ms))
+                prog.done(None)
+                prog.paint()
+                continue
+
+            fut = ex.submit(
+                client.send, plan["messages"], plan["max_output"], rid,
+                float(ts[local_i]), lag_ms, plan["intended"], plan["chars"])
+            fut.add_done_callback(_progress_done)
+            pending[fut] = (rid, plan, body_hash, float(ts[local_i]), lag_ms)
             prog.paint()
 
-        for fut in as_completed(inflight):
-            d = dataclasses.asdict(fut.result())
-            d["phase"] = "replay"
-            results.append(d)
+        for fut in as_completed(list(pending)):
+            results.append(_collect(fut, pending[fut]))
             prog.paint()
     prog.finish()
 
+    load_meta = {
+        "load_mode": load_mode,
+        "sizing_concurrency_requested": sizing_requested,
+        "sizing_concurrency_local": sizing_local,
+        "derived_qps": derived_qps,
+        "run_id": run_id,
+        "start_at_unix": rc.start_at_unix,
+        "max_pending_requests": pending_limit,
+        # This is deliberately not `concurrency_target`: a fixed-rate open
+        # loop does not hold an occupancy target. Metrics still reports the
+        # concurrency that actually happened as an outcome.
+        "concurrency_target": None,
+    }
     if prompts_mode:
         meta = {
             "input_mode": "prompts",
@@ -412,7 +770,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "network_path": net_path,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
-            "concurrency_target": _shard_concurrency(rc),
+            **load_meta,
             # identity of the thing under test. without these, compare and
             # merge cannot tell two different providers apart when both sit
             # behind the same route.
@@ -426,12 +784,12 @@ def run(rc: RunConfig, token_override: str | None = None,
         meta = {
             "input_mode": "profile",
             "profile": p.name, "profile_provenance": p.provenance,
-            "profile_label": p.label, "cpt_final": mat.cpt,
+            "profile_label": p.label, "cpt_final": workload.mat.cpt,
             "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
             "request_params": req_params, "endpoint_metadata": endpoint_meta,
             "network_path": net_path,
             "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
-            "concurrency_target": _shard_concurrency(rc),
+            **load_meta,
             # identity of the thing under test. without these, compare and
             # merge cannot tell two different providers apart when both sit
             # behind the same route.
@@ -456,7 +814,7 @@ def run(rc: RunConfig, token_override: str | None = None,
                         acceptance=acceptance,
                         ttft_definition=rc.ttft_definition,
                         pricing=rc.pricing,
-                        concurrency_target=_shard_concurrency(rc))
+                        concurrency_target=None)
     out = write_outputs(results, summary,
                         Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
                         rc.title)

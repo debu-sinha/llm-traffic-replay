@@ -29,8 +29,9 @@ def _run_quickstart(out: Path, *extra):
 
 def test_quickstart_writes_a_config_the_runner_accepts():
     cfg = _run_quickstart(_tmp() / "q.json")
-    # the whole point: concurrency is expressible, not derived by the reader
-    assert cfg["concurrency"] == 30
+    # This is an open-loop sizing hint, not a held closed-loop concurrency.
+    assert cfg["sizing_concurrency"] == 30
+    assert "concurrency" not in cfg
     assert cfg["endpoint"]["path"] == "/serving-endpoints/my-endpoint/invocations"
     RunConfig(**cfg)                      # constructs without extra fields
 

@@ -32,6 +32,25 @@ def test_suffix_unique_per_request():
     assert "req-a" in s1 and "req-b" in s2
 
 
+def test_short_suffix_never_overshoots_its_character_budget():
+    m = TextMaterializer(cpt=4.0)
+    for tokens in (0, 1, 2, 8, 16):
+        s = m.suffix_text("request-identity", tokens)
+        assert len(s) == round(tokens * 4.0)
+
+
+def test_total_message_character_target_is_exact():
+    m = TextMaterializer(cpt=3.7)
+    for prefix, suffix in ((0, 1), (100, 1), (100, 7), (123, 456)):
+        msgs = m.messages("global-17", doc_id=(2 if prefix else -1),
+                          prefix_tokens=prefix,
+                          doc_len_tokens=(1_000 if prefix else 0),
+                          suffix_tokens=suffix)
+        rep = m.construction_report(msgs, prefix + suffix)
+        assert rep["error_chars"] == 0
+        assert rep["actual_chars"] == round((prefix + suffix) * 3.7)
+
+
 def test_messages_structure():
     m = TextMaterializer(cpt=4.0)
     msgs = m.messages("rid1", doc_id=2, prefix_tokens=1_000,

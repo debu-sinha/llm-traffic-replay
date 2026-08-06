@@ -44,25 +44,28 @@ def _with_mock(make_cfg):
         srv.shutdown(); srv.server_close()
 
 
-def test_concurrency_derives_the_rate_and_the_pool():
-    """The user says 30 in flight. The harness measures service time and
-    works out both numbers, which is the arithmetic that used to be theirs."""
-    out = _with_mock(lambda p: _cfg(p, concurrency=8))
+def test_sizing_concurrency_derives_a_fixed_rate_and_pool():
+    """The hint sizes an open-loop rate; it is never claimed as held."""
+    out = _with_mock(lambda p: _cfg(p, sizing_concurrency=8))
     s = out["summary"]
     sched = s["schedule"]
     # a rate was chosen, and it is not the RunConfig default of 25
     assert sched["rate_p50"] > 0
     assert abs(sched["rate_p50"] - 25.0) > 1e-6
-    # and the run reports what concurrency it actually held
+    # and the run reports what concurrency actually happened, without
+    # pretending the open-loop generator held the sizing hint
     assert "concurrency" in s
-    assert s["concurrency"]["asked_for"] == 8
+    assert "asked_for" not in s["concurrency"]
+    assert s["run"]["load_mode"] == "sizing_concurrency"
+    assert s["run"]["sizing_concurrency_requested"] == 8
+    assert s["run"]["derived_qps"] > 0
 
 
 def test_the_sizing_rows_never_reach_the_summary():
     """The probe requests are real traffic, so they are written to
     requests.jsonl, but they must not be scored as part of the replay."""
     import json
-    out = _with_mock(lambda p: _cfg(p, concurrency=6))
+    out = _with_mock(lambda p: _cfg(p, sizing_concurrency=6))
     rows = [json.loads(x) for x in
             (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
     phases = {r.get("phase") for r in rows}
@@ -81,7 +84,7 @@ def test_without_concurrency_the_configured_rate_is_used():
 def test_a_dead_endpoint_says_why_sizing_failed():
     """Deriving a rate needs at least one response. Failing with a clear
     reason beats dividing by a service time nobody measured."""
-    rc = _cfg(1, concurrency=10)
+    rc = _cfg(1, sizing_concurrency=10)
     rc.endpoint["base_url"] = "http://127.0.0.1:1"
     try:
         run(rc, quiet=True)

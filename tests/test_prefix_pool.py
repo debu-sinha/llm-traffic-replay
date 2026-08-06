@@ -45,6 +45,25 @@ def test_prefix_never_exceeds_want_or_doc():
             assert a.prefix_tokens[i] <= pool.doc_len[int(a.doc_id[i])]
 
 
+def test_large_prefix_is_not_silently_clipped_to_40k():
+    pool = PrefixPool(seed=13)
+    wants = np.array([40_001, 99_999, 199_999])
+    a = pool.assign(wants)
+    assert np.array_equal(a.prefix_tokens, wants)
+    assert all(pool.doc_len[int(doc)] >= want
+               for doc, want in zip(a.doc_id, wants))
+
+
+def test_out_of_range_prefix_is_rejected_not_misreported():
+    pool = PrefixPool(seed=13)
+    try:
+        pool.assign(np.array([200_001]))
+    except ValueError as exc:
+        assert "outside pool range" in str(exc)
+    else:
+        raise AssertionError("out-of-range prefix was silently clipped")
+
+
 def test_zero_prefix_handled():
     pool = PrefixPool(seed=13)
     a = pool.assign(np.array([0, 5_000, 0]))

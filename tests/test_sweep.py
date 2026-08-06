@@ -64,14 +64,14 @@ def test_the_ceiling_is_the_highest_rung_that_HELD():
     assert code == 0
 
 
-def test_a_caution_still_counts_as_held_but_says_so():
+def test_a_caution_is_not_claimed_as_a_proven_held_rung():
     from traffic_replay.cli import _sweep_report
     tmp_path = Path(tempfile.mkdtemp(prefix='sweep-'))
     rungs = [_rung(1, "ok", held=2), _rung(2, "caution", held=5)]
     _sweep_report(rungs, tmp_path, _Args())
     body = (tmp_path / "sweep.md").read_text()
-    assert "Highest rate that held: 2 requests/second" in body
-    assert "Read it with care" in body
+    assert "Highest rate that held: 1 requests/second" in body
+    assert "next rung, 2 rps, cautioned" in body
 
 
 def test_topping_out_says_the_ceiling_may_be_higher():
@@ -122,7 +122,8 @@ def test_the_config_the_sweep_builds_is_actually_a_valid_run_config():
         token_env = "T"
         model = None
         extra_body = None
-        concurrency = None
+        sizing_concurrency = None
+        legacy_concurrency = None
         duration = 10
         out_dir = tempfile.mkdtemp()
         title = label = None
@@ -135,8 +136,7 @@ def test_the_config_the_sweep_builds_is_actually_a_valid_run_config():
         success_rate = 0.99
 
     base = _benchmark_config(A())
-    base.pop("concurrency", None)
-    base.pop("_input_tokens", None)
+    base.pop("sizing_concurrency", None)
     cfg = copy.deepcopy(base)
     cfg.update(qps_base=4.0, qps_burst=4.0, qps_min=4.0, qps_max=4.0,
                rate_scale=1.0, duration_s=10,
@@ -144,4 +144,67 @@ def test_the_config_the_sweep_builds_is_actually_a_valid_run_config():
                max_concurrency=120)
     rc = RunConfig(**cfg)              # must not raise
     assert rc.qps_base == 4.0
-    assert rc.concurrency is None, "the ladder sets a rate, not a concurrency"
+    assert rc.sizing_concurrency is None, "the ladder sets a fixed rate"
+
+
+def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
+    import json
+    from traffic_replay.cli import main
+
+    root = Path(tempfile.mkdtemp(prefix="sweep-exact-"))
+    prompts = root / "prompts.jsonl"
+    prompts.write_text('{"prompt":"real one"}\n{"prompt":"real two"}\n')
+    preflight = []
+    runs = []
+    sleeps = []
+
+    def fake_preflight(cfg, args):
+        preflight.append(json.loads(json.dumps(cfg)))
+        return None
+
+    def fake_run(rc, quiet=False):
+        runs.append(rc)
+        d = Path(rc.out_dir) / "fake"
+        d.mkdir(parents=True, exist_ok=True)
+        return {"out_dir": str(d), "summary": {
+            "arrivals": {"achieved_qps_overall": rc.qps_base},
+            "error_rate": 0.0,
+            "ttft_ms": {"p50": 10.0, "p95": 20.0},
+            "e2e_ms": {"p50": 30.0},
+            "concurrency": {"in_flight_p50": 2.0}}}
+
+    monkeypatch.setattr("traffic_replay.cli._check_preflight", fake_preflight)
+    monkeypatch.setattr("traffic_replay.runner.run", fake_run)
+    monkeypatch.setattr("traffic_replay.metrics._verdict",
+                        lambda summary: ("ok", "held"))
+    monkeypatch.setattr("time.sleep", lambda seconds: sleeps.append(seconds))
+
+    code = main([
+        "sweep", "--host", "https://ws.example", "--endpoint", "ep",
+        "--rate", "1,2", "--duration", "7", "--cooldown", "3",
+        "--prompts", str(prompts), "--output-tokens", "40,90",
+        "--auth-profile", "yuchen-test",
+        "--extra-body", '{"chat_template_kwargs":{"enable_thinking":false}}',
+        "--max-concurrency", "17", "--max-pending-requests", "23",
+        "--out-dir", str(root / "out")])
+
+    assert code == 0
+    assert len(preflight) == 1
+    assert len(runs) == 2
+    assert sleeps == [3]
+    assert [r.qps_base for r in runs] == [1.0, 2.0]
+    for rc in runs:
+        assert rc.prompts_file == str(prompts)
+        assert rc.max_output_tokens_cap == 135
+        assert rc.endpoint["auth_profile"] == "yuchen-test"
+        assert rc.endpoint["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False}}
+        assert rc.max_concurrency == 17
+        assert rc.max_pending_requests == 23
+        assert rc.sizing_concurrency is None
+    for rate in (1, 2):
+        saved = json.loads((root / "out" / f"rate_{rate}" /
+                            "run-config.json").read_text())
+        assert saved["prompts_file"] == str(prompts)
+        assert saved["endpoint"]["extra_body"] == {
+            "chat_template_kwargs": {"enable_thinking": False}}

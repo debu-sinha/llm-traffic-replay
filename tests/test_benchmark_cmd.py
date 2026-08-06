@@ -83,12 +83,36 @@ def test_the_saved_config_reruns_the_same_experiment():
         os.environ.pop("TR_BENCH_TOKEN", None)
     cfg = json.loads((d / "run-config.json").read_text())
     assert cfg["endpoint"]["path"] == "/serving-endpoints/my-ep/invocations"
-    assert cfg["concurrency"] == 1
+    assert cfg["sizing_concurrency"] == 1
+    assert "concurrency" not in cfg
     assert cfg["acceptance_targets"]["ttft_ms"]["p95"] == 900
     assert cfg["acceptance_targets"]["success_rate"] == 0.99
     assert cfg["acceptance_targets"]["targets_are"].startswith("yours")
     # the internal preflight key must not leak into the saved config
     assert "_input_tokens" not in cfg
+
+
+def test_prompts_mode_honors_output_tokens_without_a_512_floor():
+    d = _tmp()
+    prompts = d / "prompts.jsonl"
+    prompts.write_text('{"prompt":"hello"}\n')
+    try:
+        main(["benchmark", "--host", "https://example.invalid",
+              "--endpoint", "my-ep", "--prompts", str(prompts),
+              "--output-tokens", "40,90", "--duration", "1",
+              "--sizing-concurrency", "1", "--out-dir", str(d),
+              "--skip-preflight"])
+    except Exception:
+        pass
+    cfg = json.loads((d / "run-config.json").read_text())
+    assert cfg["prompts_file"] == str(prompts)
+    assert cfg["max_output_tokens_cap"] == 135
+    assert cfg["max_output_tokens_cap"] != 512
+
+
+def test_constant_cli_pairs_are_allowed_and_zero_cache_stays_zero():
+    assert _pair("32,32", "output-tokens") == {"p50": 32, "p95": 32}
+    assert _pair("0", "cache-hit-rate") == {"p50": 0, "p95": 0}
 
 
 def test_extra_body_reaches_the_endpoint_config():

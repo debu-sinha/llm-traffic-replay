@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Iterable, Iterator
 
 
 @dataclass
@@ -16,8 +17,10 @@ class StreamState:
     saw_first_content: bool = False
     saw_first_visible: bool = False       # first visible content delta
     saw_first_reasoning: bool = False     # first reasoning-channel delta
+    saw_first_tool_call: bool = False     # first tool/function-call delta
     content_chunks: int = 0
     reasoning_chunks: int = 0             # count of reasoning-channel deltas
+    tool_call_chunks: int = 0
     finish_reason: str | None = None
     usage: dict | None = None
     done: bool = False
@@ -38,14 +41,103 @@ def parse_sse_line(line: bytes | str) -> dict | None:
     if payload == "[DONE]":
         return {"__done__": True}
     try:
-        return json.loads(payload)
+        event = json.loads(payload)
     except json.JSONDecodeError:
         return {"__parse_error__": payload[:200]}
+    if not isinstance(event, dict):
+        return {"__parse_error__":
+                f"SSE data must be a JSON object, got "
+                f"{type(event).__name__}: {payload[:160]}"}
+    return event
 
 
-def update_state(state: StreamState, event: dict) -> bool:
+def iter_sse_events(lines: Iterable[bytes | str]) -> Iterator[dict]:
+    """Yield complete SSE ``data`` events from an iterable of raw lines.
+
+    SSE permits an event to contain multiple ``data:`` fields. Their values
+    are joined with newlines and dispatched by a blank line. OpenAI-compatible
+    servers normally use one data field per event, but treating each physical
+    line as a complete event corrupts otherwise valid multiline streams.
+
+    Non-data fields and comments are ignored. A final unterminated event is
+    dispatched at EOF, which is useful for defensive interoperability with
+    servers that omit the last blank line.
+    """
+    data: list[str] = []
+
+    def dispatch() -> dict | None:
+        if not data:
+            return None
+        payload = "\n".join(data)
+        data.clear()
+        if payload.strip() == "[DONE]":
+            return {"__done__": True}
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            return {"__parse_error__": payload[:200]}
+        if not isinstance(event, dict):
+            return {"__parse_error__":
+                    f"SSE data must be a JSON object, got "
+                    f"{type(event).__name__}: {payload[:160]}"}
+        return event
+
+    for raw in lines:
+        if isinstance(raw, bytes):
+            line = raw.decode("utf-8", errors="replace")
+        else:
+            line = raw
+        line = line.rstrip("\r\n")
+        if not line:
+            event = dispatch()
+            if event is not None:
+                yield event
+            continue
+        if line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if field != "data":
+            continue
+        if separator and value.startswith(" "):
+            value = value[1:]
+        data.append(value)
+
+    event = dispatch()
+    if event is not None:
+        yield event
+
+
+def _meaningful_text(value: object) -> bool:
+    """Whether a provider content value contains user-visible text."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        for part in value:
+            if isinstance(part, str) and part.strip():
+                return True
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    return True
+    return False
+
+
+def _nonempty_delta(value: object) -> bool:
+    """Whether a delta represents at least one emitted stream fragment."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return False
+
+
+def update_state(state: StreamState, event: object) -> bool:
     """Fold one event into state. Returns True if this event carries the
     FIRST content delta (the TTFT moment)."""
+    if not isinstance(event, dict):
+        state.errors.append(
+            f"stream event must be an object, got {type(event).__name__}")
+        return False
     if event.get("__done__"):
         state.done = True
         return False
@@ -53,28 +145,57 @@ def update_state(state: StreamState, event: dict) -> bool:
         state.errors.append(event["__parse_error__"])
         return False
 
+    choices = event.get("choices")
+    if choices is None:
+        choices = []
+    elif not isinstance(choices, list):
+        state.errors.append("stream event choices must be a list")
+        choices = []
+
     first_content = False
-    for choice in event.get("choices") or []:
-        delta = choice.get("delta") or {}
+    for index, choice in enumerate(choices):
+        if not isinstance(choice, dict):
+            state.errors.append(
+                f"stream choice {index} must be an object, got "
+                f"{type(choice).__name__}")
+            continue
+        delta = choice.get("delta")
+        if delta is None:
+            delta = {}
+        elif not isinstance(delta, dict):
+            state.errors.append(
+                f"stream choice {index} delta must be an object")
+            delta = {}
         visible = delta.get("content")
         reasoning = delta.get("reasoning_content")
-        if visible or reasoning:
+        tool_call = delta.get("tool_calls") or delta.get("function_call")
+        has_visible_delta = _nonempty_delta(visible)
+        has_reasoning_delta = _nonempty_delta(reasoning)
+        has_tool_call_delta = _nonempty_delta(tool_call)
+        if has_visible_delta or has_reasoning_delta:
             state.content_chunks += 1
             if not state.saw_first_content:
                 state.saw_first_content = True
                 first_content = True
-        if reasoning:
+        if has_reasoning_delta:
             state.reasoning_chunks += 1
-        if reasoning and not state.saw_first_reasoning:
+        if has_reasoning_delta and not state.saw_first_reasoning:
             state.saw_first_reasoning = True
-        if visible and not state.saw_first_visible:
+        if _meaningful_text(visible) and not state.saw_first_visible:
             state.saw_first_visible = True
+        if has_tool_call_delta:
+            state.tool_call_chunks += 1
+            state.saw_first_tool_call = True
         fr = choice.get("finish_reason")
-        if fr:
+        if isinstance(fr, str) and fr:
             state.finish_reason = fr
 
-    if event.get("usage"):
-        state.usage = event["usage"]
+    usage = event.get("usage")
+    if usage is not None:
+        if isinstance(usage, dict):
+            state.usage = usage
+        else:
+            state.errors.append("stream event usage must be an object")
     return first_content
 
 

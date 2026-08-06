@@ -1,7 +1,7 @@
 """SSE parsing: TTFT keys on first CONTENT delta (role-only chunks must not
 trigger it), usage extraction is defensive across provider field names."""
-from traffic_replay.sse import (StreamState, extract_usage, parse_sse_line,
-                                update_state)
+from traffic_replay.sse import (StreamState, extract_usage, iter_sse_events,
+                                parse_sse_line, update_state)
 
 
 def test_role_only_chunk_is_not_content():
@@ -40,6 +40,73 @@ def test_parse_error_recorded_not_raised():
     ev = parse_sse_line("data: {not json")
     update_state(st, ev)
     assert st.errors and "not json" in st.errors[0]
+
+
+def test_non_object_json_is_a_parse_error_not_a_crash():
+    for payload in ("[]", "null", '"text"', "3"):
+        st = StreamState()
+        ev = parse_sse_line("data: " + payload)
+        assert update_state(st, ev) is False
+        assert st.errors
+
+
+def test_unexpected_choice_shapes_are_recorded_not_raised():
+    malformed = [
+        {"choices": {}},
+        {"choices": [None]},
+        {"choices": [{"delta": "not-an-object"}]},
+        {"choices": [], "usage": []},
+    ]
+    for event in malformed:
+        st = StreamState()
+        assert update_state(st, event) is False
+        assert st.errors
+
+
+def test_whitespace_is_not_a_visible_answer():
+    st = StreamState()
+    event = parse_sse_line(
+        'data: {"choices":[{"delta":{"content":"  \\n"}}]}')
+    assert update_state(st, event) is True
+    assert st.saw_first_content is True
+    assert st.saw_first_visible is False
+
+
+def test_structured_content_text_is_visible():
+    st = StreamState()
+    event = {"choices": [{"delta": {
+        "content": [{"type": "text", "text": "hello"}]
+    }}]}
+    assert update_state(st, event) is True
+    assert st.saw_first_visible is True
+
+
+def test_tool_call_only_response_is_classified_separately():
+    st = StreamState()
+    event = {"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "function": {"name": "lookup"}
+    }]}}]}
+    assert update_state(st, event) is False
+    assert st.saw_first_content is False
+    assert st.saw_first_visible is False
+    assert st.saw_first_tool_call is True
+    assert st.tool_call_chunks == 1
+
+
+def test_multiline_sse_data_is_joined_and_eof_is_dispatched():
+    lines = [
+        ": comment\n",
+        "event: message\n",
+        'data: {"choices":\n',
+        'data: [{"delta":{"content":"hello"}}]}\n',
+        "\n",
+        "data: [DONE]",
+    ]
+    events = list(iter_sse_events(lines))
+    assert events == [
+        {"choices": [{"delta": {"content": "hello"}}]},
+        {"__done__": True},
+    ]
 
 
 def test_usage_openai_style():

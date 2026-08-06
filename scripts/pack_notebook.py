@@ -19,6 +19,7 @@ verifies the packed copy imports and its tests pass in a scratch directory.
 from __future__ import annotations
 
 import base64
+import ast
 import json
 import re
 import subprocess
@@ -80,6 +81,36 @@ def verify(files: dict[str, str]) -> int:
         return n
 
 
+def metadata(files: dict[str, str]) -> tuple[str, int, int]:
+    """Return version, payload file count, and statically collected tests.
+
+    The bundled stdlib runner executes top-level callables named ``test_*``.
+    Counting the same definitions here lets ``--check`` validate notebook
+    claims without re-running the expensive suite. The full pack path still
+    executes the suite and uses its observed count as the authority.
+    """
+    match = re.search(
+        r'__version__ = "([^"]+)"', files["traffic_replay/__init__.py"])
+    if not match:
+        raise SystemExit("could not read package version for notebook")
+    tests = 0
+    for path, source in files.items():
+        if not path.startswith("tests/test_") or not path.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError as exc:
+            raise SystemExit(f"cannot parse packed test {path}: {exc}") from exc
+        tests += sum(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+            for node in tree.body
+        )
+    if tests < 1:
+        raise SystemExit("packed tree contains no statically collectible tests")
+    return match.group(1), len(files), tests
+
+
 def _applied(count: int, what: str) -> None:
     """A rewrite that silently matched nothing would freeze a stale count in
     the notebook while the payload moved on, which is the drift this script
@@ -115,7 +146,25 @@ def check() -> None:
                 print(f"{label}: {', '.join(items)}")
         raise SystemExit(
             "notebook payload is stale. run: python3 scripts/pack_notebook.py")
-    print(f"notebook payload in sync ({len(files)} files)")
+
+    version, file_count, test_count = metadata(files)
+    header = re.search(
+        r"Self-contained copy of the repo \(v([^,]+), (\d+) files, "
+        r"(\d+) tests\)", src)
+    cell_count = re.search(
+        r"run the full test suite \((\d+) tests\)", src)
+    if not header or not cell_count:
+        raise SystemExit("notebook version/file/test claims are missing")
+    claimed = (header.group(1), int(header.group(2)), int(header.group(3)))
+    actual = (version, file_count, test_count)
+    if claimed != actual or int(cell_count.group(1)) != test_count:
+        raise SystemExit(
+            "notebook displayed metadata is stale: "
+            f"claims {claimed} / cell tests {cell_count.group(1)}, "
+            f"tree is {actual}. run: python3 scripts/pack_notebook.py")
+    print(
+        f"notebook payload and claims in sync "
+        f"(v{version}, {file_count} files, {test_count} tests)")
 
 
 def main() -> None:
@@ -128,9 +177,12 @@ def main() -> None:
 
     hits = {"payload": 0, "test count": 0, "header": 0}
     nb = json.loads(NOTEBOOK.read_text())
-    version = re.search(
-        r'__version__ = "([^"]+)"', files["traffic_replay/__init__.py"]
-    ).group(1)
+    version, file_count, static_test_count = metadata(files)
+    if static_test_count != n_tests:
+        raise SystemExit(
+            "packed runner and static collection disagree: "
+            f"runner={n_tests}, static={static_test_count}. Update the "
+            "zero-dependency runner before publishing its test count.")
 
     for cell in nb["cells"]:
         src = "".join(cell["source"])
@@ -150,7 +202,7 @@ def main() -> None:
             src, k = re.subn(
                 r"Self-contained copy of the repo \([^)]*\)",
                 f"Self-contained copy of the repo (v{version}, "
-                f"{len(files)} files, {n_tests} tests)",
+                f"{file_count} files, {n_tests} tests)",
                 src,
             )
             hits["header"] += k
@@ -163,7 +215,7 @@ def main() -> None:
 
     NOTEBOOK.write_text(json.dumps(nb, indent=1) + "\n")
     print(
-        f"packed v{version}: {len(files)} files, {n_tests} tests, "
+        f"packed v{version}: {file_count} files, {n_tests} tests, "
         f"payload {len(payload)} chars"
     )
 

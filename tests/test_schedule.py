@@ -1,6 +1,9 @@
 """Schedule must be genuinely spiky, span the configured range, respect
 rate_scale, and shard deterministically."""
+import math
+
 import numpy as np
+import pytest
 
 from traffic_replay.schedule import make_schedule, schedule_report, shard
 
@@ -30,6 +33,25 @@ def test_rate_scale_thins_volume_preserving_shape():
     assert 0.02 < n_thin / n_full < 0.10  # ~5% with Poisson noise
     # shape preserved: same underlying rate curve up to the scale factor
     assert np.allclose(thin["rates"] * 20, full["rates"], rtol=1e-9)
+    # It is actual thinning, not a fresh Poisson draw: every reduced-rate
+    # arrival is one of the exact full-run arrivals.
+    assert set(thin["timestamps"]).issubset(set(full["timestamps"]))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"duration_s": 0},
+    {"duration_s": 1.5},
+    {"qps_base": math.nan},
+    {"qps_min": 20, "qps_max": 10},
+    {"qps_base": 5, "qps_min": 10},
+    {"qps_burst": 501, "qps_max": 500},
+    {"mean_base_dwell_s": 0},
+    {"rate_scale": True},
+    {"seed": -1},
+])
+def test_invalid_schedule_parameters_fail_before_allocation(kwargs):
+    with pytest.raises(ValueError):
+        make_schedule(**kwargs)
 
 
 def test_shard_partitions_exactly():
@@ -63,3 +85,26 @@ def test_load_trace_replaces_synthetic(tmp_path_factory=None):
         f'{{"t": {t}}}' for t in [10.0, 11.0, 12.0, 40.0]))
     s2 = load_trace(d / "trace.jsonl", duration_cap_s=5.0)
     assert len(s2["timestamps"]) == 3        # the 40s arrival capped out
+
+
+@pytest.mark.parametrize("content", [
+    "nan\n", "inf\n", '{"missing": 1}\n', '{"t": "bad"}\n', "{bad}\n",
+])
+def test_invalid_trace_rows_have_context_and_never_reach_numpy(content,
+                                                                tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "bad.trace"
+    path.write_text(content)
+    with pytest.raises(ValueError, match=r"bad\.trace:1"):
+        load_trace(path)
+
+
+@pytest.mark.parametrize("cap", [-1, math.nan, math.inf, True])
+def test_invalid_trace_duration_cap_is_rejected(cap, tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "trace.txt"
+    path.write_text("1\n")
+    with pytest.raises(ValueError, match="duration_cap_s"):
+        load_trace(path, duration_cap_s=cap)

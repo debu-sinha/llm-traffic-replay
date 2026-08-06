@@ -13,6 +13,8 @@ is how the same schedule serves both a laptop smoke test and a full run.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -21,8 +23,31 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
                   qps_max: float = 500.0, mean_base_dwell_s: float = 20.0,
                   mean_burst_dwell_s: float = 6.0, rate_scale: float = 1.0,
                   seed: int = 23) -> dict:
+    if not isinstance(duration_s, int) or isinstance(duration_s, bool) \
+            or duration_s <= 0:
+        raise ValueError("duration_s must be a positive integer")
+    numeric = {
+        "qps_base": qps_base, "qps_burst": qps_burst,
+        "qps_min": qps_min, "qps_max": qps_max,
+        "mean_base_dwell_s": mean_base_dwell_s,
+        "mean_burst_dwell_s": mean_burst_dwell_s,
+        "rate_scale": rate_scale,
+    }
+    for name, value in numeric.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(float(value)) or value <= 0:
+            raise ValueError(f"{name} must be positive and finite")
+    if qps_min > qps_max:
+        raise ValueError("qps_min cannot exceed qps_max")
+    if not qps_min <= qps_base <= qps_max:
+        raise ValueError("qps_base must be between qps_min and qps_max")
+    if not qps_min <= qps_burst <= qps_max:
+        raise ValueError("qps_burst must be between qps_min and qps_max")
     if not (0 < rate_scale <= 1.0):
         raise ValueError("rate_scale must be in (0, 1]")
+    if not isinstance(seed, (int, np.integer)) or isinstance(seed, bool) \
+            or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
     rng = np.random.default_rng(seed)
     rates = np.empty(duration_s)
     t, state = 0, "base"
@@ -38,12 +63,19 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
                                qps_min, qps_max)
         t, state = end, ("burst" if state == "base" else "base")
 
-    counts = rng.poisson(rates * rate_scale)
-    if counts.sum() == 0:
+    # Generate the full schedule first, then deterministically thin it. Runs
+    # with the same seed at lower scales are exact subsets of the full run,
+    # which makes smoke/full comparisons preserve individual arrival times.
+    full_counts = rng.poisson(rates)
+    if full_counts.sum() == 0:
+        counts = np.zeros(duration_s, dtype=int)
         return {"rates": rates * rate_scale, "counts": counts,
                 "timestamps": np.array([])}
-    ts = np.concatenate([i + np.sort(rng.uniform(0, 1, c))
-                         for i, c in enumerate(counts) if c > 0])
+    full_ts = np.concatenate([i + np.sort(rng.uniform(0, 1, c))
+                              for i, c in enumerate(full_counts) if c > 0])
+    keep = rng.random(len(full_ts)) < rate_scale
+    ts = full_ts[keep]
+    counts = np.bincount(ts.astype(int), minlength=duration_s)
     return {"rates": rates * rate_scale, "counts": counts,
             "timestamps": np.sort(ts)}
 
@@ -60,15 +92,34 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
     import json as _json
     from pathlib import Path as _Path
 
+    if duration_cap_s is not None and (
+            isinstance(duration_cap_s, bool)
+            or not isinstance(duration_cap_s, (int, float))
+            or not math.isfinite(float(duration_cap_s))
+            or duration_cap_s < 0):
+        raise ValueError("duration_cap_s must be non-negative and finite")
     ts = []
-    for line in _Path(path).read_text().splitlines():
-        line = line.strip()
+    for line_number, raw_line in enumerate(
+            _Path(path).read_text().splitlines(), 1):
+        line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("{"):
-            ts.append(float(_json.loads(line)["t"]))
-        else:
-            ts.append(float(line))
+        try:
+            if line.startswith("{"):
+                value = _json.loads(line)
+                if not isinstance(value, dict) or "t" not in value:
+                    raise ValueError("JSON row must be an object with a t field")
+                timestamp = float(value["t"])
+            else:
+                timestamp = float(line)
+        except (KeyError, TypeError, ValueError, _json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid arrival timestamp at {path}:{line_number}: {exc}") \
+                from exc
+        if not math.isfinite(timestamp):
+            raise ValueError(
+                f"arrival timestamp at {path}:{line_number} must be finite")
+        ts.append(timestamp)
     if not ts:
         raise ValueError(f"no timestamps in {path}")
     arr = np.sort(np.asarray(ts, dtype=float))

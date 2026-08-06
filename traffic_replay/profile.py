@@ -4,7 +4,7 @@ Turns stated quantiles (P50/P95) into per-request draws of
 (input_tokens, output_tokens, cache_target_fraction) using closed-form fits:
 
   token counts        -> lognormal fitted to (P50, P95)
-  cache hit fraction  -> logit-normal fitted to (P50, P95), bounded in (0, 1)
+  cached prompt-token fraction -> logit-normal fitted to (P50, P95), bounded in (0, 1)
 
 Why closed form: two quantiles determine a two-parameter distribution
 exactly, the fit is reproducible with no optimizer, and the sampled

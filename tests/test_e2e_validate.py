@@ -113,7 +113,7 @@ def test_token_targeting_tight_when_cpt_matches(run_out):
 def test_report_carries_believability_block(run_out):
     report = (Path(run_out["out"]["out_dir"]) / "report.md").read_text()
     assert "Believability block" in report
-    assert "achieved cache fraction" in report
+    assert "achieved cached prompt-token fraction" in report
     assert "dispatch lag" in report
 
 

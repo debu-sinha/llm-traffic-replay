@@ -1,15 +1,17 @@
 """Summaries and the honesty block.
 
 Every latency table is printed WITH the context that decides whether it can
-be believed: achieved cache-hit distribution (endpoint-reported), achieved
+be believed: cached prompt-token fraction (endpoint-reported), achieved
 arrival rate vs scheduled, wire lateness, error rate, and token
-targeting error. A good p50 at the wrong cache rate is a fake result; this
+targeting error. A good p50 at the wrong cached-token fraction is a fake
+result; this
 module makes the pairing unavoidable.
 """
 from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,51 @@ import numpy as np
 from . import __version__
 
 PCTS = (50, 90, 95, 99)
+
+_SECRET_KEY = re.compile(
+    r"(?:^authorization$|^api[_-]?key$|secret|password|credential|cookie|"
+    r"(?:^|[_-])token$)",
+    re.IGNORECASE)
+_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_TOKEN_VALUE = re.compile(r"\b(?:dapi|sk-)[A-Za-z0-9._-]{8,}\b")
+_URL_CREDENTIALS = re.compile(r"(https?://)[^/@\s:]+:[^/@\s]+@",
+                              re.IGNORECASE)
+
+
+def _redact_secrets(value, key: str | None = None, *, aggressive=False):
+    """Return a JSON-safe copy with credential-bearing fields redacted.
+
+    Request ``extra_body`` is intentionally arbitrary JSON. Persisting it
+    verbatim made a typo such as ``api_key`` part of every summary, report and
+    manifest. Redact by both key and recognizable bearer-token value, while
+    retaining the surrounding configuration needed for provenance.
+    """
+    if key is not None:
+        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        sensitive = bool(_SECRET_KEY.search(str(key))) or normalized in {
+            "authorization", "apikey", "accesstoken", "authtoken",
+            "bearertoken", "refreshtoken", "password", "secret",
+            "credential", "cookie",
+        }
+        if aggressive and re.search(
+                r"(?:auth|key|token|secret|password|credential|cookie)",
+                normalized):
+            sensitive = True
+        if sensitive:
+            return "<redacted>"
+    if isinstance(value, dict):
+        return {
+            str(k): _redact_secrets(
+                v, str(k), aggressive=(aggressive or str(k) == "extra_body"))
+            for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_secrets(v, aggressive=aggressive) for v in value]
+    if isinstance(value, str):
+        return _URL_CREDENTIALS.sub(
+            r"\1<redacted>@",
+            _TOKEN_VALUE.sub("<redacted>",
+                             _BEARER_VALUE.sub("<redacted>", value)))
+    return value
 
 
 def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
@@ -126,21 +173,24 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
         "in_flight_p95": _tw(0.95),
         "in_flight_max": float(true_peak or peak),
         "in_flight_max_in_window": float(peak),
-        "measured_over": "successful requests only",
+        "measured_over": "content-bearing request rows with a recorded duration",
         "method": ("exact interval overlap. percentiles are time weighted "
                    "over the middle 60 percent of the LOAD interval, bounded "
                    "by send times so one straggler cannot stretch the "
                    "window. the maximum is a true peak over the whole run"),
     }
     if asked:
-        out["asked_for"] = asked
+        # --concurrency is a sizing input used to derive an open-loop arrival
+        # rate. It is not a closed-loop controller and therefore must never be
+        # labeled as concurrency the run promised to hold.
+        out["sizing_concurrency_requested"] = asked
         if med < asked * 0.8:
             out["warning"] = (
-                f"the run asked to hold {asked} requests in flight and held "
-                f"about {med:.0f}. the endpoint was not carrying the "
-                "concurrency on the label, so read the error rate and the "
-                "stability card before treating this as a result for that "
-                "load level.")
+                f"the open-loop rate was sized from an unloaded estimate of "
+                f"{asked} concurrent requests, while observed in-flight p50 "
+                f"was {med:.0f}. {asked} was a sizing input, not a held "
+                "concurrency target; describe this run by its achieved QPS "
+                f"and observed occupancy {med:.0f}.")
         elif med > asked * 1.25:
             # the arrival rate is derived from UNLOADED service time. under
             # load the service time rises and in-flight rises with it, so
@@ -148,11 +198,12 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
             # on only the other direction let a run labeled "30 concurrent"
             # that actually held 65 go out clean.
             out["warning"] = (
-                f"the run asked to hold {asked} requests in flight and held "
-                f"about {med:.0f}. the arrival rate was derived from service "
-                "time measured without load, and service time rises under "
-                "load, so the run carried more than the label says. treat "
-                f"the load level as {med:.0f}, not {asked}.")
+                f"the open-loop rate was sized from an unloaded estimate of "
+                f"{asked} concurrent requests, while observed in-flight p50 "
+                f"was {med:.0f}. service time rose under load, so occupancy "
+                "exceeded the sizing estimate. describe this run by its "
+                f"achieved QPS and observed occupancy {med:.0f}, not as "
+                f"holding {asked} concurrent requests.")
     return out
 
 
@@ -210,6 +261,14 @@ def _verdict(s: dict) -> tuple[str, str]:
 
     if a.get("invalid"):
         return "invalid", a["invalid"]
+    _run = s.get("run") or {}
+    if _run.get("aggregation_valid") is False:
+        issues = _run.get("compatibility_issues") or []
+        detail = "; ".join(str(x) for x in issues[:3])
+        return "invalid", (
+            "this aggregate combined inputs that were not proven compatible"
+            + (f": {detail}" if detail else "")
+            + ". read the source runs separately")
 
     # answers gate the banner on their own. an SLA block with no success_rate
     # key has no row that a collapse in readable answers can miss, so without
@@ -249,25 +308,22 @@ def _verdict(s: dict) -> tuple[str, str]:
     if err:
         doubts.append(f"{s.get('requests_failed') or 0} requests failed")
     if (s.get("concurrency") or {}).get("warning"):
-        doubts.append("the run did not hold the concurrency on its label")
+        doubts.append("observed concurrency diverged substantially from the "
+                      "unloaded estimate used to size the open-loop rate")
     if (s.get("client") or {}).get("warning"):
         doubts.append("the load did not reach the endpoint on schedule")
-    # the SLA rows score service time. if the caller waited materially
-    # longer, a PASS on those rows describes the endpoint and not the user.
-    for _base, _corr, _name in (("e2e_ms", "e2e_corrected_ms", "end to end"),
-                                ("ttft_ms", "ttft_corrected_ms", "TTFT")):
-        _u = (s.get(_base) or {}).get("p95")
-        _c = (s.get(_corr) or {}).get("p95")
-        if _u and _c and _c > _u * 1.10:
-            doubts.append(
-                f"callers waited {_c:.0f} ms for {_name} at p95 against "
-                f"{_u:.0f} ms of endpoint time, so the targets above were "
-                "scored on service time rather than on what a caller "
-                "experienced")
-            break
+    if sla.get("caller_latency_warning"):
+        doubts.append(sla["caller_latency_warning"])
     if (s.get("throughput") or {}).get("coverage_warning"):
         doubts.append("token usage was missing on many responses, so "
                       "throughput and cost cover a subset")
+    if (s.get("cost") or {}).get("coverage_warning"):
+        doubts.append("cost could not be computed for every successful "
+                      "response because required usage fields were missing")
+    if (s.get("cache_fidelity") or {}).get("warning"):
+        doubts.append((s.get("cache_fidelity") or {})["warning"])
+    if (s.get("latency_population") or {}).get("warning"):
+        doubts.append((s.get("latency_population") or {})["warning"])
     _npw = (s.get("network_path") or {})
     if _npw.get("warning"):
         doubts.append(
@@ -349,17 +405,35 @@ def _answered(r: dict) -> bool:
                 and not r.get("parse_errors"))
 
 
-def _answer_block(ok: list[dict], attempted: int) -> dict | None:
-    """Answer completion, separately from transport success."""
-    scored = [r for r in ok if "visible_content_seen" in r]
-    if not scored:
+def _answer_block(results: list[dict]) -> dict | None:
+    """Answer completion, separately from HTTP and content-stream success.
+
+    ``ok`` is a harness field meaning that at least one visible or reasoning
+    content delta arrived. It is not an HTTP-status counter. Keep the three
+    populations separate so a reasoning-only HTTP 200 cannot be presented as
+    a readable answer, and a content-bearing stream cannot be mislabeled as
+    "returned HTTP 200" when status was not retained by a legacy row.
+    """
+    ok = [r for r in results if r.get("ok")]
+    scored = [r for r in results if "visible_content_seen" in r]
+    legacy_failures = [r for r in results
+                       if not r.get("ok")
+                       and "visible_content_seen" not in r]
+    if not scored and not legacy_failures:
         return None          # rows written before this was recorded
-    n_ok = len(scored)
+    n_observed = len(scored)
     complete = sum(1 for r in scored if _answered(r))
+    judged = n_observed + len(legacy_failures)
+    statuses = [r.get("status") for r in results if r.get("status") is not None]
     out = {
-        "attempted": attempted,
+        "attempted": len(results),
+        # Backward-compatible field name. Its definition is now explicit and
+        # renderers never call it an HTTP counter.
         "transport_ok": len(ok),
-        "scored": n_ok,
+        "content_streams": len(ok),
+        "http_status_observed_for": len(statuses),
+        "http_200": sum(1 for status in statuses if status == 200),
+        "scored": n_observed,
         "answered": complete,
         "no_visible_content": sum(
             1 for r in scored if not r.get("visible_content_seen")),
@@ -373,7 +447,7 @@ def _answer_block(ok: list[dict], attempted: int) -> dict | None:
         # rows written before these fields existed are NOT counted, because
         # they are unmeasurable rather than unanswered, and counting them
         # would fail a merged 0.3.0 shard for having old-format rows.
-        "judged": n_ok + max(0, attempted - len(ok)),
+        "judged": judged,
         # a row whose budget was cut by the global cap rather than by its own
         # sampled target is a different animal: "length" there means the run
         # did NOT reach the output size the profile asked for, which shortens
@@ -383,11 +457,9 @@ def _answer_block(ok: list[dict], attempted: int) -> dict | None:
             if r.get("truncated") and r.get("max_tokens_requested")
             and r.get("intended_output_tokens")
             and r["max_tokens_requested"] < r["intended_output_tokens"]),
-        "answer_rate": (round(complete / (n_ok + max(0, attempted - len(ok))),
-                              6)
-                        if (n_ok + max(0, attempted - len(ok))) else None),
-        "answer_rate_of_transport_ok": (round(complete / n_ok, 6)
-                                        if n_ok else None),
+        "answer_rate": (round(complete / judged, 6) if judged else None),
+        "answer_rate_of_transport_ok": (round(complete / len(ok), 6)
+                                        if ok else None),
         "note": "answered means visible content arrived and the stream "
                 "finished cleanly. it does NOT mean the answer was complete "
                 "or correct: most generations stop at the requested output "
@@ -396,18 +468,21 @@ def _answer_block(ok: list[dict], attempted: int) -> dict | None:
                 "\"length\" is the expected way to hit a target output "
                 "length. producing no visible content is the failure.",
     }
-    if complete == 0 and n_ok:
+    if complete == 0 and judged:
         # name the counter that actually drove it. asserting "produced no
         # visible content" when the real cause was a stream that never
         # terminated puts a false statement next to a zero counter.
         cause = max((("returned no visible content", out["no_visible_content"]),
                      ("never terminated their stream", out["stream_incomplete"]),
-                     ("hit unrecoverable parse errors", out["parse_errors"])),
+                     ("hit unrecoverable parse errors", out["parse_errors"]),
+                     ("failed before a content stream was established",
+                      len(legacy_failures))),
                     key=lambda kv: kv[1])
         out["invalid"] = (
-            f"not one of the {n_ok} requests that returned HTTP 200 produced "
-            f"a readable answer. most of them {cause[0]} ({cause[1]} of "
-            f"{n_ok}). there is no latency-to-answer in this run and nothing "
+            f"not one of the {judged} requests with answer observability "
+            f"produced a readable answer. most of them {cause[0]} "
+            f"({cause[1]} of {judged}). there is no latency-to-answer in this "
+            "run and nothing "
             "here is a performance result.")
     return out
 
@@ -420,6 +495,39 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
               concurrency_target: int | None = None) -> dict:
     ok = [r for r in results if r.get("ok")]
     failed = [r for r in results if not r.get("ok")]
+    safe_run_meta = _redact_secrets(run_meta or {})
+
+    # Current rows say whether visible content arrived and the stream ended
+    # cleanly. When that observability exists, the primary latency tables are
+    # answer latencies, not percentiles over reasoning-only or malformed HTTP
+    # successes. Older rows are retained as an explicitly unclassified legacy
+    # population rather than silently mixed into user-facing numbers.
+    answer_observed = [r for r in ok if "visible_content_seen" in r]
+    answered = [r for r in answer_observed if _answered(r)]
+    latency_ok = answered if answer_observed else ok
+    unclassified_ok = len(ok) - len(answer_observed)
+    latency_population = {
+        "kind": ("readable_answers" if answer_observed
+                 else "legacy_content_streams_unverified"),
+        "n": len(latency_ok),
+        "content_streams": len(ok),
+        "answer_observed_for": len(answer_observed),
+        "excluded_unreadable": (len(answer_observed) - len(answered)
+                                if answer_observed else 0),
+        "unclassified_legacy_rows": unclassified_ok,
+        "note": (
+            "primary latency percentiles include only requests that produced "
+            "visible content and finished with no parse errors"
+            if answer_observed else
+            "these legacy rows do not record answer observability, so latency "
+            "percentiles describe content-bearing response streams and cannot "
+            "be claimed as latency to a readable answer"),
+    }
+    if answer_observed and unclassified_ok:
+        latency_population["warning"] = (
+            f"{unclassified_ok} successful legacy rows do not record whether "
+            "they produced a readable answer, so they are excluded from the "
+            "primary answer-latency population")
 
     # achieved cache, endpoint-reported only
     ach = [(r["cached_tokens"] / r["prompt_tokens"])
@@ -428,6 +536,18 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
            and r.get("prompt_tokens")]
     cache_sources = sorted({r.get("cached_tokens_source") for r in ok
                             if r.get("cached_tokens_source")})
+    intended_cache = [r.get("intended_cache_fraction") for r in results
+                      if r.get("intended_cache_fraction") is not None]
+    paired_cache_error = [
+        abs((r["cached_tokens"] / r["prompt_tokens"])
+            - r["intended_cache_fraction"])
+        for r in ok
+        if r.get("cached_tokens") is not None and r.get("prompt_tokens")
+        and r.get("intended_cache_fraction") is not None]
+    invalid_cache_rows = sum(
+        1 for r in ok
+        if r.get("cached_tokens") is not None and r.get("prompt_tokens")
+        and not 0 <= r["cached_tokens"] / r["prompt_tokens"] <= 1)
 
     # token targeting: endpoint-reported prompt tokens vs intended
     ratios = [r["prompt_tokens"] / r["intended_input_tokens"]
@@ -525,12 +645,12 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "requests_retried": retried,
         "error_rate": len(failed) / len(results) if results else None,
         "failures_by_error": _top_errors(failed),
-        "ttft_ms": _pct_table([r.get("ttft_ms") for r in ok]),
-        "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in ok]),
+        "ttft_ms": _pct_table([r.get("ttft_ms") for r in latency_ok]),
+        "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in latency_ok]),
         "connect_ms": _pct_table([r.get("connect_ms") for r in ok]),
-        "e2e_ms": _pct_table([r.get("e2e_ms") for r in ok]),
+        "e2e_ms": _pct_table([r.get("e2e_ms") for r in latency_ok]),
         "interchunk_max_ms": _pct_table(
-            [r.get("interchunk_max_ms") for r in ok]),
+            [r.get("interchunk_max_ms") for r in latency_ok]),
         "throughput": {
             "input_tokens_per_min": in_tok / dur_min if dur_min else None,
             "output_tokens_per_min": out_tok / dur_min if dur_min else None,
@@ -547,10 +667,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         },
         "achieved_cache_fraction": _pct_table(ach) | {
             "reported_for_n": len(ach),
-            "source_fields": cache_sources or ["NOT REPORTED BY ENDPOINT"],
+            "eligible_successes": len(ok),
+            "coverage": (len(ach) / len(ok)) if ok else None,
+            "source_fields": (cache_sources
+                              or (["SOURCE FIELD NOT RECORDED"] if ach else
+                                  ["NOT REPORTED BY ENDPOINT"])),
         },
-        "intended_cache_fraction": _pct_table(
-            [r.get("intended_cache_fraction") for r in results]),
+        "intended_cache_fraction": _pct_table(intended_cache),
+        "latency_population": latency_population,
         "token_targeting": {
             "reported_over_intended_p50":
                 float(np.percentile(ratios, 50)) if ratios else None,
@@ -585,12 +709,45 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                     "dispatcher.",
         },
         "schedule": schedule_meta or {},
-        "run": run_meta or {},
+        "run": safe_run_meta,
     }
+    if intended_cache:
+        tolerance = 0.10
+        err = _pct_table(paired_cache_error)
+        coverage = (len(ach) / len(ok)) if ok else None
+        warnings = []
+        if not paired_cache_error:
+            warnings.append(
+                "the workload specified a cached prompt-token fraction, but "
+                "the endpoint did not report enough cache usage to verify it")
+        elif invalid_cache_rows:
+            warnings.append(
+                f"{invalid_cache_rows} responses reported cached tokens outside "
+                "the valid zero-to-prompt-token range")
+        elif ((err.get("p50") or 0) > tolerance
+              or (err.get("p95") or 0) > tolerance):
+            warnings.append(
+                "the achieved cached prompt-token fraction did not reproduce "
+                f"the intended workload within ±{tolerance:.2f} "
+                f"(absolute error p50 {err['p50']:.3f}, p95 {err['p95']:.3f})")
+        if coverage is not None and coverage < 0.99:
+            warnings.append(
+                f"cache usage was reported for only {len(ach)} of {len(ok)} "
+                "content-bearing successful responses")
+        summary["cache_fidelity"] = {
+            "status": "verified" if not warnings else "unverified",
+            "tolerance_abs": tolerance,
+            "paired_n": len(paired_cache_error),
+            "coverage": coverage,
+            "absolute_error": err,
+            "warning": "; ".join(warnings) if warnings else None,
+            "note": "cache fraction is cached prompt tokens divided by all "
+                    "prompt tokens for each request; it is not request hit rate",
+        }
     # how much of the latency below is the width of the network. one round
     # trip is in every figure: the request goes out, the first token comes
     # back. a run generated from the wrong region folds that in silently.
-    _np = (run_meta or {}).get("network_path")
+    _np = safe_run_meta.get("network_path")
     if _np and _np.get("rtt_ms") is not None:
         _t = (summary.get("ttft_ms") or {}).get("p50")
         _np = dict(_np)
@@ -613,7 +770,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # answer still fits the budget. every other serving benchmark reports
     # it, under this name or as time-between-tokens.
     tpot = []
-    for r in ok:
+    for r in latency_ok:
         n_out = r.get("completion_tokens")
         t, e = r.get("ttft_ms"), r.get("e2e_ms")
         if n_out and n_out > 1 and t is not None and e is not None and e >= t:
@@ -627,30 +784,11 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "whether a longer generation still fits the budget. computed "
             f"over the {len(tpot)} requests that produced more than one token")
 
-    answers = _answer_block(ok, len(results))
+    answers = _answer_block(results)
     if answers:
         summary["answers"] = answers
-    # latency as the caller experienced it, including time the request spent
-    # waiting on the client side. reported alongside the service-time view
-    # rather than replacing it, because they answer different questions:
-    # service time is the endpoint's, corrected is the user's.
-    for base_f, corr_f in (("ttft_ms", "ttft_corrected_ms"),
-                           ("e2e_ms", "e2e_corrected_ms")):
-        vals = [(r[base_f] + r["queue_wait_ms"])
-                for r in ok
-                if r.get(base_f) is not None
-                and r.get("queue_wait_ms") is not None]
-        if vals:
-            summary[corr_f] = _pct_table(vals)
-    if "e2e_corrected_ms" in summary:
-        summary["latency_correction_note"] = (
-            "corrected figures measure from the moment the schedule wanted "
-            "the request, so they include time it waited on the client. an "
-            "SLA a user feels is the corrected one. a run whose corrected "
-            "and uncorrected numbers differ was not driving the load it "
-            "claimed, and the client block above says so.")
     for fld in ("ttfr_ms", "ttfv_ms"):
-        vals = [r.get(fld) for r in ok]
+        vals = [r.get(fld) for r in latency_ok]
         if any(v is not None for v in vals):
             summary[fld] = _pct_table(vals)
             # a reasoning model that runs out of max_tokens mid-thought
@@ -661,6 +799,26 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             # it is worse here because nothing failed.
             summary[fld]["missing"] = sum(1 for v in vals if v is None)
             summary[fld]["of"] = len(vals)
+    # Latency as the caller experienced it includes time the scheduled
+    # request waited in the load generator. SLA evaluation below prefers these
+    # tables; the service-time tables remain available for endpoint diagnosis.
+    # TTFV must be corrected too when first_visible is the configured TTFT.
+    for base_f, corr_f in (("ttft_ms", "ttft_corrected_ms"),
+                           ("ttfv_ms", "ttfv_corrected_ms"),
+                           ("e2e_ms", "e2e_corrected_ms")):
+        vals = [(r[base_f] + r["queue_wait_ms"])
+                for r in latency_ok
+                if r.get(base_f) is not None
+                and r.get("queue_wait_ms") is not None]
+        if vals:
+            summary[corr_f] = _pct_table(vals)
+    if any(k in summary for k in ("ttft_corrected_ms", "ttfv_corrected_ms",
+                                  "e2e_corrected_ms")):
+        summary["latency_correction_note"] = (
+            "caller-experienced figures measure from the moment the schedule "
+            "wanted the request, so they include time it waited in the load "
+            "generator. SLA latency targets and hard caps are scored on these "
+            "figures whenever scheduling evidence is available.")
     reason_vals = [r.get("reasoning_tokens") for r in ok]
     if any(v is not None for v in reason_vals):
         total = sum(v for v in reason_vals if v)
@@ -678,14 +836,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         chunk_vals = [r.get("reasoning_chunks") for r in ok]
         if any(chunk_vals):
             ctotal = sum(v for v in chunk_vals if v)
-            summary["reasoning_tokens"] = _pct_table(chunk_vals)
-            summary["reasoning_tokens_total"] = ctotal
-            summary["reasoning_tokens_source"] = \
-                "stream-counted reasoning deltas (estimate)"
+            summary["reasoning_stream_deltas"] = _pct_table(chunk_vals)
+            summary["reasoning_stream_deltas_total"] = ctotal
+            summary["reasoning_stream_deltas_source"] = \
+                "counted reasoning_content SSE deltas (not token counts)"
             if dur_min:
-                summary["throughput"]["reasoning_tokens_per_min"] = \
+                summary["throughput"]["reasoning_stream_deltas_per_min"] = \
                     ctotal / dur_min
-    n_ok = len(ok)
+    n_ok = len(latency_ok)
     # a quantile needs enough observations ABOVE it to be an estimate rather
     # than an anecdote. at n=100 there is a 37 percent chance of drawing no
     # sample at all beyond the true p99, so the old "100 is fine for p99"
@@ -792,11 +950,12 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         }
 
     conc = _concurrency_block(ok, concurrency_target
-                              or (run_meta or {}).get("concurrency_target"))
+                              or safe_run_meta.get("sizing_concurrency_requested")
+                              or safe_run_meta.get("concurrency_target"))
     if conc:
         summary["concurrency"] = conc
 
-    summary["drift"] = _drift_block(ok, failed)
+    summary["drift"] = _drift_block(latency_ok, failed)
 
     # every report states which harness produced it and what the latency
     # numbers include. 0.3.0 moved the TCP/TLS handshake out of the timed
@@ -811,9 +970,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
 
     # prompts mode cycles the supplied prompts (runner: prompt_msgs[i % m]).
     # once the set has been through once, every later request is a verbatim
-    # repeat, which the endpoint prompt cache serves. the achieved cache
+    # repeat, which makes them eligible for endpoint prompt-cache reuse. the
     # fraction then describes the replay, not the caller's production mix.
-    rm = run_meta or {}
+    rm = safe_run_meta
     pc = rm.get("prompts_count")
     if rm.get("input_mode") == "prompts" and pc:
         repeats = (n_ok / pc) if pc else 0.0
@@ -827,8 +986,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 f"{pc} distinct prompts covered {n_ok} requests, so "
                 f"{max(0, n_ok - pc)} of them "
                 f"({max(0, n_ok - pc) / n_ok * 100:.0f} percent) repeat a "
-                f"prompt already sent and are served from the endpoint prompt "
-                f"cache. treat the achieved cache fraction and TTFT as replay "
+                f"prompt already sent and are eligible for endpoint prompt "
+                f"cache reuse. treat the reported cached prompt-token fraction "
+                f"and TTFT as replay "
                 f"behavior, not your production prompt mix. supply at least "
                 f"as many distinct prompts as requests, or read only the "
                 f"first {pc} requests, to see cold behavior."
@@ -1069,17 +1229,30 @@ def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
     mode = pricing.get("mode", "per_token")
     usd = pricing.get("usd_per_dbu")
     tok_total = in_tok + out_tok
+    usage_rows = [r for r in ok
+                  if r.get("prompt_tokens") is not None
+                  and r.get("completion_tokens") is not None]
+    usage_coverage = ((len(usage_rows) / len(ok)) if ok
+                      else (1.0 if tok_total else None))
 
     if mode == "provisioned":
         dph = pricing.get("dbu_per_hour")
         if dph is None:
             return {"mode": mode, "error": "provisioned needs dbu_per_hour"}
         dur_hr = (dur / 3600.0) if dur else None
-        tph = (tok_total / dur_hr) if dur_hr else None
+        tph = (tok_total / dur_hr) if dur_hr and usage_coverage == 1.0 else None
         eff = (dph / (tph / 1e6)) if tph else None
         block = {"mode": "provisioned", "dbu_per_hour": dph,
                  "effective_dbu_per_1m_tokens": eff,
                  "tokens_measured": tok_total,
+                 "usage_coverage": usage_coverage,
+                 "usage_rows": len(usage_rows),
+                 "successful_rows": len(ok),
+                 "coverage_warning": (
+                     None if usage_coverage in (None, 1.0) else
+                     f"token usage was reported for {len(usage_rows)} of "
+                     f"{len(ok)} successful responses, so effective cost per "
+                     "token is unavailable"),
                  "note": "provisioned throughput bills by capacity (DBU/hour), "
                          "not per token. effective cost per 1M tokens is the "
                          "hourly rate over tokens served per hour at the "
@@ -1100,36 +1273,65 @@ def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
                 "error": "per_token needs input_dbu_per_m and output_dbu_per_m"}
     cache = pricing.get("cache_read_dbu_per_m")
     cache = cache if cache is not None else inp
+    # Missing cached_tokens is harmless only when cached and uncached input
+    # have the same price. With a cache discount it is a required billing
+    # field: treating missing as zero silently prices an unknown row at the
+    # expensive rate and invents a total.
+    priced_rows = [
+        r for r in usage_rows
+        if r.get("cached_tokens") is not None or cache == inp]
     per = []
-    for r in ok:
-        pt = r.get("prompt_tokens") or 0
+    measured_cached = 0
+    for r in priced_rows:
+        pt = r["prompt_tokens"]
         ct = r.get("cached_tokens") or 0
-        comp = r.get("completion_tokens") or 0
+        comp = r["completion_tokens"]
         uncached = max(pt - ct, 0)
         per.append(uncached / 1e6 * inp + ct / 1e6 * cache + comp / 1e6 * out)
-    total = sum(per)
+        measured_cached += ct
+    measured_total = sum(per)
     n = len(per)
+    complete = n == len(ok)
+    coverage = (n / len(ok)) if ok else None
+    total = measured_total if complete else None
     block = {
         "mode": "per_token",
         "dbu_per_request": _pct_table(per),
+        "priced_rows": n,
+        "successful_rows": len(ok),
+        "coverage": coverage,
+        "complete": complete,
+        "dbu_total_measured_subset": measured_total,
         "dbu_total": total,
-        "dbu_per_1k_requests": (total / n * 1000) if n else None,
-        "dbu_per_min": (total / (dur / 60.0)) if dur else None,
-        "cache_dbu_saved": cached_tok / 1e6 * max(inp - cache, 0.0),
+        "dbu_per_1k_requests": ((total / n * 1000)
+                                 if complete and n else None),
+        "dbu_per_min": ((total / (dur / 60.0))
+                         if complete and dur else None),
+        "cache_dbu_saved": (measured_cached / 1e6
+                            * max(inp - cache, 0.0)) if complete else None,
         "rates_dbu_per_m": {"input": inp, "output": out, "cache_read": cache},
+        "coverage_warning": (
+            None if complete or not ok else
+            f"cost-required usage was present for {n} of {len(ok)} successful "
+            "responses. aggregate cost, cost per 1,000 requests, cost per "
+            "minute and cache savings are unavailable; the measured subset "
+            "is retained only for diagnosis"),
         "note": "cost from endpoint-reported tokens times user-supplied DBU "
                 "rates (Databricks pricing page). cached input is billed at "
                 "the cache-read rate.",
     }
     if usd is not None:
         block["usd_per_dbu"] = usd
-        block["usd_total"] = total * usd
+        block["usd_total"] = total * usd if total is not None else None
+        block["usd_total_measured_subset"] = measured_total * usd
         block["usd_per_1k_requests"] = (block["dbu_per_1k_requests"] * usd
                                         if block["dbu_per_1k_requests"] is not None
                                         else None)
         block["usd_per_min"] = (block["dbu_per_min"] * usd
                                 if block["dbu_per_min"] is not None else None)
-        block["cache_usd_saved"] = block["cache_dbu_saved"] * usd
+        block["cache_usd_saved"] = (
+            block["cache_dbu_saved"] * usd
+            if block["cache_dbu_saved"] is not None else None)
     return block
 
 
@@ -1149,7 +1351,8 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
     illustrative = bool(acceptance.get("note")
                         and "illustrative" in str(acceptance["note"]).lower())
     out: dict = {"targets_source": stated or "the run configuration",
-                 "ttft_definition": ttft_definition}
+                 "ttft_definition": ttft_definition,
+                 "acceptance_config": _redact_secrets(acceptance)}
     if illustrative:
         out["targets_warning"] = (
             f"these targets came from {out['targets_source']} and are "
@@ -1157,7 +1360,7 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
             "example numbers rather than yours. pass your own with "
             "--ttft-p95 and --ttfg-p95, or put them in your profile.")
 
-    def score(name, table_key, targets):
+    def score(name, table_key, targets, service_key):
         rows = []
         for q, target in (targets or {}).items():
             actual = (summary.get(table_key) or {}).get(q)
@@ -1165,21 +1368,55 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
                 "quantile": q, "target_ms": target,
                 "actual_ms": round(actual, 1) if actual is not None else None,
                 "met": (actual <= target) if actual is not None else None,
+                "scored_metric": table_key,
+                "service_metric": service_key,
             })
         out[name] = rows
 
-    ttft_key = "ttft_ms" if ttft_definition == "first_content" else "ttfv_ms"
-    score("ttft_vs_target", ttft_key, acceptance.get("ttft_ms"))
-    _miss = (summary.get(ttft_key) or {}).get("missing") or 0
-    _of = (summary.get(ttft_key) or {}).get("of") or 0
+    raw_ttft_key = ("ttft_ms" if ttft_definition == "first_content"
+                    else "ttfv_ms")
+    corrected_ttft_key = ("ttft_corrected_ms"
+                          if ttft_definition == "first_content"
+                          else "ttfv_corrected_ms")
+    ttft_key = (corrected_ttft_key if (summary.get(corrected_ttft_key) or {}).get("n")
+                else raw_ttft_key)
+    ttfg_key = ("e2e_corrected_ms"
+                if (summary.get("e2e_corrected_ms") or {}).get("n")
+                else "e2e_ms")
+    out["ttft_metric"] = ttft_key
+    out["ttfg_metric"] = ttfg_key
+    out["latency_basis"] = (
+        "caller_experienced" if (ttft_key.endswith("_corrected_ms")
+                                  or ttfg_key.endswith("_corrected_ms"))
+        else "service_time_no_schedule_wait_available")
+    score("ttft_vs_target", ttft_key, acceptance.get("ttft_ms"), raw_ttft_key)
+    _miss = (summary.get(raw_ttft_key) or {}).get("missing") or 0
+    _of = (summary.get(raw_ttft_key) or {}).get("of") or 0
     if _of and _miss / _of > 0.05:
         out["coverage_warning"] = (
             f"{_miss} of {_of} successful requests never produced the token "
-            f"this scores ({ttft_key}), so the marks below describe the "
+            f"this scores ({raw_ttft_key}), so the marks below describe the "
             f"{_of - _miss} that did. those are the fastest ones. raise the "
             "output token budget until responses stop truncating, then "
             "re-run.")
-    score("ttfg_vs_target", "e2e_ms", acceptance.get("ttfg_ms"))
+    score("ttfg_vs_target", ttfg_key, acceptance.get("ttfg_ms"), "e2e_ms")
+
+    # A partial corrected population is not safe to green-light: it can omit
+    # precisely the requests that queued. Score what is available, but make
+    # the missing caller timing an explicit validity warning.
+    caller_gaps = []
+    for raw_key, corrected_key, label in (
+            (raw_ttft_key, corrected_ttft_key, "TTFT"),
+            ("e2e_ms", "e2e_corrected_ms", "end-to-end")):
+        raw_n = (summary.get(raw_key) or {}).get("n") or 0
+        corrected_n = (summary.get(corrected_key) or {}).get("n") or 0
+        if raw_n and corrected_n < raw_n:
+            caller_gaps.append(f"{label} caller timing exists for "
+                               f"{corrected_n} of {raw_n} measured answers")
+    if caller_gaps:
+        out["caller_latency_warning"] = (
+            "; ".join(caller_gaps)
+            + ". a caller-experienced SLA cannot be proven from that coverage")
 
     hard = acceptance.get("hard_timeouts") or {}
     ttft_cap = (hard.get("ttft_s") or 0) * 1000.0
@@ -1188,9 +1425,21 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
     timeouts = inter_breaches = 0
     failing = set()
     for idx, r in enumerate(ok):
+        wait = r.get("queue_wait_ms") or 0.0
+        first = r.get(raw_ttft_key)
+        end = r.get("e2e_ms")
+        first_for_caller = first + wait if first is not None else None
+        end_for_caller = end + wait if end is not None else None
+        missing_visible_breach = bool(
+            ttft_cap and ttft_definition == "first_visible"
+            and "visible_content_seen" in r
+            and not r.get("visible_content_seen"))
         over_time = bool(
-            (ttft_cap and (r.get("ttft_ms") or 0) > ttft_cap)
-            or (ttfg_cap and (r.get("e2e_ms") or 0) > ttfg_cap))
+            missing_visible_breach
+            or (ttft_cap and first_for_caller is not None
+                and first_for_caller > ttft_cap)
+            or (ttfg_cap and end_for_caller is not None
+                and end_for_caller > ttfg_cap))
         over_inter = bool(inter_cap) and r.get("interchunk_max_ms") is not None \
             and r["interchunk_max_ms"] > inter_cap
         if over_time:
@@ -1205,6 +1454,16 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
         if "visible_content_seen" in r and not _answered(r):
             failing.add(idx)
     out["hard_timeout_breaches"] = timeouts
+    out["hard_timeout_basis"] = {
+        "ttft_metric": raw_ttft_key,
+        "ttft_cap_ms": ttft_cap or None,
+        "ttfg_cap_ms": ttfg_cap or None,
+        "interchunk_cap_ms": inter_cap,
+        "includes_client_queue_wait": any(
+            r.get("queue_wait_ms") is not None for r in ok),
+        "missing_first_visible_counts_as_breach": (
+            ttft_definition == "first_visible"),
+    }
     if inter_cap is not None:
         out["interchunk_breaches"] = inter_breaches
 
@@ -1284,6 +1543,15 @@ def render_markdown(summary: dict, title: str) -> str:
     _cw = (s.get("throughput") or {}).get("coverage_warning")
     if _cw:
         cautions += [f"CAUTION (token usage): {_cw}", ""]
+    _costw = (s.get("cost") or {}).get("coverage_warning")
+    if _costw:
+        cautions += [f"CAUTION (cost coverage): {_costw}", ""]
+    _cachew = (s.get("cache_fidelity") or {}).get("warning")
+    if _cachew:
+        cautions += [f"CAUTION (cache fidelity): {_cachew}", ""]
+    _popw = (s.get("latency_population") or {}).get("warning")
+    if _popw:
+        cautions += [f"CAUTION (latency population): {_popw}", ""]
     _sw = (s.get("sample") or {}).get("warning")
     if _sw:
         cautions += [f"CAUTION (sample size): {_sw}", ""]
@@ -1300,12 +1568,15 @@ def render_markdown(summary: dict, title: str) -> str:
     lines = [
         f"# {title}",
         "",
-        f"requests: {s['requests_total']} total, {s['requests_ok']} ok, "
-        f"{s['requests_failed']} failed "
+        f"requests: {s['requests_total']} total, {s['requests_ok']} produced "
+        f"a content delta, {s['requests_failed']} did not "
         f"(error rate {100 * (s['error_rate'] or 0):.2f}%)",
         "",
         *cautions,
-        "| metric (ms) | p50 | p90 | p95 | p99 | n |",
+        f"latency population: "
+        f"{(s.get('latency_population') or {}).get('note', 'not recorded')}",
+        "",
+        "| endpoint service metric (ms, from send) | p50 | p90 | p95 | p99 | n |",
         "|---|---|---|---|---|---|",
         row("TTFT", s["ttft_ms"]),
         row("TTFB", s["ttfb_ms"]),
@@ -1313,7 +1584,8 @@ def render_markdown(summary: dict, title: str) -> str:
         row("interchunk max", s["interchunk_max_ms"]),
         "",
         "## Believability block (read before quoting any number above)",
-        f"- achieved cache fraction, endpoint-reported: {ach_line}",
+        f"- achieved cached prompt-token fraction, endpoint-reported: "
+        f"{ach_line}",
         ("- input: real prompts replayed verbatim, sizes and any cache "
          "reuse are the prompts' own"
          if mode == "prompts" else
@@ -1375,11 +1647,13 @@ def render_markdown(summary: dict, title: str) -> str:
             f"of a pooled production client, it is an upper bound on it")
     cc = s.get("concurrency") or {}
     if cc.get("in_flight_p50") is not None:
-        askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
+        sized = (f", open-loop sizing input "
+                 f"{cc['sizing_concurrency_requested']}"
+                 if cc.get("sizing_concurrency_requested") else "")
         lines.append(
             f"- concurrency actually in flight: p50 {cc['in_flight_p50']:.0f}, "
             f"p95 {cc['in_flight_p95']:.0f}, peak "
-            f"{cc['in_flight_max']:.0f}{askd} "
+            f"{cc['in_flight_max']:.0f}{sized} "
             f"({cc['measured_over']})")
     tp = s.get("tpot_ms") or {}
     if tp.get("n"):
@@ -1393,6 +1667,7 @@ def render_markdown(summary: dict, title: str) -> str:
 
     if s.get("e2e_corrected_ms"):
         c1 = s.get("ttft_corrected_ms") or {}
+        cv = s.get("ttfv_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]
         lines += ["", "### latency as the caller experienced it", "",
                   "Includes time the request waited on the client, so these "
@@ -1402,6 +1677,9 @@ def render_markdown(summary: dict, title: str) -> str:
         if c1.get("p50") is not None:
             lines.append(f"| TTFT corrected | {c1['p50']:.0f} | "
                          f"{c1['p95']:.0f} | {c1['p99']:.0f} |")
+        if cv.get("p50") is not None:
+            lines.append(f"| TTFV corrected | {cv['p50']:.0f} | "
+                         f"{cv['p95']:.0f} | {cv['p99']:.0f} |")
         lines.append(f"| end-to-end corrected | {c2['p50']:.0f} | "
                      f"{c2['p95']:.0f} | {c2['p99']:.0f} |")
         lines += ["", s["latency_correction_note"]]
@@ -1410,7 +1688,12 @@ def render_markdown(summary: dict, title: str) -> str:
     if lb:
         lines.append(f"- latency basis: {lb}")
 
-    rt = s.get("reasoning_tokens_total")
+    _reason_source = str(s.get("reasoning_tokens_source") or "")
+    _legacy_reasoning_deltas = (
+        s.get("reasoning_tokens_total")
+        if "stream-counted" in _reason_source.lower() else None)
+    rt = (None if _legacy_reasoning_deltas is not None
+          else s.get("reasoning_tokens_total"))
     if rt is not None:
         rtab = s.get("reasoning_tokens") or {}
         rpm = (s.get("throughput") or {}).get("reasoning_tokens_per_min")
@@ -1419,6 +1702,22 @@ def render_markdown(summary: dict, title: str) -> str:
             f"- reasoning tokens: {rt:,} total{permin}, p50 "
             f"{rtab.get('p50', 0):.0f} per request "
             f"(field: {s.get('reasoning_tokens_source')})")
+    rd = (s.get("reasoning_stream_deltas_total")
+          if s.get("reasoning_stream_deltas_total") is not None
+          else _legacy_reasoning_deltas)
+    if rd is not None:
+        rtab = s.get("reasoning_stream_deltas") or {}
+        rpm = ((s.get("throughput") or {}).get(
+            "reasoning_stream_deltas_per_min")
+            or ((s.get("throughput") or {}).get("reasoning_tokens_per_min")
+                if _legacy_reasoning_deltas is not None else None))
+        permin = f", {rpm:,.0f} deltas/min" if rpm else ""
+        lines.append(
+            f"- reasoning stream deltas: {rd:,} total{permin}, p50 "
+            f"{rtab.get('p50', 0):.0f} deltas per request "
+            f"({s.get('reasoning_stream_deltas_source') or _reason_source}). "
+            "these are SSE "
+            "chunks, not tokens")
 
     tp = s.get("throughput") or {}
     if tp.get("input_tokens_per_min"):
@@ -1428,6 +1727,9 @@ def render_markdown(summary: dict, title: str) -> str:
     cost = s.get("cost")
     if cost and cost.get("error"):
         lines += ["", f"cost: config error, {cost['error']}"]
+    elif cost and cost["mode"] == "per_token" and cost.get("coverage_warning"):
+        lines += ["", "cost (per-token): unavailable for the full run. "
+                  + cost["coverage_warning"]]
     elif cost and cost["mode"] == "per_token":
         dr = cost.get("dbu_per_request") or {}
         if dr.get("p50") is None:
@@ -1468,14 +1770,20 @@ def render_markdown(summary: dict, title: str) -> str:
 
     a = s.get("answers")
     if a:
-        lines += ["", "## answers",
+        answer_lines = ["", "## answers",
                   "", f"- attempted: {a['attempted']}",
-                  f"- returned HTTP 200: {a['transport_ok']}",
-                  f"- started a readable answer: {a['answered']} "
-                  f"({a['answer_rate']:.1%} of the {a.get('judged')} judged)"
-                  if a.get("answer_rate") is not None else
-                  f"- produced a readable answer: {a['answered']}",
-                  f"- returned 200 with no visible content: "
+                  f"- produced at least one content delta: "
+                  f"{a.get('content_streams', a['transport_ok'])}"]
+        if a.get("http_status_observed_for"):
+            answer_lines.append(
+                f"- returned HTTP 200: {a['http_200']} (status recorded for "
+                f"{a['http_status_observed_for']} requests)")
+        answer_lines += [f"- produced a readable answer: {a['answered']} "
+                         f"({a['answer_rate']:.1%} of the "
+                         f"{a.get('judged')} judged)"
+                         if a.get("answer_rate") is not None else
+                         f"- produced a readable answer: {a['answered']}",
+                  f"- judged requests with no visible content: "
                   f"{a['no_visible_content']}",
                   f"- stream never terminated: {a['stream_incomplete']}",
                   f"- unrecoverable parse errors: {a['parse_errors']}",
@@ -1484,17 +1792,23 @@ def render_markdown(summary: dict, title: str) -> str:
                   f"- cut short by the global token cap: "
                   f"{a['truncated_by_global_cap']}",
                   "", a["note"]]
+        lines += answer_lines
         if a.get("invalid"):
             lines += ["", f"INVALID: {a['invalid']}"]
 
     sla = s.get("sla")
     if sla:
         _tgt_src = sla.get("targets_source") or "the run configuration"
-        lines += ["", f"## SLA scorecard (targets from {_tgt_src})"]
+        _basis = (sla.get("latency_basis") or "unknown").replace("_", " ")
+        lines += ["", f"## SLA scorecard (targets from {_tgt_src}; "
+                  f"latency basis: {_basis})"]
         if sla.get("targets_warning"):
             lines += ["", f"CAUTION (targets): {sla['targets_warning']}"]
         if sla.get("coverage_warning"):
             lines += ["", f"CAUTION (coverage): {sla['coverage_warning']}"]
+        if sla.get("caller_latency_warning"):
+            lines += ["", f"CAUTION (caller timing): "
+                      f"{sla['caller_latency_warning']}"]
         lines += ["", "| metric | quantile | target ms | actual ms | met |",
                   "|---|---|---|---|---|"]
         for name, key in (("TTFT", "ttft_vs_target"),
@@ -1554,7 +1868,7 @@ def render_markdown(summary: dict, title: str) -> str:
         if drift.get("windows"):
             lines += ["", f"per-{drift.get('window_seconds', 60)}s windows, p95 in ms:",
                       "",
-                      "| window | n (ok) | errors | TTFT p95 | E2E p95 |",
+                      "| window | content-bearing streams | errors | TTFT p95 | E2E p95 |",
                       "|---|---|---|---|---|"]
         for w in (drift.get("windows") or []):
             tt = f"{w['ttft_p95']:.0f}" if w['ttft_p95'] is not None else "-"
@@ -1596,14 +1910,15 @@ def _manifest(summary: dict, out: Path) -> dict:
     no judgment, no interpretation, just the state that would otherwise be
     reconstructed from memory months later.
 
-    Nothing here can leak a credential. The host is recorded because a
-    result is meaningless without knowing where it ran, and callers who
-    treat the host as sensitive should scrub the manifest, which is exactly
-    why it sits in its own file.
+    The endpoint identity is retained because the result is meaningless
+    without it. Arbitrary request parameters are recursively redacted before
+    this object is returned; provenance must not turn ``extra_body`` into a
+    credential side channel.
     """
     import hashlib
     import platform
     import subprocess
+    from datetime import datetime, timezone
 
     def _git(*a):
         try:
@@ -1613,22 +1928,50 @@ def _manifest(summary: dict, out: Path) -> dict:
         except Exception:
             return None
 
-    run = summary.get("run") or {}
+    run = _redact_secrets(summary.get("run") or {})
     prof_path = run.get("profile_path") or run.get("prompts_file")
     prof_sha = None
     if prof_path and Path(prof_path).exists():
-        prof_sha = hashlib.sha256(
-            Path(prof_path).read_bytes()).hexdigest()[:16]
+        prof_sha = hashlib.sha256(Path(prof_path).read_bytes()).hexdigest()
+
+    # Preserve a canonical, redacted identity snapshot in addition to its
+    # digest. A digest alone can prove equality but cannot explain a mismatch.
+    config_identity = _redact_secrets({
+        "harness_version": summary.get("harness_version"),
+        "latency_basis": summary.get("latency_basis"),
+        "run": run,
+        "schedule": summary.get("schedule") or {},
+        "sla_definition": {
+            "ttft_definition": (summary.get("sla") or {}).get(
+                "ttft_definition"),
+            "targets_source": (summary.get("sla") or {}).get("targets_source"),
+            "acceptance_config": (summary.get("sla") or {}).get(
+                "acceptance_config"),
+        },
+        "pricing": {
+            key: (summary.get("cost") or {}).get(key)
+            for key in ("mode", "rates_dbu_per_m", "dbu_per_hour",
+                        "usd_per_dbu")
+            if (summary.get("cost") or {}).get(key) is not None
+        },
+    })
+    config_raw = json.dumps(config_identity, sort_keys=True,
+                            separators=(",", ":")).encode()
+    config_sha = hashlib.sha256(config_raw).hexdigest()
 
     dirty = _git("status", "--porcelain")
-    return {
+    manifest = {
+        "manifest_schema_version": 2,
+        "artifact_created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": run.get("run_id") or out.name,
         "harness_version": summary.get("harness_version"),
         "git_commit": _git("rev-parse", "HEAD"),
         "git_dirty": bool(dirty) if dirty is not None else None,
         "latency_basis": summary.get("latency_basis"),
         "profile": run.get("profile"),
         "profile_path": prof_path,
-        "profile_sha256_16": prof_sha,
+        "profile_sha256": prof_sha,
+        "profile_sha256_16": prof_sha[:16] if prof_sha else None,
         "profile_provenance": run.get("profile_provenance"),
         "input_mode": run.get("input_mode"),
         "seed": run.get("seed"),
@@ -1638,29 +1981,96 @@ def _manifest(summary: dict, out: Path) -> dict:
         "endpoint_metadata": run.get("endpoint_metadata"),
         "network_path": run.get("network_path"),
         "request_params": run.get("request_params"),
+        "load_mode": run.get("load_mode"),
+        "sizing_concurrency_requested": run.get(
+            "sizing_concurrency_requested", run.get("concurrency_target")),
+        "derived_qps": run.get("derived_qps"),
         "concurrency_target": run.get("concurrency_target"),
+        "start_at_unix": run.get("start_at_unix"),
+        "global_index_start": run.get("global_index_start"),
+        "global_index_end": run.get("global_index_end"),
+        "global_index_range": run.get("global_index_range"),
         "shard": run.get("shard"),
         "schedule": summary.get("schedule"),
+        "config_sha256": config_sha,
+        "config_identity": config_identity,
+        "aggregation": run.get("aggregation"),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "numpy": getattr(np, "__version__", None),
         "note": ("written by the harness, not by hand. a number quoted "
                  "without this cannot be reproduced or audited."),
     }
+    return _redact_secrets(manifest)
 
 
 def write_outputs(results: list[dict], summary: dict, out_dir: str | Path,
                   title: str) -> Path:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "manifest.json").write_text(
-        json.dumps(_manifest(summary, out), indent=2) + "\n")
-    with (out / "requests.jsonl").open("w") as f:
-        for r in results:
-            f.write(json.dumps(r, separators=(",", ":")) + "\n")
-    (out / "summary.json").write_text(json.dumps(summary, indent=2))
-    (out / "report.md").write_text(render_markdown(summary, title))
-    (out / "report.html").write_text(render_html(summary, title))
+    """Write a run without overwriting a same-second sibling.
+
+    The runner historically named directories to one-second precision and
+    used ``exist_ok=True``. Two launches in the same second then replaced one
+    another's evidence file by file. Claim the directory with an exclusive
+    marker, add a random suffix on collision, and replace each artifact from
+    a same-directory temporary file so readers never observe a torn JSON or
+    report file.
+    """
+    import os
+    import uuid
+
+    requested = Path(out_dir)
+    requested.parent.mkdir(parents=True, exist_ok=True)
+
+    def _claim(candidate: Path) -> Path | None:
+        try:
+            candidate.mkdir(parents=False, exist_ok=False)
+        except FileExistsError:
+            if not candidate.is_dir():
+                return None
+            try:
+                next(candidate.iterdir())
+            except StopIteration:
+                pass                    # caller supplied an empty run dir
+            else:
+                return None
+        marker = candidate / ".traffic-replay-writing"
+        try:
+            marker.open("x").close()
+        except FileExistsError:
+            return None
+        return candidate
+
+    out = _claim(requested)
+    while out is None:
+        out = _claim(requested.with_name(
+            f"{requested.name}-{uuid.uuid4().hex[:12]}"))
+
+    safe_summary = _redact_secrets(summary)
+
+    def _atomic_text(path: Path, value: str) -> None:
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        with tmp.open("x") as f:
+            f.write(value)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+
+    requests_path = out / "requests.jsonl"
+    requests_tmp = requests_path.with_name(
+        f".{requests_path.name}.{uuid.uuid4().hex}.tmp")
+    with requests_tmp.open("x") as f:
+        for row in results:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    requests_tmp.replace(requests_path)
+    _atomic_text(out / "summary.json", json.dumps(safe_summary, indent=2))
+    _atomic_text(out / "report.md", render_markdown(safe_summary, title))
+    _atomic_text(out / "report.html", render_html(safe_summary, title))
+    # Manifest last: its presence means every referenced artifact is complete.
+    _atomic_text(out / "manifest.json",
+                 json.dumps(_manifest(safe_summary, out), indent=2) + "\n")
+    (out / ".traffic-replay-writing").replace(out / ".traffic-replay-complete")
     return out
 
 
@@ -1741,8 +2151,8 @@ def render_html(summary: dict, title: str) -> str:
     okc = s.get("requests_ok") or 0
     failed = s.get("requests_failed") or 0
     err = (s.get("error_rate") or 0) * 100
-    sub = (f"{ep} &middot; {src} &middot; {total} requests, {okc} ok, "
-           f"{failed} failed")
+    sub = (f"{ep} &middot; {src} &middot; {total} requests, {okc} produced a "
+           f"content delta, {failed} did not")
 
     # ---- stat cards ----
     cards = []
@@ -1759,10 +2169,11 @@ def render_html(summary: dict, title: str) -> str:
                  f"{err:.2f}%</span></div></div>")
     ach = s.get("achieved_cache_fraction") or {}
     if has(ach):
-        cards.append(_html_stat("achieved cache p50", num(ach["p50"], 2),
-                                "hit fraction (0-1)"))
+        cards.append(_html_stat("cached prompt-token fraction p50",
+                                num(ach["p50"], 2), "fraction (0-1)"))
     else:
-        cards.append("<div class='stat'><div class='k'>achieved cache</div>"
+        cards.append("<div class='stat'><div class='k'>cached prompt-token "
+                     "fraction</div>"
                      "<div class='v'><span class='pill neutral' "
                      "style='font-size:12px'>not reported</span></div></div>")
     tp = s.get("throughput") or {}
@@ -1854,9 +2265,10 @@ def render_html(summary: dict, title: str) -> str:
                 f"p50 {num(tft)} ms arrives before the first visible token.")
         slanote = (f"<div class='slanote'>{' '.join(note_bits)}</div>"
                    if note_bits else "")
+        basis = esc((sla.get("latency_basis") or "unknown").replace("_", " "))
         sla_html = (
             f"<div class='card'><h2>SLA scorecard "
-            f"(TTFT scored on {defn})</h2>"
+            f"(TTFT definition: {defn}; latency basis: {basis})</h2>"
             f"<div class='cap'>targets from {esc(sla.get('targets_source') or 'the run configuration')}. "
             f"target and actual share each row's unit, shown in the metric "
             f"name</div>"
@@ -1864,6 +2276,9 @@ def render_html(summary: dict, title: str) -> str:
                if sla.get("targets_warning") else "")
             + (f"<div class='banner warn'>{esc(sla['coverage_warning'])}</div>"
                if sla.get("coverage_warning") else "")
+            + (f"<div class='banner warn'>"
+               f"{esc(sla['caller_latency_warning'])}</div>"
+               if sla.get("caller_latency_warning") else "")
             + "<table>"
             f"<tr><th class='lbl'>metric</th><th>target</th><th>actual</th>"
             f"<th>result</th></tr>{''.join(rows)}</table>{slanote}</div>")
@@ -1893,10 +2308,13 @@ def render_html(summary: dict, title: str) -> str:
                 f"<tr><td class='lbl'>{label}</td><td>{num(t['p50'])}</td>"
                 f"<td>{num(t['p90'])}</td><td>{num(t['p95'])}</td>"
                 f"<td>{num(t['p99'])}</td><td class='n'>{t['n']}</td></tr>")
+    pop_note = esc((s.get("latency_population") or {}).get("note")
+                   or "latency population was not recorded")
     lat_html = (
-        "<div class='card'><h2>Latency (milliseconds)</h2>"
-        "<div class='cap'>p50 to p99 are percentiles across requests, lower is "
-        "better. n is the request count. all values in ms.</div><table>"
+        "<div class='card'><h2>Endpoint service latency (milliseconds, from send)</h2>"
+        f"<div class='cap'>{pop_note}. p50 to p99 are percentiles across that "
+        "population, lower is better. n is the measured count; all values are "
+        "in ms.</div><table>"
         "<tr><th class='lbl'>metric</th><th>p50</th><th>p90</th><th>p95</th>"
         f"<th>p99</th><th>n</th></tr>{''.join(lat)}</table></div>")
 
@@ -1914,13 +2332,15 @@ def render_html(summary: dict, title: str) -> str:
                if _sh else "")
             + ". One round trip sits inside every latency figure above</li>")
     if has(ach):
-        bel.append(f"<li><b>Achieved cache fraction</b> (endpoint-reported, "
+        bel.append(f"<li><b>Achieved cached prompt-token fraction</b> "
+                   f"(endpoint-reported, "
                    f"0-1, share of prompt tokens served from cache): "
                    f"p50 {num(ach['p50'], 3)} / p95 {num(ach['p95'], 3)} "
                    f"(field: {esc(', '.join(ach.get('source_fields') or []))})"
                    f"</li>")
     else:
-        bel.append("<li><b>Achieved cache fraction</b>: not reported by this "
+        bel.append("<li><b>Achieved cached prompt-token fraction</b>: not "
+                   "reported by this "
                    "endpoint (shown as unknown, never guessed)</li>")
     if mode == "prompts":
         bel.append("<li><b>Input</b>: real prompts replayed verbatim, sizes "
@@ -1936,13 +2356,31 @@ def render_html(summary: dict, title: str) -> str:
             bel.append(f"<li><b>Token targeting</b>: reported/intended p50 "
                        f"{num(tt['reported_over_intended_p50'], 3)} "
                        f"(abs error {num(tt['abs_error_pct_p50'], 1)}%)</li>")
-    rt = s.get("reasoning_tokens_total")
+    _reason_source = str(s.get("reasoning_tokens_source") or "")
+    _legacy_reasoning_deltas = (
+        s.get("reasoning_tokens_total")
+        if "stream-counted" in _reason_source.lower() else None)
+    rt = (None if _legacy_reasoning_deltas is not None
+          else s.get("reasoning_tokens_total"))
     if rt is not None:
         rpm = (s.get("throughput") or {}).get("reasoning_tokens_per_min")
         pm = f", {num(rpm)}/min" if rpm else ""
         bel.append(f"<li><b>Reasoning tokens</b> (thinking tokens): {num(rt)} "
                    f"tokens total{pm} "
                    f"(field: {esc(str(s.get('reasoning_tokens_source')))})</li>")
+    rd = (s.get("reasoning_stream_deltas_total")
+          if s.get("reasoning_stream_deltas_total") is not None
+          else _legacy_reasoning_deltas)
+    if rd is not None:
+        rpm = ((s.get("throughput") or {}).get(
+            "reasoning_stream_deltas_per_min")
+            or ((s.get("throughput") or {}).get("reasoning_tokens_per_min")
+                if _legacy_reasoning_deltas is not None else None))
+        pm = f", {num(rpm)} deltas/min" if rpm else ""
+        bel.append(
+            f"<li><b>Reasoning stream deltas</b>: {num(rd)} deltas total{pm} "
+            f"(source: {esc(str(s.get('reasoning_stream_deltas_source') or _reason_source))}). "
+            "These are SSE chunks, not tokens.</li>")
     arr = s.get("arrivals") or {}
     if arr.get("achieved_qps_overall"):
         lag = (arr.get("dispatch_lag_ms") or {}).get("p95")
@@ -1987,10 +2425,12 @@ def render_html(summary: dict, title: str) -> str:
                    f"{esc(str(rp.get('max_output_tokens_cap')))}{extra}</li>")
     cc = s.get("concurrency") or {}
     if cc.get("in_flight_p50") is not None:
-        askd = (f", asked for {cc['asked_for']}" if cc.get("asked_for") else "")
+        sized = (f", open-loop sizing input "
+                 f"{cc['sizing_concurrency_requested']}"
+                 if cc.get("sizing_concurrency_requested") else "")
         bel.append(f"<li><b>Concurrency in flight</b>: p50 "
                    f"{cc['in_flight_p50']:.0f}, p95 {cc['in_flight_p95']:.0f}, peak "
-                   f"{cc['in_flight_max']:.0f}{askd} "
+                   f"{cc['in_flight_max']:.0f}{sized} "
                    f"({esc(cc['measured_over'])})</li>")
     lb = s.get("latency_basis")
     if lb:
@@ -2034,6 +2474,12 @@ def render_html(summary: dict, title: str) -> str:
         cost_html = (f"<div class='card'><h2>Cost</h2>"
                      f"<div class='cap'>config error: {esc(cost['error'])}</div>"
                      f"</div>")
+    elif cost and cost["mode"] == "per_token" and cost.get("coverage_warning"):
+        cost_html = (
+            "<div class='card'><h2>Cost (Databricks DBUs)</h2>"
+            "<div class='banner warn'>Full-run cost is unavailable. "
+            + esc(cost["coverage_warning"])
+            + "</div></div>")
     elif cost and cost["mode"] == "per_token" \
             and (cost.get("dbu_per_request") or {}).get("p50") is None:
         cost_html = ("<div class='card'><h2>Cost (Databricks DBUs)</h2>"
@@ -2103,11 +2549,19 @@ def render_html(summary: dict, title: str) -> str:
     _netw = (s.get("network_path") or {}).get("warning")
     if _netw:
         sample_banner += f"<div class='banner warn'>{esc(_netw)}</div>"
+    for warning in (
+            (s.get("throughput") or {}).get("coverage_warning"),
+            (s.get("cost") or {}).get("coverage_warning"),
+            (s.get("cache_fidelity") or {}).get("warning"),
+            (s.get("latency_population") or {}).get("warning")):
+        if warning:
+            sample_banner += f"<div class='banner warn'>{esc(warning)}</div>"
 
     drift = s.get("drift") or {}
     if drift.get("windows") or drift.get("drift_kind"):
         wr = "".join(
-            f"<tr><td class='lbl'>window {w['window']} ({w['n']} ok)"
+            f"<tr><td class='lbl'>window {w['window']} "
+            f"({w['n']} content-bearing streams)"
             f"{'' if w.get('counted', True) else ', not counted'}</td>"
             f"<td>{_err_cell(w)}</td>"
             f"<td>{num(w['ttft_p95'])}</td><td>{num(w['e2e_p95'])}</td></tr>"
@@ -2124,7 +2578,7 @@ def render_html(summary: dict, title: str) -> str:
         drift_html = (
             f"<div class='card'><h2>Stability over time &nbsp;{flag}</h2>"
             f"<div class='cap'>"
-            f"{f'per-' + str(drift.get('window_seconds', 60)) + 's windows, counts and p95 in ms. ' if drift.get('windows') else ''}"
+            f"{'per-' + str(drift.get('window_seconds', 60)) + 's windows, counts and p95 in ms. ' if drift.get('windows') else ''}"
             f"{sp}"
             f"{esc(drift.get('drift_headline') or drift.get('note', ''))}"
             f"{('<br>' + esc(drift.get('note', ''))) if drift.get('drift_headline') else ''}"
@@ -2171,11 +2625,12 @@ def render_html(summary: dict, title: str) -> str:
         rate = (f"{a['answer_rate']:.1%}" if a.get("answer_rate") is not None
                 else "n/a")
         rows_a = [("attempted", a.get("attempted")),
-                  ("returned HTTP 200", a.get("transport_ok")),
-                  ("started a readable answer",
+                  ("produced at least one content delta",
+                   a.get("content_streams", a.get("transport_ok"))),
+                  ("produced a readable answer",
                    f"{a.get('answered')} ({rate} of "
                    f"{a.get('judged')} judged)"),
-                  ("returned 200 with no visible content",
+                  ("judged request with no visible content",
                    a.get("no_visible_content")),
                   ("stream never terminated", a.get("stream_incomplete")),
                   ("unrecoverable parse errors", a.get("parse_errors")),
@@ -2183,6 +2638,11 @@ def render_html(summary: dict, title: str) -> str:
                    a.get("truncated")),
                   ("cut short by the global token cap",
                    a.get("truncated_by_global_cap"))]
+        if a.get("http_status_observed_for"):
+            rows_a.insert(2, (
+                "returned HTTP 200",
+                f"{a.get('http_200')} (status recorded for "
+                f"{a.get('http_status_observed_for')} requests)"))
         ans_html = (
             "<div class='card'><h2>Answers</h2><table>"
             + "".join(f"<tr><td class='lbl'>{esc(k)}</td>"
@@ -2195,10 +2655,13 @@ def render_html(summary: dict, title: str) -> str:
     corr_html = ""
     if s.get("e2e_corrected_ms"):
         c1 = s.get("ttft_corrected_ms") or {}
+        cv = s.get("ttfv_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]
         r_ = []
         if c1.get("p50") is not None:
             r_.append(("TTFT corrected (ms)", c1))
+        if cv.get("p50") is not None:
+            r_.append(("TTFV corrected (ms)", cv))
         r_.append(("end-to-end corrected (ms)", c2))
         corr_html = (
             "<div class='card'><h2>Latency as the caller experienced it</h2>"

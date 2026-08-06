@@ -18,6 +18,118 @@ def _load_summary(d: Path) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def _load_manifest(d: Path) -> dict | None:
+    p = d / "manifest.json"
+    if not p.exists():
+        return None
+    value = json.loads(p.read_text())
+    return value if isinstance(value, dict) else None
+
+
+def _stable(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _schedule_identity(schedule: dict, merging: bool) -> dict:
+    """Comparable schedule fields, excluding shard-local bookkeeping."""
+    out = dict(schedule or {})
+    for key in ("shard", "rates_describe"):
+        out.pop(key, None)
+    if merging:
+        # Each shard owns a subset of the same parent schedule.
+        out.pop("requests", None)
+    return out
+
+
+def _compatibility_issues(dirs: list[Path], summaries: list[dict],
+                          manifests: list[dict | None], *,
+                          merging: bool) -> list[str]:
+    """Facts that make pooled or side-by-side latency incomparable.
+
+    Compare deliberately allows different endpoints; merge does not. Both
+    require immutable code provenance and the same workload definition.
+    Missing provenance is an incompatibility, not evidence that values match.
+    """
+    titles = [_run_title(d, s) for d, s in zip(dirs, summaries)]
+    issues: list[str] = []
+    missing = [t for t, m in zip(titles, manifests) if m is None]
+    if missing:
+        issues.append(
+            f"missing manifest.json for {', '.join(missing)}; workload and "
+            "code identity cannot be proven")
+
+    present = [(t, s, m) for t, s, m in zip(titles, summaries, manifests)
+               if m is not None]
+    dirty = [t for t, _s, m in present if m.get("git_dirty") is not False]
+    if dirty:
+        issues.append(
+            f"{', '.join(dirty)} has dirty or unknown Git state; its source "
+            "cannot be reconstructed from a commit")
+    for title, source_summary, manifest in present:
+        run = source_summary.get("run") or {}
+        for label, summary_value, manifest_value in (
+                ("harness version", source_summary.get("harness_version"),
+                 manifest.get("harness_version")),
+                ("latency basis", source_summary.get("latency_basis"),
+                 manifest.get("latency_basis")),
+                ("endpoint path", run.get("endpoint_path"),
+                 manifest.get("endpoint_path")),
+                ("endpoint model", run.get("endpoint_model"),
+                 manifest.get("endpoint_model")),
+                ("input mode", run.get("input_mode"),
+                 manifest.get("input_mode"))):
+            if (summary_value is not None and manifest_value is not None
+                    and summary_value != manifest_value):
+                issues.append(
+                    f"{title} summary and manifest disagree on {label} "
+                    f"({_stable(summary_value)} vs {_stable(manifest_value)})")
+
+    def check(label, getter, *, required=True, detail=None):
+        values = [(t, getter(s, m)) for t, s, m in present]
+        absent = [t for t, v in values if v is None]
+        have = [(t, v) for t, v in values if v is not None]
+        if (required or have) and absent:
+            issues.append(f"missing {label} for {', '.join(absent)}")
+        groups = {}
+        for title, value in have:
+            groups.setdefault(_stable(value), []).append(title)
+        if len(groups) > 1:
+            desc = "; ".join(f"{', '.join(ts)}={value}"
+                             for value, ts in groups.items())
+            issues.append((detail or f"different {label}") + f": {desc}")
+
+    check("Git commit", lambda _s, m: m.get("git_commit"))
+    check("harness version",
+          lambda s, m: m.get("harness_version") or s.get("harness_version"),
+          detail=("different harness versions; latency definitions can change "
+                  "between releases, including whether TCP/TLS is measured"))
+    check("latency basis",
+          lambda s, m: m.get("latency_basis") or s.get("latency_basis"))
+    check("input mode", lambda _s, m: m.get("input_mode"))
+    check("profile or prompts SHA-256",
+          lambda _s, m: m.get("profile_sha256")
+          or m.get("profile_sha256_16"))
+    check("sampling seed", lambda _s, m: m.get("seed"))
+    check("request parameters", lambda _s, m: m.get("request_params"))
+    check("arrival schedule",
+          lambda s, m: (_schedule_identity(m.get("schedule")
+                                           or s.get("schedule") or {}, merging)
+                        or None))
+    check("load mode", lambda _s, m: m.get("load_mode"), required=False)
+    check("TTFT definition", lambda s, m: (
+        (((m.get("config_identity") or {}).get("sla_definition") or {}).get(
+            "ttft_definition"))
+        or (s.get("sla") or {}).get("ttft_definition")), required=False)
+    if merging:
+        check("endpoint identity", lambda _s, m: ({
+            "base_url": m.get("endpoint_base_url"),
+            "model": m.get("endpoint_model"),
+            "path": m.get("endpoint_path"),
+        } if any((m.get("endpoint_base_url"), m.get("endpoint_model"),
+                  m.get("endpoint_path"))) else None))
+    return issues
+
+
 def _run_title(d: Path, summ: dict) -> str:
     return (summ.get("run") or {}).get("title") or d.name
 
@@ -46,9 +158,19 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     dirs = [Path(d) for d in input_dirs]
     for d in dirs:
         _require_run_dir(d, "requests.jsonl")
+    summaries = [_load_summary(d) for d in dirs]
+    manifests = [_load_manifest(d) for d in dirs]
+    compatibility_issues = _compatibility_issues(
+        dirs, summaries, manifests, merging=True)
+    if compatibility_issues and not force:
+        raise ValueError(
+            "refusing to merge inputs that are not proven compatible: "
+            + "; ".join(compatibility_issues)
+            + ". pass force=True only to create an explicitly INVALID "
+              "diagnostic aggregate.")
     endpoints, rows = set(), []
-    for d in dirs:
-        run = _load_summary(d).get("run") or {}
+    for d, source_summary in zip(dirs, summaries):
+        run = source_summary.get("run") or {}
         # identity is host plus model plus route. comparing the route alone
         # pooled two different providers whenever both served
         # /v1/chat/completions, which is most of them.
@@ -57,18 +179,21 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         if any(x is not None for x in ident):
             endpoints.add(ident)
         rows += _replay_rows(d)
-    if len(endpoints) > 1 and not force:
-        _shown = sorted(
-            " ".join(str(x) for x in ident if x) for ident in endpoints)
-        raise ValueError(
-            "refusing to merge runs from different endpoints. identity is "
-            f"host, model and route: {_shown}. pass force=True to override.")
     # prompts-mode shards each cycled the same prompt file, so the pooled
     # cache fraction is still replay behavior. carry the fields summarize()
     # needs, otherwise the merged report shows the cache number with no note.
-    modes = {(_load_summary(d).get("run") or {}).get("input_mode") for d in dirs}
-    counts = {(_load_summary(d).get("run") or {}).get("prompts_count")
-              for d in dirs}
+    modes = {(s.get("run") or {}).get("input_mode") for s in summaries}
+    counts = {(s.get("run") or {}).get("prompts_count") for s in summaries}
+    source_provenance = []
+    for d, manifest in zip(dirs, manifests):
+        source_provenance.append({
+            "run_dir": str(d),
+            "run_id": (manifest or {}).get("run_id"),
+            "git_commit": (manifest or {}).get("git_commit"),
+            "profile_sha256": ((manifest or {}).get("profile_sha256")
+                               or (manifest or {}).get("profile_sha256_16")),
+            "config_sha256": (manifest or {}).get("config_sha256"),
+        })
     meta = {
         "merged_from": [str(d) for d in dirs],
         **({"endpoint_base_url": next(iter(endpoints))[0],
@@ -78,6 +203,13 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "endpoint_path": (next(iter(endpoints))[2] if len(endpoints) == 1
                           else "MIXED"),
         "label": f"merged from {len(dirs)} runs",
+        "aggregation_valid": not compatibility_issues,
+        "compatibility_issues": compatibility_issues,
+        "aggregation": {
+            "kind": "merge",
+            "forced": bool(force),
+            "sources": source_provenance,
+        },
         **({"input_mode": "prompts", "prompts_count": counts.pop()}
            if modes == {"prompts"} and len(counts) == 1
            and None not in counts else {}),
@@ -145,12 +277,13 @@ def _cell(v, fmt="{:.0f}") -> str:
 
 def compare_runs(out_dir, input_dirs) -> Path:
     """Tabulate several runs one column each, on identical measurement, and
-    warn when their achieved cache rates diverge enough to make the latency
-    comparison meaningless."""
+    invalidate the comparison when their per-request cached prompt-token
+    fractions or provenance diverge enough to make latency incomparable."""
     dirs = [Path(d) for d in input_dirs]
     for d in dirs:
         _require_run_dir(d, "summary.json")
     summ = [_load_summary(d) for d in dirs]
+    manifests = [_load_manifest(d) for d in dirs]
     titles = [_run_title(d, s) for d, s in zip(dirs, summ)]
     n = len(titles)
     hdr = "| metric / quantile | " + " | ".join(titles) + " |"
@@ -159,20 +292,19 @@ def compare_runs(out_dir, input_dirs) -> Path:
          "Runs measured on the same instrument. Read the warnings and the "
          "believability section before trusting the latency tables.", ""]
 
+    compatibility_issues = _compatibility_issues(
+        dirs, summ, manifests, merging=False)
+    if compatibility_issues:
+        L += ["## INVALID COMPARISON — inputs are not proven like-for-like", "",
+              "The tables below are retained for diagnosis only. Do not quote "
+              "a winner or a relative latency until every incompatibility is "
+              "resolved and the runs are repeated.", ""]
+        for issue in compatibility_issues:
+            L += [f"> INVALID: {issue}", ""]
+
     # Everything that can make a side-by-side dishonest goes ABOVE the tables.
     # A reader who stops after the first screen still sees the disqualifiers.
     warns: list[str] = []
-
-    # 0.3.0 moved TCP/TLS setup out of the timed region. putting a 0.2.x
-    # column next to a 0.3.x column compares two different measurements.
-    vers = {(s.get("harness_version") or "unknown") for s in summ}
-    if len(vers) > 1:
-        warns.append(
-            "these runs came from different harness versions "
-            f"({', '.join(sorted(vers))}). 0.3.0 stopped counting TCP/TLS "
-            "setup inside TTFT, TTFB and TTFG, so latency columns across "
-            "that boundary are not the same measurement. re-run the older "
-            "one before comparing.")
 
     # cache parity. one endpoint reporting no cache at all is the common case
     # when putting Databricks next to a provider that does not report cached
@@ -189,26 +321,26 @@ def compare_runs(out_dir, input_dirs) -> Path:
     missing = [t for t, c in zip(titles, caches) if c is None]
     have = [c for c in caches if c is not None]
     # a missing value means the endpoint did not report the field, NOT that it
-    # served nothing from cache. a reported zero comes through as 0.0.
+    # had zero cached prompt tokens. a reported zero comes through as 0.0.
     if missing and have:
         warns.append(
             f"{', '.join(missing)} did not report cached tokens, so its cache "
             f"usage is unknown, while another run measured a cache p50 of "
-            f"{max(have):.3f}. Serving a cached prompt is far cheaper than "
-            "serving a cold one, so unless you can establish the unknown side "
+            f"{max(have):.3f}. Serving cached prompt tokens is far cheaper "
+            "than serving cold ones, so unless you can establish the unknown side "
             "independently these latency columns may not be measuring the "
             "same work. Do not present this as a like-for-like result.")
     elif missing and not have:
         warns.append(
             "no run reported cached tokens, so cache usage is unknown for "
-            "every column. Prompt-cache hit rate is usually the single "
+            "every column. Cached prompt-token fraction is usually a major "
             "biggest driver of the latency you are about to compare. Confirm "
             "how each endpoint handles caching before quoting these numbers.")
     if len(have) >= 2 and (max(have) - min(have)) > 0.10:
         warns.append(
-            f"achieved cache p50 spans {min(have):.3f} to {max(have):.3f}, a "
-            "gap over 0.10. Comparing latency at different cache rates is not "
-            "a fair comparison. Match the cache rates before quoting these "
+            f"cached prompt-token fraction p50 spans {min(have):.3f} to "
+            f"{max(have):.3f}, a gap over 0.10. Comparing latency at different "
+            "cached-token fractions is not fair. Match them before quoting "
             "numbers.")
 
     # error rates. percentiles over a run that dropped requests carry
@@ -272,7 +404,7 @@ def compare_runs(out_dir, input_dirs) -> Path:
         for w in warns:
             L.append(f"> WARNING: {w}")
             L.append("")
-    else:
+    elif not compatibility_issues:
         L += ["Comparability checks (harness version, cache reporting and "
               "parity, error rate, sample size, steady state) all passed on "
               "these runs.", ""]
@@ -292,9 +424,21 @@ def compare_runs(out_dir, input_dirs) -> Path:
         return f"| {label} | " + " | ".join(_cell(fn(s), fmt)
                                              for s in summ) + " |"
 
+    def _reported_reasoning_tokens(s):
+        source = str(s.get("reasoning_tokens_source") or "").lower()
+        return (None if "stream-counted" in source
+                else s.get("reasoning_tokens_total"))
+
+    def _reasoning_deltas(s):
+        if s.get("reasoning_stream_deltas_total") is not None:
+            return s["reasoning_stream_deltas_total"]
+        source = str(s.get("reasoning_tokens_source") or "").lower()
+        return (s.get("reasoning_tokens_total")
+                if "stream-counted" in source else None)
+
     L.extend(["## rates and throughput", hdr, sep,
               scalar("error rate", lambda s: s.get("error_rate"), "{:.4f}"),
-              "| achieved cache p50 | " + " | ".join(
+              "| cached prompt-token fraction p50 | " + " | ".join(
                   _cache_cell(s, "p50") for s in summ) + " |",
               scalar("input tokens/min",
                      lambda s: (s.get("throughput") or {}).get("input_tokens_per_min"),
@@ -302,18 +446,20 @@ def compare_runs(out_dir, input_dirs) -> Path:
               scalar("output tokens/min",
                      lambda s: (s.get("throughput") or {}).get("output_tokens_per_min"),
                      "{:,.0f}"),
-              scalar("reasoning tokens (total)",
-                     lambda s: s.get("reasoning_tokens_total"),
+              scalar("endpoint-reported reasoning tokens (total)",
+                     _reported_reasoning_tokens,
                      "{:,.0f}"),
+              scalar("reasoning stream deltas (total; not tokens)",
+                     _reasoning_deltas, "{:,.0f}"),
               scalar("DBU per 1k requests",
                      lambda s: (s.get("cost") or {}).get("dbu_per_1k_requests"),
                      "{:,.2f}"), ""])
 
     L.extend(["## believability (read before trusting the latency tables)",
               hdr, sep,
-              "| achieved cache p50 | " + " | ".join(
+              "| cached prompt-token fraction p50 | " + " | ".join(
                   _cache_cell(s, "p50") for s in summ) + " |",
-              "| achieved cache p95 | " + " | ".join(
+              "| cached prompt-token fraction p95 | " + " | ".join(
                   _cache_cell(s, "p95") for s in summ) + " |",
               scalar("dispatch lag p95 (ms)",
                      lambda s: ((s.get("arrivals") or {}).get("dispatch_lag_ms")

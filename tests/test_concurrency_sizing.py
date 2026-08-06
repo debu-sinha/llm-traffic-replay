@@ -56,6 +56,7 @@ def test_sizing_concurrency_derives_a_fixed_rate_and_pool():
     # pretending the open-loop generator held the sizing hint
     assert "concurrency" in s
     assert "asked_for" not in s["concurrency"]
+    assert s["concurrency"]["sizing_concurrency_requested"] == 8
     assert s["run"]["load_mode"] == "sizing_concurrency"
     assert s["run"]["sizing_concurrency_requested"] == 8
     assert s["run"]["derived_qps"] > 0

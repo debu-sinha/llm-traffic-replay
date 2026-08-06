@@ -61,9 +61,30 @@ def test_stream_counted_reasoning_fallback():
            "completion_tokens": 10, "reasoning_chunks": 8,
            "reasoning_tokens": None, "dispatch_lag_ms": 0.0}]
     s = summarize(ok)
-    assert s["reasoning_tokens_total"] == 20
-    assert "stream-counted" in s["reasoning_tokens_source"]
-    assert "estimate" in s["reasoning_tokens_source"]
+    assert "reasoning_tokens_total" not in s
+    assert "reasoning_tokens_per_min" not in s["throughput"]
+    assert s["reasoning_stream_deltas_total"] == 20
+    assert "not token counts" in s["reasoning_stream_deltas_source"]
+    assert s["throughput"]["reasoning_stream_deltas_per_min"] > 0
+    report = render_html(s, "reasoning chunks")
+    assert "Reasoning stream deltas" in report
+    assert "These are SSE chunks, not tokens" in report
+
+
+def test_missing_usage_makes_full_run_cost_unavailable_not_zero():
+    rows = _rows(1000, 400, 50, n=2)
+    rows.append({"ok": True, "prompt_tokens": None, "cached_tokens": None,
+                 "completion_tokens": None})
+    c = _cost_block(
+        rows, dur=60, in_tok=2000, out_tok=100, cached_tok=800,
+        pricing={"mode": "per_token", "input_dbu_per_m": 10.0,
+                 "output_dbu_per_m": 30.0, "cache_read_dbu_per_m": 2.0})
+    assert c["coverage"] == 2 / 3
+    assert c["dbu_total"] is None
+    assert c["dbu_per_1k_requests"] is None
+    assert c["dbu_per_min"] is None
+    assert c["coverage_warning"]
+    assert c["dbu_total_measured_subset"] > 0
 
 
 def test_cost_card_in_html():

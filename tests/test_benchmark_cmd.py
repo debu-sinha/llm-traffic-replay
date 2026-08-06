@@ -348,6 +348,63 @@ def test_a_run_with_no_readable_answers_exits_two():
     assert _finish(_summary_dir("invalid")) == 2
 
 
+def test_write_outputs_never_overwrites_a_same_second_run_directory():
+    from traffic_replay.metrics import summarize, write_outputs
+    base = _tmp()
+    requested = base / "20260806-010203"
+    rows = [{"ok": True, "ttft_ms": 10.0, "e2e_ms": 20.0,
+             "t_send_unix": 1.0, "prompt_tokens": 10,
+             "completion_tokens": 2}]
+    first_summary = summarize(rows, run_meta={"title": "first"})
+    second_summary = summarize(rows, run_meta={"title": "second"})
+    first = write_outputs(rows, first_summary, requested, "first")
+    second = write_outputs(rows, second_summary, requested, "second")
+    assert first == requested
+    assert second != first
+    assert second.name.startswith(requested.name + "-")
+    assert json.loads((first / "summary.json").read_text())["run"]["title"] \
+        == "first"
+    assert json.loads((second / "summary.json").read_text())["run"]["title"] \
+        == "second"
+    assert json.loads((first / "manifest.json").read_text())["run_id"] != \
+        json.loads((second / "manifest.json").read_text())["run_id"]
+    for out in (first, second):
+        assert (out / ".traffic-replay-complete").exists()
+        assert not list(out.glob("*.tmp"))
+
+
+def test_persisted_provenance_is_full_length_and_secret_redacted():
+    from traffic_replay.metrics import summarize, write_outputs
+    base = _tmp()
+    profile = base / "profile.json"
+    profile.write_text('{"name":"shape"}\n')
+    secret = "dapi0123456789supersecret"
+    rows = [{"ok": True, "ttft_ms": 10.0, "e2e_ms": 20.0,
+             "t_send_unix": 1.0, "prompt_tokens": 10,
+             "completion_tokens": 2}]
+    summary = summarize(rows, run_meta={
+        "profile_path": str(profile), "profile": "shape", "seed": 7,
+        "endpoint_base_url": "https://user:password@example.test",
+        "request_params": {"temperature": 0.0, "extra_body": {
+            "reasoning_effort": "low", "api_key": secret,
+            "nested": {"authorization": f"Bearer {secret}",
+                       "vendorAccessToken": secret}}}})
+    assert summary["run"]["request_params"]["extra_body"]["api_key"] \
+        == "<redacted>"
+    out = write_outputs(rows, summary, base / "run", "redacted")
+    persisted = "\n".join(
+        (out / name).read_text()
+        for name in ("summary.json", "report.md", "report.html", "manifest.json"))
+    assert secret not in persisted
+    assert "user:password@" not in persisted
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert len(manifest["profile_sha256"]) == 64
+    assert len(manifest["config_sha256"]) == 64
+    assert manifest["artifact_created_at_utc"].endswith("+00:00")
+    assert manifest["run_id"] == out.name
+    assert manifest["request_params"]["extra_body"]["reasoning_effort"] == "low"
+
+
 def test_fail_on_none_always_exits_zero():
     from traffic_replay.cli import _finish
     assert _finish(_summary_dir("miss"), fail_on="none") == 0

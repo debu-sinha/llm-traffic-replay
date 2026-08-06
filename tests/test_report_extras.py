@@ -573,7 +573,8 @@ def test_the_caution_is_above_the_tables_in_both_formats():
     rows = _paced(240, offered_qps=8.0, service_s=1.0, pool=2)
     s = summarize(rows)
     md = render_markdown(s, "sat")
-    assert md.index("CAUTION (client saturation)") < md.index("| metric (ms) |")
+    assert md.index("CAUTION (client saturation)") < md.index(
+        "| endpoint service metric (ms, from send) |")
     assert "banner warn" in render_html(s, "sat")
 
 
@@ -797,7 +798,8 @@ def test_concurrency_measures_actual_overlap():
     rows = _spans(600, start_rate=20.0, service_s=1.5)
     c = _concurrency_block(rows, asked=30)
     assert 28 <= c["in_flight_p50"] <= 32
-    assert "warning" not in c            # it reached what it asked for
+    assert "warning" not in c
+    assert c["sizing_concurrency_requested"] == 30
 
 
 def test_concurrency_warns_when_the_load_never_arrived():
@@ -807,15 +809,16 @@ def test_concurrency_warns_when_the_load_never_arrived():
     rows = _spans(600, start_rate=20.0, service_s=0.15)   # only ~3 in flight
     c = _concurrency_block(rows, asked=30)
     assert c["in_flight_p50"] < 10
-    assert "asked to hold 30" in c["warning"]
-    assert "not carrying the concurrency on the label" in c["warning"]
+    assert "sized from an unloaded estimate of 30" in c["warning"]
+    assert "not a held concurrency target" in c["warning"]
 
 
 def test_concurrency_caution_renders_above_the_tables():
     rows = _spans(600, start_rate=20.0, service_s=0.15)
     s = summarize(rows, concurrency_target=30)
     md = render_markdown(s, "conc")
-    assert md.index("CAUTION (concurrency not reached)") < md.index("| metric (ms) |")
+    assert md.index("CAUTION (concurrency not reached)") < md.index(
+        "| endpoint service metric (ms, from send) |")
     assert "banner warn" in render_html(s, "conc")
 
 
@@ -959,6 +962,11 @@ def test_a_200_with_no_visible_content_is_not_a_successful_answer():
     assert a["answered"] == 55
     assert a["no_visible_content"] == 132
     assert a["answer_rate"] == round(55 / 187, 6)
+    assert s["ttft_ms"]["n"] == 55
+    assert s["latency_population"]["kind"] == "readable_answers"
+    md = render_markdown(s, "answers")
+    assert "produced at least one content delta" in md
+    assert "returned HTTP 200:" not in md  # status was not retained by rows
 
 
 def test_silent_responses_count_against_the_success_rate():
@@ -1239,9 +1247,9 @@ def test_a_retried_request_occupies_a_worker_for_its_whole_life():
 
 # ---- a PASS on service time is not a PASS for the caller ----------------
 
-def test_a_service_time_pass_is_downgraded_when_callers_waited():
-    """The SLA rows score service time. If the client queued the work, a row
-    can read PASS while the person who asked waited ten seconds."""
+def test_caller_experienced_latency_is_the_sla_measurement_not_a_warning():
+    """A queued request must fail in the scorecard itself, not show a service
+    time PASS with a warning elsewhere on the page."""
     base = 1_700_000_000.0
     rows = []
     for i in range(300):
@@ -1253,11 +1261,12 @@ def test_a_service_time_pass_is_downgraded_when_callers_waited():
                      "first_send_unix": base + sched + lag,
                      "prompt_tokens": 100, "completion_tokens": 10})
     s = summarize(rows, acceptance={"ttfg_ms": {"p95": 1500}})
-    assert s["sla"]["ttfg_vs_target"][0]["met"] is True   # service time passes
+    scored = s["sla"]["ttfg_vs_target"][0]
+    assert scored["met"] is False
+    assert scored["scored_metric"] == "e2e_corrected_ms"
+    assert scored["actual_ms"] > 9000
     assert "Meets every acceptance target" not in render_html(s, "x")
-    md = [x for x in render_markdown(s, "x").splitlines()
-          if x.startswith("verdict:")][0]
-    assert "callers waited" in md
+    assert "latency basis: caller experienced" in render_markdown(s, "x")
 
 
 def test_missing_token_usage_is_shown_and_downgrades_the_verdict():
@@ -1332,9 +1341,7 @@ def test_sparse_concurrency_does_not_claim_a_load_it_never_held():
     assert _concurrency_block(steady, None)["in_flight_p50"] == 50.0
 
 
-def test_a_ttft_target_scored_on_service_time_is_caught():
-    """The caller-latency gate compared only end-to-end, so a TTFT target
-    could pass while the caller's first token was far later."""
+def test_ttft_target_is_scored_on_caller_time():
     base = 1_700_000_000.0
     rows = []
     for i in range(300):
@@ -1348,8 +1355,25 @@ def test_a_ttft_target_scored_on_service_time_is_caught():
                      "stream_complete": True, "visible_content_seen": True,
                      "truncated": False, "parse_errors": 0})
     s = summarize(rows, acceptance={"ttft_ms": {"p95": 500}})
+    scored = s["sla"]["ttft_vs_target"][0]
+    assert scored["met"] is False
+    assert scored["scored_metric"] == "ttft_corrected_ms"
+    assert scored["actual_ms"] > 1900
     assert "Meets every acceptance target" not in render_html(s, "x")
-    assert "callers waited" in _v(s)
+
+
+def test_cache_shape_mismatch_cannot_render_green():
+    rows = _clean(400, intended_cache_fraction=0.60, cached_tokens=0,
+                  cached_tokens_source="prompt_tokens_details.cached_tokens")
+    # Stretch the sends enough to establish stable windows, isolating cache.
+    for i, row in enumerate(rows):
+        row["t_send_unix"] = 1_700_000_000.0 + i * 0.5
+        row["first_send_unix"] = row["t_send_unix"]
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 5000}})
+    assert s["cache_fidelity"]["status"] == "unverified"
+    assert "did not reproduce" in s["cache_fidelity"]["warning"]
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    assert "CAUTION (cache fidelity)" in render_markdown(s, "x")
 
 
 def test_usage_missing_only_on_the_output_side_is_still_partial():

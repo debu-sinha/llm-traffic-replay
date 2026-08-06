@@ -108,7 +108,11 @@ def test_reasoning_split_end_to_end():
     assert s["ttfr_ms"]["p50"] < s["ttfv_ms"]["p50"], \
         f"ttfr {s['ttfr_ms']['p50']} not < ttfv {s['ttfv_ms']['p50']}"
     scored = {r["quantile"]: r["actual_ms"] for r in s["sla"]["ttft_vs_target"]}
-    assert abs(scored["p50"] - s["ttfv_ms"]["p50"]) < 0.6   # scored the ttfv table
+    # Acceptance is evaluated as the caller experienced it, including time a
+    # scheduled request waited in the load generator.  The raw TTFV table is
+    # retained separately to diagnose endpoint service time.
+    assert s["sla"]["ttft_metric"] == "ttfv_corrected_ms"
+    assert abs(scored["p50"] - s["ttfv_corrected_ms"]["p50"]) < 0.6
     report = (Path(out["out_dir"]) / "report.md").read_text()
     assert "reasoning model detected" in report
 

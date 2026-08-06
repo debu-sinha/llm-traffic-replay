@@ -56,6 +56,43 @@ def test_hard_timeout_counts_against_success_rate():
     assert s2["sla"]["success_rate"]["met"] is False
 
 
+def test_hard_ttft_timeout_uses_the_configured_first_visible_definition():
+    rows = [_row(i, 100.0, 21_000.0) for i in range(20)]
+    for row in rows:
+        row.update({"ttfv_ms": 20_000.0, "visible_content_seen": True,
+                    "stream_complete": True, "parse_errors": 0})
+    acceptance = {"hard_timeouts": {"ttft_s": 15}}
+    visible = summarize(rows, acceptance=acceptance,
+                        ttft_definition="first_visible")
+    content = summarize(rows, acceptance=acceptance,
+                        ttft_definition="first_content")
+    assert visible["sla"]["hard_timeout_breaches"] == 20
+    assert visible["sla"]["hard_timeout_basis"]["ttft_metric"] == "ttfv_ms"
+    assert content["sla"]["hard_timeout_breaches"] == 0
+
+
+def test_missing_first_visible_event_breaches_a_first_visible_hard_cap():
+    rows = [_row(i, 100.0, 1000.0) for i in range(10)]
+    for row in rows:
+        row.update({"ttfv_ms": None, "visible_content_seen": False,
+                    "stream_complete": True, "parse_errors": 0})
+    s = summarize(rows, acceptance={"hard_timeouts": {"ttft_s": 15}},
+                  ttft_definition="first_visible")
+    assert s["sla"]["hard_timeout_breaches"] == 10
+
+
+def test_hard_caps_include_client_queue_wait():
+    rows = [_row(i, 100.0, 200.0) for i in range(20)]
+    for i, row in enumerate(rows):
+        # First half establishes the schedule-to-send offset; the second half
+        # waits two seconds inside the generator before a fast endpoint call.
+        row["t_send_unix"] += 0.0 if i < 10 else 2.0
+    s = summarize(rows, acceptance={"hard_timeouts": {"ttfg_s": 1}})
+    assert s["e2e_ms"]["p95"] == 200.0
+    assert s["sla"]["hard_timeout_breaches"] == 10
+    assert s["sla"]["hard_timeout_basis"]["includes_client_queue_wait"] is True
+
+
 def test_interchunk_and_throughput_present():
     rows = [_row(i, 400.0, 800.0, inter=7.5) for i in range(50)]
     s = summarize(rows)

@@ -61,7 +61,7 @@ def test_html_is_self_contained_and_has_units():
     assert "http://" not in h and "https://" not in h
     assert "<link" not in h and "<script" not in h
     # units are spelled out for every metric family
-    for unit in ("milliseconds", "(ms)", "hit fraction (0-1)",
+    for unit in ("milliseconds", "(ms)", "fraction (0-1)",
                  "requests/second (QPS)", "tok/min", "(count)",
                  "fraction 0-1"):
         assert unit in h, f"missing unit label: {unit}"
@@ -108,7 +108,7 @@ def test_write_outputs_emits_html_end_to_end():
     html_path = Path(out["out_dir"], "report.html")
     assert html_path.exists()
     body = html_path.read_text()
-    assert "e2e html" in body and "Latency (milliseconds)" in body
+    assert "e2e html" in body and "Endpoint service latency (milliseconds" in body
     assert body.startswith("<!doctype html>")
 
 

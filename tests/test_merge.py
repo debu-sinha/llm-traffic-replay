@@ -23,10 +23,35 @@ def _row(i, ttft, e2e):
             "error": None, "doc_id": 1, "chars_sent": 4000, "retries": 0}
 
 
-def _mkrun(d: Path, ep: str, ttfts, title="run"):
+def _source_manifest(ep: str, *, input_mode="profile", profile_sha="b" * 64):
+    return {
+        "git_commit": "a" * 40, "git_dirty": False,
+        "harness_version": "0.4.1",
+        "latency_basis": "send-to-first-token; connection excluded",
+        "input_mode": input_mode, "profile_sha256": profile_sha,
+        "seed": 7,
+        "request_params": {"temperature": 0.0,
+                           "max_output_tokens_cap": 512},
+        "schedule": {"seconds": 120, "requests": 600,
+                     "rate_min": 5.0, "rate_p50": 5.0,
+                     "rate_p95": 5.0, "rate_max": 5.0,
+                     "source": "synthetic"},
+        "endpoint_base_url": "https://example.test",
+        "endpoint_model": "model", "endpoint_path": ep,
+    }
+
+
+def _mkrun(d: Path, ep: str, ttfts, title="run", profile_sha="b" * 64):
     d.mkdir(parents=True, exist_ok=True)
-    (d / "summary.json").write_text(json.dumps(
-        {"run": {"endpoint_path": ep, "title": title}}))
+    (d / "summary.json").write_text(json.dumps({
+        "run": {"endpoint_path": ep, "title": title,
+                "input_mode": "profile"},
+        "harness_version": "0.4.1",
+        "latency_basis": "send-to-first-token; connection excluded",
+        "schedule": _source_manifest(ep)["schedule"],
+    }))
+    (d / "manifest.json").write_text(json.dumps(
+        _source_manifest(ep, profile_sha=profile_sha)))
     with (d / "requests.jsonl").open("w") as f:
         cal = dict(_row(0, 999.0, 999.0)); cal["phase"] = "calibration"
         f.write(json.dumps(cal) + "\n")   # proves merge keeps only replay rows
@@ -63,6 +88,16 @@ def test_merge_missing_input_dir_gives_clean_error():
         merge_runs(base / "out", [base / "a", base / "does_not_exist"])
 
 
+def test_merge_refuses_a_source_without_a_manifest():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 3)
+    _mkrun(base / "b", ep, [100] * 3)
+    (base / "b" / "manifest.json").unlink()
+    with pytest.raises(ValueError, match="missing manifest.json"):
+        merge_runs(base / "out", [base / "a", base / "b"])
+
+
 def test_merged_report_carries_concurrency_note():
     base = _tmp()
     _mkrun(base / "a", "/serving-endpoints/pt/invocations", [100] * 4)
@@ -75,10 +110,16 @@ def _mkprompts_run(d: Path, ep: str, n_rows: int, prompts_count: int):
     """A shard from prompts mode, carrying the fields summarize() needs to
     know the prompts were cycled."""
     d.mkdir(parents=True, exist_ok=True)
-    (d / "summary.json").write_text(json.dumps(
-        {"run": {"endpoint_path": ep, "title": "shard",
-                 "input_mode": "prompts", "prompts_file": "p.jsonl",
-                 "prompts_count": prompts_count}}))
+    (d / "summary.json").write_text(json.dumps({
+        "run": {"endpoint_path": ep, "title": "shard",
+                "input_mode": "prompts", "prompts_file": "p.jsonl",
+                "prompts_count": prompts_count},
+        "harness_version": "0.4.1",
+        "latency_basis": "send-to-first-token; connection excluded",
+        "schedule": _source_manifest(ep)["schedule"],
+    }))
+    (d / "manifest.json").write_text(json.dumps(
+        _source_manifest(ep, input_mode="prompts")))
     with (d / "requests.jsonl").open("w") as f:
         for i in range(n_rows):
             f.write(json.dumps(_row(i + 1, 100.0, 300.0)) + "\n")
@@ -150,3 +191,18 @@ def test_merged_run_does_not_report_wire_lateness():
     note = summary["arrivals"]["wire_lateness_note"]
     assert "not computed for a merged run" in note
     assert note in (out / "report.md").read_text()
+
+
+def test_merge_rejects_different_workload_hashes_and_force_marks_invalid():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 5, profile_sha="b" * 64)
+    _mkrun(base / "b", ep, [100] * 5, profile_sha="c" * 64)
+    with pytest.raises(ValueError, match="profile or prompts SHA-256"):
+        merge_runs(base / "refused", [base / "a", base / "b"])
+    out = merge_runs(base / "forced", [base / "a", base / "b"], force=True)
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["run"]["aggregation_valid"] is False
+    assert "different profile or prompts SHA-256" in \
+        " ".join(summary["run"]["compatibility_issues"])
+    assert "verdict: INVALID" in (out / "report.md").read_text()

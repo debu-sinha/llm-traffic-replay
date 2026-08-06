@@ -48,13 +48,22 @@ def test_load_txt_one_per_line_skips_blanks():
     p = _write("p.txt", "first prompt\n\n  second prompt  \n")
     got = load_prompts(p)
     assert got == [[{"role": "user", "content": "first prompt"}],
-                   [{"role": "user", "content": "second prompt"}]]
+                   [{"role": "user", "content": "  second prompt  "}]]
 
 
 def test_load_json_array():
     p = _write("p.json", json.dumps(["a", {"text": "b"}]))
     assert load_prompts(p) == [[{"role": "user", "content": "a"}],
                                [{"role": "user", "content": "b"}]]
+
+
+def test_extensions_are_case_insensitive_and_unknown_ones_fail():
+    assert load_prompts(_write("p.JSON", '["a"]')) == [
+        [{"role": "user", "content": "a"}]]
+    assert load_prompts(_write("p.NDJSON", '"a"\n')) == [
+        [{"role": "user", "content": "a"}]]
+    with pytest.raises(ValueError, match="unsupported prompts extension"):
+        load_prompts(_write("p.yaml", "hello"))
 
 
 def test_loader_rejects_bad_inputs():
@@ -68,6 +77,10 @@ def test_loader_rejects_bad_inputs():
         load_prompts(_write("noshape.jsonl", json.dumps({"foo": "bar"}) + "\n"))
     with pytest.raises(ValueError):
         load_prompts(_write("arr.json", json.dumps({"not": "an array"})))
+    with pytest.raises(ValueError, match="item 1"):
+        load_prompts(_write("bad-item.json", json.dumps(["ok", {"bad": 1}])))
+    with pytest.raises(ValueError, match="line 2"):
+        load_prompts(_write("bad-shape.jsonl", '"ok"\n{"bad":1}\n'))
     # content must be a string: null and multimodal (list of parts) fail loud
     with pytest.raises(ValueError):
         load_prompts(_write("null.jsonl", json.dumps(

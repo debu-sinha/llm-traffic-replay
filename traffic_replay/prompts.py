@@ -62,20 +62,29 @@ def load_prompts(path: str) -> list[list[dict]]:
     p = Path(path)
     if not p.exists():
         raise ValueError(f"prompts file not found: {path}")
-    raw = p.read_text()
+    raw = p.read_text(encoding="utf-8")
     prompts: list[list[dict]] = []
-    if p.suffix == ".json":
-        data = json.loads(raw)
+    suffix = p.suffix.lower()
+    if suffix == ".json":
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}: not valid JSON ({exc})") from exc
         if not isinstance(data, list):
             raise ValueError(".json prompts file must be a JSON array")
-        for item in data:
-            prompts.append(_coerce(item))
-    elif p.suffix == ".txt":
+        for index, item in enumerate(data):
+            try:
+                prompts.append(_coerce(item))
+            except ValueError as exc:
+                raise ValueError(f"item {index}: {exc}") from exc
+    elif suffix == ".txt":
         for line in raw.splitlines():
-            line = line.strip()
-            if line:
+            # A text prompt is still real customer input. Use strip only to
+            # decide whether the line is blank; do not silently mutate leading
+            # or trailing whitespace in a file advertised as verbatim replay.
+            if line.strip():
                 prompts.append([{"role": "user", "content": line}])
-    else:  # .jsonl and anything else: one json value per line
+    elif suffix in (".jsonl", ".ndjson"):
         for ln, line in enumerate(raw.splitlines(), 1):
             line = line.strip()
             if not line:
@@ -84,7 +93,14 @@ def load_prompts(path: str) -> list[list[dict]]:
                 item = json.loads(line)
             except json.JSONDecodeError as e:
                 raise ValueError(f"line {ln}: not valid JSON ({e})") from e
-            prompts.append(_coerce(item))
+            try:
+                prompts.append(_coerce(item))
+            except ValueError as exc:
+                raise ValueError(f"line {ln}: {exc}") from exc
+    else:
+        raise ValueError(
+            f"unsupported prompts extension {p.suffix!r}; use .jsonl, "
+            ".ndjson, .json, or .txt")
     if not prompts:
         raise ValueError(f"no prompts found in {path}")
     return prompts

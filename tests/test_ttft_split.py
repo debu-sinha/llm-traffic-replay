@@ -160,6 +160,13 @@ def test_a_reasoning_only_stream_is_not_counted_as_a_successful_answer():
             (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
     replay = [r for r in rows if r.get("phase") == "replay"]
     assert replay, "no replay rows"
+    truth = [json.loads(x) for x in (wd / "truth.jsonl").read_text().splitlines()]
+    truth_by_id = {r["request_id"]: r for r in truth}
+    assert all(r["request_id"] in truth_by_id for r in replay)
+    assert all(truth_by_id[r["request_id"]]["ttfv_true_ms"] is None
+               for r in replay)
+    assert all(truth_by_id[r["request_id"]]["ttfr_true_ms"] is not None
+               for r in replay)
 
     # the transport was fine on every one of them
     assert all(r["ok"] for r in replay)

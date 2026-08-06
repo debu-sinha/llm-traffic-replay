@@ -97,6 +97,24 @@ def test_inline_role_content_message_preserves_role():
     assert load_prompts(p) == [[{"role": "assistant", "content": "prior turn"}]]
 
 
+def test_utf8_bom_is_accepted_without_changing_prompt_text():
+    p = _write("p.json", "\ufeff" + json.dumps(["café"]))
+    assert load_prompts(p) == [[{"role": "user", "content": "café"}]]
+
+
+def test_empty_message_role_is_rejected():
+    p = _write("p.jsonl", json.dumps({
+        "messages": [{"role": "  ", "content": "hello"}],
+    }) + "\n")
+    with pytest.raises(ValueError, match="non-empty"):
+        load_prompts(p)
+
+
+def test_directory_is_not_misreported_as_a_prompts_file(tmp_path):
+    with pytest.raises(ValueError, match="not a readable file"):
+        load_prompts(str(tmp_path))
+
+
 # ---- config guards -------------------------------------------------------
 
 def _endpoint(port):

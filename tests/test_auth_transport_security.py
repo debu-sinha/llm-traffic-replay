@@ -32,6 +32,22 @@ def test_profile_token_is_bound_to_its_normalized_origin(tmp_path, monkeypatch):
         ("https", "example.com", 443)
 
 
+@pytest.mark.parametrize("url", [
+    "https://example.com/serving",
+    "https://example.com?redirect=elsewhere",
+    "https://example.com#fragment",
+])
+def test_base_url_is_an_origin_and_request_path_is_configured_separately(url):
+    with pytest.raises(ValueError, match="must be an origin"):
+        EndpointConfig(base_url=url, path="/invocations")
+
+
+@pytest.mark.parametrize("path", ["relative", "//other-host/path", "/bad\npath"])
+def test_request_path_rejects_ambiguous_or_unsafe_forms(path):
+    with pytest.raises(ValueError, match="path"):
+        EndpointConfig(base_url="https://example.com", path=path)
+
+
 def test_profile_host_mismatch_fails_before_credential_can_escape(
         tmp_path, monkeypatch):
     cfg = _profile_file(
@@ -174,7 +190,7 @@ def test_failure_before_http_send_is_not_claimed_as_a_wire_send():
     assert result.connection_attempts == 2
     assert result.request_attempts == 0
     assert result.retries == 1
-    assert result.retry_reasons == ["connection_error"]
+    assert result.retry_reasons == ["connection_error_before_post"]
 
 
 def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
@@ -205,7 +221,8 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
             pass
 
     connections = iter([
-        Connection(_Response(400, b'{"error":"unsupported"}')),
+        Connection(_Response(
+            400, b'{"error":"stream_options include_usage unsupported"}')),
         Connection(_Response(200, events=events)),
     ])
     client = EndpointClient(
@@ -227,6 +244,121 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     assert result.request_attempts == 2
     assert result.retries == 1
     assert result.retry_reasons == ["stream_options_rejected"]
+
+
+def test_generic_400_is_not_retried_or_persisted_verbatim():
+    secret_body = b'{"error":"customer prompt: private-value"}'
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response(400, secret_body)
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = Connection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "bad400", 0.0, 0.0,
+        (0, 0, None, 0), 2,
+    )
+    assert result.ok is False
+    assert result.request_attempts == 1
+    assert result.retry_reasons == []
+    assert "private-value" not in result.error
+    assert "sha256=" in result.error
+
+
+def test_error_echoing_optional_field_without_rejecting_it_is_not_retried():
+    body = (b'{"error":"invalid messages; received request with '
+            b'stream_options.include_usage=true"}')
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response(400, body)
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = Connection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "bad-messages", 0.0, 0.0,
+        (0, 0, None, 0), 2,
+    )
+    assert result.request_attempts == 1
+    assert result.retry_reasons == []
+
+
+def test_request_serialization_failure_never_opens_a_connection():
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = lambda: (_ for _ in ()).throw(
+        AssertionError("must not connect"))
+    result = client.send(
+        [{"role": "user", "content": object()}], 8, "bad-json", 0.0, 0.0,
+        (0, 0, None, 0), 2,
+    )
+    assert result.ok is False
+    assert result.first_attempt_unix is None
+    assert result.first_send_unix is None
+    assert result.connection_attempts == 0
+    assert result.request_attempts == 0
+    assert result.error == "request serialization failed: TypeError"
+
+
+def test_permission_403_does_not_trigger_token_refresh():
+    refreshed = False
+
+    def refresh():
+        nonlocal refreshed
+        refreshed = True
+        return "new-token"
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response(403, b'{"error":"permission denied"}')
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"),
+        "old-token", refresh=refresh)
+    client._connect = Connection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "forbidden", 0.0, 0.0,
+        (0, 0, None, 0), 2,
+    )
+    assert result.ok is False
+    assert result.request_attempts == 1
+    assert refreshed is False
 
 
 def test_auth_refresh_is_counted_and_only_the_fresh_token_is_retried():
@@ -275,6 +407,38 @@ def test_auth_refresh_is_counted_and_only_the_fresh_token_is_retried():
     assert result.request_attempts == 2
     assert result.retries == 1
     assert result.retry_reasons == ["auth_token_refreshed"]
+
+
+def test_refresh_callback_failure_is_a_result_not_a_worker_exception():
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response(401, b'{"error":"expired"}')
+
+        def close(self):
+            pass
+
+    def fail_refresh():
+        raise RuntimeError("secret provider detail")
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"),
+        "old-token", refresh=fail_refresh)
+    client._connect = Connection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "refresh-fail", 0.0, 0.0,
+        (0, 0, None, 0), 2,
+    )
+    assert result.ok is False
+    assert result.error == "credential refresh failed: RuntimeError"
+    assert "secret provider detail" not in result.error
 
 
 def test_refresh_capable_bearer_flow_is_rejected_before_remote_cleartext_io():

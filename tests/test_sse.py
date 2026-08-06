@@ -2,6 +2,7 @@
 trigger it), usage extraction is defensive across provider field names."""
 from traffic_replay.sse import (StreamState, extract_usage, iter_sse_events,
                                 parse_sse_line, update_state)
+from traffic_replay.client import EndpointClient, EndpointConfig
 
 
 def test_role_only_chunk_is_not_content():
@@ -37,9 +38,11 @@ def test_blank_and_comment_lines_ignored():
 
 def test_parse_error_recorded_not_raised():
     st = StreamState()
-    ev = parse_sse_line("data: {not json")
+    ev = parse_sse_line("data: {not-json-private-value")
     update_state(st, ev)
-    assert st.errors and "not json" in st.errors[0]
+    assert st.errors and "invalid SSE JSON" in st.errors[0]
+    assert "private-value" not in st.errors[0]
+    assert "sha256=" in st.errors[0]
 
 
 def test_non_object_json_is_a_parse_error_not_a_crash():
@@ -109,6 +112,112 @@ def test_multiline_sse_data_is_joined_and_eof_is_dispatched():
     ]
 
 
+def test_sse_incrementally_decodes_split_utf8_and_accepts_cr_line_endings():
+    wire = ('data: {"choices":[{"delta":{"content":"café"}}]}'
+            '\r\rdata: [DONE]\r').encode("utf-8")
+    split = wire.index("é".encode("utf-8")) + 1
+    events = list(iter_sse_events([wire[:split], wire[split:]]))
+    assert events == [
+        {"choices": [{"delta": {"content": "café"}}]},
+        {"__done__": True},
+    ]
+
+
+def test_oversized_multiline_event_is_bounded_and_next_event_recovers():
+    events = list(iter_sse_events([
+        "data: 12345\n",
+        "data: 67890\n",
+        "\n",
+        "data: {}\n\n",
+    ], max_event_chars=8))
+    assert len(events) == 2
+    assert "exceeded 8" in events[0]["__parse_error__"]
+    assert events[1] == {}
+
+
+def test_sse_event_limit_must_be_a_positive_integer():
+    import pytest
+
+    for value in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            list(iter_sse_events([], max_event_chars=value))
+
+
+def test_malformed_tool_call_and_finish_reason_are_parse_errors():
+    st = StreamState()
+    update_state(st, {"choices": [{
+        "delta": {"tool_calls": "not-structured"},
+        "finish_reason": 7,
+    }]})
+    assert st.saw_first_tool_call is False
+    assert st.tool_call_chunks == 0
+    assert len(st.errors) == 2
+
+
+def test_client_consumes_multiline_tool_call_stream_without_network():
+    class _Socket:
+        def settimeout(self, value):
+            self.timeout = value
+
+    class _Response:
+        status = 200
+
+        def __iter__(self):
+            return iter([
+                b'data: {"choices": [{"delta":\n',
+                b'data: {"tool_calls": [{"index": 0, "function": '
+                b'{"name": "lookup"}}]}}]}\n',
+                b'\n',
+                b'data: {"choices":[{"delta":{},'
+                b'"finish_reason":"tool_calls"}]}\n',
+                b'\n',
+                b'data: [DONE]\n',
+                b'\n',
+            ])
+
+    class _Connection:
+        def __init__(self):
+            self.sock = _Socket()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/chat",
+                       max_retries=0),
+        token=None,
+        refresh=None,
+    )
+    client._connect = _Connection
+    result = client.send(
+        [{"role": "user", "content": "look it up"}],
+        20,
+        "r1",
+        0.0,
+        0.0,
+        (3, 20, None, -1),
+        10,
+    )
+    assert result.ok is True
+    assert result.status == 200
+    assert result.tool_call_seen is True
+    assert result.tool_call_chunks == 1
+    assert result.ttf_tool_call_ms is not None
+    assert result.visible_content_seen is False
+    assert result.ttft_ms is None
+    assert result.finish_reason == "tool_calls"
+    assert result.stream_complete is True
+
+
 def test_usage_openai_style():
     u = extract_usage({"prompt_tokens": 100, "completion_tokens": 10,
                        "prompt_tokens_details": {"cached_tokens": 60}})
@@ -132,12 +241,13 @@ def test_usage_absent_is_none_never_guessed():
 
 def test_usage_rejects_invalid_token_counts_without_crashing():
     for usage in ([], "bad", {"prompt_tokens": -1},
-                  {"prompt_tokens": True}, {"prompt_tokens": float("nan")}):
+                  {"prompt_tokens": True}, {"prompt_tokens": float("nan")},
+                  {"prompt_tokens": 10.9}):
         u = extract_usage(usage)
         assert u["prompt_tokens"] is None
     u = extract_usage({
-        "prompt_tokens": 10.9,
-        "completion_tokens": 2.2,
+        "prompt_tokens": 10.0,
+        "completion_tokens": 2.0,
         "prompt_tokens_details": {"cached_tokens": -5},
     })
     assert u["prompt_tokens"] == 10

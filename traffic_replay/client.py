@@ -18,9 +18,11 @@ and automatically retried without it for endpoints that reject the field.
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import ipaddress
 import json
+import math
 import ssl
 import threading
 import time
@@ -28,7 +30,7 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass, asdict, field
 
-from .sse import StreamState, parse_sse_line, update_state, extract_usage
+from .sse import StreamState, extract_usage, iter_sse_events, update_state
 
 
 @dataclass
@@ -44,8 +46,41 @@ class EndpointConfig:
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 120.0
     temperature: float = 0.0
-    max_retries: int = 1             # connection-level errors only
+    max_retries: int = 0             # physical inference retry; opt in only
+    include_usage: bool = True       # request streamed usage when supported
     extra_body: dict | None = None   # passthrough request params (see _body)
+
+    def __post_init__(self) -> None:
+        normalized_origin(self.base_url)
+        if not isinstance(self.path, str) or not self.path.startswith("/") \
+                or self.path.startswith("//"):
+            raise ValueError("endpoint path must start with one / character")
+        if any(char in self.path for char in ("\r", "\n", "\x00")):
+            raise ValueError("endpoint path must not contain control characters")
+        if self.model is not None \
+                and (not isinstance(self.model, str) or not self.model.strip()):
+            raise ValueError("endpoint model must be a non-empty string")
+        for name, value in (("connect_timeout_s", self.connect_timeout_s),
+                            ("read_timeout_s", self.read_timeout_s)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                    or not math.isfinite(float(value)) or value <= 0:
+                raise ValueError(f"endpoint {name} must be positive and finite")
+        if isinstance(self.temperature, bool) \
+                or not isinstance(self.temperature, (int, float)) \
+                or not math.isfinite(float(self.temperature)):
+            raise ValueError("endpoint temperature must be finite")
+        if not isinstance(self.max_retries, int) \
+                or isinstance(self.max_retries, bool) or self.max_retries < 0:
+            raise ValueError("endpoint max_retries must be a non-negative integer")
+        if not isinstance(self.include_usage, bool):
+            raise ValueError("endpoint include_usage must be boolean")
+        if self.extra_body is not None and not isinstance(self.extra_body, dict):
+            raise ValueError("endpoint extra_body must be an object")
+        try:
+            json.dumps(self.extra_body or {}, allow_nan=False)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "endpoint extra_body must contain finite JSON values") from exc
 
 
 @dataclass
@@ -56,7 +91,7 @@ class RequestResult:
                                      # queues, so this does NOT see client
                                      # saturation. metrics computes wire
                                      # lateness from first_send_unix.
-    t_send_unix: float
+    t_send_unix: float | None
     ttfb_ms: float | None
     ttft_ms: float | None            # first content of either kind (back compat)
     ttfr_ms: float | None            # first reasoning-channel delta, else None
@@ -102,12 +137,12 @@ class RequestResult:
     connection_attempts: int = 0
     request_attempts: int = 0             # calls that may have emitted a POST
     retry_reasons: list[str] = field(default_factory=list)
+    tool_call_seen: bool = False
+    tool_call_chunks: int = 0
+    ttf_tool_call_ms: float | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
-
-
-_MAX_TOKEN_REFRESH = 5
 
 
 class UnsafeBearerTransport(ValueError):
@@ -130,6 +165,10 @@ def normalized_origin(value: str) -> tuple[str, str, int]:
         raise ValueError("endpoint base_url must use an explicit http or https scheme")
     if u.username is not None or u.password is not None:
         raise ValueError("endpoint base_url must not contain userinfo")
+    if u.path not in ("", "/") or u.query or u.fragment:
+        raise ValueError(
+            "endpoint base_url must be an origin without a path, query, or "
+            "fragment; configure the request path separately")
     if u.hostname is None:
         raise ValueError("endpoint base_url must contain a host")
     try:
@@ -174,6 +213,37 @@ def validate_bearer_transport(base_url: str) -> tuple[str, str, int]:
     return origin
 
 
+def _safe_http_error(status: int, body: bytes) -> str:
+    """Describe a sampled HTTP error without persisting response content."""
+    digest = hashlib.sha256(body).hexdigest()[:16]
+    return (f"http {status} (body sample bytes={len(body)}, "
+            f"sha256={digest})")
+
+
+def _stream_options_rejected(body: bytes) -> bool:
+    """Only retry a 400 that explicitly identifies our optional field."""
+    text = body.decode("utf-8", "replace").casefold()
+    names_field = "stream_options" in text or "include_usage" in text
+    rejects_field = any(term in text for term in (
+        "unsupported", "not supported", "unknown", "unrecognized",
+        "unexpected", "not allowed", "not permitted", "cannot",
+        "additional propert", "extra field", "invalid field",
+        "invalid parameter",
+    ))
+    return names_field and rejects_field
+
+
+def _credential_may_be_expired(status: int, body: bytes) -> bool:
+    if status == 401:
+        return True
+    if status != 403:
+        return False
+    text = body.decode("utf-8", "replace").casefold()
+    return any(word in text for word in (
+        "invalid token", "expired token", "token expired", "unauthenticated",
+    ))
+
+
 class EndpointClient:
     def __init__(self, cfg: EndpointConfig, token: str | None,
                  refresh: "callable | None" = None):
@@ -185,10 +255,11 @@ class EndpointClient:
         misleading one. Measured for real: a 90 second run lost 171 of 281
         requests to `http 403: Invalid Token`.
         """
+        if token is not None and (not isinstance(token, str) or not token):
+            raise ValueError("bearer token must be a non-empty string")
         self.cfg = cfg
         self.token = token
         self._refresh = refresh
-        self._refreshed = 0
         self._lock = threading.Lock()
         self.scheme, self.host, self.port = normalized_origin(cfg.base_url)
         # A refresh callback means this is a bearer-auth flow even when the
@@ -197,7 +268,8 @@ class EndpointClient:
         if token or refresh is not None:
             validate_bearer_transport(cfg.base_url)
         self._ssl = ssl.create_default_context() if self.scheme == "https" else None
-        self._include_usage_supported: bool | None = None  # learned
+        self._include_usage_supported: bool | None = (
+            None if cfg.include_usage else False)  # learned or explicitly off
 
     def _connect(self) -> http.client.HTTPConnection:
         if self.scheme == "https":
@@ -227,7 +299,9 @@ class EndpointClient:
             payload["model"] = self.cfg.model
         if include_usage:
             payload["stream_options"] = {"include_usage": True}
-        return json.dumps(payload).encode()
+        return json.dumps(
+            payload, ensure_ascii=False, allow_nan=False,
+            separators=(",", ":")).encode("utf-8")
 
     def send(self, messages: list[dict], max_tokens: int, request_id: str,
              scheduled_s: float, dispatch_lag_ms: float,
@@ -246,11 +320,27 @@ class EndpointClient:
         connection_attempts = 0
         request_attempts = 0
         retry_reasons: list[str] = []
+        auth_retried = False
 
         while attempt <= self.cfg.max_retries:
             attempt += 1
             conn = None
+            posts_before_attempt = request_attempts
             try:
+                try:
+                    body = self._body(messages, max_tokens, include_usage)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    return self._finish(
+                        request_id, scheduled_s, dispatch_lag_ms,
+                        None, None, None, None, None, False,
+                        f"request serialization failed: {type(exc).__name__}",
+                        StreamState(), intended, chars_sent,
+                        len(retry_reasons), None, None, None, None,
+                        first_send_unix, max_tokens,
+                        first_attempt_unix=first_attempt_unix,
+                        connection_attempts=connection_attempts,
+                        request_attempts=request_attempts,
+                        retry_reasons=retry_reasons)
                 conn = self._connect()
                 connection_attempts += 1
                 if first_attempt_unix is None:
@@ -270,7 +360,6 @@ class EndpointClient:
                     validate_bearer_transport(self.cfg.base_url)
                     headers["Authorization"] = f"Bearer {tok_used}"
 
-                body = self._body(messages, max_tokens, include_usage)
                 t_send = time.monotonic()
                 t_send_unix = time.time()
                 last_send_unix = t_send_unix
@@ -283,22 +372,35 @@ class EndpointClient:
 
                 if resp.status == 400 and include_usage \
                         and self._include_usage_supported is None:
-                    # Endpoint may reject stream_options; learn and retry once
-                    # without counting it against the retry budget.
-                    resp.read()
-                    self._include_usage_supported = False
-                    include_usage = False
-                    retry_reasons.append("stream_options_rejected")
-                    attempt -= 1
-                    continue
+                    detail = resp.read(64 * 1024)
+                    if _stream_options_rejected(detail):
+                        # This is a real second POST and is recorded as such.
+                        self._include_usage_supported = False
+                        include_usage = False
+                        retry_reasons.append("stream_options_rejected")
+                        attempt -= 1
+                        continue
+                    return self._finish(
+                        request_id, scheduled_s, dispatch_lag_ms,
+                        t_send_unix, None, None, None, resp.status, False,
+                        _safe_http_error(resp.status, detail), StreamState(),
+                        intended, chars_sent, len(retry_reasons), None, None,
+                        None, connect_ms, first_send_unix, max_tokens,
+                        first_attempt_unix=first_attempt_unix,
+                        connection_attempts=connection_attempts,
+                        request_attempts=request_attempts,
+                        retry_reasons=retry_reasons)
 
                 if resp.status in (401, 403) and self._refresh:
-                    detail = resp.read(2048).decode("utf-8", "replace")
+                    detail = resp.read(64 * 1024)
                     # keep the real reason. falling out of the retry loop
                     # with "exhausted retries" hides an auth problem, which
                     # is the most common thing to get wrong.
-                    last_err = f"http {resp.status}: {detail[:300]}"
-                    conn.close()
+                    last_err = _safe_http_error(resp.status, detail)
+                    try:
+                        conn.close()
+                    except (OSError, http.client.HTTPException):
+                        pass
                     # this is a concurrent load generator, so when a token
                     # expires MANY requests fail at once. each of them must
                     # get a retry against the new token, and only the first
@@ -306,28 +408,39 @@ class EndpointClient:
                     # token this request actually used, rather than against
                     # the shared one, is what makes that true: a thread that
                     # arrives after someone else refreshed simply retries.
-                    with self._lock:
-                        if self.token != tok_used:
-                            retry_auth = True          # someone refreshed
-                        elif self._refreshed < _MAX_TOKEN_REFRESH:
-                            self._refreshed += 1
-                            fresh = self._refresh()
-                            if fresh and fresh != self.token:
-                                try:
-                                    validate_bearer_transport(self.cfg.base_url)
-                                except UnsafeBearerTransport as exc:
-                                    # Do not install the token: the next loop
-                                    # must never get a chance to emit it.
-                                    last_err = str(exc)
-                                    retry_auth = False
-                                else:
-                                    self.token = fresh
-                                    retry_auth = True
+                    retry_auth = False
+                    if not auth_retried and _credential_may_be_expired(
+                            resp.status, detail):
+                        with self._lock:
+                            if self.token != tok_used:
+                                retry_auth = True      # someone refreshed
                             else:
-                                retry_auth = False
-                        else:
-                            retry_auth = False
+                                try:
+                                    fresh = self._refresh()
+                                except Exception as exc:
+                                    last_err = (
+                                        "credential refresh failed: "
+                                        f"{type(exc).__name__}")
+                                    fresh = None
+                                if isinstance(fresh, str) and fresh \
+                                        and fresh != self.token:
+                                    try:
+                                        validate_bearer_transport(
+                                            self.cfg.base_url)
+                                    except UnsafeBearerTransport as exc:
+                                        # Never install a token that would be
+                                        # sent over an unsafe transport.
+                                        last_err = str(exc)
+                                    else:
+                                        self.token = fresh
+                                        retry_auth = True
+                                elif fresh is not None and not isinstance(
+                                        fresh, str):
+                                    last_err = (
+                                        "credential refresh returned an "
+                                        "invalid token type")
                     if retry_auth:
+                        auth_retried = True
                         retry_reasons.append("auth_token_refreshed")
                         attempt -= 1
                         continue
@@ -343,11 +456,11 @@ class EndpointClient:
                         retry_reasons=retry_reasons)
 
                 if resp.status != 200:
-                    detail = resp.read(2048).decode("utf-8", "replace")
+                    detail = resp.read(64 * 1024)
                     return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                         t_send_unix, None, None, None,
                                         resp.status, False,
-                                        f"http {resp.status}: {detail[:300]}",
+                                        _safe_http_error(resp.status, detail),
                                         StreamState(), intended, chars_sent,
                                         len(retry_reasons), None, None, None,
                                         connect_ms, first_send_unix,
@@ -362,18 +475,24 @@ class EndpointClient:
 
                 state = StreamState()
                 ttfb_ms = ttft_ms = ttfr_ms = ttfv_ms = None
+                ttf_tool_call_ms = None
                 interchunk_max = None
                 last_content_t = None
-                for raw in resp:
+
+                def timed_lines():
+                    nonlocal ttfb_ms
+                    for raw in resp:
+                        now = time.monotonic()
+                        if ttfb_ms is None:
+                            ttfb_ms = (now - t_send) * 1000.0
+                        yield raw
+
+                for event in iter_sse_events(timed_lines()):
                     now = time.monotonic()
-                    if ttfb_ms is None:
-                        ttfb_ms = (now - t_send) * 1000.0
-                    event = parse_sse_line(raw)
-                    if event is None:
-                        continue
                     chunks_before = state.content_chunks
                     reasoning_before = state.saw_first_reasoning
                     visible_before = state.saw_first_visible
+                    tool_before = state.saw_first_tool_call
                     first = update_state(state, event)
                     if first and ttft_ms is None:
                         ttft_ms = (now - t_send) * 1000.0
@@ -381,6 +500,8 @@ class EndpointClient:
                         ttfr_ms = (now - t_send) * 1000.0
                     if state.saw_first_visible and not visible_before:
                         ttfv_ms = (now - t_send) * 1000.0
+                    if state.saw_first_tool_call and not tool_before:
+                        ttf_tool_call_ms = (now - t_send) * 1000.0
                     if state.content_chunks > chunks_before:
                         if last_content_t is not None:
                             gap = (now - last_content_t) * 1000.0
@@ -390,8 +511,9 @@ class EndpointClient:
                     if state.done:
                         break
                 e2e_ms = (time.monotonic() - t_send) * 1000.0
-                ok = state.saw_first_content
-                err = None if ok else "stream ended with no content delta"
+                ok = state.saw_first_content or state.saw_first_tool_call
+                err = (None if ok else
+                       "stream ended with no content or tool-call delta")
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
@@ -401,16 +523,23 @@ class EndpointClient:
                                     first_attempt_unix=first_attempt_unix,
                                     connection_attempts=connection_attempts,
                                     request_attempts=request_attempts,
-                                    retry_reasons=retry_reasons)
+                                    retry_reasons=retry_reasons,
+                                    ttf_tool_call_ms=ttf_tool_call_ms)
 
             except (OSError, http.client.HTTPException) as exc:
-                last_err = f"{type(exc).__name__}: {exc}"
+                last_err = f"transport failed: {type(exc).__name__}"
                 if attempt <= self.cfg.max_retries:
-                    retry_reasons.append("connection_error")
+                    retry_reasons.append(
+                        "transport_error_after_post"
+                        if request_attempts > posts_before_attempt else
+                        "connection_error_before_post")
                 continue
             finally:
                 if conn is not None:
-                    conn.close()
+                    try:
+                        conn.close()
+                    except (OSError, http.client.HTTPException):
+                        pass
 
         return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                             last_send_unix if last_send_unix is not None
@@ -433,7 +562,8 @@ class EndpointClient:
                 ttfr_ms=None, ttfv_ms=None, connect_ms=None,
                 first_send_unix=None, max_tokens_requested=None, *,
                 first_attempt_unix=None, connection_attempts=0,
-                request_attempts=0, retry_reasons=None
+                request_attempts=0, retry_reasons=None,
+                ttf_tool_call_ms=None
                 ) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
@@ -468,6 +598,9 @@ class EndpointClient:
             connection_attempts=connection_attempts,
             request_attempts=request_attempts,
             retry_reasons=list(retry_reasons or []),
+            tool_call_seen=bool(state.saw_first_tool_call),
+            tool_call_chunks=state.tool_call_chunks,
+            ttf_tool_call_ms=ttf_tool_call_ms,
         )
 
 

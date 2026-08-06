@@ -455,7 +455,8 @@ def test_retry_exhausted_failures_keep_their_original_send_time():
     assert r.t_send_unix > r.first_send_unix
     assert r.connection_attempts == 3
     assert r.request_attempts == 3
-    assert r.retry_reasons == ["connection_error", "connection_error"]
+    assert r.retry_reasons == ["transport_error_after_post",
+                               "transport_error_after_post"]
 
 
 def test_a_total_outage_actually_renders_its_verdict():

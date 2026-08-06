@@ -7,6 +7,8 @@ Kept separate from the HTTP layer so it is unit-testable against fixtures.
 """
 from __future__ import annotations
 
+import codecs
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -28,6 +30,14 @@ class StreamState:
     errors: list[str] = field(default_factory=list)
 
 
+def _safe_parse_error(kind: str, payload: str) -> dict:
+    """Return diagnostic metadata without persisting streamed content."""
+    encoded = payload.encode("utf-8", "replace")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return {"__parse_error__":
+            f"{kind} (payload bytes={len(encoded)}, sha256={digest})"}
+
+
 def parse_sse_line(line: bytes | str) -> dict | None:
     """Return the JSON payload of a `data:` line, {'__done__': True} for
     [DONE], or None for blanks/comments/other fields."""
@@ -44,15 +54,17 @@ def parse_sse_line(line: bytes | str) -> dict | None:
     try:
         event = json.loads(payload)
     except json.JSONDecodeError:
-        return {"__parse_error__": payload[:200]}
+        return _safe_parse_error("invalid SSE JSON", payload)
     if not isinstance(event, dict):
-        return {"__parse_error__":
-                f"SSE data must be a JSON object, got "
-                f"{type(event).__name__}: {payload[:160]}"}
+        return _safe_parse_error(
+            f"SSE data must be a JSON object, got {type(event).__name__}",
+            payload)
     return event
 
 
-def iter_sse_events(lines: Iterable[bytes | str]) -> Iterator[dict]:
+def iter_sse_events(lines: Iterable[bytes | str],
+                    max_event_chars: int = 4 * 1024 * 1024
+                    ) -> Iterator[dict]:
     """Yield complete SSE ``data`` events from an iterable of raw lines.
 
     SSE permits an event to contain multiple ``data:`` fields. Their values
@@ -64,45 +76,121 @@ def iter_sse_events(lines: Iterable[bytes | str]) -> Iterator[dict]:
     dispatched at EOF, which is useful for defensive interoperability with
     servers that omit the last blank line.
     """
+    if not isinstance(max_event_chars, int) or isinstance(max_event_chars, bool) \
+            or max_event_chars <= 0:
+        raise ValueError("max_event_chars must be a positive integer")
+
     data: list[str] = []
+    data_chars = 0
+    discard_event = False
+    buffered = ""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    at_stream_start = True
 
     def dispatch() -> dict | None:
+        nonlocal data_chars, discard_event
+        if discard_event:
+            data.clear()
+            data_chars = 0
+            discard_event = False
+            return None
         if not data:
             return None
         payload = "\n".join(data)
         data.clear()
+        data_chars = 0
+        if len(payload) > max_event_chars:
+            return {"__parse_error__":
+                    f"SSE event exceeded {max_event_chars} characters"}
         if payload.strip() == "[DONE]":
             return {"__done__": True}
         try:
             event = json.loads(payload)
         except json.JSONDecodeError:
-            return {"__parse_error__": payload[:200]}
+            return _safe_parse_error("invalid SSE JSON", payload)
         if not isinstance(event, dict):
-            return {"__parse_error__":
-                    f"SSE data must be a JSON object, got "
-                    f"{type(event).__name__}: {payload[:160]}"}
+            return _safe_parse_error(
+                f"SSE data must be a JSON object, got {type(event).__name__}",
+                payload)
         return event
 
-    for raw in lines:
-        if isinstance(raw, bytes):
-            line = raw.decode("utf-8", errors="replace")
-        else:
-            line = raw
-        line = line.rstrip("\r\n")
+    def consume_line(line: str) -> dict | None:
+        nonlocal data_chars, discard_event
         if not line:
-            event = dispatch()
-            if event is not None:
-                yield event
-            continue
+            return dispatch()
+        if discard_event:
+            return None
         if line.startswith(":"):
-            continue
+            return None
         field, separator, value = line.partition(":")
         if field != "data":
-            continue
+            return None
         if separator and value.startswith(" "):
             value = value[1:]
+        added = len(value) + (1 if data else 0)
+        if data_chars + added > max_event_chars:
+            data.clear()
+            data_chars = 0
+            discard_event = True
+            return {"__parse_error__":
+                    f"SSE event exceeded {max_event_chars} characters"}
         data.append(value)
+        data_chars += added
+        return None
 
+    def decoded_chunks() -> Iterator[str]:
+        """Decode bytes incrementally so UTF-8 code points may cross chunks."""
+        nonlocal decoder
+        for raw in lines:
+            if isinstance(raw, bytes):
+                yield decoder.decode(raw, final=False)
+            elif isinstance(raw, str):
+                # Mixed byte/string streams are unusual, but flushing pending
+                # byte state avoids joining half a code point to native text.
+                pending = decoder.decode(b"", final=True)
+                decoder = codecs.getincrementaldecoder("utf-8")(
+                    errors="replace")
+                yield pending + raw
+            else:
+                raise TypeError("SSE chunks must be bytes or strings")
+        yield decoder.decode(b"", final=True)
+
+    for text in decoded_chunks():
+        if at_stream_start and text:
+            text = text.removeprefix("\ufeff")
+            at_stream_start = False
+        buffered += text
+        while True:
+            lf = buffered.find("\n")
+            cr = buffered.find("\r")
+            indexes = [x for x in (lf, cr) if x >= 0]
+            if not indexes:
+                break
+            end = min(indexes)
+            # A terminal CR might be the first half of CRLF in the next
+            # network chunk. Waiting preserves one logical blank separator.
+            if buffered[end] == "\r" and end + 1 == len(buffered):
+                break
+            separator_len = (2 if buffered[end:end + 2] == "\r\n" else 1)
+            line = buffered[:end]
+            buffered = buffered[end + separator_len:]
+            event = consume_line(line)
+            if event is not None:
+                yield event
+        if len(buffered) > max_event_chars:
+            yield {"__parse_error__":
+                   f"SSE line exceeded {max_event_chars} characters"}
+            buffered = ""
+            data.clear()
+            data_chars = 0
+            discard_event = True
+
+    if buffered:
+        if buffered.endswith("\r"):
+            buffered = buffered[:-1]
+        event = consume_line(buffered)
+        if event is not None:
+            yield event
     event = dispatch()
     if event is not None:
         yield event
@@ -120,6 +208,9 @@ def _meaningful_text(value: object) -> bool:
                 text = part.get("text")
                 if isinstance(text, str) and text.strip():
                     return True
+    if isinstance(value, dict):
+        text = value.get("text")
+        return isinstance(text, str) and bool(text.strip())
     return False
 
 
@@ -172,7 +263,12 @@ def update_state(state: StreamState, event: object) -> bool:
         tool_call = delta.get("tool_calls") or delta.get("function_call")
         has_visible_delta = _nonempty_delta(visible)
         has_reasoning_delta = _nonempty_delta(reasoning)
-        has_tool_call_delta = _nonempty_delta(tool_call)
+        if tool_call is not None and not isinstance(tool_call, (list, dict)):
+            state.errors.append(
+                f"stream choice {index} tool call must be an object or list")
+            has_tool_call_delta = False
+        else:
+            has_tool_call_delta = _nonempty_delta(tool_call)
         if has_visible_delta or has_reasoning_delta:
             state.content_chunks += 1
             if not state.saw_first_content:
@@ -190,6 +286,9 @@ def update_state(state: StreamState, event: object) -> bool:
         fr = choice.get("finish_reason")
         if isinstance(fr, str) and fr:
             state.finish_reason = fr
+        elif fr is not None:
+            state.errors.append(
+                f"stream choice {index} finish_reason must be a string")
 
     usage = event.get("usage")
     if usage is not None:
@@ -227,16 +326,19 @@ def _walk(usage: dict, paths) -> tuple[int | None, str | None]:
             else:
                 ok = False
                 break
-        if (ok and isinstance(node, (int, float))
-                and not isinstance(node, bool)
-                and math.isfinite(float(node)) and node >= 0):
-            return int(node), ".".join(path)
+        parsed = _token_count(node) if ok else None
+        if parsed is not None:
+            return parsed, ".".join(path)
     return None, None
 
 
 def _token_count(value: object) -> int | None:
-    if (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)) and value >= 0):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and math.isfinite(value) \
+            and value >= 0 and value.is_integer():
         return int(value)
     return None
 

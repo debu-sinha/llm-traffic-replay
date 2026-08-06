@@ -11,60 +11,24 @@ from __future__ import annotations
 
 import html
 import json
-import re
+import time
 from pathlib import Path
 
 import numpy as np
 
 from . import __version__
+from .artifacts import (
+    FINAL_REQUESTS,
+    RunArtifacts,
+    canonical_sha256,
+    redact_secrets as _redact_secrets,
+    sanitize_title,
+    sha256_bytes,
+    snapshot_source_state,
+    strict_json_dumps,
+)
 
 PCTS = (50, 90, 95, 99)
-
-_SECRET_KEY = re.compile(
-    r"(?:^authorization$|^api[_-]?key$|secret|password|credential|cookie|"
-    r"(?:^|[_-])token$)",
-    re.IGNORECASE)
-_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-_TOKEN_VALUE = re.compile(r"\b(?:dapi|sk-)[A-Za-z0-9._-]{8,}\b")
-_URL_CREDENTIALS = re.compile(r"(https?://)[^/@\s:]+:[^/@\s]+@",
-                              re.IGNORECASE)
-
-
-def _redact_secrets(value, key: str | None = None, *, aggressive=False):
-    """Return a JSON-safe copy with credential-bearing fields redacted.
-
-    Request ``extra_body`` is intentionally arbitrary JSON. Persisting it
-    verbatim made a typo such as ``api_key`` part of every summary, report and
-    manifest. Redact by both key and recognizable bearer-token value, while
-    retaining the surrounding configuration needed for provenance.
-    """
-    if key is not None:
-        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-        sensitive = bool(_SECRET_KEY.search(str(key))) or normalized in {
-            "authorization", "apikey", "accesstoken", "authtoken",
-            "bearertoken", "refreshtoken", "password", "secret",
-            "credential", "cookie",
-        }
-        if aggressive and re.search(
-                r"(?:auth|key|token|secret|password|credential|cookie)",
-                normalized):
-            sensitive = True
-        if sensitive:
-            return "<redacted>"
-    if isinstance(value, dict):
-        return {
-            str(k): _redact_secrets(
-                v, str(k), aggressive=(aggressive or str(k) == "extra_body"))
-            for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_redact_secrets(v, aggressive=aggressive) for v in value]
-    if isinstance(value, str):
-        return _URL_CREDENTIALS.sub(
-            r"\1<redacted>@",
-            _TOKEN_VALUE.sub("<redacted>",
-                             _BEARER_VALUE.sub("<redacted>", value)))
-    return value
-
 
 def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     """How many requests were actually in flight, by exact interval overlap.
@@ -215,10 +179,9 @@ def _sent_at(r: dict) -> float | None:
     first attempt, which is when the load was actually offered. Rows written
     by an older harness only have the former.
     """
-    v = r.get("first_send_unix")
-    if v is None:
-        v = r.get("t_send_unix")
-    return v
+    if "first_send_unix" in r:
+        return r.get("first_send_unix")
+    return r.get("t_send_unix")
 
 
 def _pct_table(values: list[float | None]) -> dict:
@@ -388,7 +351,7 @@ def _verdict(s: dict) -> tuple[str, str]:
 
 
 def _answered(r: dict) -> bool:
-    """Did this request actually produce an answer?
+    """Did this request produce a usable assistant outcome?
 
     Transport success is not answer success. A reasoning model that spends
     its whole token budget thinking returns HTTP 200, a well formed stream,
@@ -398,9 +361,12 @@ def _answered(r: dict) -> bool:
     to the sampled output size on purpose, so finish_reason "length" is the
     normal ending for a run hitting its target output length. Truncation is
     reported as its own rate instead, because the thing that separates a
-    short answer from no answer is whether visible content appeared at all.
+    short answer from no answer is whether visible content or a structurally
+    valid tool call appeared at all. A partial or malformed tool-call fragment
+    is deliberately not enough.
     """
-    return bool(r.get("visible_content_seen")
+    return bool((r.get("visible_content_seen")
+                 or (r.get("valid_tool_calls") or 0) > 0)
                 and r.get("stream_complete")
                 and not r.get("parse_errors"))
 
@@ -415,7 +381,8 @@ def _answer_block(results: list[dict]) -> dict | None:
     "returned HTTP 200" when status was not retained by a legacy row.
     """
     ok = [r for r in results if r.get("ok")]
-    scored = [r for r in results if "visible_content_seen" in r]
+    scored = [r for r in results
+              if "visible_content_seen" in r or "valid_tool_calls" in r]
     legacy_failures = [r for r in results
                        if not r.get("ok")
                        and "visible_content_seen" not in r]
@@ -435,8 +402,21 @@ def _answer_block(results: list[dict]) -> dict | None:
         "http_200": sum(1 for status in statuses if status == 200),
         "scored": n_observed,
         "answered": complete,
+        "acceptable_outcomes": complete,
+        "valid_tool_call_outcomes": sum(
+            1 for r in scored if (r.get("valid_tool_calls") or 0) > 0),
+        "tool_call_only_outcomes": sum(
+            1 for r in scored
+            if (r.get("valid_tool_calls") or 0) > 0
+            and not r.get("visible_content_seen")),
+        "valid_tool_calls_total": sum(
+            int(r.get("valid_tool_calls") or 0) for r in scored),
         "no_visible_content": sum(
             1 for r in scored if not r.get("visible_content_seen")),
+        "no_acceptable_outcome": sum(
+            1 for r in scored
+            if not r.get("visible_content_seen")
+            and not (r.get("valid_tool_calls") or 0) > 0),
         "stream_incomplete": sum(
             1 for r in scored if not r.get("stream_complete")),
         "parse_errors": sum(1 for r in scored if r.get("parse_errors")),
@@ -460,19 +440,18 @@ def _answer_block(results: list[dict]) -> dict | None:
         "answer_rate": (round(complete / judged, 6) if judged else None),
         "answer_rate_of_transport_ok": (round(complete / len(ok), 6)
                                         if ok else None),
-        "note": "answered means visible content arrived and the stream "
-                "finished cleanly. it does NOT mean the answer was complete "
-                "or correct: most generations stop at the requested output "
-                "length. truncation is not counted as a failure. the harness caps "
-                "max_tokens at the sampled output size, so ending on "
-                "\"length\" is the expected way to hit a target output "
-                "length. producing no visible content is the failure.",
+        "note": "an acceptable outcome means visible content or at least one "
+                "structurally valid tool call arrived and the stream finished "
+                "cleanly. it does NOT mean the answer or tool choice was "
+                "correct. truncation alone is not counted as a failure. a "
+                "partial or malformed tool-call fragment is not accepted.",
     }
     if complete == 0 and judged:
         # name the counter that actually drove it. asserting "produced no
         # visible content" when the real cause was a stream that never
         # terminated puts a false statement next to a zero counter.
-        cause = max((("returned no visible content", out["no_visible_content"]),
+        cause = max((("returned no visible content or valid tool call",
+                      out["no_acceptable_outcome"]),
                      ("never terminated their stream", out["stream_incomplete"]),
                      ("hit unrecoverable parse errors", out["parse_errors"]),
                      ("failed before a content stream was established",
@@ -480,7 +459,8 @@ def _answer_block(results: list[dict]) -> dict | None:
                     key=lambda kv: kv[1])
         out["invalid"] = (
             f"not one of the {judged} requests with answer observability "
-            f"produced a readable answer. most of them {cause[0]} "
+            f"produced visible content or a valid tool call. most of them "
+            f"{cause[0]} "
             f"({cause[1]} of {judged}). there is no latency-to-answer in this "
             "run and nothing "
             "here is a performance result.")
@@ -502,12 +482,17 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # answer latencies, not percentiles over reasoning-only or malformed HTTP
     # successes. Older rows are retained as an explicitly unclassified legacy
     # population rather than silently mixed into user-facing numbers.
-    answer_observed = [r for r in ok if "visible_content_seen" in r]
+    answer_observed = [
+        r for r in ok
+        if "visible_content_seen" in r or "valid_tool_calls" in r]
     answered = [r for r in answer_observed if _answered(r)]
     latency_ok = answered if answer_observed else ok
     unclassified_ok = len(ok) - len(answer_observed)
     latency_population = {
-        "kind": ("readable_answers" if answer_observed
+        "kind": (("acceptable_content_or_tool_outcomes"
+                  if any((r.get("valid_tool_calls") or 0) > 0
+                         for r in answered)
+                  else "readable_answers") if answer_observed
                  else "legacy_content_streams_unverified"),
         "n": len(latency_ok),
         "content_streams": len(ok),
@@ -517,7 +502,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "unclassified_legacy_rows": unclassified_ok,
         "note": (
             "primary latency percentiles include only requests that produced "
-            "visible content and finished with no parse errors"
+            "visible content or a structurally valid tool call and finished "
+            "with no parse errors"
             if answer_observed else
             "these legacy rows do not record answer observability, so latency "
             "percentiles describe content-bearing response streams and cannot "
@@ -579,8 +565,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # on a retried row it carries the endpoint's delay rather than saying
     # when the load was offered. no row needs excluding once the honest
     # stamp is available. older rows without the field fall back.
+    exact_wait = [float(r["queue_wait_ms"]) for r in results
+                  if r.get("queue_wait_ms") is not None]
+    wire.extend(exact_wait)
+    # Rows from harnesses predating exact monotonic caller clocks can still be
+    # reconstructed from epoch send stamps. Never overwrite an exact field:
+    # an explicit None means the newer client did not put a request on wire.
     stamped = [r for r in results
-               if r.get("scheduled_s") is not None
+               if "queue_wait_ms" not in r
+               and r.get("scheduled_s") is not None
                and _sent_at(r) is not None]
     if stamped:
         # one offset, taken from the row that was earliest relative to its own
@@ -600,9 +593,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             # moment actually experienced.
             r["queue_wait_ms"] = max(late, 0.0)
     wire_note = None
-    if results and not stamped:
-        wire_note = ("wire lateness is not reported: no request carried both "
-                     "a scheduled time and a send time.")
+    if results and not wire:
+        wire_note = ("wire lateness is not reported: no request carried an "
+                     "exact queue-wait clock or legacy schedule/send stamps.")
     retried = sum(1 for r in results if r.get("retries"))
 
     # observation interval, not the send window. token totals include
@@ -646,6 +639,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "error_rate": len(failed) / len(results) if results else None,
         "failures_by_error": _top_errors(failed),
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in latency_ok]),
+        "ttf_tool_call_ms": _pct_table(
+            [r.get("ttf_tool_call_ms") for r in latency_ok]),
         "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in latency_ok]),
         "connect_ms": _pct_table([r.get("connect_ms") for r in ok]),
         "e2e_ms": _pct_table([r.get("e2e_ms") for r in latency_ok]),
@@ -711,6 +706,10 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": safe_run_meta,
     }
+    for field in ("ttft_ms", "ttf_tool_call_ms"):
+        values = [r.get(field) for r in latency_ok]
+        summary[field]["missing"] = sum(v is None for v in values)
+        summary[field]["of"] = len(values)
     if intended_cache:
         tolerance = 0.10
         err = _pct_table(paired_cache_error)
@@ -803,22 +802,42 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # request waited in the load generator. SLA evaluation below prefers these
     # tables; the service-time tables remain available for endpoint diagnosis.
     # TTFV must be corrected too when first_visible is the configured TTFT.
-    for base_f, corr_f in (("ttft_ms", "ttft_corrected_ms"),
-                           ("ttfv_ms", "ttfv_corrected_ms"),
-                           ("e2e_ms", "e2e_corrected_ms")):
-        vals = [(r[base_f] + r["queue_wait_ms"])
-                for r in latency_ok
-                if r.get(base_f) is not None
-                and r.get("queue_wait_ms") is not None]
+    caller_fields = (
+        ("ttft_ms", "caller_ttft_ms", "ttft_corrected_ms"),
+        ("ttfv_ms", "caller_ttfv_ms", "ttfv_corrected_ms"),
+        ("ttf_tool_call_ms", "caller_ttf_tool_call_ms",
+         "ttf_tool_call_corrected_ms"),
+        ("e2e_ms", "caller_e2e_ms", "e2e_corrected_ms"),
+    )
+    exact_caller_n = 0
+    reconstructed_caller_n = 0
+    for base_f, caller_f, corr_f in caller_fields:
+        vals = []
+        for r in latency_ok:
+            if caller_f in r:
+                if r.get(caller_f) is not None:
+                    vals.append(r[caller_f])
+                    exact_caller_n += 1
+            elif (r.get(base_f) is not None
+                  and r.get("queue_wait_ms") is not None):
+                vals.append(r[base_f] + r["queue_wait_ms"])
+                reconstructed_caller_n += 1
         if vals:
             summary[corr_f] = _pct_table(vals)
     if any(k in summary for k in ("ttft_corrected_ms", "ttfv_corrected_ms",
+                                  "ttf_tool_call_corrected_ms",
                                   "e2e_corrected_ms")):
         summary["latency_correction_note"] = (
-            "caller-experienced figures measure from the moment the schedule "
-            "wanted the request, so they include time it waited in the load "
-            "generator. SLA latency targets and hard caps are scored on these "
-            "figures whenever scheduling evidence is available.")
+            "caller-experienced figures measure from the exact monotonic "
+            "scheduled target through the observed event, including worker "
+            "queueing, connection setup, retries and fallbacks. Legacy rows "
+            "without exact clocks are reconstructed as service time plus "
+            "queue wait. SLA latency targets and hard caps prefer these "
+            "figures whenever available.")
+        summary["latency_correction_provenance"] = {
+            "exact_values": exact_caller_n,
+            "legacy_reconstructed_values": reconstructed_caller_n,
+        }
     reason_vals = [r.get("reasoning_tokens") for r in ok]
     if any(v is not None for v in reason_vals):
         total = sum(v for v in reason_vals if v)
@@ -1425,11 +1444,23 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
     timeouts = inter_breaches = 0
     failing = set()
     for idx, r in enumerate(ok):
-        wait = r.get("queue_wait_ms") or 0.0
         first = r.get(raw_ttft_key)
         end = r.get("e2e_ms")
-        first_for_caller = first + wait if first is not None else None
-        end_for_caller = end + wait if end is not None else None
+        caller_first_key = ("caller_ttft_ms"
+                            if ttft_definition == "first_content"
+                            else "caller_ttfv_ms")
+        if caller_first_key in r:
+            first_for_caller = r.get(caller_first_key)
+        elif first is not None and r.get("queue_wait_ms") is not None:
+            first_for_caller = first + r["queue_wait_ms"]
+        else:
+            first_for_caller = first
+        if "caller_e2e_ms" in r:
+            end_for_caller = r.get("caller_e2e_ms")
+        elif end is not None and r.get("queue_wait_ms") is not None:
+            end_for_caller = end + r["queue_wait_ms"]
+        else:
+            end_for_caller = end
         missing_visible_breach = bool(
             ttft_cap and ttft_definition == "first_visible"
             and "visible_content_seen" in r
@@ -1461,6 +1492,7 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
         "interchunk_cap_ms": inter_cap,
         "includes_client_queue_wait": any(
             r.get("queue_wait_ms") is not None for r in ok),
+        "prefers_exact_monotonic_caller_clocks": True,
         "missing_first_visible_counts_as_breach": (
             ttft_definition == "first_visible"),
     }
@@ -1475,8 +1507,9 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
             "actual": round(actual_sr, 6),
             "met": actual_sr >= target_sr,
             "note": "failures, hard-timeout breaches, interchunk breaches, "
-                    "and responses that returned 200 with no visible content "
-                    "count against it",
+                    "and responses that returned 200 with neither visible "
+                    "content nor a structurally valid tool call count against "
+                    "it",
         }
     return out
 
@@ -1579,6 +1612,7 @@ def render_markdown(summary: dict, title: str) -> str:
         "| endpoint service metric (ms, from send) | p50 | p90 | p95 | p99 | n |",
         "|---|---|---|---|---|---|",
         row("TTFT", s["ttft_ms"]),
+        row("TTF valid tool call", s.get("ttf_tool_call_ms")),
         row("TTFB", s["ttfb_ms"]),
         row("TTFG (E2E)", s["e2e_ms"]),
         row("interchunk max", s["interchunk_max_ms"]),
@@ -1668,6 +1702,7 @@ def render_markdown(summary: dict, title: str) -> str:
     if s.get("e2e_corrected_ms"):
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
+        ct = s.get("ttf_tool_call_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]
         lines += ["", "### latency as the caller experienced it", "",
                   "Includes time the request waited on the client, so these "
@@ -1680,6 +1715,10 @@ def render_markdown(summary: dict, title: str) -> str:
         if cv.get("p50") is not None:
             lines.append(f"| TTFV corrected | {cv['p50']:.0f} | "
                          f"{cv['p95']:.0f} | {cv['p99']:.0f} |")
+        if ct.get("p50") is not None:
+            lines.append(f"| TTF valid tool call corrected | "
+                         f"{ct['p50']:.0f} | {ct['p95']:.0f} | "
+                         f"{ct['p99']:.0f} |")
         lines.append(f"| end-to-end corrected | {c2['p50']:.0f} | "
                      f"{c2['p95']:.0f} | {c2['p99']:.0f} |")
         lines += ["", s["latency_correction_note"]]
@@ -1778,11 +1817,19 @@ def render_markdown(summary: dict, title: str) -> str:
             answer_lines.append(
                 f"- returned HTTP 200: {a['http_200']} (status recorded for "
                 f"{a['http_status_observed_for']} requests)")
-        answer_lines += [f"- produced a readable answer: {a['answered']} "
+        answer_lines += [f"- produced a readable answer or valid tool call: "
+                         f"{a['answered']} "
                          f"({a['answer_rate']:.1%} of the "
                          f"{a.get('judged')} judged)"
                          if a.get("answer_rate") is not None else
-                         f"- produced a readable answer: {a['answered']}",
+                         "- produced a readable answer or valid tool call: "
+                         f"{a['answered']}",
+                  f"- valid tool-call outcomes: "
+                  f"{a.get('valid_tool_call_outcomes', 0)} "
+                  f"({a.get('tool_call_only_outcomes', 0)} tool-call-only; "
+                  f"{a.get('valid_tool_calls_total', 0)} calls total)",
+                  f"- judged requests with neither visible content nor a "
+                  f"valid tool call: {a.get('no_acceptable_outcome', a['no_visible_content'])}",
                   f"- judged requests with no visible content: "
                   f"{a['no_visible_content']}",
                   f"- stream never terminated: {a['stream_incomplete']}",
@@ -1902,7 +1949,11 @@ def render_markdown(summary: dict, title: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _manifest(summary: dict, out: Path) -> dict:
+def _manifest(summary: dict, out: Path, *,
+              start_provenance: dict | None = None,
+              artifact_metadata: dict | None = None,
+              artifact_id: str | None = None,
+              ended_at_unix: float | None = None) -> dict:
     """Everything needed to trace a number back to what produced it.
 
     A latency figure with no record of which code, which traffic shape and
@@ -1915,35 +1966,53 @@ def _manifest(summary: dict, out: Path) -> dict:
     this object is returned; provenance must not turn ``extra_body`` into a
     credential side channel.
     """
-    import hashlib
     import platform
-    import subprocess
     from datetime import datetime, timezone
 
-    def _git(*a):
-        try:
-            r = subprocess.run(["git", *a], cwd=str(Path(__file__).parent),
-                               capture_output=True, text=True, timeout=10)
-            return r.stdout.strip() if r.returncode == 0 else None
-        except Exception:
-            return None
-
     run = _redact_secrets(summary.get("run") or {})
+    start = _redact_secrets(start_provenance or {})
+    source = start.get("source") or snapshot_source_state(Path(__file__).parent)
+    inputs = start.get("inputs") or {}
     prof_path = run.get("profile_path") or run.get("prompts_file")
-    prof_sha = None
-    if prof_path and Path(prof_path).exists():
-        prof_sha = hashlib.sha256(Path(prof_path).read_bytes()).hexdigest()
+    primary_key = ("profile" if run.get("input_mode") == "profile"
+                   else "prompts" if run.get("input_mode") == "prompts"
+                   else None)
+    primary_input = inputs.get(primary_key) if primary_key else None
+    prof_sha = ((primary_input or {}).get("sha256")
+                if isinstance(primary_input, dict) else None)
+    # Backward-compatible standalone write_outputs callers do not have a
+    # start-of-run snapshot. They still receive a digest, but real runner runs
+    # always carry the immutable pre-traffic value above.
+    if prof_sha is None and prof_path and Path(prof_path).is_file():
+        prof_sha = sha256_bytes(Path(prof_path).read_bytes())
+
+    logical_run_id = (run.get("logical_run_id") or run.get("run_id")
+                      or start.get("logical_run_id") or out.name)
+    execution_id = (run.get("execution_id") or start.get("execution_id")
+                    or artifact_id or out.name)
+    artifact_id = (run.get("artifact_id") or start.get("artifact_id")
+                   or artifact_id or out.name)
+    workload_id = run.get("workload_id") or start.get("workload_id")
+    effective_config = _redact_secrets(start.get("effective_config") or {})
+    schedule_identity = (start.get("schedule_identity")
+                         or run.get("schedule_identity"))
+    index_identity = start.get("index_identity") or run.get("index_identity") or {}
 
     # Preserve a canonical, redacted identity snapshot in addition to its
     # digest. A digest alone can prove equality but cannot explain a mismatch.
     config_identity = _redact_secrets({
         "harness_version": summary.get("harness_version"),
         "latency_basis": summary.get("latency_basis"),
-        "run": run,
+        "effective_config": effective_config,
+        "workload_id": workload_id,
+        "schedule_identity": schedule_identity,
+        "index_identity": index_identity,
+        "request_params": run.get("request_params"),
         "schedule": summary.get("schedule") or {},
         "sla_definition": {
-            "ttft_definition": (summary.get("sla") or {}).get(
-                "ttft_definition"),
+            "ttft_definition": (run.get("ttft_definition")
+                                or (summary.get("sla") or {}).get(
+                                    "ttft_definition")),
             "targets_source": (summary.get("sla") or {}).get("targets_source"),
             "acceptance_config": (summary.get("sla") or {}).get(
                 "acceptance_config"),
@@ -1955,18 +2024,33 @@ def _manifest(summary: dict, out: Path) -> dict:
             if (summary.get("cost") or {}).get(key) is not None
         },
     })
-    config_raw = json.dumps(config_identity, sort_keys=True,
-                            separators=(",", ":")).encode()
-    config_sha = hashlib.sha256(config_raw).hexdigest()
-
-    dirty = _git("status", "--porcelain")
+    config_sha = canonical_sha256(config_identity)
+    effective_config_sha = (canonical_sha256(effective_config)
+                            if effective_config else None)
+    ended_at_unix = ended_at_unix if ended_at_unix is not None else time.time()
+    ended = datetime.fromtimestamp(ended_at_unix, timezone.utc).isoformat()
+    started_at_unix = start.get("run_started_at_unix")
+    started = start.get("run_started_at_utc")
+    if started is None and started_at_unix is not None:
+        started = datetime.fromtimestamp(
+            float(started_at_unix), timezone.utc).isoformat()
     manifest = {
-        "manifest_schema_version": 2,
-        "artifact_created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "run_id": run.get("run_id") or out.name,
+        "manifest_schema_version": 3,
+        "artifact_created_at_utc": ended,
+        "run_started_at_utc": started,
+        "run_started_at_unix": started_at_unix,
+        "run_ended_at_utc": ended,
+        "run_ended_at_unix": ended_at_unix,
+        "run_id": logical_run_id,       # legacy alias
+        "logical_run_id": logical_run_id,
+        "workload_id": workload_id,
+        "execution_id": execution_id,
+        "artifact_id": artifact_id,
         "harness_version": summary.get("harness_version"),
-        "git_commit": _git("rev-parse", "HEAD"),
-        "git_dirty": bool(dirty) if dirty is not None else None,
+        "git_commit": source.get("git_commit"),
+        "git_dirty": source.get("git_dirty"),
+        "source": source,
+        "source_tree_sha256": source.get("source_tree_sha256"),
         "latency_basis": summary.get("latency_basis"),
         "profile": run.get("profile"),
         "profile_path": prof_path,
@@ -1987,13 +2071,21 @@ def _manifest(summary: dict, out: Path) -> dict:
         "derived_qps": run.get("derived_qps"),
         "concurrency_target": run.get("concurrency_target"),
         "start_at_unix": run.get("start_at_unix"),
-        "global_index_start": run.get("global_index_start"),
-        "global_index_end": run.get("global_index_end"),
+        "global_index_start": index_identity.get(
+            "min", run.get("global_index_start")),
+        "global_index_end": index_identity.get(
+            "max", run.get("global_index_end")),
         "global_index_range": run.get("global_index_range"),
+        "index_identity": index_identity or None,
+        "schedule_identity": schedule_identity,
         "shard": run.get("shard"),
         "schedule": summary.get("schedule"),
         "config_sha256": config_sha,
         "config_identity": config_identity,
+        "effective_config_sha256": effective_config_sha,
+        "effective_config": effective_config,
+        "inputs": inputs,
+        "artifacts": artifact_metadata or {},
         "aggregation": run.get("aggregation"),
         "python": platform.python_version(),
         "platform": platform.platform(),
@@ -2004,8 +2096,9 @@ def _manifest(summary: dict, out: Path) -> dict:
     return _redact_secrets(manifest)
 
 
-def write_outputs(results: list[dict], summary: dict, out_dir: str | Path,
-                  title: str) -> Path:
+def write_outputs(results, summary: dict, out_dir: str | Path,
+                  title: str, *, artifact_run: RunArtifacts | None = None,
+                  start_provenance: dict | None = None) -> Path:
     """Write a run without overwriting a same-second sibling.
 
     The runner historically named directories to one-second precision and
@@ -2015,63 +2108,57 @@ def write_outputs(results: list[dict], summary: dict, out_dir: str | Path,
     a same-directory temporary file so readers never observe a torn JSON or
     report file.
     """
-    import os
-    import uuid
-
-    requested = Path(out_dir)
-    requested.parent.mkdir(parents=True, exist_ok=True)
-
-    def _claim(candidate: Path) -> Path | None:
+    owned = artifact_run is None
+    safe_title = sanitize_title(title)
+    if artifact_run is None:
+        now = time.time()
+        from datetime import datetime, timezone
+        artifact_run = RunArtifacts.claim(out_dir, start_provenance or {
+            "run_started_at_unix": now,
+            "run_started_at_utc": datetime.fromtimestamp(
+                now, timezone.utc).isoformat(),
+            "source": snapshot_source_state(Path(__file__).parent),
+            "effective_config": {"title": safe_title},
+        })
         try:
-            candidate.mkdir(parents=False, exist_ok=False)
-        except FileExistsError:
-            if not candidate.is_dir():
-                return None
-            try:
-                next(candidate.iterdir())
-            except StopIteration:
-                pass                    # caller supplied an empty run dir
-            else:
-                return None
-        marker = candidate / ".traffic-replay-writing"
-        try:
-            marker.open("x").close()
-        except FileExistsError:
-            return None
-        return candidate
-
-    out = _claim(requested)
-    while out is None:
-        out = _claim(requested.with_name(
-            f"{requested.name}-{uuid.uuid4().hex[:12]}"))
-
+            for row in results or []:
+                artifact_run.append(row)
+        except BaseException as exc:
+            artifact_run.abort(exc)
+            raise
+    out = artifact_run.path
     safe_summary = _redact_secrets(summary)
-
-    def _atomic_text(path: Path, value: str) -> None:
-        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        with tmp.open("x") as f:
-            f.write(value)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(path)
-
-    requests_path = out / "requests.jsonl"
-    requests_tmp = requests_path.with_name(
-        f".{requests_path.name}.{uuid.uuid4().hex}.tmp")
-    with requests_tmp.open("x") as f:
-        for row in results:
-            f.write(json.dumps(row, separators=(",", ":")) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    requests_tmp.replace(requests_path)
-    _atomic_text(out / "summary.json", json.dumps(safe_summary, indent=2))
-    _atomic_text(out / "report.md", render_markdown(safe_summary, title))
-    _atomic_text(out / "report.html", render_html(safe_summary, title))
-    # Manifest last: its presence means every referenced artifact is complete.
-    _atomic_text(out / "manifest.json",
-                 json.dumps(_manifest(safe_summary, out), indent=2) + "\n")
-    (out / ".traffic-replay-writing").replace(out / ".traffic-replay-complete")
-    return out
+    try:
+        artifact_run.finalize_requests()
+        artifact_run.atomic_text(
+            "summary.json", strict_json_dumps(safe_summary, indent=2) + "\n")
+        artifact_run.atomic_text(
+            "report.md", render_markdown(safe_summary, safe_title))
+        artifact_run.atomic_text(
+            "report.html", render_html(safe_summary, safe_title))
+        names = [FINAL_REQUESTS, "summary.json", "report.md", "report.html",
+                 "start.json"]
+        metadata = artifact_run.metadata(names)
+        ended_at = time.time()
+        manifest = _manifest(
+            safe_summary, out,
+            start_provenance=(start_provenance
+                              or artifact_run.start_provenance),
+            artifact_metadata=metadata,
+            artifact_id=artifact_run.artifact_id,
+            ended_at_unix=ended_at)
+        # Manifest is deliberately last. Completion is a separate marker so a
+        # crash between these two operations remains visibly incomplete.
+        artifact_run.atomic_text(
+            "manifest.json", strict_json_dumps(manifest, indent=2) + "\n")
+        artifact_run.mark_complete()
+        return out
+    except BaseException as exc:
+        artifact_run.abort(exc)
+        raise
+    finally:
+        if owned and not artifact_run.complete:  # defensive close on errors
+            artifact_run.close()
 
 
 _HTML_STYLE = """<style>
@@ -2297,6 +2384,7 @@ def render_html(summary: dict, title: str) -> str:
     # ---- latency table ----
     lat = []
     for label, key in (("TTFT (first token)", "ttft_ms"),
+                       ("TTF valid tool call", "ttf_tool_call_ms"),
                        ("TTFB (first byte)", "ttfb_ms"),
                        ("TTFG (end to end)", "e2e_ms"),
                        ("interchunk max", "interchunk_max_ms"),
@@ -2627,9 +2715,15 @@ def render_html(summary: dict, title: str) -> str:
         rows_a = [("attempted", a.get("attempted")),
                   ("produced at least one content delta",
                    a.get("content_streams", a.get("transport_ok"))),
-                  ("produced a readable answer",
+                  ("produced a readable answer or valid tool call",
                    f"{a.get('answered')} ({rate} of "
                    f"{a.get('judged')} judged)"),
+                  ("valid tool-call outcomes",
+                   f"{a.get('valid_tool_call_outcomes', 0)} "
+                   f"({a.get('tool_call_only_outcomes', 0)} tool-call-only; "
+                   f"{a.get('valid_tool_calls_total', 0)} calls total)"),
+                  ("judged request with neither visible content nor a valid tool call",
+                   a.get("no_acceptable_outcome", a.get("no_visible_content"))),
                   ("judged request with no visible content",
                    a.get("no_visible_content")),
                   ("stream never terminated", a.get("stream_incomplete")),
@@ -2656,12 +2750,15 @@ def render_html(summary: dict, title: str) -> str:
     if s.get("e2e_corrected_ms"):
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
+        ct = s.get("ttf_tool_call_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]
         r_ = []
         if c1.get("p50") is not None:
             r_.append(("TTFT corrected (ms)", c1))
         if cv.get("p50") is not None:
             r_.append(("TTFV corrected (ms)", cv))
+        if ct.get("p50") is not None:
+            r_.append(("TTF valid tool call corrected (ms)", ct))
         r_.append(("end-to-end corrected (ms)", c2))
         corr_html = (
             "<div class='card'><h2>Latency as the caller experienced it</h2>"

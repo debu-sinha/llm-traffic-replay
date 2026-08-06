@@ -27,20 +27,34 @@ prompts mode the text is fixed, so the warmup only primes the endpoint.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
+import inspect
 import json
 import math
 import os
+import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from . import profile as prof
+from .artifacts import (
+    RunArtifacts,
+    canonical_sha256,
+    redact_secrets,
+    sha256_bytes,
+    snapshot_source_state,
+)
 from .client import (EndpointClient, EndpointConfig,
                      validate_bearer_transport)
+from .config_validation import (validate_acceptance_targets,
+                                validate_pricing)
 from .metrics import summarize, write_outputs
 from .prefix_pool import PrefixPool
 from .schedule import load_trace, make_schedule, schedule_report, shard
@@ -87,39 +101,22 @@ class RunConfig:
     ttft_definition: str = "first_content"   # or "first_visible"; sla scores it
 
     def __post_init__(self) -> None:
+        for name in ("profile_path", "prompts_file", "timestamps_file"):
+            value = getattr(self, name)
+            if value is not None and (
+                    not isinstance(value, (str, os.PathLike))
+                    or not str(value).strip()):
+                raise ValueError(f"{name} must be a non-empty path")
+            if value is not None:
+                setattr(self, name, str(value))
         if bool(self.profile_path) == bool(self.prompts_file):
             raise ValueError("set exactly one of profile_path or prompts_file")
         if not isinstance(self.endpoint, dict):
             raise ValueError("endpoint must be an object")
-        if not str(self.endpoint.get("base_url") or "").strip() \
-                or not str(self.endpoint.get("path") or "").strip():
-            raise ValueError("endpoint needs non-empty base_url and path")
-        from urllib.parse import urlparse
-        parsed = urlparse(str(self.endpoint["base_url"]))
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError("endpoint base_url must be an http(s) URL with a host")
-        if not str(self.endpoint["path"]).startswith("/"):
-            raise ValueError("endpoint path must start with /")
-        extra_body = self.endpoint.get("extra_body")
-        if extra_body is not None and not isinstance(extra_body, dict):
-            raise ValueError("endpoint extra_body must be an object")
         try:
-            json.dumps(extra_body or {})
-        except (TypeError, ValueError) as exc:
-            raise ValueError("endpoint extra_body must be JSON-serializable") from exc
-        for timeout_name in ("connect_timeout_s", "read_timeout_s"):
-            timeout = self.endpoint.get(timeout_name)
-            if timeout is not None and (
-                    not math.isfinite(float(timeout)) or float(timeout) <= 0):
-                raise ValueError(f"endpoint {timeout_name} must be positive and finite")
-        retries = self.endpoint.get("max_retries")
-        if retries is not None and (
-                not isinstance(retries, int) or isinstance(retries, bool)
-                or retries < 0):
-            raise ValueError("endpoint max_retries must be a non-negative integer")
-        temperature = self.endpoint.get("temperature")
-        if temperature is not None and not math.isfinite(float(temperature)):
-            raise ValueError("endpoint temperature must be finite")
+            EndpointConfig(**self.endpoint)
+        except TypeError as exc:
+            raise ValueError(f"invalid endpoint configuration: {exc}") from exc
         if self.sizing_concurrency is not None and self.concurrency is not None:
             raise ValueError("set sizing_concurrency, not both it and legacy concurrency")
         if self.sizing_concurrency is None and self.concurrency is not None:
@@ -127,12 +124,15 @@ class RunConfig:
             self.concurrency = None
         if self.sizing_concurrency is not None \
                 and (not isinstance(self.sizing_concurrency, int)
+                     or isinstance(self.sizing_concurrency, bool)
                      or self.sizing_concurrency <= 0):
             raise ValueError("sizing_concurrency must be a positive integer")
-        if not isinstance(self.duration_s, int) or self.duration_s <= 0:
+        if not isinstance(self.duration_s, int) \
+                or isinstance(self.duration_s, bool) or self.duration_s <= 0:
             raise ValueError("duration_s must be a positive integer")
         rates = (self.qps_base, self.qps_burst, self.qps_min, self.qps_max)
-        if any(not math.isfinite(float(x)) or float(x) <= 0 for x in rates):
+        if any(isinstance(x, bool) or not isinstance(x, (int, float))
+               or not math.isfinite(float(x)) or float(x) <= 0 for x in rates):
             raise ValueError("qps_base/qps_burst/qps_min/qps_max must be positive and finite")
         if self.qps_min > self.qps_max:
             raise ValueError("qps_min cannot exceed qps_max")
@@ -140,47 +140,78 @@ class RunConfig:
             raise ValueError("qps_base must be between qps_min and qps_max")
         if not (self.qps_min <= self.qps_burst <= self.qps_max):
             raise ValueError("qps_burst must be between qps_min and qps_max")
-        if not math.isfinite(float(self.rate_scale)) \
+        if isinstance(self.rate_scale, bool) \
+                or not isinstance(self.rate_scale, (int, float)) \
+                or not math.isfinite(float(self.rate_scale)) \
                 or not (0 < self.rate_scale <= 1):
             raise ValueError("rate_scale must be in (0, 1]")
-        if not isinstance(self.max_concurrency, int) or self.max_concurrency <= 0:
+        if not isinstance(self.max_concurrency, int) \
+                or isinstance(self.max_concurrency, bool) \
+                or self.max_concurrency <= 0:
             raise ValueError("max_concurrency must be a positive integer")
         if self.max_pending_requests is not None and (
                 not isinstance(self.max_pending_requests, int)
+                or isinstance(self.max_pending_requests, bool)
                 or self.max_pending_requests <= 0):
             raise ValueError("max_pending_requests must be a positive integer")
-        if not math.isfinite(float(self.cpt)) or self.cpt <= 0:
+        if isinstance(self.cpt, bool) or not isinstance(self.cpt, (int, float)) \
+                or not math.isfinite(float(self.cpt)) or self.cpt <= 0:
             raise ValueError("cpt must be positive and finite")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool) \
                 or self.seed < 0:
             raise ValueError("seed must be a non-negative integer")
-        if not isinstance(self.calibrate_n, int) or self.calibrate_n < 0:
+        if not isinstance(self.calibrate_n, int) \
+                or isinstance(self.calibrate_n, bool) or self.calibrate_n < 0:
             raise ValueError("calibrate_n must be a non-negative integer")
-        if not isinstance(self.shard_total, int) or self.shard_total <= 0 \
+        if not isinstance(self.shard_total, int) \
+                or isinstance(self.shard_total, bool) \
+                or self.shard_total <= 0 \
                 or not isinstance(self.shard_index, int) \
+                or isinstance(self.shard_index, bool) \
                 or not (0 <= self.shard_index < self.shard_total):
             raise ValueError("need 0 <= shard_index < shard_total")
         if not isinstance(self.pool_docs_per_bucket, int) \
+                or isinstance(self.pool_docs_per_bucket, bool) \
                 or self.pool_docs_per_bucket <= 0:
             raise ValueError("pool_docs_per_bucket must be a positive integer")
-        if not math.isfinite(float(self.pool_zipf_s)) or self.pool_zipf_s <= 0:
+        if isinstance(self.pool_zipf_s, bool) \
+                or not isinstance(self.pool_zipf_s, (int, float)) \
+                or not math.isfinite(float(self.pool_zipf_s)) \
+                or self.pool_zipf_s <= 0:
             raise ValueError("pool_zipf_s must be positive and finite")
         if not isinstance(self.max_output_tokens_cap, int) \
+                or isinstance(self.max_output_tokens_cap, bool) \
                 or self.max_output_tokens_cap <= 0:
             raise ValueError("max_output_tokens_cap must be a positive integer")
         if self.ttft_definition not in ("first_content", "first_visible"):
             raise ValueError("ttft_definition must be first_content or first_visible")
-        if self.acceptance_targets is not None \
-                and not isinstance(self.acceptance_targets, dict):
-            raise ValueError("acceptance_targets must be an object")
-        if self.pricing is not None and not isinstance(self.pricing, dict):
-            raise ValueError("pricing must be an object")
-        if not math.isfinite(float(self.start_tolerance_s)) \
+        validate_acceptance_targets(self.acceptance_targets)
+        validate_pricing(self.pricing)
+        for name in ("capture_endpoint_metadata", "measure_network_path"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
+        if isinstance(self.start_tolerance_s, bool) \
+                or not isinstance(self.start_tolerance_s, (int, float)) \
+                or not math.isfinite(float(self.start_tolerance_s)) \
                 or self.start_tolerance_s < 0:
             raise ValueError("start_tolerance_s must be non-negative and finite")
         if self.start_at_unix is not None \
-                and not math.isfinite(float(self.start_at_unix)):
+                and (isinstance(self.start_at_unix, bool)
+                     or not isinstance(self.start_at_unix, (int, float))
+                     or not math.isfinite(float(self.start_at_unix))):
             raise ValueError("start_at_unix must be finite")
+        if self.run_id is not None and (
+                not isinstance(self.run_id, str) or not self.run_id.strip()):
+            raise ValueError("run_id must be a non-empty string when set")
+        if self.run_id is not None:
+            self.run_id = self.run_id.strip()
+        if not isinstance(self.out_dir, (str, os.PathLike)) \
+                or not str(self.out_dir).strip():
+            raise ValueError("out_dir must be a non-empty path")
+        self.out_dir = str(self.out_dir)
+        for name in ("title", "label"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"{name} must be a string")
         if self.shard_total > 1:
             if not isinstance(self.run_id, str) or not self.run_id.strip():
                 raise ValueError("sharded runs require one shared non-empty run_id")
@@ -208,6 +239,157 @@ def _file_identity(path: str | None) -> str | None:
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
     except OSError:
         return f"unreadable:{path}"
+
+
+def _read_stable_bytes(path: str) -> tuple[bytes, os.stat_result]:
+    """Read one immutable view of an input, rejecting concurrent mutation."""
+    source = Path(path)
+    try:
+        fd = os.open(source, os.O_RDONLY)
+    except OSError as exc:
+        raise ValueError(f"cannot snapshot input {source}: {exc}") from exc
+    try:
+        before = os.fstat(fd)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    identity_before = (before.st_dev, before.st_ino, before.st_size,
+                       before.st_mtime_ns, before.st_ctime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns)
+    raw = b"".join(chunks)
+    if identity_before != identity_after or len(raw) != before.st_size:
+        raise ValueError(
+            f"input changed while it was being snapshotted: {source}")
+    return raw, before
+
+
+def _snapshot_run_inputs(rc: RunConfig, directory: Path) \
+        -> tuple[RunConfig, dict]:
+    """Copy workload inputs once; all later parsing uses these private bytes."""
+    replacements = {}
+    metadata = {}
+    for field, key in (("profile_path", "profile"),
+                       ("prompts_file", "prompts"),
+                       ("timestamps_file", "timestamps")):
+        original = getattr(rc, field)
+        if not original:
+            continue
+        raw, info = _read_stable_bytes(original)
+        suffix = "".join(Path(original).suffixes)
+        snapshot = directory / f"{key}{suffix or '.snapshot'}"
+        fd = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            view = memoryview(raw)
+            while view:
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError("short write")
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        replacements[field] = str(snapshot)
+        metadata[key] = {
+            "path": str(Path(original).absolute()),
+            "sha256": sha256_bytes(raw),
+            "bytes": len(raw),
+            "captured_size": int(info.st_size),
+            "captured_mtime_ns": int(info.st_mtime_ns),
+            "snapshot_used_for_workload": True,
+        }
+    return dataclasses.replace(rc, **replacements), metadata
+
+
+def _effective_config(original: RunConfig, effective: RunConfig) -> dict:
+    """Persist resolved values without leaking private temporary paths."""
+    value = dataclasses.asdict(effective)
+    for field in ("profile_path", "prompts_file", "timestamps_file",
+                  "out_dir"):
+        value[field] = getattr(original, field)
+    return redact_secrets(value)
+
+
+def _resolved_workload_id(rc: RunConfig, inputs: dict) -> str:
+    """Deterministic identity of logical bodies and their global ordering."""
+    material = {
+        "schema": 1,
+        "inputs": {key: {"sha256": value["sha256"],
+                         "bytes": value["bytes"]}
+                   for key, value in sorted(inputs.items())},
+        "input_mode": "prompts" if rc.prompts_file else "profile",
+        "seed": rc.seed,
+        "cpt": rc.cpt,
+        "calibrate_n": rc.calibrate_n,
+        "pool_docs_per_bucket": rc.pool_docs_per_bucket,
+        "pool_zipf_s": rc.pool_zipf_s,
+        "max_output_tokens_cap": rc.max_output_tokens_cap,
+        "schedule": {
+            key: getattr(rc, key) for key in (
+                "duration_s", "qps_base", "qps_burst", "qps_min",
+                "qps_max", "rate_scale", "sizing_concurrency")
+        },
+        "request_shape": {
+            "model": rc.endpoint.get("model"),
+            "temperature": rc.endpoint.get("temperature", 0.0),
+            "extra_body": rc.endpoint.get("extra_body") or {},
+        },
+    }
+    # Only the digest is persisted. Hash the real values so two payloads that
+    # differ solely in a credential-like parameter do not collide, while the
+    # effective configuration itself remains redacted.
+    return "workload-" + canonical_sha256(material)[:24]
+
+
+def _execution_ids(rc: RunConfig) -> tuple[str, str, str]:
+    logical = (rc.run_id if rc.run_id
+               else f"run-{uuid.uuid4().hex}")
+    return logical, f"execution-{uuid.uuid4().hex}", \
+        f"artifact-{uuid.uuid4().hex}"
+
+
+def _schedule_identities(full: dict, selected: dict, rc: RunConfig) \
+        -> tuple[dict, dict]:
+    """Hash canonical binary schedule/index vectors without lossy JSON."""
+    global_ts = np.asarray(full["timestamps"], dtype="<f8")
+    shard_ts = np.asarray(selected["timestamps"], dtype="<f8")
+    indices = np.asarray(selected.get("global_indices", []), dtype="<i8")
+
+    def edge(values, which):
+        if not len(values):
+            return None
+        return float(values.min() if which == "min" else values.max())
+
+    schedule_identity = {
+        "encoding": "float64-le-seconds-from-run-start",
+        "global_timestamps_sha256": sha256_bytes(global_ts.tobytes()),
+        "global_count": int(len(global_ts)),
+        "global_min_s": edge(global_ts, "min"),
+        "global_max_s": edge(global_ts, "max"),
+        "shard_timestamps_sha256": sha256_bytes(shard_ts.tobytes()),
+        "shard_count": int(len(shard_ts)),
+        "shard_min_s": edge(shard_ts, "min"),
+        "shard_max_s": edge(shard_ts, "max"),
+    }
+    index_identity = {
+        "encoding": "int64-le",
+        "global_indices_sha256": sha256_bytes(indices.tobytes()),
+        "count": int(len(indices)),
+        "min": int(indices.min()) if len(indices) else None,
+        "max": int(indices.max()) if len(indices) else None,
+        "global_count": int(len(global_ts)),
+        "shard_index": rc.shard_index,
+        "shard_total": rc.shard_total,
+        "partition": ("round_robin_modulo" if rc.shard_total > 1
+                      else "unsharded"),
+    }
+    return schedule_identity, index_identity
 
 
 def _resolved_run_id(rc: RunConfig) -> str:
@@ -297,6 +479,7 @@ class _PreparedWorkload:
                 "prompt_index": prompt_index,
                 "sample_index": None,
                 "construction": None,
+                "body_request_id": request_id,
             }
 
         i = global_index
@@ -324,6 +507,7 @@ class _PreparedWorkload:
             "prompt_index": None,
             "sample_index": global_index,
             "construction": self.mat.construction_report(messages, input_tokens),
+            "body_request_id": request_id,
         }
 
 
@@ -390,6 +574,7 @@ def _annotate_result(res, phase: str, plan: dict, body_hash: str) -> dict:
     row.update(phase=phase, global_index=plan["global_index"],
                sample_index=plan["sample_index"],
                prompt_index=plan["prompt_index"],
+               body_request_id=plan.get("body_request_id"),
                request_body_sha256=body_hash)
     if plan["construction"]:
         row.update(
@@ -397,6 +582,26 @@ def _annotate_result(res, phase: str, plan: dict, body_hash: str) -> dict:
             constructed_actual_chars=plan["construction"]["actual_chars"],
             constructed_error_chars=plan["construction"]["error_chars"])
     return row
+
+
+def _send_request(client, messages, max_tokens, request_id, scheduled_s,
+                  dispatch_lag_ms, intended, chars_sent, *,
+                  scheduled_monotonic: float | None = None):
+    """Call current clients with exact clocks, retaining old test adapters."""
+    kwargs = {}
+    if scheduled_monotonic is not None:
+        try:
+            parameters = inspect.signature(client.send).parameters.values()
+            supports_clock = any(
+                p.name == "scheduled_monotonic"
+                or p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in parameters)
+        except (TypeError, ValueError):
+            supports_clock = True
+        if supports_clock:
+            kwargs["scheduled_monotonic"] = scheduled_monotonic
+    return client.send(messages, max_tokens, request_id, scheduled_s,
+                       dispatch_lag_ms, intended, chars_sent, **kwargs)
 
 
 def _exception_result(request_id: str, phase: str, plan: dict,
@@ -409,6 +614,10 @@ def _exception_result(request_id: str, phase: str, plan: dict,
         "dispatch_lag_ms": dispatch_lag_ms, "t_send_unix": None,
         "first_send_unix": None, "ttfb_ms": None, "ttft_ms": None,
         "ttfr_ms": None, "ttfv_ms": None, "e2e_ms": None,
+        "queue_wait_ms": None, "caller_ttfb_ms": None,
+        "caller_ttft_ms": None, "caller_ttfr_ms": None,
+        "caller_ttfv_ms": None, "caller_ttf_tool_call_ms": None,
+        "caller_e2e_ms": None,
         "status": None, "ok": False, "error": error,
         "content_chunks": 0, "interchunk_max_ms": None,
         "finish_reason": None, "prompt_tokens": None,
@@ -423,10 +632,15 @@ def _exception_result(request_id: str, phase: str, plan: dict,
         "stream_complete": False, "visible_content_seen": False,
         "reasoning_seen": False, "truncated": False, "parse_errors": 0,
         "max_tokens_requested": plan["max_output"],
+        "first_attempt_unix": None, "connection_attempts": 0,
+        "request_attempts": 0, "retry_reasons": [],
+        "tool_call_seen": False, "tool_call_chunks": 0,
+        "ttf_tool_call_ms": None, "valid_tool_calls": 0,
     }
     row.update(phase=phase, global_index=plan["global_index"],
                sample_index=plan["sample_index"],
                prompt_index=plan["prompt_index"],
+               body_request_id=plan.get("body_request_id"),
                request_body_sha256=body_hash)
     if plan["construction"]:
         row.update(
@@ -436,8 +650,9 @@ def _exception_result(request_id: str, phase: str, plan: dict,
     return row
 
 
-def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
-                          quiet: bool, run_id: str) -> "RunConfig":
+def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
+                          quiet: bool, workload_id: str,
+                          execution_id: str) -> "RunConfig":
     """Derive a fixed open-loop rate from an unloaded concurrency hint.
 
     This does not hold concurrency. It measures unloaded service time once,
@@ -446,20 +661,18 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
     """
     import numpy as _np
 
-    from .client import EndpointClient
-
     probe_n = max(4, min(rc.calibrate_n, 8))
-    client = EndpointClient(ecfg, token,
-                            refresh=lambda: _token(ecfg))
     workload = _PreparedWorkload(rc, probe_n)
 
     e2e = []
     for i in range(probe_n):
-        rid = _stable_request_id(run_id, i, "sizing")
-        plan = workload.plan(i, rid)
+        body_rid = _stable_request_id(workload_id, i, "sizing-body")
+        rid = _stable_request_id(execution_id, i, "sizing")
+        plan = workload.plan(i, body_rid)
         body_hash = _payload_hash(ecfg, plan["messages"], plan["max_output"])
         try:
-            res = client.send(
+            res = _send_request(
+                client,
                 plan["messages"], plan["max_output"], rid, scheduled_s=0.0,
                 dispatch_lag_ms=0.0, intended=plan["intended"],
                 chars_sent=plan["chars"])
@@ -468,7 +681,7 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, token, out_rows: list,
             d = _exception_result(
                 rid, "sizing", plan, body_hash,
                 f"unexpected worker exception: {type(exc).__name__}: {exc}")
-        out_rows.append(d)
+        record(d)
         if d.get("ok") and d.get("e2e_ms"):
             e2e.append(d["e2e_ms"])
 
@@ -577,6 +790,13 @@ def _token(cfg: EndpointConfig) -> str | None:
 
 def run(rc: RunConfig, token_override: str | None = None,
         quiet: bool = False) -> dict:
+    # Freeze all nested request/policy configuration and re-run validation in
+    # case a caller mutated the dataclass after constructing it.
+    rc = dataclasses.replace(
+        rc,
+        endpoint=copy.deepcopy(rc.endpoint),
+        acceptance_targets=copy.deepcopy(rc.acceptance_targets),
+        pricing=copy.deepcopy(rc.pricing))
     prompts_mode = bool(rc.prompts_file)
     if prompts_mode and rc.profile_path:
         raise ValueError("set profile_path or prompts_file, not both")
@@ -588,273 +808,411 @@ def run(rc: RunConfig, token_override: str | None = None,
         raise ValueError(
             f"start_at_unix is stale by {time.time() - rc.start_at_unix:.3f}s; "
             "use a future shared start and synchronize shard clocks")
-
     ecfg = EndpointConfig(**rc.endpoint)
-    run_id = _resolved_run_id(rc)
-    sizing_requested = rc.sizing_concurrency
-    sizing_local = _shard_concurrency(rc)
-    load_mode = "sizing_concurrency" if sizing_requested is not None \
-        else "fixed_rate"
     if token_override is not None and ecfg.auth_profile:
         raise AuthProfileError(
             "token_override cannot be combined with a named auth_profile")
-    token = token_override if token_override is not None else _token(ecfg)
-    client = EndpointClient(ecfg, token,
-                            refresh=lambda: _token(ecfg))
-    req_params = {"temperature": ecfg.temperature,
-                  "max_output_tokens_cap": rc.max_output_tokens_cap,
-                  "extra_body": ecfg.extra_body or {}}
-    # where the client sits relative to the endpoint. this is cheap, and
-    # without it a run generated from the wrong region silently folds a
-    # round trip into every latency number it prints.
-    net_path = None
-    if rc.measure_network_path:
-        from .netpath import measure_network_path
-        net_path = measure_network_path(ecfg.base_url)
-        if net_path and not quiet:
-            print(f"[runner] network: {net_path['rtt_ms']:.0f} ms round trip "
-                  f"to {net_path['endpoint_host']} "
-                  f"({', '.join(net_path['endpoint_ips'][:2])})")
 
-    endpoint_meta = None
-    if rc.capture_endpoint_metadata:
-        from .endpoint_meta import fetch_endpoint_metadata
-        endpoint_meta = fetch_endpoint_metadata(ecfg.base_url, ecfg.path,
-                                                token, timeout=5.0)
+    original_rc = rc
+    sizing_requested = rc.sizing_concurrency
+    sizing_local = _shard_concurrency(rc)
+    load_mode = ("sizing_concurrency" if sizing_requested is not None
+                 else "fixed_rate")
+    run_started_at = time.time()
+    source = snapshot_source_state(Path(__file__).parent)
 
-    # ---- optional unloaded sizing pass -----------------------------------
-    sizing_rows: list[dict] = []
-    if rc.sizing_concurrency is not None:
-        rc = _size_for_concurrency(
-            rc, ecfg, token, sizing_rows, quiet, run_id)
-    derived_qps = rc.qps_base if sizing_requested is not None else None
+    # A private snapshot is the only input parsed below. If the source profile,
+    # prompts, or trace changes while a long run is active, request bodies and
+    # schedule remain tied to the hashes captured in start.json.
+    with tempfile.TemporaryDirectory(prefix="traffic-replay-inputs-") as tmp:
+        work_rc, inputs = _snapshot_run_inputs(rc, Path(tmp))
+        workload_id = _resolved_workload_id(original_rc, inputs)
+        logical_run_id, execution_id, artifact_id = _execution_ids(original_rc)
+        started_utc = datetime.fromtimestamp(
+            run_started_at, timezone.utc).isoformat()
+        start_provenance = {
+            "start_schema_version": 1,
+            "status": "writing",
+            "run_started_at_unix": run_started_at,
+            "run_started_at_utc": started_utc,
+            "logical_run_id": logical_run_id,
+            "workload_id": workload_id,
+            "execution_id": execution_id,
+            "artifact_id": artifact_id,
+            "effective_config": _effective_config(original_rc, original_rc),
+            "inputs": inputs,
+            "source": source,
+            "token_override_supplied": token_override is not None,
+            "schedule_configuration": {
+                key: getattr(original_rc, key) for key in (
+                    "duration_s", "qps_base", "qps_burst", "qps_min",
+                    "qps_max", "rate_scale", "sizing_concurrency",
+                    "timestamps_file", "seed", "shard_index", "shard_total",
+                    "start_at_unix")
+            },
+        }
+        requested_out = (Path(original_rc.out_dir)
+                         / time.strftime("%Y%m%d-%H%M%S",
+                                         time.localtime(run_started_at)))
+        # This exclusive, fsynced claim is deliberately before token lookup,
+        # endpoint discovery, network measurement, sizing, or replay traffic.
+        artifact = RunArtifacts.claim(
+            requested_out, start_provenance, artifact_id=artifact_id)
 
-    # arrival schedule is shared by both modes
-    if rc.timestamps_file:
-        sched = load_trace(rc.timestamps_file, duration_cap_s=rc.duration_s)
-    else:
-        sched = make_schedule(
-            duration_s=rc.duration_s, qps_base=rc.qps_base,
-            qps_burst=rc.qps_burst, qps_min=rc.qps_min, qps_max=rc.qps_max,
-            rate_scale=rc.rate_scale, seed=rc.seed + 16)
-    total_n = len(sched["timestamps"])
-    if total_n == 0:
-        raise RuntimeError("schedule produced zero arrivals; "
-                           "raise rate_scale or duration")
-    sched["global_indices"] = np.arange(total_n, dtype=int)
-    sched["total_requests"] = total_n
-    if rc.shard_total > 1:
-        sched = shard(sched, rc.shard_index, rc.shard_total)
-    ts = sched["timestamps"]
-    global_indices = sched.get("global_indices")
-    n = len(ts)
-    workload = _PreparedWorkload(rc, total_n)
-    m = workload.prompts_count
-    p = workload.profile
+        with artifact:
+            # Parse policy-bearing workload input before auth lookup or any
+            # endpoint call. Profile construction centrally validates embedded
+            # acceptance targets; prompt loading likewise fails malformed
+            # inputs before a benchmark can begin.
+            if work_rc.profile_path:
+                prof.Profile.from_json(work_rc.profile_path)
+            else:
+                from .prompts import load_prompts
+                load_prompts(work_rc.prompts_file)
+            token = (token_override if token_override is not None
+                     else _token(ecfg))
+            client = EndpointClient(ecfg, token,
+                                    refresh=lambda: _token(ecfg))
+            req_params = {
+                "temperature": ecfg.temperature,
+                "max_output_tokens_cap": original_rc.max_output_tokens_cap,
+                "extra_body": ecfg.extra_body or {},
+            }
 
-    if not quiet:
-        if prompts_mode:
-            print(f"[runner] {n} scheduled arrivals over {rc.duration_s}s, "
-                  f"replaying {m} real prompts from {rc.prompts_file}")
-        else:
-            print(f"[runner] {n} scheduled arrivals over {rc.duration_s}s "
-                  f"(rate_scale {rc.rate_scale}), profile '{p.name}'")
-            if p.label:
-                print(f"[runner] profile label: {p.label}")
+            # ---- optional unloaded sizing pass ---------------------------
+            effective_rc = work_rc
+            if sizing_requested is not None:
+                effective_rc = _size_for_concurrency(
+                    work_rc, ecfg, client, artifact.append, quiet,
+                    workload_id, execution_id)
+            derived_qps = (effective_rc.qps_base
+                           if sizing_requested is not None else None)
 
-    results: list[dict] = list(sizing_rows)
+            # Capture the complete unsharded schedule, then select this
+            # process's globally indexed subset. Exact binary identities are
+            # persisted before calibration and measured replay traffic.
+            if effective_rc.timestamps_file:
+                full_sched = load_trace(
+                    effective_rc.timestamps_file,
+                    duration_cap_s=effective_rc.duration_s)
+            else:
+                full_sched = make_schedule(
+                    duration_s=effective_rc.duration_s,
+                    qps_base=effective_rc.qps_base,
+                    qps_burst=effective_rc.qps_burst,
+                    qps_min=effective_rc.qps_min,
+                    qps_max=effective_rc.qps_max,
+                    rate_scale=effective_rc.rate_scale,
+                    seed=effective_rc.seed + 16)
+            total_n = len(full_sched["timestamps"])
+            if total_n == 0:
+                raise RuntimeError(
+                    "schedule produced zero arrivals; raise rate_scale or duration")
+            full_sched["global_indices"] = np.arange(total_n, dtype=int)
+            full_sched["total_requests"] = total_n
+            sched = (shard(full_sched, effective_rc.shard_index,
+                           effective_rc.shard_total)
+                     if effective_rc.shard_total > 1 else full_sched)
+            schedule_identity, index_identity = _schedule_identities(
+                full_sched, sched, original_rc)
+            sched_meta = schedule_report(sched)
+            if original_rc.timestamps_file:
+                sched_meta["source"] = original_rc.timestamps_file
+            artifact.update_start(
+                status="schedule-snapshotted",
+                effective_config=_effective_config(original_rc, effective_rc),
+                schedule_identity=schedule_identity,
+                index_identity=index_identity,
+                schedule=sched_meta,
+                derived_qps=derived_qps)
 
-    # ---- calibration / warmup pass (sequential, low rate) --------------
-    # Calibration is extra traffic, not arrivals removed from the measured
-    # schedule. Every shard uses the same global indices so cpt calibration
-    # cannot change replay bodies merely because the workload was partitioned.
-    calib_n = min(rc.calibrate_n, total_n)
-    chars_total = 0
-    ptok_total = 0
-    for i in range(calib_n):
-        body_rid = _stable_request_id(run_id, i, "calibration")
-        rid = _stable_request_id(
-            run_id, i, f"calibration-shard-{rc.shard_index}")
-        # Identical calibration bodies give every shard the same cpt update;
-        # the transport request id remains shard-unique for tracing.
-        plan = workload.plan(i, body_rid)
-        body_hash = _payload_hash(ecfg, plan["messages"], plan["max_output"])
-        try:
-            res = client.send(
-                plan["messages"], plan["max_output"], rid, scheduled_s=0.0,
-                dispatch_lag_ms=0.0, intended=plan["intended"],
-                chars_sent=plan["chars"])
-            d = _annotate_result(res, "calibration", plan, body_hash)
-        except Exception as exc:
-            d = _exception_result(
-                rid, "calibration", plan, body_hash,
-                f"unexpected worker exception: {type(exc).__name__}: {exc}")
-        results.append(d)
-        if d.get("ok") and d.get("prompt_tokens"):
-            chars_total += plan["chars"]
-            ptok_total += d["prompt_tokens"]
+            # where the client sits relative to the endpoint. this is cheap,
+            # and without it a run from the wrong region silently folds a
+            # round trip into every latency number it prints.
+            net_path = None
+            if original_rc.measure_network_path:
+                from .netpath import measure_network_path
+                net_path = measure_network_path(ecfg.base_url)
+                if net_path and not quiet:
+                    print(f"[runner] network: {net_path['rtt_ms']:.0f} ms "
+                          f"round trip to {net_path['endpoint_host']} "
+                          f"({', '.join(net_path['endpoint_ips'][:2])})")
 
-    # recalibrate chars/token only in profile mode (real prompts are fixed)
-    if not prompts_mode and ptok_total:
-        old_cpt = workload.mat.cpt
-        new_cpt = calibrate_cpt(old_cpt, chars_total, ptok_total)
+            endpoint_meta = None
+            if original_rc.capture_endpoint_metadata:
+                from .endpoint_meta import fetch_endpoint_metadata
+                endpoint_meta = fetch_endpoint_metadata(
+                    ecfg.base_url, ecfg.path, token, timeout=5.0)
+
+            ts = sched["timestamps"]
+            global_indices = sched["global_indices"]
+            n = len(ts)
+            workload = _PreparedWorkload(effective_rc, total_n)
+            m = workload.prompts_count
+            p = workload.profile
+
+            if not quiet:
+                if prompts_mode:
+                    print(f"[runner] {n} scheduled arrivals over "
+                          f"{effective_rc.duration_s}s, replaying {m} real "
+                          f"prompts from {original_rc.prompts_file}")
+                else:
+                    print(f"[runner] {n} scheduled arrivals over "
+                          f"{effective_rc.duration_s}s (rate_scale "
+                          f"{effective_rc.rate_scale}), profile '{p.name}'")
+                    if p.label:
+                        print(f"[runner] profile label: {p.label}")
+
+            # ---- calibration / warmup pass ------------------------------
+            calib_n = min(effective_rc.calibrate_n, total_n)
+            chars_total = 0
+            ptok_total = 0
+            for i in range(calib_n):
+                body_rid = _stable_request_id(
+                    workload_id, i, "calibration-body")
+                rid = _stable_request_id(
+                    execution_id, i,
+                    f"calibration-shard-{effective_rc.shard_index}")
+                plan = workload.plan(i, body_rid)
+                body_hash = _payload_hash(
+                    ecfg, plan["messages"], plan["max_output"])
+                try:
+                    res = _send_request(
+                        client, plan["messages"], plan["max_output"], rid,
+                        0.0, 0.0, plan["intended"], plan["chars"])
+                    row = _annotate_result(
+                        res, "calibration", plan, body_hash)
+                except Exception as exc:
+                    row = _exception_result(
+                        rid, "calibration", plan, body_hash,
+                        "unexpected worker exception: "
+                        f"{type(exc).__name__}: {exc}")
+                artifact.append(row)
+                if row.get("ok") and row.get("prompt_tokens"):
+                    chars_total += plan["chars"]
+                    ptok_total += row["prompt_tokens"]
+
+            # Recalibrate only synthetic material. The original input cannot
+            # change this run: workload parsing is already on private bytes.
+            calibration = {
+                "requests": calib_n,
+                "reported_prompt_tokens": ptok_total,
+                "cpt_initial": effective_rc.cpt,
+                "cpt_final": effective_rc.cpt,
+            }
+            if not prompts_mode and ptok_total:
+                old_cpt = workload.mat.cpt
+                new_cpt = calibrate_cpt(old_cpt, chars_total, ptok_total)
+                calibration["cpt_final"] = new_cpt
+                if not quiet:
+                    print(f"[runner] cpt calibrated {old_cpt:.2f} -> "
+                          f"{new_cpt:.2f} (from {ptok_total} reported "
+                          "prompt tokens)")
+                workload.set_cpt(new_cpt)
+            artifact.update_start(
+                status="replay-ready", calibration=calibration,
+                endpoint_metadata=endpoint_meta, network_path=net_path)
+
+            # ---- paced replay --------------------------------------------
+            if effective_rc.start_at_unix is not None:
+                until_start = effective_rc.start_at_unix - time.time()
+                if until_start < -effective_rc.start_tolerance_s:
+                    raise RuntimeError(
+                        f"shared start_at_unix became stale by "
+                        f"{-until_start:.3f}s during setup; choose a later "
+                        "start and verify shard clocks")
+                t0 = time.monotonic() + until_start
+            else:
+                t0 = time.monotonic() + 0.25
+
+            from .progress import Progress
+            prog = Progress(n, float(effective_rc.duration_s),
+                            enabled=not quiet)
+            pending_limit = (
+                effective_rc.max_pending_requests
+                if effective_rc.max_pending_requests is not None
+                else max(effective_rc.max_concurrency * 2,
+                         effective_rc.max_concurrency + 1))
+
+            def _progress_done(fut):
+                if fut.cancelled():
+                    prog.done(None)
+                    return
+                try:
+                    prog.done(fut.result())
+                except Exception:
+                    # Collection below persists the exception as an error row.
+                    prog.done(None)
+
+            def _collect(fut, context):
+                rid, plan, body_hash, scheduled_s, lag_ms = context
+                try:
+                    return _annotate_result(
+                        fut.result(), "replay", plan, body_hash)
+                except Exception as exc:
+                    return _exception_result(
+                        rid, "replay", plan, body_hash,
+                        "unexpected worker exception: "
+                        f"{type(exc).__name__}: {exc}",
+                        scheduled_s=scheduled_s, dispatch_lag_ms=lag_ms)
+
+            try:
+                parameters = inspect.signature(
+                    client.send).parameters.values()
+                supports_scheduled_clock = any(
+                    p.name == "scheduled_monotonic"
+                    or p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in parameters)
+            except (TypeError, ValueError):
+                supports_scheduled_clock = True
+
+            pending: dict = {}
+            with ThreadPoolExecutor(
+                    max_workers=effective_rc.max_concurrency) as ex:
+                for local_i in range(n):
+                    target = t0 + float(ts[local_i])
+                    now = time.monotonic()
+                    if target > now:
+                        time.sleep(target - now)
+                    lag_ms = max(
+                        (time.monotonic() - target) * 1000.0, 0.0)
+
+                    # Both bookkeeping and the executor queue stay bounded.
+                    # Rows are journaled as soon as this dispatcher observes
+                    # completion; no run-sized in-memory result list exists.
+                    for done in [f for f in pending if f.done()]:
+                        artifact.append(_collect(done, pending.pop(done)))
+
+                    global_i = int(global_indices[local_i])
+                    body_rid = _stable_request_id(
+                        workload_id, global_i, "replay-body")
+                    rid = _stable_request_id(
+                        execution_id, global_i, "replay")
+                    plan = workload.plan(global_i, body_rid)
+                    body_hash = _payload_hash(
+                        ecfg, plan["messages"], plan["max_output"])
+                    prog.sent()
+                    if len(pending) >= pending_limit:
+                        artifact.append(_exception_result(
+                            rid, "replay", plan, body_hash,
+                            f"client pending limit {pending_limit} reached; "
+                            "request was not sent",
+                            scheduled_s=float(ts[local_i]),
+                            dispatch_lag_ms=lag_ms))
+                        prog.done(None)
+                        prog.paint()
+                        continue
+
+                    send_args = (
+                        plan["messages"], plan["max_output"], rid,
+                        float(ts[local_i]), lag_ms, plan["intended"],
+                        plan["chars"])
+                    if supports_scheduled_clock:
+                        fut = ex.submit(
+                            client.send, *send_args,
+                            scheduled_monotonic=target)
+                    else:  # compatibility for narrow third-party adapters
+                        fut = ex.submit(client.send, *send_args)
+                    fut.add_done_callback(_progress_done)
+                    pending[fut] = (
+                        rid, plan, body_hash, float(ts[local_i]), lag_ms)
+                    prog.paint()
+
+                for fut in as_completed(list(pending)):
+                    artifact.append(_collect(fut, pending[fut]))
+                    prog.paint()
+            prog.finish()
+            artifact.sync()
+
+            load_meta = {
+                "load_mode": load_mode,
+                "sizing_concurrency_requested": sizing_requested,
+                "sizing_concurrency_local": sizing_local,
+                "derived_qps": derived_qps,
+                "run_id": logical_run_id,
+                "logical_run_id": logical_run_id,
+                "workload_id": workload_id,
+                "execution_id": execution_id,
+                "artifact_id": artifact_id,
+                "schedule_identity": schedule_identity,
+                "index_identity": index_identity,
+                "start_at_unix": effective_rc.start_at_unix,
+                "max_pending_requests": pending_limit,
+                "global_index_start": index_identity["min"],
+                "global_index_end": index_identity["max"],
+                "global_index_range": [index_identity["min"],
+                                       index_identity["max"]],
+                # A fixed-rate open loop does not hold occupancy. Metrics
+                # reports observed concurrency as an outcome instead.
+                "concurrency_target": None,
+            }
+            common_meta = {
+                "endpoint_path": ecfg.path,
+                "label": original_rc.label,
+                "title": original_rc.title,
+                "request_params": req_params,
+                "endpoint_metadata": endpoint_meta,
+                "network_path": net_path,
+                "shard": (f"{effective_rc.shard_index + 1}/"
+                          f"{effective_rc.shard_total}"),
+                "endpoint_base_url": ecfg.base_url,
+                "endpoint_model": ecfg.model,
+                "profile_path": original_rc.profile_path,
+                "prompts_file": original_rc.prompts_file,
+                "seed": effective_rc.seed,
+                "ttft_definition": effective_rc.ttft_definition,
+                **load_meta,
+            }
+            if prompts_mode:
+                meta = {
+                    **common_meta,
+                    "input_mode": "prompts",
+                    "prompts_count": m,
+                }
+                acceptance = effective_rc.acceptance_targets
+            else:
+                meta = {
+                    **common_meta,
+                    "input_mode": "profile",
+                    "profile": p.name,
+                    "profile_provenance": p.provenance,
+                    "profile_label": p.label,
+                    "cpt_final": workload.mat.cpt,
+                }
+                acceptance = (
+                    effective_rc.acceptance_targets
+                    or (p.extra or {}).get("acceptance_targets"))
+
+            if acceptance and "targets_are" not in acceptance:
+                acceptance = {
+                    **acceptance,
+                    "targets_are": (
+                        "the run config" if original_rc.acceptance_targets
+                        else "this profile"),
+                }
+
+            # The journal is reread only after traffic has drained. During
+            # generation memory is bounded by max_pending_requests; the final
+            # exact percentile calculation uses the persisted replay rows.
+            replay_rows = [
+                row for row in artifact.read_rows()
+                if row.get("phase") == "replay"]
+            summary = summarize(
+                replay_rows, schedule_meta=sched_meta, run_meta=meta,
+                acceptance=acceptance,
+                ttft_definition=effective_rc.ttft_definition,
+                pricing=effective_rc.pricing,
+                concurrency_target=None)
+            out = write_outputs(
+                None, summary, artifact.path, original_rc.title,
+                artifact_run=artifact,
+                start_provenance=artifact.start_provenance)
+
         if not quiet:
-            print(f"[runner] cpt calibrated {old_cpt:.2f} -> {new_cpt:.2f} "
-                  f"(from {ptok_total} reported prompt tokens)")
-        workload.set_cpt(new_cpt)
-
-    # ---- paced replay ----------------------------------------------------
-    if rc.start_at_unix is not None:
-        until_start = rc.start_at_unix - time.time()
-        if until_start < -rc.start_tolerance_s:
-            raise RuntimeError(
-                f"shared start_at_unix became stale by {-until_start:.3f}s "
-                "during setup; choose a later start and verify shard clocks")
-        t0 = time.monotonic() + until_start
-    else:
-        t0 = time.monotonic() + 0.25
-
-    from .progress import Progress
-    prog = Progress(n, float(rc.duration_s), enabled=not quiet)
-    pending_limit = (rc.max_pending_requests
-                     if rc.max_pending_requests is not None
-                     else max(rc.max_concurrency * 2, rc.max_concurrency + 1))
-
-    def _progress_done(fut):
-        if fut.cancelled():
-            prog.done(None)
-            return
-        try:
-            prog.done(fut.result())
-        except Exception:
-            # Collection below persists the exception as an error row. A
-            # callback must never re-raise on a worker thread.
-            prog.done(None)
-
-    def _collect(fut, context):
-        rid, plan, body_hash, scheduled_s, lag_ms = context
-        try:
-            return _annotate_result(fut.result(), "replay", plan, body_hash)
-        except Exception as exc:
-            return _exception_result(
-                rid, "replay", plan, body_hash,
-                f"unexpected worker exception: {type(exc).__name__}: {exc}",
-                scheduled_s=scheduled_s, dispatch_lag_ms=lag_ms)
-
-    pending: dict = {}
-    with ThreadPoolExecutor(max_workers=rc.max_concurrency) as ex:
-        for local_i in range(n):
-            target = t0 + float(ts[local_i])
-            now = time.monotonic()
-            if target > now:
-                time.sleep(target - now)
-            lag_ms = max((time.monotonic() - target) * 1000.0, 0.0)
-
-            # Keep both our bookkeeping and ThreadPoolExecutor's private queue
-            # bounded. Completed work is drained without blocking the paced
-            # dispatcher; if the bound is still full, record an explicit
-            # client-side rejection instead of silently accumulating memory.
-            for done in [f for f in pending if f.done()]:
-                results.append(_collect(done, pending.pop(done)))
-
-            global_i = int(global_indices[local_i])
-            rid = _stable_request_id(run_id, global_i)
-            plan = workload.plan(global_i, rid)
-            body_hash = _payload_hash(
-                ecfg, plan["messages"], plan["max_output"])
-            prog.sent()
-            if len(pending) >= pending_limit:
-                results.append(_exception_result(
-                    rid, "replay", plan, body_hash,
-                    f"client pending limit {pending_limit} reached; request "
-                    "was not sent", scheduled_s=float(ts[local_i]),
-                    dispatch_lag_ms=lag_ms))
-                prog.done(None)
-                prog.paint()
-                continue
-
-            fut = ex.submit(
-                client.send, plan["messages"], plan["max_output"], rid,
-                float(ts[local_i]), lag_ms, plan["intended"], plan["chars"])
-            fut.add_done_callback(_progress_done)
-            pending[fut] = (rid, plan, body_hash, float(ts[local_i]), lag_ms)
-            prog.paint()
-
-        for fut in as_completed(list(pending)):
-            results.append(_collect(fut, pending[fut]))
-            prog.paint()
-    prog.finish()
-
-    load_meta = {
-        "load_mode": load_mode,
-        "sizing_concurrency_requested": sizing_requested,
-        "sizing_concurrency_local": sizing_local,
-        "derived_qps": derived_qps,
-        "run_id": run_id,
-        "start_at_unix": rc.start_at_unix,
-        "max_pending_requests": pending_limit,
-        # This is deliberately not `concurrency_target`: a fixed-rate open
-        # loop does not hold an occupancy target. Metrics still reports the
-        # concurrency that actually happened as an outcome.
-        "concurrency_target": None,
-    }
-    if prompts_mode:
-        meta = {
-            "input_mode": "prompts",
-            "prompts_file": rc.prompts_file, "prompts_count": m,
-            "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
-            "request_params": req_params, "endpoint_metadata": endpoint_meta,
-            "network_path": net_path,
-            "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
-            **load_meta,
-            # identity of the thing under test. without these, compare and
-            # merge cannot tell two different providers apart when both sit
-            # behind the same route.
-            "endpoint_base_url": ecfg.base_url,
-            "endpoint_model": ecfg.model,
-            "profile_path": rc.profile_path,
-            "seed": rc.seed,
+            print(f"[runner] wrote {out}/report.html (open in a browser) "
+                  f"and {out}/report.md")
+        return {
+            "summary": summary,
+            "out_dir": str(out),
+            "results_n": artifact.row_count,
         }
-        acceptance = rc.acceptance_targets
-    else:
-        meta = {
-            "input_mode": "profile",
-            "profile": p.name, "profile_provenance": p.provenance,
-            "profile_label": p.label, "cpt_final": workload.mat.cpt,
-            "endpoint_path": ecfg.path, "label": rc.label, "title": rc.title,
-            "request_params": req_params, "endpoint_metadata": endpoint_meta,
-            "network_path": net_path,
-            "shard": f"{rc.shard_index + 1}/{rc.shard_total}",
-            **load_meta,
-            # identity of the thing under test. without these, compare and
-            # merge cannot tell two different providers apart when both sit
-            # behind the same route.
-            "endpoint_base_url": ecfg.base_url,
-            "endpoint_model": ecfg.model,
-            "profile_path": rc.profile_path,
-            "prompts_file": rc.prompts_file,
-            "seed": rc.seed,
-        }
-        acceptance = (rc.acceptance_targets
-                      or (p.extra or {}).get("acceptance_targets"))
-
-    # name the origin, so the scorecard cannot credit the profile for numbers
-    # the run config supplied. the CLI stamps its own before we get here.
-    if acceptance and "targets_are" not in acceptance:
-        acceptance = {**acceptance,
-                      "targets_are": ("the run config" if rc.acceptance_targets
-                                      else "this profile")}
-
-    summary = summarize([r for r in results if r.get("phase") == "replay"],
-                        schedule_meta=schedule_report(sched), run_meta=meta,
-                        acceptance=acceptance,
-                        ttft_definition=rc.ttft_definition,
-                        pricing=rc.pricing,
-                        concurrency_target=None)
-    out = write_outputs(results, summary,
-                        Path(rc.out_dir) / time.strftime("%Y%m%d-%H%M%S"),
-                        rc.title)
-    if not quiet:
-        print(f"[runner] wrote {out}/report.html (open in a browser) "
-              f"and {out}/report.md")
-    return {"summary": summary, "out_dir": str(out), "results_n": len(results)}

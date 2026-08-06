@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import re
 import sys
 import tempfile
 import traceback
@@ -21,8 +22,10 @@ sys.path.insert(0, str(ROOT))
 
 # ---------------- pytest shim ----------------
 class _Raises:
-    def __init__(self, exc_type):
+    def __init__(self, exc_type, match: str | None = None):
         self.exc_type = exc_type
+        self.match = match
+        self.value = None
 
     def __enter__(self):
         return self
@@ -31,7 +34,14 @@ class _Raises:
         if et is None:
             raise AssertionError(f"expected {self.exc_type.__name__}, "
                                  f"nothing raised")
-        return issubclass(et, self.exc_type)
+        if not issubclass(et, self.exc_type):
+            return False
+        self.value = ev
+        if self.match is not None and re.search(self.match, str(ev)) is None:
+            raise AssertionError(
+                f"exception message {str(ev)!r} does not match "
+                f"{self.match!r}")
+        return True
 
 
 class _TmpPathFactory:

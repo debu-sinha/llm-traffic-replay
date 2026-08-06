@@ -75,17 +75,26 @@ class Profile:
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("profile name must be a non-empty string")
+        for name in ("provenance", "label"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(f"profile {name} must be a string")
+        if not isinstance(self.extra, dict):
+            raise ValueError("profile extra fields must form an object")
         for field_name in ("input_tokens", "output_tokens", "cache_fraction"):
             value = getattr(self, field_name)
             if not isinstance(value, dict) or set(value) != {"p50", "p95"}:
                 raise ValueError(
                     f"{field_name} must contain exactly p50 and p95")
-            try:
-                p50, p95 = float(value["p50"]), float(value["p95"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{field_name} quantiles must be numbers") from exc
+            if any(isinstance(value[q], bool)
+                   or not isinstance(value[q], (int, float))
+                   for q in ("p50", "p95")):
+                raise ValueError(f"{field_name} quantiles must be numbers")
+            p50, p95 = float(value["p50"]), float(value["p95"])
             if not (math.isfinite(p50) and math.isfinite(p95)):
                 raise ValueError(f"{field_name} quantiles must be finite")
+            # Normalize once. Downstream comparisons and **kwargs must never
+            # see a numeric-looking string or provider-specific number type.
+            setattr(self, field_name, {"p50": p50, "p95": p95})
         lognormal_from_quantiles(
             float(self.input_tokens["p50"]), float(self.input_tokens["p95"]))
         lognormal_from_quantiles(
@@ -95,6 +104,11 @@ class Profile:
         if not (0.0 <= cp50 <= cp95 <= 1.0):
             raise ValueError(
                 f"need 0 <= p50 <= p95 <= 1, got p50={cp50}, p95={cp95}")
+        if "acceptance_targets" in self.extra:
+            from .config_validation import validate_acceptance_targets
+            validate_acceptance_targets(
+                self.extra["acceptance_targets"],
+                "profile.acceptance_targets")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Profile":
@@ -127,11 +141,17 @@ def sample(profile: Profile, n: int, seed: int = 7,
     prefix_tokens is the per-request number of input tokens INTENDED to be
     served from prompt cache; suffix_tokens is the unique remainder.
     """
-    if not isinstance(n, (int, np.integer)) or n < 0:
+    if not isinstance(n, (int, np.integer)) or isinstance(n, bool) or n < 0:
         raise ValueError(f"n must be a non-negative integer, got {n!r}")
-    if not (0 < min_input <= max_input):
+    if not isinstance(seed, (int, np.integer)) or isinstance(seed, bool) \
+            or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    if any(not isinstance(x, (int, np.integer)) or isinstance(x, bool)
+           for x in (min_input, max_input)) or not (0 < min_input <= max_input):
         raise ValueError("need 0 < min_input <= max_input")
-    if not (0 < min_output <= max_output):
+    if any(not isinstance(x, (int, np.integer)) or isinstance(x, bool)
+           for x in (min_output, max_output)) \
+            or not (0 < min_output <= max_output):
         raise ValueError("need 0 < min_output <= max_output")
     rng = np.random.default_rng(seed)
 
@@ -173,7 +193,8 @@ def sample(profile: Profile, n: int, seed: int = 7,
         else:
             cache_f = np.full(n, 1.0 / (1.0 + math.exp(-mu_c)), dtype=float)
     else:
-        cache_f = 1.0 / (1.0 + np.exp(-rng.normal(mu_c, sg_c, n)))
+        latent = np.clip(rng.normal(mu_c, sg_c, n), -709.0, 709.0)
+        cache_f = 1.0 / (1.0 + np.exp(-latent))
 
     prefix = np.round(inp * cache_f).astype(int)
     suffix = inp - prefix
@@ -202,6 +223,8 @@ def sample(profile: Profile, n: int, seed: int = 7,
 def quantile_report(draw: dict) -> dict:
     """Recovered quantiles of a draw, for comparison against the spec."""
     def q(a, p):
+        if len(a) == 0:
+            raise ValueError("cannot report quantiles for an empty draw")
         return float(np.percentile(a, p))
 
     return {

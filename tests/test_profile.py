@@ -89,3 +89,47 @@ def test_profile_schema_is_validated_when_loaded(tmp_path):
     p.write_text('{"name":"missing-shape"}')
     with pytest.raises(ValueError, match="missing required"):
         prof.Profile.from_json(p)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("input_tokens", {"p50": True, "p95": 10}),
+    ("output_tokens", {"p50": "5", "p95": 10}),
+    ("cache_fraction", {"p50": False, "p95": 0.5}),
+])
+def test_profile_quantiles_require_real_json_numbers(field, value):
+    kwargs = {
+        "name": "strict",
+        "input_tokens": {"p50": 5, "p95": 10},
+        "output_tokens": {"p50": 5, "p95": 10},
+        "cache_fraction": {"p50": 0.1, "p95": 0.5},
+    }
+    kwargs[field] = value
+    with pytest.raises(ValueError, match="must be numbers"):
+        prof.Profile(**kwargs)
+
+
+def test_profile_embedded_acceptance_policy_is_validated():
+    with pytest.raises(ValueError, match="p101"):
+        prof.Profile(
+            name="bad-policy",
+            input_tokens={"p50": 5, "p95": 10},
+            output_tokens={"p50": 5, "p95": 10},
+            cache_fraction={"p50": 0.1, "p95": 0.5},
+            extra={"acceptance_targets": {"ttft_ms": {"p101": 10}}},
+        )
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"n": True}, {"seed": True}, {"seed": -1},
+    {"min_input": 1.5}, {"max_output": True},
+])
+def test_sampler_integer_controls_are_strict(kwargs):
+    base = {"n": 10}
+    base.update(kwargs)
+    with pytest.raises(ValueError):
+        prof.sample(SPEC, **base)
+
+
+def test_empty_draw_has_no_quantiles_to_report():
+    with pytest.raises(ValueError, match="empty draw"):
+        prof.quantile_report(prof.sample(SPEC, 0))

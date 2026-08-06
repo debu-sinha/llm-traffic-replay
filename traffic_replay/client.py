@@ -140,6 +140,17 @@ class RequestResult:
     tool_call_seen: bool = False
     tool_call_chunks: int = 0
     ttf_tool_call_ms: float | None = None
+    # Exact caller-experienced clocks, measured from the runner's monotonic
+    # scheduled target. These include pool wait, connection setup, and every
+    # automatic retry/fallback. They are intentionally separate from the
+    # final-attempt service clocks above.
+    queue_wait_ms: float | None = None
+    caller_ttfb_ms: float | None = None
+    caller_ttft_ms: float | None = None
+    caller_ttfr_ms: float | None = None
+    caller_ttfv_ms: float | None = None
+    caller_ttf_tool_call_ms: float | None = None
+    caller_e2e_ms: float | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -306,7 +317,8 @@ class EndpointClient:
     def send(self, messages: list[dict], max_tokens: int, request_id: str,
              scheduled_s: float, dispatch_lag_ms: float,
              intended: tuple[int, int, float, int],
-             chars_sent: int) -> RequestResult:
+             chars_sent: int, *,
+             scheduled_monotonic: float | None = None) -> RequestResult:
         """One request, fully measured. Never raises; errors land in result."""
         attempt = 0
         include_usage = self._include_usage_supported is not False
@@ -321,6 +333,28 @@ class EndpointClient:
         request_attempts = 0
         retry_reasons: list[str] = []
         auth_retried = False
+        queue_wait_ms = None
+        caller_ttfb_ms = caller_ttft_ms = None
+        caller_ttfr_ms = caller_ttfv_ms = None
+        caller_ttf_tool_call_ms = None
+
+        def caller_elapsed(now: float | None = None) -> float | None:
+            if scheduled_monotonic is None:
+                return None
+            if now is None:
+                now = time.monotonic()
+            return max((now - scheduled_monotonic) * 1000.0, 0.0)
+
+        def caller_kwargs() -> dict:
+            return {
+                "scheduled_monotonic": scheduled_monotonic,
+                "queue_wait_ms": queue_wait_ms,
+                "caller_ttfb_ms": caller_ttfb_ms,
+                "caller_ttft_ms": caller_ttft_ms,
+                "caller_ttfr_ms": caller_ttfr_ms,
+                "caller_ttfv_ms": caller_ttfv_ms,
+                "caller_ttf_tool_call_ms": caller_ttf_tool_call_ms,
+            }
 
         while attempt <= self.cfg.max_retries:
             attempt += 1
@@ -340,7 +374,8 @@ class EndpointClient:
                         first_attempt_unix=first_attempt_unix,
                         connection_attempts=connection_attempts,
                         request_attempts=request_attempts,
-                        retry_reasons=retry_reasons)
+                        retry_reasons=retry_reasons,
+                        **caller_kwargs())
                 conn = self._connect()
                 connection_attempts += 1
                 if first_attempt_unix is None:
@@ -365,6 +400,7 @@ class EndpointClient:
                 last_send_unix = t_send_unix
                 if first_send_unix is None:
                     first_send_unix = t_send_unix
+                    queue_wait_ms = caller_elapsed(t_send)
                 request_attempts += 1
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
                 conn.sock.settimeout(self.cfg.read_timeout_s)
@@ -389,7 +425,8 @@ class EndpointClient:
                         first_attempt_unix=first_attempt_unix,
                         connection_attempts=connection_attempts,
                         request_attempts=request_attempts,
-                        retry_reasons=retry_reasons)
+                        retry_reasons=retry_reasons,
+                        **caller_kwargs())
 
                 if resp.status in (401, 403) and self._refresh:
                     detail = resp.read(64 * 1024)
@@ -453,7 +490,8 @@ class EndpointClient:
                         first_attempt_unix=first_attempt_unix,
                         connection_attempts=connection_attempts,
                         request_attempts=request_attempts,
-                        retry_reasons=retry_reasons)
+                        retry_reasons=retry_reasons,
+                        **caller_kwargs())
 
                 if resp.status != 200:
                     detail = resp.read(64 * 1024)
@@ -468,7 +506,8 @@ class EndpointClient:
                                         first_attempt_unix=first_attempt_unix,
                                         connection_attempts=connection_attempts,
                                         request_attempts=request_attempts,
-                                        retry_reasons=retry_reasons)
+                                        retry_reasons=retry_reasons,
+                                        **caller_kwargs())
 
                 if include_usage and self._include_usage_supported is None:
                     self._include_usage_supported = True
@@ -480,11 +519,12 @@ class EndpointClient:
                 last_content_t = None
 
                 def timed_lines():
-                    nonlocal ttfb_ms
+                    nonlocal ttfb_ms, caller_ttfb_ms
                     for raw in resp:
                         now = time.monotonic()
                         if ttfb_ms is None:
                             ttfb_ms = (now - t_send) * 1000.0
+                            caller_ttfb_ms = caller_elapsed(now)
                         yield raw
 
                 for event in iter_sse_events(timed_lines()):
@@ -496,12 +536,16 @@ class EndpointClient:
                     first = update_state(state, event)
                     if first and ttft_ms is None:
                         ttft_ms = (now - t_send) * 1000.0
+                        caller_ttft_ms = caller_elapsed(now)
                     if state.saw_first_reasoning and not reasoning_before:
                         ttfr_ms = (now - t_send) * 1000.0
+                        caller_ttfr_ms = caller_elapsed(now)
                     if state.saw_first_visible and not visible_before:
                         ttfv_ms = (now - t_send) * 1000.0
+                        caller_ttfv_ms = caller_elapsed(now)
                     if state.saw_first_tool_call and not tool_before:
                         ttf_tool_call_ms = (now - t_send) * 1000.0
+                        caller_ttf_tool_call_ms = caller_elapsed(now)
                     if state.content_chunks > chunks_before:
                         if last_content_t is not None:
                             gap = (now - last_content_t) * 1000.0
@@ -524,7 +568,8 @@ class EndpointClient:
                                     connection_attempts=connection_attempts,
                                     request_attempts=request_attempts,
                                     retry_reasons=retry_reasons,
-                                    ttf_tool_call_ms=ttf_tool_call_ms)
+                                    ttf_tool_call_ms=ttf_tool_call_ms,
+                                    **caller_kwargs())
 
             except (OSError, http.client.HTTPException) as exc:
                 last_err = f"transport failed: {type(exc).__name__}"
@@ -552,7 +597,8 @@ class EndpointClient:
                             first_attempt_unix=first_attempt_unix,
                             connection_attempts=connection_attempts,
                             request_attempts=request_attempts,
-                            retry_reasons=retry_reasons)
+                            retry_reasons=retry_reasons,
+                            **caller_kwargs())
 
     @staticmethod
     def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
@@ -563,7 +609,10 @@ class EndpointClient:
                 first_send_unix=None, max_tokens_requested=None, *,
                 first_attempt_unix=None, connection_attempts=0,
                 request_attempts=0, retry_reasons=None,
-                ttf_tool_call_ms=None
+                ttf_tool_call_ms=None, scheduled_monotonic=None,
+                queue_wait_ms=None, caller_ttfb_ms=None,
+                caller_ttft_ms=None, caller_ttfr_ms=None,
+                caller_ttfv_ms=None, caller_ttf_tool_call_ms=None
                 ) -> RequestResult:
         u = extract_usage(state.usage)
         return RequestResult(
@@ -601,6 +650,15 @@ class EndpointClient:
             tool_call_seen=bool(state.saw_first_tool_call),
             tool_call_chunks=state.tool_call_chunks,
             ttf_tool_call_ms=ttf_tool_call_ms,
+            queue_wait_ms=queue_wait_ms,
+            caller_ttfb_ms=caller_ttfb_ms,
+            caller_ttft_ms=caller_ttft_ms,
+            caller_ttfr_ms=caller_ttfr_ms,
+            caller_ttfv_ms=caller_ttfv_ms,
+            caller_ttf_tool_call_ms=caller_ttf_tool_call_ms,
+            caller_e2e_ms=(
+                max((time.monotonic() - scheduled_monotonic) * 1000.0, 0.0)
+                if scheduled_monotonic is not None else None),
         )
 
 

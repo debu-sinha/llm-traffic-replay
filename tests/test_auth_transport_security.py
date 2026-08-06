@@ -163,6 +163,44 @@ def test_send_timestamp_excludes_connection_setup_and_attempts_are_explicit():
     assert result.retry_reasons == []
 
 
+def test_exact_caller_clocks_preserve_uniform_schedule_delay():
+    events = (
+        b'data: {"choices":[{"delta":{"content":"ok"},'
+        b'"finish_reason":"stop"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response(200, events=events)
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = Connection
+    scheduled = time.monotonic() - 2.0
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "late", 0.0, 0.0,
+        (0, 0, None, 0), 2, scheduled_monotonic=scheduled,
+    )
+    assert 1900 <= result.queue_wait_ms <= 2300
+    assert 1900 <= result.caller_ttfb_ms <= 2300
+    assert 1900 <= result.caller_ttft_ms <= 2300
+    assert 1900 <= result.caller_ttfv_ms <= 2300
+    assert result.caller_e2e_ms >= result.caller_ttft_ms
+    assert result.ttft_ms < 300
+
+
 class _ConnectFailure:
     sock = _Sock()
 
@@ -244,6 +282,55 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     assert result.request_attempts == 2
     assert result.retries == 1
     assert result.retry_reasons == ["stream_options_rejected"]
+
+
+def test_exact_caller_clock_includes_automatic_fallback_elapsed_time():
+    events = (
+        b'data: {"choices":[{"delta":{"content":"ok"},'
+        b'"finish_reason":"stop"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    class DelayedResponse(_Response):
+        def read(self, n=-1):
+            time.sleep(0.04)
+            return super().read(n)
+
+    class Connection:
+        sock = _Sock()
+
+        def __init__(self, response):
+            self.response = response
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return self.response
+
+        def close(self):
+            pass
+
+    connections = iter([
+        Connection(DelayedResponse(
+            400, b'{"error":"stream_options unsupported"}')),
+        Connection(_Response(200, events=events)),
+    ])
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = lambda: next(connections)
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "fallback", 0.0, 0.0,
+        (0, 0, None, 0), 2, scheduled_monotonic=time.monotonic(),
+    )
+    assert result.ok is True
+    assert result.request_attempts == 2
+    assert result.caller_ttft_ms >= 35
+    assert result.caller_e2e_ms >= 35
+    assert result.ttft_ms < result.caller_ttft_ms
 
 
 def test_generic_400_is_not_retried_or_persisted_verbatim():

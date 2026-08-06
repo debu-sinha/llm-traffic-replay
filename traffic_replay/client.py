@@ -30,7 +30,8 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass, asdict, field
 
-from .sse import StreamState, extract_usage, iter_sse_events, update_state
+from .sse import (StreamState, extract_usage, finalize_tool_calls,
+                  iter_sse_events, update_state)
 
 
 @dataclass
@@ -140,6 +141,7 @@ class RequestResult:
     tool_call_seen: bool = False
     tool_call_chunks: int = 0
     ttf_tool_call_ms: float | None = None
+    valid_tool_calls: int = 0
     # Exact caller-experienced clocks, measured from the runner's monotonic
     # scheduled target. These include pool wait, connection setup, and every
     # automatic retry/fallback. They are intentionally separate from the
@@ -555,9 +557,10 @@ class EndpointClient:
                     if state.done:
                         break
                 e2e_ms = (time.monotonic() - t_send) * 1000.0
-                ok = state.saw_first_content or state.saw_first_tool_call
+                finalize_tool_calls(state)
+                ok = state.saw_first_content or state.valid_tool_calls > 0
                 err = (None if ok else
-                       "stream ended with no content or tool-call delta")
+                       "stream ended with no content or valid tool call")
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
@@ -650,6 +653,7 @@ class EndpointClient:
             tool_call_seen=bool(state.saw_first_tool_call),
             tool_call_chunks=state.tool_call_chunks,
             ttf_tool_call_ms=ttf_tool_call_ms,
+            valid_tool_calls=state.valid_tool_calls,
             queue_wait_ms=queue_wait_ms,
             caller_ttfb_ms=caller_ttfb_ms,
             caller_ttft_ms=caller_ttft_ms,

@@ -24,10 +24,14 @@ class StreamState:
     content_chunks: int = 0
     reasoning_chunks: int = 0             # count of reasoning-channel deltas
     tool_call_chunks: int = 0
+    valid_tool_calls: int = 0
     finish_reason: str | None = None
     usage: dict | None = None
     done: bool = False
     errors: list[str] = field(default_factory=list)
+    _tool_names: dict[int, list[str]] = field(default_factory=dict, repr=False)
+    _tool_arguments: dict[int, list[str]] = field(
+        default_factory=dict, repr=False)
 
 
 def _safe_parse_error(kind: str, payload: str) -> dict:
@@ -223,6 +227,112 @@ def _nonempty_delta(value: object) -> bool:
     return False
 
 
+def _update_tool_calls(state: StreamState, value: object,
+                       choice_index: int) -> bool:
+    """Validate and retain only the structure needed to judge tool calls.
+
+    Argument text is held only until the stream finishes so its assembled JSON
+    can be validated; it is never copied into request artifacts.
+    """
+    legacy = isinstance(value, dict)
+    items = [value] if legacy else value
+    if not isinstance(items, list):
+        state.errors.append(
+            f"stream choice {choice_index} tool call must be an object or list")
+        return False
+    meaningful = False
+    for position, item in enumerate(items):
+        if not isinstance(item, dict):
+            state.errors.append(
+                f"stream choice {choice_index} tool call {position} must be "
+                "an object")
+            continue
+        index = item.get("index", position)
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            state.errors.append(
+                f"stream choice {choice_index} tool call index must be a "
+                "non-negative integer")
+            continue
+        function = item if legacy else item.get("function")
+        fragment = False
+        for metadata in ("id", "type"):
+            if metadata in item:
+                field_value = item[metadata]
+                if not isinstance(field_value, str):
+                    state.errors.append(
+                        f"stream choice {choice_index} tool call {metadata} "
+                        "must be a string")
+                elif field_value:
+                    fragment = True
+        if function is not None:
+            if not isinstance(function, dict):
+                state.errors.append(
+                    f"stream choice {choice_index} tool call function must "
+                    "be an object")
+            else:
+                if "name" in function:
+                    name = function["name"]
+                    if not isinstance(name, str):
+                        state.errors.append(
+                            f"stream choice {choice_index} tool call name "
+                            "must be a string")
+                    elif name:
+                        state._tool_names.setdefault(index, []).append(name)
+                        fragment = True
+                if "arguments" in function:
+                    arguments = function["arguments"]
+                    if not isinstance(arguments, str):
+                        state.errors.append(
+                            f"stream choice {choice_index} tool call arguments "
+                            "must be a string")
+                    else:
+                        state._tool_arguments.setdefault(index, []).append(
+                            arguments)
+                        fragment = True
+        if not fragment:
+            state.errors.append(
+                f"stream choice {choice_index} tool call {position} was empty")
+        meaningful = meaningful or fragment
+    return meaningful
+
+
+def finalize_tool_calls(state: StreamState) -> None:
+    """Validate complete tool names and JSON arguments after all deltas."""
+    if not state.saw_first_tool_call:
+        return
+    indexes = set(state._tool_names) | set(state._tool_arguments)
+    valid = 0
+    for index in sorted(indexes):
+        name = "".join(state._tool_names.get(index, [])).strip()
+        arguments = "".join(state._tool_arguments.get(index, []))
+        if not name:
+            state.errors.append(
+                f"tool call {index} did not identify a function name")
+            continue
+        if not arguments:
+            state.errors.append(
+                f"tool call {index} did not provide JSON arguments")
+            continue
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            # Never persist argument content; it may contain customer data.
+            encoded = arguments.encode("utf-8", "replace")
+            digest = hashlib.sha256(encoded).hexdigest()[:16]
+            state.errors.append(
+                f"tool call {index} arguments were invalid JSON "
+                f"(bytes={len(encoded)}, sha256={digest})")
+            continue
+        if not isinstance(parsed, dict):
+            state.errors.append(
+                f"tool call {index} arguments must decode to an object")
+            continue
+        valid += 1
+    state.valid_tool_calls = valid
+    state._tool_names.clear()
+    state._tool_arguments.clear()
+
+
 def update_state(state: StreamState, event: object) -> bool:
     """Fold one event into state. Returns True if this event carries the
     FIRST content delta (the TTFT moment)."""
@@ -263,12 +373,9 @@ def update_state(state: StreamState, event: object) -> bool:
         tool_call = delta.get("tool_calls") or delta.get("function_call")
         has_visible_delta = _nonempty_delta(visible)
         has_reasoning_delta = _nonempty_delta(reasoning)
-        if tool_call is not None and not isinstance(tool_call, (list, dict)):
-            state.errors.append(
-                f"stream choice {index} tool call must be an object or list")
-            has_tool_call_delta = False
-        else:
-            has_tool_call_delta = _nonempty_delta(tool_call)
+        has_tool_call_delta = (
+            _update_tool_calls(state, tool_call, index)
+            if tool_call is not None else False)
         if has_visible_delta or has_reasoning_delta:
             state.content_chunks += 1
             if not state.saw_first_content:

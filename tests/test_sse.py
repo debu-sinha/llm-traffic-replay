@@ -1,6 +1,7 @@
 """SSE parsing: TTFT keys on first CONTENT delta (role-only chunks must not
 trigger it), usage extraction is defensive across provider field names."""
-from traffic_replay.sse import (StreamState, extract_usage, iter_sse_events,
+from traffic_replay.sse import (StreamState, extract_usage,
+                                finalize_tool_calls, iter_sse_events,
                                 parse_sse_line, update_state)
 from traffic_replay.client import EndpointClient, EndpointConfig
 
@@ -87,13 +88,46 @@ def test_structured_content_text_is_visible():
 def test_tool_call_only_response_is_classified_separately():
     st = StreamState()
     event = {"choices": [{"delta": {"tool_calls": [{
-        "index": 0, "function": {"name": "lookup"}
+        "index": 0, "function": {"name": "lookup", "arguments": "{}"}
     }]}}]}
     assert update_state(st, event) is False
     assert st.saw_first_content is False
     assert st.saw_first_visible is False
     assert st.saw_first_tool_call is True
     assert st.tool_call_chunks == 1
+    finalize_tool_calls(st)
+    assert st.valid_tool_calls == 1
+
+
+def test_fragmented_tool_call_is_validated_only_after_complete_json():
+    st = StreamState()
+    update_state(st, {"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "id": "call-1", "type": "function",
+        "function": {"name": "look", "arguments": '{"city":'},
+    }]}}]})
+    update_state(st, {"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"name": "up", "arguments": '"Paris"}'},
+    }]}}]})
+    assert st.saw_first_tool_call is True
+    assert st.valid_tool_calls == 0
+    finalize_tool_calls(st)
+    assert st.valid_tool_calls == 1
+    assert st.errors == []
+
+
+def test_invalid_tool_arguments_are_redacted_and_not_valid():
+    st = StreamState()
+    secret = "private-customer-value"
+    update_state(st, {"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"name": "lookup", "arguments": "{" + secret},
+    }]}}]})
+    finalize_tool_calls(st)
+    assert st.valid_tool_calls == 0
+    assert "invalid JSON" in st.errors[-1]
+    assert "sha256=" in st.errors[-1]
+    assert secret not in st.errors[-1]
 
 
 def test_multiline_sse_data_is_joined_and_eof_is_dispatched():
@@ -166,7 +200,7 @@ def test_client_consumes_multiline_tool_call_stream_without_network():
             return iter([
                 b'data: {"choices": [{"delta":\n',
                 b'data: {"tool_calls": [{"index": 0, "function": '
-                b'{"name": "lookup"}}]}}]}\n',
+                b'{"name": "lookup", "arguments": "{}"}}]}}]}\n',
                 b'\n',
                 b'data: {"choices":[{"delta":{},'
                 b'"finish_reason":"tool_calls"}]}\n',
@@ -211,6 +245,7 @@ def test_client_consumes_multiline_tool_call_stream_without_network():
     assert result.status == 200
     assert result.tool_call_seen is True
     assert result.tool_call_chunks == 1
+    assert result.valid_tool_calls == 1
     assert result.ttf_tool_call_ms is not None
     assert result.visible_content_seen is False
     assert result.ttft_ms is None

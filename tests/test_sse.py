@@ -128,3 +128,18 @@ def test_usage_absent_is_none_never_guessed():
     assert u["prompt_tokens"] is None and u["cached_tokens"] is None
     u2 = extract_usage({"prompt_tokens": 50})
     assert u2["cached_tokens"] is None and u2["cached_tokens_source"] is None
+
+
+def test_usage_rejects_invalid_token_counts_without_crashing():
+    for usage in ([], "bad", {"prompt_tokens": -1},
+                  {"prompt_tokens": True}, {"prompt_tokens": float("nan")}):
+        u = extract_usage(usage)
+        assert u["prompt_tokens"] is None
+    u = extract_usage({
+        "prompt_tokens": 10.9,
+        "completion_tokens": 2.2,
+        "prompt_tokens_details": {"cached_tokens": -5},
+    })
+    assert u["prompt_tokens"] == 10
+    assert u["completion_tokens"] == 2
+    assert u["cached_tokens"] is None

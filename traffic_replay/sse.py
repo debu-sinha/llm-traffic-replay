@@ -8,6 +8,7 @@ Kept separate from the HTTP layer so it is unit-testable against fixtures.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator
 
@@ -226,22 +227,31 @@ def _walk(usage: dict, paths) -> tuple[int | None, str | None]:
             else:
                 ok = False
                 break
-        if ok and isinstance(node, (int, float)):
+        if (ok and isinstance(node, (int, float))
+                and not isinstance(node, bool)
+                and math.isfinite(float(node)) and node >= 0):
             return int(node), ".".join(path)
     return None, None
 
 
+def _token_count(value: object) -> int | None:
+    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and value >= 0):
+        return int(value)
+    return None
+
+
 def extract_usage(usage: dict | None) -> dict:
     """Normalize a usage block. Absent fields come back None, never guessed."""
-    if not usage:
+    if not isinstance(usage, dict) or not usage:
         return {"prompt_tokens": None, "completion_tokens": None,
                 "cached_tokens": None, "cached_tokens_source": None,
                 "reasoning_tokens": None, "reasoning_tokens_source": None}
     cached, cached_src = _walk(usage, CACHED_TOKEN_PATHS)
     reasoning, reasoning_src = _walk(usage, REASONING_TOKEN_PATHS)
     return {
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "completion_tokens": usage.get("completion_tokens"),
+        "prompt_tokens": _token_count(usage.get("prompt_tokens")),
+        "completion_tokens": _token_count(usage.get("completion_tokens")),
         "cached_tokens": cached,
         "cached_tokens_source": cached_src,
         "reasoning_tokens": reasoning,

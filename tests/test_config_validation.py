@@ -13,10 +13,12 @@ def test_valid_acceptance_and_pricing_schemas():
     validate_acceptance_targets({
         "ttft_ms": {"p50": 500, "p95": 900.0},
         "ttfg_ms": {"p99": 2000},
-        "hard_timeouts": {"ttft_s": 15, "ttfg_s": 45},
+        "hard_timeouts": {"ttft_s": 15, "ttfg_s": 45,
+                          "note": "hard cap"},
         "interchunk_ms": 500,
         "success_rate": 0.999,
         "targets_are": "customer SLO",
+        "priority": "latency and throughput",
         "note": "measured in production",
     })
     validate_pricing({
@@ -36,6 +38,7 @@ def test_valid_acceptance_and_pricing_schemas():
     {"ttfg_ms": {"p99": math.nan}},
     {"hard_timeouts": {"ttft_s": 0}},
     {"hard_timeouts": {"unknown": 1}},
+    {"hard_timeouts": {"note": "no actual cap"}},
     {"success_rate": -1},
     {"success_rate": 1.01},
     {"success_rate": True},

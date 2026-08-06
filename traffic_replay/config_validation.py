@@ -54,7 +54,7 @@ def validate_acceptance_targets(value: Any, where: str =
         raise ValueError(f"{where} must be an object")
     allowed = {
         "ttft_ms", "ttfg_ms", "hard_timeouts", "success_rate",
-        "interchunk_ms", "targets_are", "note",
+        "interchunk_ms", "targets_are", "priority", "note",
     }
     _keys(value, allowed, where)
     for name in ("ttft_ms", "ttfg_ms"):
@@ -64,16 +64,24 @@ def validate_acceptance_targets(value: Any, where: str =
         hard = value["hard_timeouts"]
         if not isinstance(hard, dict) or not hard:
             raise ValueError(f"{where}.hard_timeouts must be a non-empty object")
-        _keys(hard, {"ttft_s", "ttfg_s"}, f"{where}.hard_timeouts")
-        for name, limit in hard.items():
+        _keys(hard, {"ttft_s", "ttfg_s", "note"},
+              f"{where}.hard_timeouts")
+        limits = {name: limit for name, limit in hard.items()
+                  if name != "note"}
+        if not limits:
+            raise ValueError(
+                f"{where}.hard_timeouts needs ttft_s or ttfg_s")
+        for name, limit in limits.items():
             _number(limit, f"{where}.hard_timeouts.{name}", positive=True)
+        if "note" in hard and not isinstance(hard["note"], str):
+            raise ValueError(f"{where}.hard_timeouts.note must be a string")
     if "success_rate" in value:
         _number(value["success_rate"], f"{where}.success_rate",
                 positive=True, maximum=1.0)
     if "interchunk_ms" in value:
         _number(value["interchunk_ms"], f"{where}.interchunk_ms",
                 positive=True)
-    for name in ("targets_are", "note"):
+    for name in ("targets_are", "priority", "note"):
         if name in value and not isinstance(value[name], str):
             raise ValueError(f"{where}.{name} must be a string")
 

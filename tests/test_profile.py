@@ -133,3 +133,13 @@ def test_sampler_integer_controls_are_strict(kwargs):
 def test_empty_draw_has_no_quantiles_to_report():
     with pytest.raises(ValueError, match="empty draw"):
         prof.quantile_report(prof.sample(SPEC, 0))
+
+
+def test_every_shipped_profile_loads_and_samples():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted((root / "configs").glob("profile_*.json")):
+        profile = prof.Profile.from_json(path)
+        draw = prof.sample(profile, 10, seed=1)
+        assert len(draw["input_tokens"]) == 10, path

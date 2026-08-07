@@ -30,7 +30,7 @@ def _rows(n, ttft, base=1_700_000_000.0):
 def _meta(rtt):
     return {"network_path": {"endpoint_host": "ws.example.com",
                              "endpoint_ips": ["44.234.192.45"],
-                             "rtt_ms": rtt, "samples": 5}}
+                             "tcp_connect_min_ms": rtt, "samples": 5}}
 
 
 def test_it_measures_a_real_round_trip_to_a_local_server():
@@ -50,7 +50,8 @@ def test_it_measures_a_real_round_trip_to_a_local_server():
     assert r is not None
     assert r["endpoint_ips"] == ["127.0.0.1"]
     assert r["samples"] == 3
-    assert r["rtt_ms"] < 50, r        # loopback is sub-millisecond in practice
+    assert r["tcp_connect_min_ms"] < 50, r
+    assert "rtt_ms" not in r
     assert "client_hostname" not in r
     assert "client_egress_ip" not in r
 
@@ -92,30 +93,30 @@ def test_ipv6_is_supported_and_even_sample_median_is_arithmetic(monkeypatch):
                         lambda: next(times))
     result = measure_network_path("https://[::1]", samples=2)
     assert connected == [("::1", 443, 0, 0), ("::1", 443, 0, 0)]
-    assert result["rtt_ms"] == 10.0
-    assert result["rtt_median_ms"] == 20.0
+    assert result["tcp_connect_min_ms"] == 10.0
+    assert result["tcp_connect_median_ms"] == 20.0
 
 
-def test_the_share_of_ttft_is_computed_and_the_remainder_shown():
+def test_tcp_connect_floor_is_context_and_never_subtracted_from_ttft():
     s = summarize(_rows(300, 842.0), run_meta=_meta(82.0))
     np = s["network_path"]
-    assert np["ttft_p50_less_rtt"] == 760.0
-    assert 0.09 < np["share_of_ttft_p50"] < 0.10
+    assert "ttft_p50_less_rtt" not in np
+    assert 0.09 < np["tcp_connect_floor_to_ttft_p50_ratio"] < 0.10
+    assert "must not be subtracted" in np["interpretation"]
 
 
-def test_a_distant_client_is_called_out_in_both_reports():
+def test_a_network_floor_is_accurately_labeled_in_both_reports():
     s = summarize(_rows(300, 842.0), run_meta=_meta(82.0),
                   acceptance={"ttft_ms": {"p50": 5000}})
-    assert s["network_path"]["warning"]
+    assert "warning" not in s["network_path"]
     md = render_markdown(s, "x")
-    assert "CAUTION (network distance)" in md
-    assert "network distance: 82 ms round trip" in md
+    assert "network-path floor: 82 ms minimum TCP connect" in md
+    assert "do not subtract it from TTFT" in md
+    assert "endpoint time" not in md
     html = render_html(s, "x")
-    assert "Network distance" in html
-    assert "round trip to ws.example.com" in html
-    # and it is not allowed to pass clean while a tenth of the number is
-    # the width of the network
-    assert "Meets every acceptance target" not in html
+    assert "Network-path floor" in html
+    assert "minimum TCP connect to ws.example.com" in html
+    assert "endpoint time" not in html
 
 
 def test_a_nearby_client_says_the_distance_without_crying_about_it():
@@ -125,7 +126,7 @@ def test_a_nearby_client_says_the_distance_without_crying_about_it():
     assert "warning" not in s["network_path"]
     md = render_markdown(s, "x")
     assert "CAUTION (network distance)" not in md
-    assert "network distance: 2 ms round trip" in md    # still reported
+    assert "network-path floor: 2 ms minimum TCP connect" in md
 
 
 def test_no_network_block_when_it_could_not_be_measured():

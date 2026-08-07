@@ -30,6 +30,15 @@ from .artifacts import (
 
 PCTS = (50, 90, 95, 99)
 
+
+def _tcp_connect_floor(network_path: dict) -> float | None:
+    """Read current network-path evidence, with legacy artifact support."""
+    value = network_path.get("tcp_connect_min_ms")
+    if value is None:
+        value = network_path.get("rtt_ms")
+    return value
+
+
 def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     """How many requests were actually in flight, by exact interval overlap.
 
@@ -289,10 +298,7 @@ def _verdict(s: dict) -> tuple[str, str]:
         doubts.append((s.get("latency_population") or {})["warning"])
     _npw = (s.get("network_path") or {})
     if _npw.get("warning"):
-        doubts.append(
-            f"{_npw['rtt_ms']:.0f} ms of the TTFT is the round trip to the "
-            f"endpoint ({_npw['share_of_ttft_p50']:.1%} of p50), so the "
-            "client is measuring its own distance as well as the endpoint")
+        doubts.append(str(_npw["warning"]))
     _cap = a.get("truncated_by_global_cap") or 0
     _scored_n = a.get("scored") or 0
     if _scored_n and _cap / _scored_n > 0.05:
@@ -743,24 +749,25 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "note": "cache fraction is cached prompt tokens divided by all "
                     "prompt tokens for each request; it is not request hit rate",
         }
-    # how much of the latency below is the width of the network. one round
-    # trip is in every figure: the request goes out, the first token comes
-    # back. a run generated from the wrong region folds that in silently.
+    # A minimum TCP connect duration is useful location context but is not an
+    # exact RTT and cannot be subtracted from TTFT to recover endpoint time.
     _np = safe_run_meta.get("network_path")
-    if _np and _np.get("rtt_ms") is not None:
+    if _np and _tcp_connect_floor(_np) is not None:
+        floor = float(_tcp_connect_floor(_np))
         _t = (summary.get("ttft_ms") or {}).get("p50")
         _np = dict(_np)
+        _np["tcp_connect_min_ms"] = floor
+        # Old artifacts may already carry these invalid derived fields. Never
+        # repeat or re-render them as current evidence.
+        _np.pop("ttft_p50_less_rtt", None)
+        _np.pop("share_of_ttft_p50", None)
         if _t:
-            _np["share_of_ttft_p50"] = round(_np["rtt_ms"] / _t, 4)
-            _np["ttft_p50_less_rtt"] = round(_t - _np["rtt_ms"], 1)
-            if _np["rtt_ms"] / _t > 0.05:
-                _np["warning"] = (
-                    f"{_np['rtt_ms']:.0f} ms of the {_t:.0f} ms TTFT p50 is "
-                    f"the round trip to {_np['endpoint_host']}, which is "
-                    f"{_np['rtt_ms'] / _t:.1%} of it. the client is not near "
-                    "the endpoint. run the generator where the traffic "
-                    "actually originates, or quote "
-                    f"{_np['ttft_p50_less_rtt']:.0f} ms and say why")
+            _np["tcp_connect_floor_to_ttft_p50_ratio"] = round(
+                floor / _t, 4)
+        _np["interpretation"] = (
+            "TCP connect duration is a network-path floor and location "
+            "diagnostic. It is not an exact RTT or endpoint processing-time "
+            "measurement and must not be subtracted from TTFT.")
         summary["network_path"] = _np
 
     # time per output token, after the first. this is the metric the serving
@@ -1659,18 +1666,16 @@ def render_markdown(summary: dict, title: str) -> str:
         if s.get("requests_retried") else "- connection retries: none",
     ]
     npth = s.get("network_path") or {}
-    if npth.get("rtt_ms") is not None:
-        _sh = npth.get("share_of_ttft_p50")
+    floor = _tcp_connect_floor(npth)
+    if floor is not None:
+        ratio = npth.get("tcp_connect_floor_to_ttft_p50_ratio")
         lines.append(
-            f"- network distance: {npth['rtt_ms']:.0f} ms round trip from "
-            f"{npth.get('client_egress_ip') or 'this client'} to "
+            f"- network-path floor: {floor:.0f} ms minimum TCP connect to "
             f"{npth['endpoint_host']} ({', '.join(npth['endpoint_ips'][:3])})"
-            + (f". that is {_sh:.1%} of TTFT p50, leaving "
-               f"{npth['ttft_p50_less_rtt']:.0f} ms of endpoint time"
-               if _sh else "")
-            + ". one round trip is inside every latency figure above, "
-              "because the request has to arrive and the first token has to "
-              "come back")
+            + (f", a floor-to-TTFT-p50 ratio of {ratio:.1%}"
+               if ratio is not None else "")
+            + ". this is a location diagnostic, not exact RTT or endpoint "
+              "processing time; do not subtract it from TTFT")
     conn = s.get("connect_ms") or {}
     if conn.get("n"):
         lines.append(
@@ -2409,16 +2414,17 @@ def render_html(summary: dict, title: str) -> str:
     # ---- believability panel ----
     bel = []
     npth = s.get("network_path") or {}
-    if npth.get("rtt_ms") is not None:
-        _sh = npth.get("share_of_ttft_p50")
+    floor = _tcp_connect_floor(npth)
+    if floor is not None:
+        ratio = npth.get("tcp_connect_floor_to_ttft_p50_ratio")
         bel.append(
-            f"<li><b>Network distance</b>: {num(npth['rtt_ms'])} ms round "
-            f"trip to {esc(npth['endpoint_host'])} "
+            f"<li><b>Network-path floor</b>: {num(floor)} ms minimum TCP "
+            f"connect to {esc(npth['endpoint_host'])} "
             f"({esc(', '.join(npth['endpoint_ips'][:3]))})"
-            + (f", which is {_sh:.1%} of TTFT p50 and leaves "
-               f"{num(npth['ttft_p50_less_rtt'])} ms of endpoint time"
-               if _sh else "")
-            + ". One round trip sits inside every latency figure above</li>")
+            + (f", a floor-to-TTFT-p50 ratio of {ratio:.1%}"
+               if ratio is not None else "")
+            + ". This is a location diagnostic, not exact RTT or endpoint "
+              "processing time; do not subtract it from TTFT.</li>")
     if has(ach):
         bel.append(f"<li><b>Achieved cached prompt-token fraction</b> "
                    f"(endpoint-reported, "

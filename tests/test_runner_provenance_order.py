@@ -13,7 +13,8 @@ def test_endpoint_and_network_snapshots_precede_sizing_traffic(
     def fake_network(base_url):
         events.append("network")
         return {"endpoint_host": "example.invalid", "endpoint_ips": [],
-                "rtt_ms": 1.0, "rtt_median_ms": 1.0, "samples": 1}
+                "tcp_connect_min_ms": 1.0,
+                "tcp_connect_median_ms": 1.0, "samples": 1}
 
     def fake_metadata(base_url, path, token, timeout):
         events.append("metadata")

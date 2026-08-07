@@ -887,7 +887,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                 from .netpath import measure_network_path
                 net_path = measure_network_path(ecfg.base_url)
                 if net_path and not quiet:
-                    print(f"[runner] network: {net_path['rtt_ms']:.0f} ms "
+                    print(f"[runner] network: "
+                          f"{net_path['tcp_connect_min_ms']:.0f} ms "
                           f"TCP-connect floor to {net_path['endpoint_host']} "
                           f"({', '.join(net_path['endpoint_ips'][:2])})")
 

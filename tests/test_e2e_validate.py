@@ -45,10 +45,10 @@ def run_out(mock):
         title="e2e test", label="test", max_output_tokens_cap=16,
     )
     out = run(rc, quiet=True)
-    rows = [json.loads(l) for l in
+    rows = [json.loads(line) for line in
             (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
-    truth = {json.loads(l)["request_id"]: json.loads(l)
-             for l in mock["truth"].read_text().splitlines()}
+    truth = {json.loads(line)["request_id"]: json.loads(line)
+             for line in mock["truth"].read_text().splitlines()}
     return {"out": out, "rows": rows, "truth": truth}
 
 

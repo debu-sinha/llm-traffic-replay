@@ -81,7 +81,9 @@ def test_probe_argument_requires_a_finite_json_object():
     assert _json_object_arg('{"reasoning_effort":"none"}') == {
         "reasoning_effort": "none"}
     for value in ("[]", "null", '{"temperature": NaN}', "not-json",
-                  '{"api_key":"sensitive-value"}'):
+                  '{"api_key":"sensitive-value"}',
+                  '{"service_token":"opaque-value"}',
+                  '{"headers":{"X-Custom-Auth":"opaque-value"}}'):
         with pytest.raises(argparse.ArgumentTypeError):
             _json_object_arg(value)
 

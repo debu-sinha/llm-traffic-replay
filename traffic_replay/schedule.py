@@ -17,6 +17,29 @@ import math
 
 import numpy as np
 
+from .json_input import loads_strict
+
+
+# The current scheduler and profile materializer are intentionally exact but
+# O(N). Fail closed before they can allocate an unbounded schedule. Supporting
+# larger runs requires a streaming scheduler/workload implementation, not an
+# undocumented memory gamble.
+MAX_SCHEDULE_REQUESTS = 1_000_000
+MAX_SCHEDULE_SECONDS = 604_800
+
+
+def validate_schedule_capacity(duration_s: int, qps_max: float) -> None:
+    if duration_s > MAX_SCHEDULE_SECONDS:
+        raise ValueError(
+            f"duration_s exceeds the {MAX_SCHEDULE_SECONDS}-second exact "
+            "scheduler limit")
+    projected = float(duration_s) * float(qps_max)
+    if projected > MAX_SCHEDULE_REQUESTS:
+        raise ValueError(
+            f"schedule can project up to {projected:,.0f} arrivals, above "
+            f"the exact scheduler limit of {MAX_SCHEDULE_REQUESTS:,}; lower "
+            "duration/rate or implement a streaming schedule")
+
 
 def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
                   qps_burst: float = 350.0, qps_min: float = 10.0,
@@ -48,6 +71,7 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
     if not isinstance(seed, (int, np.integer)) or isinstance(seed, bool) \
             or seed < 0:
         raise ValueError("seed must be a non-negative integer")
+    validate_schedule_capacity(duration_s, qps_max)
     rng = np.random.default_rng(seed)
     rates = np.empty(duration_s)
     t, state = 0, "base"
@@ -67,7 +91,12 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
     # with the same seed at lower scales are exact subsets of the full run,
     # which makes smoke/full comparisons preserve individual arrival times.
     full_counts = rng.poisson(rates)
-    if full_counts.sum() == 0:
+    total = int(full_counts.sum())
+    if total > MAX_SCHEDULE_REQUESTS:
+        raise ValueError(
+            f"sampled schedule contains {total:,} arrivals, above the exact "
+            f"scheduler limit of {MAX_SCHEDULE_REQUESTS:,}")
+    if total == 0:
         counts = np.zeros(duration_s, dtype=int)
         return {"rates": rates * rate_scale, "counts": counts,
                 "timestamps": np.array([])}
@@ -106,7 +135,7 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
             continue
         try:
             if line.startswith("{"):
-                value = _json.loads(line)
+                value = loads_strict(line)
                 if not isinstance(value, dict) or "t" not in value:
                     raise ValueError("JSON row must be an object with a t field")
                 timestamp = float(value["t"])
@@ -120,6 +149,10 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
             raise ValueError(
                 f"arrival timestamp at {path}:{line_number} must be finite")
         ts.append(timestamp)
+        if len(ts) > MAX_SCHEDULE_REQUESTS:
+            raise ValueError(
+                f"arrival trace exceeds the exact scheduler limit of "
+                f"{MAX_SCHEDULE_REQUESTS:,} rows")
     if not ts:
         raise ValueError(f"no timestamps in {path}")
     arr = np.sort(np.asarray(ts, dtype=float))

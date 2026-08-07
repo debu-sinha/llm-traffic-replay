@@ -320,16 +320,28 @@ def test_redaction_covers_credentials_without_hiding_token_controls():
         "min_tokens": 8,
         "max_tokens": 64,
         "output_token_limit": 128,
+        "api_token": "opaque-api-value",
+        "service_token": "opaque-service-value",
+        "custom_headers": {
+            "Content-Type": "application/json",
+            "X-Custom-Auth": "opaque-header-value",
+            "X-Numeric": 123,
+        },
         "auth_profile": "customer-workspace-profile",
         "note": "basic benchmark methodology",
     }
     safe = redact_secrets(value)
     persisted = strict_json_dumps(safe)
-    for secret in (pat, jwt, "dXNlcjpwYXNz", "azure-secret", "password"):
+    for secret in (pat, jwt, "dXNlcjpwYXNz", "azure-secret", "password",
+                   "opaque-api-value", "opaque-service-value",
+                   "opaque-header-value", "application/json"):
         assert secret not in persisted
     assert safe["min_tokens"] == 8
     assert safe["max_tokens"] == 64
     assert safe["output_token_limit"] == 128
+    assert safe["api_token"] == "<redacted>"
+    assert safe["service_token"] == "<redacted>"
+    assert set(safe["custom_headers"].values()) == {"<redacted>"}
     assert safe["auth_profile"] == "<redacted>"
     assert safe["note"] == "basic benchmark methodology"
     title = sanitize_title(f"report\nAuthorization: Bearer {pat}")

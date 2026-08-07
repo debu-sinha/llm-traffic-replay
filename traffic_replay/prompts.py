@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .json_input import loads_strict
+
 
 def _coerce(item) -> list[dict]:
     """Turn one loaded item into a chat messages list.
@@ -74,8 +76,8 @@ def load_prompts(path: str) -> list[list[dict]]:
     suffix = p.suffix.lower()
     if suffix == ".json":
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            data = loads_strict(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"{path}: not valid JSON ({exc})") from exc
         if not isinstance(data, list):
             raise ValueError(".json prompts file must be a JSON array")
@@ -97,8 +99,8 @@ def load_prompts(path: str) -> list[list[dict]]:
             if not line:
                 continue
             try:
-                item = json.loads(line)
-            except json.JSONDecodeError as e:
+                item = loads_strict(line)
+            except (json.JSONDecodeError, ValueError) as e:
                 raise ValueError(f"line {ln}: not valid JSON ({e})") from e
             try:
                 prompts.append(_coerce(item))

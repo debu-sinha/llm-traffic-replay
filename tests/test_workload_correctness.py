@@ -11,7 +11,7 @@ import pytest
 from traffic_replay.client import EndpointConfig, RequestResult
 from traffic_replay.runner import (
     RunConfig, _PreparedWorkload, _payload_hash, _representative_plans,
-    _resolved_run_id, _shard_concurrency, _stable_request_id, run,
+    _resolved_run_id, _stable_request_id, run,
 )
 
 
@@ -149,15 +149,10 @@ def test_prompt_indices_are_global_not_restarted_per_shard(tmp_path):
     assert per_shard == {i: i % 5 for i in range(13)}
 
 
-def test_sizing_share_uses_exact_quotient_remainder_and_allows_zero(tmp_path):
-    shares = []
-    future = time.time() + 60
-    for shard_index in range(5):
-        rc = _cfg(tmp_path, sizing_concurrency=2, shard_total=5,
-                  shard_index=shard_index, start_at_unix=future)
-        shares.append(_shard_concurrency(rc))
-    assert shares == [1, 1, 0, 0, 0]
-    assert sum(shares) == 2
+def test_shards_reject_independent_unloaded_sizing(tmp_path):
+    with pytest.raises(ValueError, match="cannot size independently"):
+        _cfg(tmp_path, sizing_concurrency=2, shard_total=5, shard_index=0,
+             run_id="shared", start_at_unix=time.time() + 60)
 
 
 def test_shards_require_shared_identity_and_future_start(tmp_path):
@@ -180,6 +175,19 @@ def test_obvious_run_config_errors_are_refused_early(tmp_path):
         _cfg(tmp_path, qps_base=9.0)
     with pytest.raises(ValueError, match="max_output_tokens_cap"):
         _cfg(tmp_path, max_output_tokens_cap=0)
+    for field, value, match in (
+            ("max_concurrency", 4097, "max_concurrency cannot exceed"),
+            ("max_pending_requests", 100_001,
+             "max_pending_requests cannot exceed"),
+            ("pool_docs_per_bucket", 10_001,
+             "pool_docs_per_bucket cannot exceed"),
+            ("calibrate_n", 10_001, "calibrate_n cannot exceed")):
+        with pytest.raises(ValueError, match=match):
+            _cfg(tmp_path, **{field: value})
+    with pytest.raises(ValueError, match="exact scheduler limit"):
+        _cfg(tmp_path, duration_s=300, qps_base=1_000_000,
+             qps_burst=1_000_000, qps_min=1_000_000,
+             qps_max=1_000_000)
 
 
 def _fixed_schedule(n=4):

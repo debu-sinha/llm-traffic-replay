@@ -54,6 +54,15 @@ _SECRET_SUFFIXES = (
     "bearertoken", "refreshtoken", "idtoken", "clientassertion",
     "privatekey", "sharedaccesssignature", "signature", "sastoken",
 )
+_NON_SECRET_TOKEN_KEYS = {
+    # Model/request controls and usage counters. Keep this allowlist explicit:
+    # an unknown singular/plural token key is safer to treat as a credential.
+    "mintokens", "maxtokens", "maxnewtokens", "maxinputtokens",
+    "maxoutputtokens", "maxcompletiontokens", "budgettokens",
+    "inputtokens", "outputtokens", "prompttokens", "completiontokens",
+    "cachedtokens", "reasoningtokens", "totaltokens", "numtokens",
+    "tokencount", "tokencounts", "tokenlimit", "tokenbudget", "tokenids",
+}
 _HEADER_KEYS = {"header", "headers", "httpheader", "httpheaders",
                 "requestheader", "requestheaders"}
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
@@ -86,19 +95,50 @@ def _normalized_key(key: object) -> str:
 
 def _secret_key(key: object) -> bool:
     normalized = _normalized_key(key)
+    if normalized in _NON_SECRET_TOKEN_KEYS:
+        return False
+    plural_credential_tokens = normalized.endswith("tokens") and any(
+        normalized[:-6].endswith(prefix) for prefix in (
+            "api", "service", "auth", "access", "bearer", "refresh",
+            "session", "oauth", "credential", "secret", "client"))
     return (normalized in _SECRET_EXACT
             or any(normalized.endswith(suffix)
-                   for suffix in _SECRET_SUFFIXES))
+                   for suffix in _SECRET_SUFFIXES)
+            or normalized.endswith("token")
+            or plural_credential_tokens)
+
+
+def _header_container_key(key: object) -> bool:
+    normalized = _normalized_key(key)
+    return (normalized in _HEADER_KEYS
+            or normalized.endswith("header")
+            or normalized.endswith("headers"))
 
 
 def _redact_url(value: str) -> str:
-    """Redact credentials and secret-valued query parameters in HTTP URLs."""
+    """Redact credentials and secret-valued query parameters in URLs/paths."""
     try:
         parsed = urllib.parse.urlsplit(value)
     except ValueError:
         return value
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    absolute = parsed.scheme.lower() in {"http", "https"} and parsed.netloc
+    relative = not parsed.scheme and not parsed.netloc and bool(parsed.query)
+    if not absolute and not relative:
         return value
+
+    query = []
+    changed = False
+    for key, item in urllib.parse.parse_qsl(
+            parsed.query, keep_blank_values=True, strict_parsing=False):
+        secret = _secret_key(key)
+        query.append((key, "<redacted>" if secret else item))
+        changed = changed or secret
+    if relative:
+        if not changed:
+            return value
+        return urllib.parse.urlunsplit((
+            "", "", parsed.path, urllib.parse.urlencode(query, doseq=True),
+            parsed.fragment))
 
     host = parsed.hostname or ""
     if ":" in host and not host.startswith("["):
@@ -107,19 +147,20 @@ def _redact_url(value: str) -> str:
         port = f":{parsed.port}" if parsed.port is not None else ""
     except ValueError:
         port = ""
-    userinfo = "<redacted>@" if (parsed.username is not None
-                                  or parsed.password is not None) else ""
+    has_userinfo = parsed.username is not None or parsed.password is not None
+    userinfo = "<redacted>@" if has_userinfo else ""
+    changed = changed or has_userinfo
+    if not changed:
+        return value
     netloc = f"{userinfo}{host}{port}"
-    query = []
-    for key, item in urllib.parse.parse_qsl(
-            parsed.query, keep_blank_values=True, strict_parsing=False):
-        query.append((key, "<redacted>" if _secret_key(key) else item))
     return urllib.parse.urlunsplit((
         parsed.scheme, netloc, parsed.path,
         urllib.parse.urlencode(query, doseq=True), parsed.fragment))
 
 
 def _redact_string(value: str, *, header_context: bool = False) -> str:
+    if header_context:
+        return "<redacted>" if value else value
     value = _redact_url(value)
     value = _PEM_PRIVATE_KEY.sub("<redacted>", value)
     value = _URL_CREDENTIALS.sub(r"\1<redacted>@", value)
@@ -151,7 +192,9 @@ def redact_secrets(value, key: str | None = None, *, header_context=False):
     if key is not None and _secret_key(key):
         return "<redacted>"
     child_header_context = header_context or (
-        key is not None and _normalized_key(key) in _HEADER_KEYS)
+        key is not None and _header_container_key(key))
+    if header_context and not isinstance(value, (dict, list, tuple, str)):
+        return "<redacted>" if value is not None else None
     if isinstance(value, dict):
         return {str(k): redact_secrets(v, str(k),
                                        header_context=child_header_context)

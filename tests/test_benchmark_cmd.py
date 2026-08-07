@@ -162,9 +162,37 @@ def test_extra_body_must_be_a_finite_json_object():
         ttfg_p90=None, ttfg_p95=None, ttfg_p99=None, success_rate=None,
         max_concurrency=None, max_pending_requests=None, cmd="benchmark")
     for raw in ('[1, 2]', '{"x": NaN}',
-                '{"api_key":"sensitive-value"}'):
+                '{"reasoning_effort":"none","reasoning_effort":"high"}',
+                '{"api_key":"sensitive-value"}',
+                '{"service_token":"opaque-value"}',
+                '{"headers":{"X-Custom-Auth":"opaque-value"}}'):
         with pytest.raises(SystemExit):
             _benchmark_config(argparse.Namespace(**base, extra_body=raw))
+
+
+@pytest.mark.parametrize("body,key", [
+    ('{"endpoint":{},"endpoint":{}}', "endpoint"),
+    ('{"acceptance_targets":{"ttft_ms":{"p95":900,"p95":9000}}}',
+     "p95"),
+])
+def test_run_config_rejects_duplicate_policy_keys_before_run(
+        tmp_path, monkeypatch, body, key):
+    import argparse
+    from traffic_replay.cli import cmd_run
+
+    path = tmp_path / "duplicate.json"
+    path.write_text(body)
+    called = False
+
+    def should_not_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("traffic_replay.runner.run", should_not_run)
+    with pytest.raises(ValueError, match=f"duplicate key '{key}'"):
+        cmd_run(argparse.Namespace(
+            config=str(path), format="json", fail_on="miss"))
+    assert called is False
 
 
 def test_malformed_quantile_pairs_are_not_silently_repaired():

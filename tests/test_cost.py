@@ -65,7 +65,8 @@ def test_stream_counted_reasoning_fallback():
     assert "reasoning_tokens_per_min" not in s["throughput"]
     assert s["reasoning_stream_deltas_total"] == 20
     assert "not token counts" in s["reasoning_stream_deltas_source"]
-    assert s["throughput"]["reasoning_stream_deltas_per_min"] > 0
+    assert "reasoning_stream_deltas_per_min" not in s["throughput"]
+    assert "completion time" in s["throughput"]["coverage_warning"]
     report = render_html(s, "reasoning chunks")
     assert "Reasoning stream deltas" in report
     assert "These are SSE chunks, not tokens" in report

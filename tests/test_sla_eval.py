@@ -1,7 +1,7 @@
 """SLA scorecard: targets from the profile config are scored against
 measured percentiles, hard timeouts count as failures, and the report
 renders the verdicts."""
-from traffic_replay.metrics import render_markdown, summarize
+from traffic_replay.metrics import _verdict, render_markdown, summarize
 
 
 def _row(i, ttft, e2e, ok=True, prompt=1000, comp=50, inter=5.0):
@@ -141,3 +141,57 @@ def test_output_token_targeting_reports_ratio_and_finish_reasons():
     assert tt["finish_reasons"]["stop"] == 30
     assert tt["finish_reasons"]["length"] == 10
     assert "output tokens" in render_markdown(s, "t")
+
+
+def _stable_target_rows(*, prompt_actual=1000, prompt_intended=1000,
+                        output_actual=100, output_intended=100):
+    rows = []
+    for i in range(600):
+        row = _row(i, 400.0, 600.0, prompt=prompt_actual,
+                   comp=output_actual)
+        row["intended_input_tokens"] = prompt_intended
+        row["intended_output_tokens"] = output_intended
+        row["intended_cache_fraction"] = None
+        row["first_send_unix"] = row["t_send_unix"]
+        row["finished_unix"] = row["t_send_unix"] + 0.6
+        rows.append(row)
+    return rows
+
+
+def test_input_workload_mismatch_blocks_an_otherwise_green_verdict():
+    rows = _stable_target_rows(prompt_actual=100, prompt_intended=1000)
+    s = summarize(rows, acceptance=ACCEPT)
+    kind, text = _verdict(s)
+    assert kind == "caution"
+    assert "input tokens did not reproduce" in text
+    tt = s["token_targeting"]
+    assert tt["input_coverage"] == 1.0
+    assert tt["input_abs_relative_error_pct"]["p95"] == 90.0
+    assert "CAUTION (workload token fidelity)" in render_markdown(s, "t")
+
+
+def test_output_workload_mismatch_blocks_an_otherwise_green_verdict():
+    rows = _stable_target_rows(output_actual=1, output_intended=100)
+    s = summarize(rows, acceptance=ACCEPT)
+    kind, text = _verdict(s)
+    assert kind == "caution"
+    assert "output tokens did not reproduce" in text
+    assert s["token_targeting"]["output_abs_relative_error_pct"]["p95"] == 99.0
+
+
+def test_matching_workload_token_shape_can_reach_green():
+    s = summarize(_stable_target_rows(), acceptance=ACCEPT)
+    assert _verdict(s) == ("ok", "meets every acceptance target")
+    assert s["token_targeting"]["status"] == "verified"
+
+
+def test_illustrative_targets_can_never_produce_an_unqualified_green():
+    targets = {
+        **ACCEPT,
+        "note": "illustrative targets; replace with customer requirements",
+    }
+    s = summarize(_stable_target_rows(), acceptance=targets)
+    assert s["sla"]["targets_warning"]
+    kind, text = _verdict(s)
+    assert kind == "caution"
+    assert "illustrative" in text

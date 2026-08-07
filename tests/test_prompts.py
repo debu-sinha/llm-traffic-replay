@@ -81,6 +81,14 @@ def test_loader_rejects_bad_inputs():
         load_prompts(_write("bad-item.json", json.dumps(["ok", {"bad": 1}])))
     with pytest.raises(ValueError, match="line 2"):
         load_prompts(_write("bad-shape.jsonl", '"ok"\n{"bad":1}\n'))
+    with pytest.raises(ValueError, match="duplicate key 'prompt'"):
+        load_prompts(_write(
+            "duplicate.jsonl", '{"prompt":"safe","prompt":"changed"}\n'))
+    with pytest.raises(ValueError, match="duplicate key 'content'"):
+        load_prompts(_write(
+            "duplicate.json",
+            '[{"messages":[{"role":"user","content":"safe",'
+            '"content":"changed"}]}]'))
     # content must be a string: null and multimodal (list of parts) fail loud
     with pytest.raises(ValueError):
         load_prompts(_write("null.jsonl", json.dumps(

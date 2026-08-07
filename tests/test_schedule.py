@@ -5,7 +5,8 @@ import math
 import numpy as np
 import pytest
 
-from traffic_replay.schedule import make_schedule, schedule_report, shard
+from traffic_replay.schedule import (MAX_SCHEDULE_REQUESTS, make_schedule,
+                                     schedule_report, shard)
 
 
 def test_shape_spans_range_and_is_spiky():
@@ -54,6 +55,14 @@ def test_invalid_schedule_parameters_fail_before_allocation(kwargs):
         make_schedule(**kwargs)
 
 
+def test_schedule_projection_is_bounded_before_large_arrays_are_allocated():
+    with pytest.raises(ValueError, match="exact scheduler limit"):
+        make_schedule(duration_s=300, qps_base=1_000_000,
+                      qps_burst=1_000_000, qps_min=1_000_000,
+                      qps_max=1_000_000)
+    assert MAX_SCHEDULE_REQUESTS == 1_000_000
+
+
 def test_shard_partitions_exactly():
     s = make_schedule(duration_s=60, seed=11)
     sharded = [shard(s, i, 3) for i in range(3)]
@@ -97,6 +106,15 @@ def test_invalid_trace_rows_have_context_and_never_reach_numpy(content,
     path = tmp_path / "bad.trace"
     path.write_text(content)
     with pytest.raises(ValueError, match=r"bad\.trace:1"):
+        load_trace(path)
+
+
+def test_trace_json_rejects_duplicate_timestamp_keys(tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "duplicate.jsonl"
+    path.write_text('{"t":1,"t":999}\n')
+    with pytest.raises(ValueError, match="duplicate key 't'"):
         load_trace(path)
 
 

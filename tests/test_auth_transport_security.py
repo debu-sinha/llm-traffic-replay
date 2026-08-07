@@ -105,6 +105,15 @@ def test_bearer_token_is_allowed_only_on_explicit_loopback_test_hosts(url):
     assert client.scheme == "http"
 
 
+@pytest.mark.parametrize("value", [0, -1, True, float("inf"), float("nan")])
+def test_total_timeout_must_be_positive_and_finite(value):
+    with pytest.raises(ValueError, match="total_timeout_s"):
+        EndpointConfig(
+            base_url="http://127.0.0.1:1", path="/p",
+            total_timeout_s=value,
+        )
+
+
 class _Sock:
     def settimeout(self, value):
         self.timeout = value
@@ -138,6 +147,117 @@ class _TimedFailure:
 
     def close(self):
         pass
+
+
+def test_absolute_deadline_stops_a_continuous_heartbeat_stream():
+    class RecordingSock:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+    class Heartbeats:
+        status = 200
+
+        def __iter__(self):
+            while True:
+                time.sleep(0.008)
+                yield b": keepalive\n\n"
+
+    class Connection:
+        def __init__(self):
+            self.sock = RecordingSock()
+            self.closed = False
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return Heartbeats()
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+    client = EndpointClient(
+        EndpointConfig(
+            base_url="http://127.0.0.1:1", path="/p",
+            read_timeout_s=1.0, total_timeout_s=0.035,
+        ),
+        None,
+    )
+    client._connect = lambda: conn
+    started_unix = time.time()
+    started = time.monotonic()
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "deadline-stream",
+        0.0, 0.0, (0, 0, None, 0), 2,
+        scheduled_monotonic=started,
+    )
+    elapsed = time.monotonic() - started
+
+    assert 0.03 <= elapsed < 0.20
+    assert result.ok is False
+    assert result.status == 200
+    assert result.error == (
+        "request exceeded total timeout (total_timeout_s=0.035)")
+    assert result.stream_complete is False
+    assert result.ttfb_ms is not None
+    assert result.e2e_ms >= 30
+    assert result.caller_e2e_ms >= 30
+    assert result.finished_unix >= started_unix
+    assert result.request_attempts == 1
+    assert conn.closed is True
+    assert len(conn.sock.timeouts) >= 4
+    assert all(0 < timeout <= 0.035 for timeout in conn.sock.timeouts)
+    assert conn.sock.timeouts[-1] < conn.sock.timeouts[0]
+
+
+def test_absolute_deadline_also_covers_connection_setup():
+    class Connection:
+        sock = _Sock()
+
+        def __init__(self):
+            self.timeout = None
+            self.closed = False
+
+        def connect(self):
+            # A fake transport can ignore the requested socket timeout; the
+            # client still checks the absolute clock immediately afterwards.
+            time.sleep(0.025)
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+    client = EndpointClient(
+        EndpointConfig(
+            base_url="http://127.0.0.1:1", path="/p",
+            connect_timeout_s=1.0, total_timeout_s=0.01,
+        ),
+        None,
+    )
+    client._connect = lambda: conn
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "deadline-connect",
+        0.0, 0.0, (0, 0, None, 0), 2,
+    )
+
+    assert result.ok is False
+    assert result.status is None
+    assert result.error == (
+        "request exceeded total timeout (total_timeout_s=0.01)")
+    assert result.connection_attempts == 1
+    assert result.request_attempts == 0
+    assert result.first_attempt_unix is not None
+    assert result.first_send_unix is None
+    assert result.finished_unix is not None
+    assert conn.timeout <= 0.01
+    assert conn.closed is True
 
 
 def test_send_timestamp_excludes_connection_setup_and_attempts_are_explicit():

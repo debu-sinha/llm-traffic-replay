@@ -1165,6 +1165,52 @@ def test_the_arrival_rate_uses_the_send_span_not_the_drain():
     assert abs(s["throughput"]["output_tokens_per_min"] - expected) < 1.0
 
 
+def test_failed_tail_extends_the_observation_window_instead_of_zero_duration():
+    base = 1_700_000_000.0
+    rows = [
+        {"ok": True, "phase": "replay", "ttft_ms": 50.0,
+         "e2e_ms": 100.0, "prompt_tokens": 100, "completion_tokens": 10,
+         "t_send_unix": base + i * 0.1,
+         "first_send_unix": base + i * 0.1,
+         "finished_unix": base + i * 0.1 + 0.1}
+        for i in range(10)
+    ]
+    rows.append(
+        {"ok": False, "phase": "replay", "error": "read timeout",
+         "e2e_ms": None, "caller_e2e_ms": 60_000.0,
+         "t_send_unix": base + 0.95, "first_send_unix": base + 0.95,
+         "finished_unix": base + 60.95})
+    s = summarize(rows)
+    expected = 1000 / (60.95 / 60.0)
+    assert abs(s["throughput"]["input_tokens_per_min"] - expected) < 0.1
+    assert s["throughput"]["completion_time_coverage"] == 1.0
+
+
+def test_failed_requests_are_included_in_in_flight_occupancy():
+    from traffic_replay.metrics import _concurrency_block
+
+    base = 1_700_000_000.0
+    successes = [
+        {"ok": True, "e2e_ms": 100.0,
+         "first_send_unix": base + i * 0.1,
+         "t_send_unix": base + i * 0.1,
+         "finished_unix": base + i * 0.1 + 0.1}
+        for i in range(10)
+    ]
+    timeouts = [
+        {"ok": False, "error": "read timeout", "e2e_ms": None,
+         "first_send_unix": base + 0.95 + i * 0.001,
+         "t_send_unix": base + 0.95 + i * 0.001,
+         "finished_unix": base + 60.95 + i * 0.001}
+        for i in range(20)
+    ]
+    c = _concurrency_block(successes + timeouts, asked=30)
+    assert c["in_flight_max"] >= 21
+    assert c["sent_requests"] == 30
+    assert c["measured_requests"] == 30
+    assert c["coverage"] == 1.0
+
+
 def test_truncation_by_the_global_cap_is_counted_separately():
     """Ending on length at your own sampled target means the replay worked.
     Ending on it because the global cap bound first means the run never

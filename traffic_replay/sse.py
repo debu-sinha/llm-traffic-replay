@@ -29,9 +29,12 @@ class StreamState:
     usage: dict | None = None
     done: bool = False
     errors: list[str] = field(default_factory=list)
-    _tool_names: dict[int, list[str]] = field(default_factory=dict, repr=False)
-    _tool_arguments: dict[int, list[str]] = field(
+    _tool_names: dict[tuple[int, int], list[str]] = field(
         default_factory=dict, repr=False)
+    _tool_arguments: dict[tuple[int, int], list[str]] = field(
+        default_factory=dict, repr=False)
+    _choice_indexes_seen: set[int] = field(default_factory=set, repr=False)
+    _multiple_choices_reported: bool = field(default=False, repr=False)
 
 
 def _safe_parse_error(kind: str, payload: str) -> dict:
@@ -253,6 +256,7 @@ def _update_tool_calls(state: StreamState, value: object,
                 f"stream choice {choice_index} tool call index must be a "
                 "non-negative integer")
             continue
+        call_key = (choice_index, index)
         function = item if legacy else item.get("function")
         fragment = False
         for metadata in ("id", "type"):
@@ -277,7 +281,7 @@ def _update_tool_calls(state: StreamState, value: object,
                             f"stream choice {choice_index} tool call name "
                             "must be a string")
                     elif name:
-                        state._tool_names.setdefault(index, []).append(name)
+                        state._tool_names.setdefault(call_key, []).append(name)
                         fragment = True
                 if "arguments" in function:
                     arguments = function["arguments"]
@@ -286,7 +290,7 @@ def _update_tool_calls(state: StreamState, value: object,
                             f"stream choice {choice_index} tool call arguments "
                             "must be a string")
                     else:
-                        state._tool_arguments.setdefault(index, []).append(
+                        state._tool_arguments.setdefault(call_key, []).append(
                             arguments)
                         fragment = True
         if not fragment:
@@ -302,16 +306,21 @@ def finalize_tool_calls(state: StreamState) -> None:
         return
     indexes = set(state._tool_names) | set(state._tool_arguments)
     valid = 0
-    for index in sorted(indexes):
-        name = "".join(state._tool_names.get(index, [])).strip()
-        arguments = "".join(state._tool_arguments.get(index, []))
+    if len(state._choice_indexes_seen) > 1:
+        state.valid_tool_calls = 0
+        state._tool_names.clear()
+        state._tool_arguments.clear()
+        return
+    for choice_index, tool_index in sorted(indexes):
+        call_key = (choice_index, tool_index)
+        label = f"stream choice {choice_index} tool call {tool_index}"
+        name = "".join(state._tool_names.get(call_key, [])).strip()
+        arguments = "".join(state._tool_arguments.get(call_key, []))
         if not name:
-            state.errors.append(
-                f"tool call {index} did not identify a function name")
+            state.errors.append(f"{label} did not identify a function name")
             continue
         if not arguments:
-            state.errors.append(
-                f"tool call {index} did not provide JSON arguments")
+            state.errors.append(f"{label} did not provide JSON arguments")
             continue
         try:
             parsed = json.loads(arguments)
@@ -320,12 +329,12 @@ def finalize_tool_calls(state: StreamState) -> None:
             encoded = arguments.encode("utf-8", "replace")
             digest = hashlib.sha256(encoded).hexdigest()[:16]
             state.errors.append(
-                f"tool call {index} arguments were invalid JSON "
+                f"{label} arguments were invalid JSON "
                 f"(bytes={len(encoded)}, sha256={digest})")
             continue
         if not isinstance(parsed, dict):
             state.errors.append(
-                f"tool call {index} arguments must decode to an object")
+                f"{label} arguments must decode to an object")
             continue
         valid += 1
     state.valid_tool_calls = valid
@@ -355,18 +364,32 @@ def update_state(state: StreamState, event: object) -> bool:
         choices = []
 
     first_content = False
-    for index, choice in enumerate(choices):
+    for position, choice in enumerate(choices):
         if not isinstance(choice, dict):
             state.errors.append(
-                f"stream choice {index} must be an object, got "
+                f"stream choice {position} must be an object, got "
                 f"{type(choice).__name__}")
             continue
+        choice_index = choice.get("index", position)
+        if not isinstance(choice_index, int) \
+                or isinstance(choice_index, bool) or choice_index < 0:
+            state.errors.append(
+                f"stream choice {position} index must be a non-negative "
+                "integer")
+            continue
+        state._choice_indexes_seen.add(choice_index)
+        if len(state._choice_indexes_seen) > 1 \
+                and not state._multiple_choices_reported:
+            state.errors.append(
+                "stream returned multiple distinct choices; the benchmark "
+                "requires exactly one response per request")
+            state._multiple_choices_reported = True
         delta = choice.get("delta")
         if delta is None:
             delta = {}
         elif not isinstance(delta, dict):
             state.errors.append(
-                f"stream choice {index} delta must be an object")
+                f"stream choice {choice_index} delta must be an object")
             delta = {}
         visible = delta.get("content")
         reasoning = delta.get("reasoning_content")
@@ -374,7 +397,7 @@ def update_state(state: StreamState, event: object) -> bool:
         has_visible_delta = _nonempty_delta(visible)
         has_reasoning_delta = _nonempty_delta(reasoning)
         has_tool_call_delta = (
-            _update_tool_calls(state, tool_call, index)
+            _update_tool_calls(state, tool_call, choice_index)
             if tool_call is not None else False)
         if has_visible_delta or has_reasoning_delta:
             state.content_chunks += 1
@@ -395,7 +418,7 @@ def update_state(state: StreamState, event: object) -> bool:
             state.finish_reason = fr
         elif fr is not None:
             state.errors.append(
-                f"stream choice {index} finish_reason must be a string")
+                f"stream choice {choice_index} finish_reason must be a string")
 
     usage = event.get("usage")
     if usage is not None:

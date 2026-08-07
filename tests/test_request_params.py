@@ -61,12 +61,50 @@ def test_no_extra_body_is_unchanged():
 
 @pytest.mark.parametrize("extra", [
     {"api_key": "sensitive-value"},
+    {"api_token": "opaque-api-value"},
+    {"service_token": "opaque-service-value"},
     {"metadata": {"authorization": "sensitive-value"}},
     {"metadata": "Bearer sensitive-value"},
+    {"headers": {"X-Custom-Auth": "opaque-header-value"}},
 ])
 def test_extra_body_rejects_credentials_because_it_is_persisted(extra):
     with pytest.raises(ValueError, match="persisted as evidence"):
         EndpointConfig(base_url="http://x", path="/p", extra_body=extra)
+
+
+@pytest.mark.parametrize("n", [0, 2, -1, 1.0, True, "1"])
+def test_extra_body_rejects_multiple_or_ambiguous_choices(n):
+    with pytest.raises(ValueError, match="must be exactly 1"):
+        EndpointConfig(
+            base_url="http://x", path="/p", extra_body={"n": n})
+
+
+def test_extra_body_allows_an_explicit_single_choice():
+    cfg = EndpointConfig(
+        base_url="http://x", path="/p", extra_body={"n": 1})
+    assert cfg.extra_body == {"n": 1}
+
+
+@pytest.mark.parametrize("key", ["token", "api_token", "service_token"])
+def test_endpoint_path_rejects_secret_query_parameters(key):
+    path = f"/serving-endpoints/e/invocations?{key}=opaque-value-123456789"
+    with pytest.raises(ValueError, match="path must not contain credentials"):
+        EndpointConfig(base_url="https://example.invalid", path=path)
+
+
+def test_endpoint_path_allows_non_secret_query_controls():
+    path = "/openai/deployments/e/chat/completions?api-version=2026-01-01"
+    assert EndpointConfig(
+        base_url="https://example.invalid", path=path).path == path
+
+
+def test_relative_secret_query_strings_are_redacted():
+    from traffic_replay.artifacts import redact_secrets
+
+    value = "/invoke?api_token=opaque-value-123456789&api-version=2026-01-01"
+    safe = redact_secrets({"endpoint_path": value})["endpoint_path"]
+    assert "opaque-value-123456789" not in safe
+    assert "api-version=2026-01-01" in safe
 
 
 def test_reasoning_tokens_extracted_from_usage():

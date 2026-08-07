@@ -71,6 +71,8 @@ class EndpointConfig:
     model: str | None = None         # set for shared /chat/completions routes
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 120.0
+    total_timeout_s: float = 180.0   # absolute worker/request deadline; SSE
+                                     # traffic cannot extend it
     temperature: float = 0.0
     max_retries: int = 0             # physical inference retry; opt in only
     include_usage: bool = True       # request streamed usage when supported
@@ -83,11 +85,19 @@ class EndpointConfig:
             raise ValueError("endpoint path must start with one / character")
         if any(char in self.path for char in ("\r", "\n", "\x00")):
             raise ValueError("endpoint path must not contain control characters")
+        if urllib.parse.urlsplit(self.path).fragment:
+            raise ValueError("endpoint path must not contain a URL fragment")
+        from .artifacts import redact_secrets
+        if redact_secrets(self.path) != self.path:
+            raise ValueError(
+                "endpoint path must not contain credentials or secret-like "
+                "query values; use auth_profile or auth_token_env")
         if self.model is not None \
                 and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("endpoint model must be a non-empty string")
         for name, value in (("connect_timeout_s", self.connect_timeout_s),
-                            ("read_timeout_s", self.read_timeout_s)):
+                            ("read_timeout_s", self.read_timeout_s),
+                            ("total_timeout_s", self.total_timeout_s)):
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
                     or not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"endpoint {name} must be positive and finite")
@@ -101,6 +111,13 @@ class EndpointConfig:
         if not isinstance(self.include_usage, bool):
             raise ValueError("endpoint include_usage must be boolean")
         validate_extra_body_safety(self.extra_body)
+        if self.extra_body is not None and "n" in self.extra_body:
+            choices = self.extra_body["n"]
+            if isinstance(choices, bool) or not isinstance(choices, int) \
+                    or choices != 1:
+                raise ValueError(
+                    "endpoint extra_body.n must be exactly 1 because one "
+                    "benchmark request must produce one measured choice")
 
 
 @dataclass
@@ -172,6 +189,10 @@ class RequestResult:
     caller_ttfv_ms: float | None = None
     caller_ttf_tool_call_ms: float | None = None
     caller_e2e_ms: float | None = None
+    # Exact wall-clock completion for every worker result, including HTTP and
+    # transport failures. This closes the interval started by first_send_unix
+    # without pretending that a failed request occupied zero time.
+    finished_unix: float | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -179,6 +200,10 @@ class RequestResult:
 
 class UnsafeBearerTransport(ValueError):
     """A bearer credential would cross an untrusted cleartext transport."""
+
+
+class _RequestDeadlineExceeded(TimeoutError):
+    """The absolute per-request deadline expired."""
 
 
 def normalized_origin(value: str) -> tuple[str, str, int]:
@@ -358,6 +383,40 @@ class EndpointClient:
         caller_ttfb_ms = caller_ttft_ms = None
         caller_ttfr_ms = caller_ttfv_ms = None
         caller_ttf_tool_call_ms = None
+        worker_started_unix = time.time()
+        worker_started_monotonic = time.monotonic()
+        deadline_monotonic = (
+            worker_started_monotonic + float(self.cfg.total_timeout_s))
+
+        def remaining_s(now: float | None = None) -> float:
+            if now is None:
+                now = time.monotonic()
+            remaining = deadline_monotonic - now
+            if remaining <= 0:
+                raise _RequestDeadlineExceeded
+            return remaining
+
+        def cap_connect_timeout(conn) -> None:
+            # HTTPConnection.connect() reads this attribute when creating its
+            # socket. Cap it to the absolute request budget so DNS/TCP/TLS
+            # setup cannot outlive the request as a whole.
+            conn.timeout = min(
+                float(self.cfg.connect_timeout_s), remaining_s())
+
+        def cap_socket_timeout(conn) -> None:
+            # Socket timeouts are idle timeouts. Recompute the timeout before
+            # every blocking read so a stream of heartbeats cannot keep a
+            # request alive beyond total_timeout_s.
+            timeout = min(float(self.cfg.read_timeout_s), remaining_s())
+            sock = getattr(conn, "sock", None)
+            if sock is None:
+                conn.timeout = timeout
+            else:
+                sock.settimeout(timeout)
+
+        timeout_error = (
+            "request exceeded total timeout "
+            f"(total_timeout_s={float(self.cfg.total_timeout_s):g})")
 
         def caller_elapsed(now: float | None = None) -> float | None:
             if scheduled_monotonic is None:
@@ -375,6 +434,8 @@ class EndpointClient:
                 "caller_ttfr_ms": caller_ttfr_ms,
                 "caller_ttfv_ms": caller_ttfv_ms,
                 "caller_ttf_tool_call_ms": caller_ttf_tool_call_ms,
+                "worker_started_unix": worker_started_unix,
+                "worker_started_monotonic": worker_started_monotonic,
             }
 
         # send() begins when a worker actually receives this request. Capture
@@ -386,7 +447,16 @@ class EndpointClient:
             attempt += 1
             conn = None
             posts_before_attempt = request_attempts
+            state = StreamState()
+            t_send = None
+            t_send_unix = None
+            connect_ms = None
+            response_status = None
+            ttfb_ms = ttft_ms = ttfr_ms = ttfv_ms = None
+            ttf_tool_call_ms = None
+            interchunk_max = None
             try:
+                remaining_s()
                 try:
                     body = self._body(messages, max_tokens, include_usage)
                 except (TypeError, ValueError, OverflowError) as exc:
@@ -406,8 +476,10 @@ class EndpointClient:
                 connection_attempts += 1
                 if first_attempt_unix is None:
                     first_attempt_unix = time.time()
+                cap_connect_timeout(conn)
                 t_conn0 = time.monotonic()
                 conn.connect()
+                remaining_s()
                 connect_ms = (time.monotonic() - t_conn0) * 1000.0
                 headers = {
                     "Content-Type": "application/json",
@@ -427,13 +499,19 @@ class EndpointClient:
                 if first_send_unix is None:
                     first_send_unix = t_send_unix
                 request_attempts += 1
+                cap_socket_timeout(conn)
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
-                conn.sock.settimeout(self.cfg.read_timeout_s)
+                remaining_s()
+                cap_socket_timeout(conn)
                 resp = conn.getresponse()
+                remaining_s()
+                response_status = resp.status
 
                 if resp.status == 400 and include_usage \
                         and self._include_usage_supported is None:
+                    cap_socket_timeout(conn)
                     detail = resp.read(64 * 1024)
+                    remaining_s()
                     if _stream_options_rejected(detail):
                         # This is a real second POST and is recorded as such.
                         self._include_usage_supported = False
@@ -454,7 +532,9 @@ class EndpointClient:
                         **caller_kwargs())
 
                 if resp.status in (401, 403) and self._refresh:
+                    cap_socket_timeout(conn)
                     detail = resp.read(64 * 1024)
+                    remaining_s()
                     # keep the real reason. falling out of the retry loop
                     # with "exhausted retries" hides an auth problem, which
                     # is the most common thing to get wrong.
@@ -519,7 +599,9 @@ class EndpointClient:
                         **caller_kwargs())
 
                 if resp.status != 200:
+                    cap_socket_timeout(conn)
                     detail = resp.read(64 * 1024)
+                    remaining_s()
                     return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                         t_send_unix, None, None, None,
                                         resp.status, False,
@@ -537,16 +619,19 @@ class EndpointClient:
                 if include_usage and self._include_usage_supported is None:
                     self._include_usage_supported = True
 
-                state = StreamState()
-                ttfb_ms = ttft_ms = ttfr_ms = ttfv_ms = None
-                ttf_tool_call_ms = None
-                interchunk_max = None
                 last_content_t = None
 
                 def timed_lines():
                     nonlocal ttfb_ms, caller_ttfb_ms
-                    for raw in resp:
+                    response_lines = iter(resp)
+                    while True:
+                        cap_socket_timeout(conn)
+                        try:
+                            raw = next(response_lines)
+                        except StopIteration:
+                            return
                         now = time.monotonic()
+                        remaining_s(now)
                         if ttfb_ms is None:
                             ttfb_ms = (now - t_send) * 1000.0
                             caller_ttfb_ms = caller_elapsed(now)
@@ -579,7 +664,9 @@ class EndpointClient:
                         last_content_t = now
                     if state.done:
                         break
-                e2e_ms = (time.monotonic() - t_send) * 1000.0
+                finished_stream_at = time.monotonic()
+                remaining_s(finished_stream_at)
+                e2e_ms = (finished_stream_at - t_send) * 1000.0
                 finalize_tool_calls(state)
                 ok = state.saw_first_content or state.valid_tool_calls > 0
                 err = (None if ok else
@@ -597,7 +684,43 @@ class EndpointClient:
                                     ttf_tool_call_ms=ttf_tool_call_ms,
                                     **caller_kwargs())
 
+            except _RequestDeadlineExceeded:
+                finished_at = time.monotonic()
+                e2e_ms = (
+                    max((finished_at - t_send) * 1000.0, 0.0)
+                    if t_send is not None else None)
+                return self._finish(
+                    request_id, scheduled_s, dispatch_lag_ms,
+                    t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
+                    response_status, False, timeout_error, state, intended,
+                    chars_sent, len(retry_reasons), interchunk_max,
+                    ttfr_ms, ttfv_ms, connect_ms, first_send_unix,
+                    max_tokens,
+                    first_attempt_unix=first_attempt_unix,
+                    connection_attempts=connection_attempts,
+                    request_attempts=request_attempts,
+                    retry_reasons=retry_reasons,
+                    ttf_tool_call_ms=ttf_tool_call_ms,
+                    **caller_kwargs())
             except (OSError, http.client.HTTPException) as exc:
+                if time.monotonic() >= deadline_monotonic:
+                    finished_at = time.monotonic()
+                    e2e_ms = (
+                        max((finished_at - t_send) * 1000.0, 0.0)
+                        if t_send is not None else None)
+                    return self._finish(
+                        request_id, scheduled_s, dispatch_lag_ms,
+                        t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
+                        response_status, False, timeout_error, state,
+                        intended, chars_sent, len(retry_reasons),
+                        interchunk_max, ttfr_ms, ttfv_ms, connect_ms,
+                        first_send_unix, max_tokens,
+                        first_attempt_unix=first_attempt_unix,
+                        connection_attempts=connection_attempts,
+                        request_attempts=request_attempts,
+                        retry_reasons=retry_reasons,
+                        ttf_tool_call_ms=ttf_tool_call_ms,
+                        **caller_kwargs())
                 last_err = f"transport failed: {type(exc).__name__}"
                 if attempt <= self.cfg.max_retries:
                     retry_reasons.append(
@@ -638,8 +761,16 @@ class EndpointClient:
                 ttf_tool_call_ms=None, scheduled_monotonic=None,
                 queue_wait_ms=None, caller_ttfb_ms=None,
                 caller_ttft_ms=None, caller_ttfr_ms=None,
-                caller_ttfv_ms=None, caller_ttf_tool_call_ms=None
+                caller_ttfv_ms=None, caller_ttf_tool_call_ms=None,
+                worker_started_unix=None, worker_started_monotonic=None
                 ) -> RequestResult:
+        finished_monotonic = time.monotonic()
+        finished_unix = (
+            worker_started_unix
+            + max(finished_monotonic - worker_started_monotonic, 0.0)
+            if worker_started_unix is not None
+            and worker_started_monotonic is not None
+            else time.time())
         u = extract_usage(state.usage)
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
@@ -684,8 +815,9 @@ class EndpointClient:
             caller_ttfv_ms=caller_ttfv_ms,
             caller_ttf_tool_call_ms=caller_ttf_tool_call_ms,
             caller_e2e_ms=(
-                max((time.monotonic() - scheduled_monotonic) * 1000.0, 0.0)
+                max((finished_monotonic - scheduled_monotonic) * 1000.0, 0.0)
                 if scheduled_monotonic is not None else None),
+            finished_unix=finished_unix,
         )
 
 

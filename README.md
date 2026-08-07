@@ -581,7 +581,8 @@ Endpoint fields:
 | `auth_profile` | `null` | Named Databricks config profile; takes precedence and fails closed |
 | `model` | `null` | Included only when a shared Chat Completions route requires it |
 | `connect_timeout_s` | `10.0` | Positive finite setup timeout per attempt |
-| `read_timeout_s` | `120.0` | Positive finite response-read timeout per attempt |
+| `read_timeout_s` | `120.0` | Positive finite idle timeout for each response read |
+| `total_timeout_s` | `180.0` | Positive finite absolute deadline for the whole request/stream; heartbeats cannot extend it |
 | `temperature` | `0.0` | Finite sampling temperature |
 | `max_retries` | `0` | Non-negative transport retry count; duplicate POST risk applies |
 | `include_usage` | `true` | Request streamed usage and allow the explicit unsupported-field fallback |

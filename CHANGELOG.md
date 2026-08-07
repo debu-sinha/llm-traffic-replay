@@ -4,6 +4,17 @@ This file records behavior changes. It does not certify benchmark numbers from
 older artifacts. Compare only sealed runs whose manifests prove compatible
 code, workload, request, schedule, and timing definitions.
 
+## 0.5.1 - 2026-08-07
+
+- Bound every request with an absolute stream deadline and persist exact
+  completion times for both successful and failed requests.
+- Include timed-out and failed requests in observation windows and occupancy,
+  preventing throughput inflation and false low-concurrency reports.
+- Gate verdicts on paired input/output token fidelity and on whether acceptance
+  targets are explicitly illustrative.
+- Reject ambiguous multi-choice streams, duplicate JSON keys, persisted request
+  credentials, unsafe endpoint query secrets, and unbounded local allocations.
+
 ## 0.5.0 - 2026-08-06
 
 ### Crash-safe benchmark evidence

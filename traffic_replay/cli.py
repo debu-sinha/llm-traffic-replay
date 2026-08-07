@@ -78,8 +78,11 @@ def _finish(out, fail_on: str = "miss", fmt: str = "text") -> int:
 
 
 def cmd_run(args) -> int:
+    from .json_input import loads_strict
     from .runner import RunConfig, run
-    cfg = json.loads(Path(args.config).read_text())
+    cfg = loads_strict(Path(args.config).read_text())
+    if not isinstance(cfg, dict):
+        raise ValueError("run config JSON must be an object")
     if cfg.get("concurrency") is not None and cfg.get("sizing_concurrency") is None:
         print("warning: config field 'concurrency' is legacy; it is treated as "
               "'sizing_concurrency', which derives a fixed open-loop rate and "
@@ -359,8 +362,9 @@ def _benchmark_config(args) -> dict:
         ep["model"] = args.model
     if args.extra_body:
         try:
-            ep["extra_body"] = json.loads(args.extra_body)
-        except json.JSONDecodeError as e:
+            from .json_input import loads_strict
+            ep["extra_body"] = loads_strict(args.extra_body)
+        except (json.JSONDecodeError, ValueError) as e:
             raise SystemExit(f"--extra-body is not valid JSON: {e}")
         if not isinstance(ep["extra_body"], dict):
             raise SystemExit("--extra-body must be a JSON object")
@@ -477,7 +481,8 @@ def _benchmark_config(args) -> dict:
 def _json_object_arg(value: str) -> dict:
     """Parse one finite JSON object before any endpoint traffic is sent."""
     try:
-        parsed = json.loads(value)
+        from .json_input import loads_strict
+        parsed = loads_strict(value)
         if not isinstance(parsed, dict):
             raise ValueError("value is not an object")
         json.dumps(parsed, allow_nan=False)

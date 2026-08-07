@@ -335,20 +335,10 @@ class Profile:
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Profile":
-        def object_without_duplicates(pairs):
-            result = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ValueError(
-                        f"profile JSON contains duplicate key {key!r}")
-                result[key] = value
-            return result
-
+        from .json_input import loads_strict
         try:
-            raw = json.loads(
-                Path(path).read_text(encoding="utf-8-sig"),
-                object_pairs_hook=object_without_duplicates)
-        except json.JSONDecodeError as exc:
+            raw = loads_strict(Path(path).read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"profile JSON is invalid: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("profile JSON must be an object")

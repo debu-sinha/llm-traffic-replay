@@ -54,17 +54,13 @@ def _wilson_lower_95(successes: int, total: int) -> float | None:
     return max(0.0, (center - radius) / (1.0 + z2 / total))
 
 
-def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
+def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
     """How many requests were actually in flight, by exact interval overlap.
 
-    Overlap is exact for a successful request, which has both a send time and
-    a duration. Failures are excluded, since the harness records when they
-    were sent but not when they gave up, and a rejected request occupies the
-    endpoint for a moment rather than for its share of the load.
-
-    That exclusion is the point rather than a gap: if the endpoint is
-    shedding, the concurrency of real work is what a reader needs, and it is
-    the number that falls below what was asked.
+    Every request that reached the wire belongs in occupancy, including an
+    HTTP error or a transport timeout. Current rows record finished_unix for
+    that purpose; legacy successful rows can be reconstructed from their
+    final-attempt service duration.
 
     Every start and end is swept, so the maximum is a true peak rather than
     the highest of a fixed number of samples. An earlier version sampled 41
@@ -80,12 +76,12 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
     # stretch, so the span runs from the first send to the end of the
     # attempt that finished.
     spans = []
-    for r in ok:
+    sent_n = sum(1 for r in results if _sent_at(r) is not None)
+    for r in results:
         start = _sent_at(r)
-        if start is None or r.get("e2e_ms") is None:
+        end = _completed_at(r)
+        if start is None or end is None:
             continue
-        last = r.get("t_send_unix")
-        end = (last if last is not None else start) + r["e2e_ms"] / 1000.0
         spans.append((start, max(end, start)))
     spans = [(a, b) for a, b in spans if b > a]
     if len(spans) < 2:
@@ -161,19 +157,28 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
         "in_flight_p95": _tw(0.95),
         "in_flight_max": float(true_peak or peak),
         "in_flight_max_in_window": float(peak),
-        "measured_over": "content-bearing request rows with a recorded duration",
+        "measured_over": "sent request rows with a recorded completion time",
         "method": ("exact interval overlap. percentiles are time weighted "
                    "over the middle 60 percent of the LOAD interval, bounded "
                    "by send times so one straggler cannot stretch the "
                    "window. the maximum is a true peak over the whole run"),
+        "sent_requests": sent_n,
+        "measured_requests": len(spans),
+        "coverage": (len(spans) / sent_n) if sent_n else None,
     }
+    warnings = []
+    if sent_n and len(spans) / sent_n < 0.99:
+        warnings.append(
+            f"completion time was available for only {len(spans)} of "
+            f"{sent_n} requests that reached the wire, so occupancy is "
+            "incomplete")
     if asked:
         # --concurrency is a sizing input used to derive an open-loop arrival
         # rate. It is not a closed-loop controller and therefore must never be
         # labeled as concurrency the run promised to hold.
         out["sizing_concurrency_requested"] = asked
         if med < asked * 0.8:
-            out["warning"] = (
+            warnings.append(
                 f"the open-loop rate was sized from an unloaded estimate of "
                 f"{asked} concurrent requests, while observed in-flight p50 "
                 f"was {med:.0f}. {asked} was a sizing input, not a held "
@@ -185,13 +190,15 @@ def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
             # overshoot is the direction this design biases toward. warning
             # on only the other direction let a run labeled "30 concurrent"
             # that actually held 65 go out clean.
-            out["warning"] = (
+            warnings.append(
                 f"the open-loop rate was sized from an unloaded estimate of "
                 f"{asked} concurrent requests, while observed in-flight p50 "
                 f"was {med:.0f}. service time rose under load, so occupancy "
                 "exceeded the sizing estimate. describe this run by its "
                 f"achieved QPS and observed occupancy {med:.0f}, not as "
                 f"holding {asked} concurrent requests.")
+    if warnings:
+        out["warning"] = " ".join(warnings)
     return out
 
 
@@ -206,6 +213,39 @@ def _sent_at(r: dict) -> float | None:
     if "first_send_unix" in r:
         return r.get("first_send_unix")
     return r.get("t_send_unix")
+
+
+def _completed_at(r: dict) -> float | None:
+    """When a sent request stopped occupying a worker/connection.
+
+    New artifacts carry an exact epoch for successes and failures. For old
+    artifacts, reconstruct only from recorded clocks; never turn a missing
+    failure duration into zero.
+    """
+    start = _sent_at(r)
+    if start is None:
+        return None
+    if "finished_unix" in r:
+        value = r.get("finished_unix")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and math.isfinite(float(value)):
+            return max(float(value), start)
+        return None
+    first_attempt = r.get("first_attempt_unix")
+    caller = r.get("caller_e2e_ms")
+    queue = r.get("queue_wait_ms")
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool)
+           and math.isfinite(float(v)) for v in (first_attempt, caller)):
+        worker_ms = max(float(caller) - float(queue or 0.0), 0.0)
+        return max(float(first_attempt) + worker_ms / 1000.0, start)
+    service = r.get("e2e_ms")
+    last = r.get("t_send_unix")
+    if isinstance(service, (int, float)) and not isinstance(service, bool) \
+            and math.isfinite(float(service)):
+        base = (float(last) if isinstance(last, (int, float))
+                and not isinstance(last, bool) else start)
+        return max(base + max(float(service), 0.0) / 1000.0, start)
+    return None
 
 
 def _pct_table(values: list[float | None]) -> dict:
@@ -286,6 +326,8 @@ def _verdict(s: dict) -> tuple[str, str]:
 
     # met the targets. now decide whether the run is good enough to say so.
     doubts = []
+    if sla.get("targets_warning"):
+        doubts.append(str(sla["targets_warning"]))
     if unmeasured:
         doubts.append(f"{unmeasured} target"
                       f"{'s' if unmeasured != 1 else ''} had no measurement "
@@ -309,6 +351,8 @@ def _verdict(s: dict) -> tuple[str, str]:
                       "response because required usage fields were missing")
     if (s.get("cache_fidelity") or {}).get("warning"):
         doubts.append((s.get("cache_fidelity") or {})["warning"])
+    if (s.get("token_targeting") or {}).get("warning"):
+        doubts.append((s.get("token_targeting") or {})["warning"])
     if (s.get("latency_population") or {}).get("warning"):
         doubts.append((s.get("latency_population") or {})["warning"])
     _npw = (s.get("network_path") or {})
@@ -555,14 +599,74 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         if r.get("cached_tokens") is not None and r.get("prompt_tokens")
         and not 0 <= r["cached_tokens"] / r["prompt_tokens"] <= 1)
 
-    # token targeting: endpoint-reported prompt tokens vs intended
-    ratios = [r["prompt_tokens"] / r["intended_input_tokens"]
-              for r in ok
-              if r.get("prompt_tokens") and r.get("intended_input_tokens")]
-    out_ratios = [r["completion_tokens"] / r["intended_output_tokens"]
-                  for r in ok
-                  if r.get("completion_tokens")
-                  and r.get("intended_output_tokens")]
+    # Token targeting is a paired workload-fidelity check, not just a p50
+    # decoration. Synthetic/profile runs claim an input and output shape; an
+    # otherwise fast run at one tenth of that shape is not evidence for the
+    # declared workload. max_tokens is only a cap, so output mismatch is
+    # reported as mismatch rather than blamed on the endpoint.
+    def positive_number(value) -> bool:
+        return (isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value)) and value > 0)
+
+    def nonnegative_number(value) -> bool:
+        return (isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value)) and value >= 0)
+
+    input_eligible = [r for r in ok
+                      if positive_number(r.get("intended_input_tokens"))]
+    input_pairs = [
+        (float(r["prompt_tokens"]), float(r["intended_input_tokens"]))
+        for r in input_eligible if positive_number(r.get("prompt_tokens"))]
+    ratios = [actual / intended for actual, intended in input_pairs]
+    input_errors_pct = [abs(ratio - 1.0) * 100.0 for ratio in ratios]
+
+    output_eligible = [r for r in ok
+                       if positive_number(r.get("intended_output_tokens"))]
+    output_pairs = [
+        (float(r["completion_tokens"]), float(r["intended_output_tokens"]))
+        for r in output_eligible
+        if nonnegative_number(r.get("completion_tokens"))]
+    out_ratios = [actual / intended for actual, intended in output_pairs]
+    output_errors_pct = [abs(ratio - 1.0) * 100.0 for ratio in out_ratios]
+    targeting_warnings = []
+    tolerance_pct = 10.0
+    input_coverage = (len(input_pairs) / len(input_eligible)
+                      if input_eligible else None)
+    output_coverage = (len(output_pairs) / len(output_eligible)
+                       if output_eligible else None)
+    input_error_table = _pct_table(input_errors_pct)
+    output_error_table = _pct_table(output_errors_pct)
+    if input_eligible:
+        if input_coverage is not None and input_coverage < 0.99:
+            targeting_warnings.append(
+                f"prompt-token usage was reported for only "
+                f"{len(input_pairs)} of {len(input_eligible)} successful "
+                "profile requests")
+        elif ((input_error_table.get("p50") or 0.0) > tolerance_pct
+              or (input_error_table.get("p95") or 0.0) > tolerance_pct):
+            targeting_warnings.append(
+                "endpoint-reported input tokens did not reproduce the "
+                f"declared profile within ±{tolerance_pct:.0f}% "
+                f"(absolute relative error p50 "
+                f"{input_error_table['p50']:.1f}%, p95 "
+                f"{input_error_table['p95']:.1f}%)")
+    if output_eligible:
+        if output_coverage is not None and output_coverage < 0.99:
+            targeting_warnings.append(
+                f"completion-token usage was reported for only "
+                f"{len(output_pairs)} of {len(output_eligible)} successful "
+                "profile requests")
+        elif ((output_error_table.get("p50") or 0.0) > tolerance_pct
+              or (output_error_table.get("p95") or 0.0) > tolerance_pct):
+            targeting_warnings.append(
+                "endpoint-reported output tokens did not reproduce the "
+                f"declared profile within ±{tolerance_pct:.0f}% "
+                f"(absolute relative error p50 "
+                f"{output_error_table['p50']:.1f}%, p95 "
+                f"{output_error_table['p95']:.1f}%). max_tokens is a cap, "
+                "not a promise that a model will generate to that length")
     finish_reasons: dict[str, int] = {}
     for r in ok:
         fr = r.get("finish_reason")
@@ -625,13 +729,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # about 61 percent high.
     dur = None
     send_span = None
+    sent: list[float] = []
+    done: list[float] = []
     if results:
         sent = [_sent_at(r) for r in results if _sent_at(r) is not None]
-        done = [(r.get("t_send_unix") or _sent_at(r))
-                + (r.get("e2e_ms") or 0) / 1000.0
-                for r in results if _sent_at(r) is not None]
+        done = [_completed_at(r) for r in results
+                if _completed_at(r) is not None]
         if sent:
-            dur = max(max(done) - min(sent), 1e-9)
+            if len(done) == len(sent):
+                dur = max(max(done) - min(sent), 1e-9)
             # the ARRIVAL rate belongs on the send span. dividing it by the
             # observation interval above would charge it for the drain and
             # understate the load that was actually offered.
@@ -670,15 +776,22 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "input_tokens_per_min": in_tok / dur_min if dur_min else None,
             "output_tokens_per_min": out_tok / dur_min if dur_min else None,
             "usage_coverage": usage_coverage,
+            "completion_time_coverage": (
+                len(done) / len(sent) if sent else None),
             "note": ("endpoint-reported token counts over the observation "
                      "interval, which runs from the first send to the last "
                      "completion so generations finishing during the drain "
                      "are inside the window they belong to"),
             "coverage_warning": (
-                None if usage_coverage is None or usage_coverage > 0.99 else
-                f"only {usage_n} of {len(ok)} successful responses reported "
-                "token usage, so these totals and any per-token cost below "
-                "cover that subset, not the run"),
+                (f"completion time was available for only {len(done)} of "
+                 f"{len(sent)} requests that reached the wire, so token "
+                 "throughput is withheld rather than treating failed "
+                 "requests as zero-duration")
+                if sent and len(done) != len(sent) else
+                (None if usage_coverage is None or usage_coverage > 0.99 else
+                 f"only {usage_n} of {len(ok)} successful responses reported "
+                 "token usage, so these totals and any per-token cost below "
+                 "cover that subset, not the run")),
         },
         "achieved_cache_fraction": _pct_table(ach) | {
             "reported_for_n": len(ach),
@@ -691,17 +804,33 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "intended_cache_fraction": _pct_table(intended_cache),
         "latency_population": latency_population,
         "token_targeting": {
+            "input_eligible_successes": len(input_eligible),
+            "input_reported_n": len(input_pairs),
+            "input_coverage": input_coverage,
+            "input_reported_over_intended": _pct_table(ratios),
+            "input_abs_relative_error_pct": input_error_table,
             "reported_over_intended_p50":
                 float(np.percentile(ratios, 50)) if ratios else None,
             "abs_error_pct_p50":
                 float(np.percentile([abs(x - 1.0) for x in ratios], 50) * 100)
                 if ratios else None,
+            "output_eligible_successes": len(output_eligible),
+            "output_reported_n": len(output_pairs),
+            "output_coverage": output_coverage,
+            "output_reported_over_intended": _pct_table(out_ratios),
+            "output_abs_relative_error_pct": output_error_table,
             "output_reported_over_intended_p50":
                 float(np.percentile(out_ratios, 50)) if out_ratios else None,
             "output_abs_error_pct_p50":
                 float(np.percentile([abs(x - 1.0) for x in out_ratios], 50)
                       * 100) if out_ratios else None,
             "finish_reasons": finish_reasons,
+            "tolerance_pct": tolerance_pct,
+            "status": ("not_applicable" if not input_eligible
+                       and not output_eligible else
+                       "verified" if not targeting_warnings else "mismatch"),
+            "warning": "; ".join(targeting_warnings)
+            if targeting_warnings else None,
             "note": "endpoint-reported token counts are the source of truth. "
                     "input side is calibrated, output side is only reported "
                     "(models may stop before max_tokens: finish_reason stop "
@@ -989,7 +1118,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
 ),
         }
 
-    conc = _concurrency_block(ok, concurrency_target
+    conc = _concurrency_block(results, concurrency_target
                               or safe_run_meta.get("sizing_concurrency_requested")
                               or safe_run_meta.get("concurrency_target"))
     if conc:
@@ -1614,6 +1743,9 @@ def render_markdown(summary: dict, title: str) -> str:
     _cachew = (s.get("cache_fidelity") or {}).get("warning")
     if _cachew:
         cautions += [f"CAUTION (cache fidelity): {_cachew}", ""]
+    _tokenw = (s.get("token_targeting") or {}).get("warning")
+    if _tokenw:
+        cautions += [f"CAUTION (workload token fidelity): {_tokenw}", ""]
     _popw = (s.get("latency_population") or {}).get("warning")
     if _popw:
         cautions += [f"CAUTION (latency population): {_popw}", ""]
@@ -2693,6 +2825,7 @@ def render_html(summary: dict, title: str) -> str:
             (s.get("throughput") or {}).get("coverage_warning"),
             (s.get("cost") or {}).get("coverage_warning"),
             (s.get("cache_fidelity") or {}).get("warning"),
+            (s.get("token_targeting") or {}).get("warning"),
             (s.get("latency_population") or {}).get("warning")):
         if warning:
             sample_banner += f"<div class='banner warn'>{esc(warning)}</div>"

@@ -1,5 +1,7 @@
 """SSE parsing: TTFT keys on first CONTENT delta (role-only chunks must not
 trigger it), usage extraction is defensive across provider field names."""
+import json
+
 from traffic_replay.sse import (StreamState, extract_usage,
                                 finalize_tool_calls, iter_sse_events,
                                 parse_sse_line, update_state)
@@ -112,6 +114,72 @@ def test_fragmented_tool_call_is_validated_only_after_complete_json():
     assert st.saw_first_tool_call is True
     assert st.valid_tool_calls == 0
     finalize_tool_calls(st)
+    assert st.valid_tool_calls == 1
+    assert st.errors == []
+
+
+def test_tool_fragments_from_distinct_choices_cannot_form_a_valid_call():
+    st = StreamState()
+    update_state(st, {"choices": [
+        {"index": 0, "delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"name": "look", "arguments": '{"city":'},
+        }]}},
+    ]})
+    update_state(st, {"choices": [
+        {"index": 1, "delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"name": "up", "arguments": '"Paris"}'},
+        }]}},
+    ]})
+
+    assert set(st._tool_names) == {(0, 0), (1, 0)}
+    assert set(st._tool_arguments) == {(0, 0), (1, 0)}
+    assert sum("multiple distinct choices" in error
+               for error in st.errors) == 1
+
+    finalize_tool_calls(st)
+
+    assert st.valid_tool_calls == 0
+    assert st._tool_names == {}
+    assert st._tool_arguments == {}
+
+
+def test_choice_index_is_validated_before_processing_delta():
+    for invalid in (True, -1, "0", 1.5):
+        st = StreamState()
+        event = {"choices": [{
+            "index": invalid,
+            "delta": {"content": "must not be accepted"},
+        }]}
+
+        assert update_state(st, event) is False
+        assert st.saw_first_content is False
+        assert st.saw_first_visible is False
+        assert st.content_chunks == 0
+        assert len(st.errors) == 1
+        assert "index must be a non-negative integer" in st.errors[0]
+
+
+def test_single_nonzero_choice_index_preserves_fragmented_tool_call():
+    st = StreamState()
+    update_state(st, {"choices": [{
+        "index": 7,
+        "delta": {"tool_calls": [{
+            "index": 2,
+            "function": {"name": "look", "arguments": '{"city":'},
+        }]},
+    }]})
+    update_state(st, {"choices": [{
+        "index": 7,
+        "delta": {"tool_calls": [{
+            "index": 2,
+            "function": {"name": "up", "arguments": '"Paris"}'},
+        }]},
+    }]})
+
+    finalize_tool_calls(st)
+
     assert st.valid_tool_calls == 1
     assert st.errors == []
 
@@ -250,6 +318,72 @@ def test_client_consumes_multiline_tool_call_stream_without_network():
     assert result.visible_content_seen is False
     assert result.ttft_ms is None
     assert result.finish_reason == "tool_calls"
+    assert result.stream_complete is True
+
+
+def test_client_rejects_tool_call_spliced_across_stream_choices():
+    first = {"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"name": "look", "arguments": '{"city":'},
+    }]}}]}
+    second = {"choices": [{"index": 1, "delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"name": "up", "arguments": '"Paris"}'},
+    }]}}]}
+
+    class _Socket:
+        def settimeout(self, value):
+            self.timeout = value
+
+    class _Response:
+        status = 200
+
+        def __iter__(self):
+            return iter([
+                ("data: " + json.dumps(first) + "\n\n").encode(),
+                ("data: " + json.dumps(second) + "\n\n").encode(),
+                b"data: [DONE]\n\n",
+            ])
+
+    class _Connection:
+        def __init__(self):
+            self.sock = _Socket()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/chat",
+                       max_retries=0),
+        token=None,
+        refresh=None,
+    )
+    client._connect = _Connection
+
+    result = client.send(
+        [{"role": "user", "content": "look it up"}],
+        20,
+        "r-multiple-choices",
+        0.0,
+        0.0,
+        (3, 20, None, -1),
+        10,
+    )
+
+    assert result.status == 200
+    assert result.ok is False
+    assert result.parse_errors == 1
+    assert result.tool_call_seen is True
+    assert result.valid_tool_calls == 0
     assert result.stream_complete is True
 
 

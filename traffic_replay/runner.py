@@ -57,11 +57,16 @@ from .config_validation import (validate_acceptance_targets,
                                 validate_pricing)
 from .metrics import summarize, write_outputs
 from .prefix_pool import PrefixPool
-from .schedule import load_trace, make_schedule, schedule_report, shard
+from .schedule import (load_trace, make_schedule, schedule_report, shard,
+                       validate_schedule_capacity)
 from .textgen import TextMaterializer, calibrate_cpt
 
 
 _DEFAULT_MAX_CONCURRENCY = 256
+_MAX_CONCURRENCY = 4096
+_MAX_PENDING_REQUESTS = 100_000
+_MAX_POOL_DOCS_PER_BUCKET = 10_000
+_MAX_CALIBRATION_REQUESTS = 10_000
 
 
 @dataclasses.dataclass
@@ -155,11 +160,20 @@ class RunConfig:
                 or isinstance(self.max_concurrency, bool) \
                 or self.max_concurrency <= 0:
             raise ValueError("max_concurrency must be a positive integer")
+        if self.max_concurrency is not None \
+                and self.max_concurrency > _MAX_CONCURRENCY:
+            raise ValueError(
+                f"max_concurrency cannot exceed {_MAX_CONCURRENCY}; shard "
+                "the load generator instead")
         if self.max_pending_requests is not None and (
                 not isinstance(self.max_pending_requests, int)
                 or isinstance(self.max_pending_requests, bool)
                 or self.max_pending_requests <= 0):
             raise ValueError("max_pending_requests must be a positive integer")
+        if self.max_pending_requests is not None \
+                and self.max_pending_requests > _MAX_PENDING_REQUESTS:
+            raise ValueError(
+                f"max_pending_requests cannot exceed {_MAX_PENDING_REQUESTS}")
         if isinstance(self.cpt, bool) or not isinstance(self.cpt, (int, float)) \
                 or not math.isfinite(float(self.cpt)) or self.cpt <= 0:
             raise ValueError("cpt must be positive and finite")
@@ -169,6 +183,9 @@ class RunConfig:
         if not isinstance(self.calibrate_n, int) \
                 or isinstance(self.calibrate_n, bool) or self.calibrate_n < 0:
             raise ValueError("calibrate_n must be a non-negative integer")
+        if self.calibrate_n > _MAX_CALIBRATION_REQUESTS:
+            raise ValueError(
+                f"calibrate_n cannot exceed {_MAX_CALIBRATION_REQUESTS}")
         if not isinstance(self.shard_total, int) \
                 or isinstance(self.shard_total, bool) \
                 or self.shard_total <= 0 \
@@ -180,6 +197,10 @@ class RunConfig:
                 or isinstance(self.pool_docs_per_bucket, bool) \
                 or self.pool_docs_per_bucket <= 0:
             raise ValueError("pool_docs_per_bucket must be a positive integer")
+        if self.pool_docs_per_bucket > _MAX_POOL_DOCS_PER_BUCKET:
+            raise ValueError(
+                "pool_docs_per_bucket cannot exceed "
+                f"{_MAX_POOL_DOCS_PER_BUCKET}")
         if isinstance(self.pool_zipf_s, bool) \
                 or not isinstance(self.pool_zipf_s, (int, float)) \
                 or not math.isfinite(float(self.pool_zipf_s)) \
@@ -219,10 +240,16 @@ class RunConfig:
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a string")
         if self.shard_total > 1:
+            if self.sizing_concurrency is not None:
+                raise ValueError(
+                    "sharded runs cannot size independently; perform sizing "
+                    "once, then put the resulting fixed QPS in every shard")
             if not isinstance(self.run_id, str) or not self.run_id.strip():
                 raise ValueError("sharded runs require one shared non-empty run_id")
             if self.start_at_unix is None:
                 raise ValueError("sharded runs require one shared start_at_unix")
+        if self.sizing_concurrency is None and self.timestamps_file is None:
+            validate_schedule_capacity(self.duration_s, self.qps_max)
 
 
 def _shard_concurrency(rc) -> int | None:
@@ -629,6 +656,7 @@ def _exception_result(request_id: str, phase: str, plan: dict,
         "caller_ttft_ms": None, "caller_ttfr_ms": None,
         "caller_ttfv_ms": None, "caller_ttf_tool_call_ms": None,
         "caller_e2e_ms": None,
+        "finished_unix": None,
         "status": None, "ok": False, "error": error,
         "content_chunks": 0, "interchunk_max_ms": None,
         "finish_reason": None, "prompt_tokens": None,
@@ -706,6 +734,7 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
     p50 = float(_np.percentile(e2e, 50)) / 1000.0
     p95 = float(_np.percentile(e2e, 95)) / 1000.0
     rate = rc.sizing_concurrency / max(p50, 1e-3)
+    validate_schedule_capacity(rc.duration_s, rate)
     derived_pool_size = max(rc.sizing_concurrency * 2,
                             int(math.ceil(rate * p95 * 1.5)))
     pool_cap = (rc.max_concurrency if rc.max_concurrency is not None

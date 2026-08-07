@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from traffic_replay.metrics import render_html, write_outputs
+from traffic_replay.metrics import render_html
 from traffic_replay.mock_server import serve
 from traffic_replay.runner import RunConfig, run
 

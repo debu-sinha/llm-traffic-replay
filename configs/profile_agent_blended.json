@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "name": "agent_blended_classes",
   "input_tokens": {
     "p50": 10000,
@@ -12,29 +13,15 @@
     "p50": 0.6,
     "p95": 0.87
   },
-  "provenance": "Two workload classes blended into one distribution, which is why the P90 points do not sit on a single curve through the P50 and P95 anchors.",
-  "label": "Blended across two workload classes. Run per-class profiles when the per-class quantiles are available.",
-  "doc_quantiles_full": {
-    "input_tokens": {
-      "p50": 10000,
-      "p90": 13000,
-      "p95": 24000,
-      "p99": 25000
-    },
-    "output_tokens": {
-      "p50": 40,
-      "p90": 70,
-      "p95": 90,
-      "p99": 165
-    },
-    "cache_fraction": {
-      "p50": 0.6,
-      "p90": 0.75,
-      "p95": 0.87,
-      "p99": 0.98
-    },
-    "note": "the full quantile ladder behind the anchors above. blending two classes is what makes the P90 points sit off the curve."
+  "sampling": {
+    "mode": "quantile_cdf",
+    "probabilities": [0.5, 0.9, 0.95, 0.99],
+    "input_tokens": [10000, 13000, 24000, 25000],
+    "output_tokens": [40, 70, 90, 165],
+    "cache_fraction": [0.6, 0.75, 0.87, 0.98]
   },
+  "provenance": "Quantile-CDF representation of the full documented P50/P90/P95/P99 ladder for two blended workload classes. No joint request-level dataset was available, so input, output, and cache are sampled as independent marginals and must not be interpreted as measured cross-field correlation.",
+  "label": "Blended quantile marginals, not joint observations. Run empirical-joint or per-class profiles when request-level or per-class data is available.",
   "acceptance_targets": {
     "ttft_ms": {
       "p50": 600,

@@ -521,7 +521,8 @@ def test_the_window_table_is_a_real_markdown_table():
     rows += _rows(60, base_ttft=210.0, t0=140.0, dt=0.2)
     md = render_markdown(summarize(rows), "tbl")
     block = md[md.index("stability over time"):].splitlines()
-    header = next(i for i, l in enumerate(block) if l.startswith("| window |"))
+    header = next(
+        i for i, line in enumerate(block) if line.startswith("| window |"))
     assert block[header - 1].strip() == ""      # blank line before the table
 
 
@@ -749,7 +750,8 @@ def test_the_client_distinguishes_connection_attempts_from_http_sends():
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers(); self.wfile.write(body)
+            self.end_headers()
+            self.wfile.write(body)
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     port = srv.server_address[1]
@@ -767,7 +769,8 @@ def test_the_client_distinguishes_connection_attempts_from_http_sends():
         assert r.first_attempt_unix <= r.first_send_unix
         assert r.request_attempts == 1
     finally:
-        srv.shutdown(); srv.server_close()
+        srv.shutdown()
+        srv.server_close()
 
     # exhausted-retry path: nothing listening at all
     cfg2 = EndpointConfig(base_url="http://127.0.0.1:1",
@@ -1037,8 +1040,8 @@ def _mixed(silent, good):
 
 
 def _md_verdict(s):
-    return [l for l in render_markdown(s, "x").splitlines()
-            if l.startswith("verdict:")][0]
+    return [line for line in render_markdown(s, "x").splitlines()
+            if line.startswith("verdict:")][0]
 
 
 def test_an_answer_collapse_is_not_green_without_a_success_rate_target():
@@ -1424,8 +1427,27 @@ def test_a_run_whose_stability_was_never_established_is_not_green():
 def test_a_success_rate_target_needs_enough_requests_to_miss_it():
     """Two requests cannot demonstrate a 99 percent success rate."""
     s = summarize(_clean(2), acceptance={"success_rate": 0.99})
-    assert "cannot demonstrate it" in _v(s)
-    assert "at least 99" in _v(s)
+    assert "cannot demonstrate" in _v(s)
+    sr = s["sla"]["success_rate"]
+    assert sr["actual"] == 1.0
+    assert sr["met"] is True
+    assert sr["statistically_demonstrated"] is False
+    assert sr["one_sided_95pct_wilson_lower"] < 0.99
+
+
+def test_success_rate_green_requires_confidence_bound_to_clear_target():
+    thin = summarize(_clean(1_899), acceptance={"success_rate": 0.999})
+    thin_sr = thin["sla"]["success_rate"]
+    assert thin_sr["actual"] == 1.0
+    assert thin_sr["one_sided_95pct_wilson_lower"] < 0.999
+    assert thin_sr["statistically_demonstrated"] is False
+    assert "cannot demonstrate" in _v(thin)
+
+    sufficient = summarize(_clean(3_000),
+                           acceptance={"success_rate": 0.999})
+    sufficient_sr = sufficient["sla"]["success_rate"]
+    assert sufficient_sr["one_sided_95pct_wilson_lower"] >= 0.999
+    assert sufficient_sr["statistically_demonstrated"] is True
 
 
 def test_the_arrival_rate_counts_only_rows_it_measured_the_span_over():

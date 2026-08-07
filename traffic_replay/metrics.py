@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import time
 from pathlib import Path
 
@@ -37,6 +38,20 @@ def _tcp_connect_floor(network_path: dict) -> float | None:
     if value is None:
         value = network_path.get("rtt_ms")
     return value
+
+
+def _wilson_lower_95(successes: int, total: int) -> float | None:
+    """One-sided 95% Wilson lower confidence bound for a success fraction."""
+    if total <= 0 or successes < 0 or successes > total:
+        return None
+    z = 1.6448536269514722
+    observed = successes / total
+    z2 = z * z
+    center = observed + z2 / (2.0 * total)
+    radius = z * math.sqrt(
+        observed * (1.0 - observed) / total
+        + z2 / (4.0 * total * total))
+    return max(0.0, (center - radius) / (1.0 + z2 / total))
 
 
 def _concurrency_block(ok: list[dict], asked: int | None) -> dict | None:
@@ -332,14 +347,13 @@ def _verdict(s: dict) -> tuple[str, str]:
     _scored_weak = sorted({r["quantile"] for r in rows
                            if r["quantile"] in _weak})
     _sr = sla.get("success_rate") or {}
-    if _sr.get("target") is not None:
-        _n_all = (s.get("requests_total") or 0)
-        _floor = 1.0 / max(1e-9, 1.0 - float(_sr["target"]))
-        if _n_all < _floor:
-            doubts.append(
-                f"a {_sr['target']} success rate was scored on {_n_all} "
-                f"requests, which cannot demonstrate it. it needs at least "
-                f"{int(_floor)}")
+    if _sr.get("met") is True \
+            and _sr.get("statistically_demonstrated") is False:
+        doubts.append(
+            f"the observed success rate met {_sr['target']}, but its "
+            f"one-sided 95% Wilson lower bound is "
+            f"{_sr['one_sided_95pct_wilson_lower']:.4%}, so this sample "
+            "cannot demonstrate the target")
     if _scored_weak:
         doubts.append(f"{', '.join(_scored_weak)} scored on "
                       f"{_samp.get('n')} requests, which cannot support "
@@ -1511,15 +1525,23 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
 
     target_sr = acceptance.get("success_rate")
     if target_sr and total:
-        actual_sr = (len(ok) - len(failing)) / total
+        successes = len(ok) - len(failing)
+        actual_sr = successes / total
+        lower_95 = _wilson_lower_95(successes, total)
         out["success_rate"] = {
             "target": target_sr,
             "actual": round(actual_sr, 6),
             "met": actual_sr >= target_sr,
+            "successes": successes,
+            "attempts": total,
+            "one_sided_95pct_wilson_lower": round(lower_95, 6),
+            "statistically_demonstrated": lower_95 >= target_sr,
             "note": "failures, hard-timeout breaches, interchunk breaches, "
                     "and responses that returned 200 with neither visible "
                     "content nor a structurally valid tool call count against "
-                    "it",
+                    "it. a clean benchmark verdict also requires the "
+                    "one-sided 95% Wilson lower confidence bound to meet the "
+                    "target; this assumes request outcomes are independent",
         }
     return out
 
@@ -1885,6 +1907,17 @@ def render_markdown(summary: dict, title: str) -> str:
         if sr:
             lines.append(f"| success rate | - | {sr['target']} | "
                          f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
+            demonstrated = sr.get("statistically_demonstrated")
+            if demonstrated is not None:
+                lines += ["", "success-rate evidence: "
+                          f"{sr['successes']} successes in {sr['attempts']} "
+                          "attempts; one-sided 95% Wilson lower bound "
+                          f"{sr['one_sided_95pct_wilson_lower']:.6f}. "
+                          + ("the confidence bound meets the target."
+                             if demonstrated else
+                             "the observed fraction meets the target, but "
+                             "the confidence bound does not; this cannot be "
+                             "a clean green-light result.")]
 
 
     if s.get("ttfr_ms"):
@@ -2325,6 +2358,16 @@ def render_html(summary: dict, title: str) -> str:
                 f"<tr><td class='lbl'>success rate (fraction 0-1)</td>"
                 f"<td>{num(sr['target'], 4)}</td><td>{num(sr['actual'], 4)}</td>"
                 f"<td class='{cls}'>{'PASS' if met else 'NO'}</td></tr>")
+            lower = sr.get("one_sided_95pct_wilson_lower")
+            demonstrated = sr.get("statistically_demonstrated")
+            if lower is not None:
+                confidence_cls = "yes" if demonstrated else "no"
+                rows.append(
+                    "<tr><td class='lbl'>success-rate one-sided 95% Wilson "
+                    "lower bound</td>"
+                    f"<td>{num(sr['target'], 4)}</td><td>{num(lower, 4)}</td>"
+                    f"<td class='{confidence_cls}'>"
+                    f"{'PASS' if demonstrated else 'NOT PROVEN'}</td></tr>")
         defn = esc(sla.get("ttft_definition", "first_content"))
         note_bits = []
         ttft_rows = sla.get("ttft_vs_target") or []

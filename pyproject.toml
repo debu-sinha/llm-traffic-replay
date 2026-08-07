@@ -1,6 +1,6 @@
 [project]
 name = "llm-traffic-replay"
-version = "0.4.1"
+version = "0.5.0"
 description = "Replay your production traffic shape against an LLM serving endpoint: heavy-tailed prompt sizes, constructed prompt-cache hit ratios, bursty arrivals, honest measurement."
 readme = "README.md"
 requires-python = ">=3.10"

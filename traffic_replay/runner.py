@@ -879,6 +879,27 @@ def run(rc: RunConfig, token_override: str | None = None,
                 "extra_body": ecfg.extra_body or {},
             }
 
+            # Capture target and network evidence before the first inference
+            # request. A sizing pass is real endpoint traffic; metadata read
+            # after it could describe a different config than the one sized.
+            net_path = None
+            if original_rc.measure_network_path:
+                from .netpath import measure_network_path
+                net_path = measure_network_path(ecfg.base_url)
+                if net_path and not quiet:
+                    print(f"[runner] network: {net_path['rtt_ms']:.0f} ms "
+                          f"TCP-connect floor to {net_path['endpoint_host']} "
+                          f"({', '.join(net_path['endpoint_ips'][:2])})")
+
+            endpoint_meta = None
+            if original_rc.capture_endpoint_metadata:
+                from .endpoint_meta import fetch_endpoint_metadata
+                endpoint_meta = fetch_endpoint_metadata(
+                    ecfg.base_url, ecfg.path, token, timeout=5.0)
+            artifact.update_start(
+                status="target-snapshotted",
+                endpoint_metadata=endpoint_meta, network_path=net_path)
+
             # ---- optional unloaded sizing pass ---------------------------
             effective_rc = work_rc
             if sizing_requested is not None:
@@ -925,24 +946,6 @@ def run(rc: RunConfig, token_override: str | None = None,
                 index_identity=index_identity,
                 schedule=sched_meta,
                 derived_qps=derived_qps)
-
-            # where the client sits relative to the endpoint. this is cheap,
-            # and without it a run from the wrong region silently folds a
-            # round trip into every latency number it prints.
-            net_path = None
-            if original_rc.measure_network_path:
-                from .netpath import measure_network_path
-                net_path = measure_network_path(ecfg.base_url)
-                if net_path and not quiet:
-                    print(f"[runner] network: {net_path['rtt_ms']:.0f} ms "
-                          f"round trip to {net_path['endpoint_host']} "
-                          f"({', '.join(net_path['endpoint_ips'][:2])})")
-
-            endpoint_meta = None
-            if original_rc.capture_endpoint_metadata:
-                from .endpoint_meta import fetch_endpoint_metadata
-                endpoint_meta = fetch_endpoint_metadata(
-                    ecfg.base_url, ecfg.path, token, timeout=5.0)
 
             ts = sched["timestamps"]
             global_indices = sched["global_indices"]

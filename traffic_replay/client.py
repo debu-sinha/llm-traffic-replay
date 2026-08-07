@@ -358,6 +358,11 @@ class EndpointClient:
                 "caller_ttf_tool_call_ms": caller_ttf_tool_call_ms,
             }
 
+        # send() begins when a worker actually receives this request. Capture
+        # schedule-to-worker delay here; connection setup is a separate clock
+        # and must not be mislabeled as queue wait.
+        queue_wait_ms = caller_elapsed()
+
         while attempt <= self.cfg.max_retries:
             attempt += 1
             conn = None
@@ -402,7 +407,6 @@ class EndpointClient:
                 last_send_unix = t_send_unix
                 if first_send_unix is None:
                     first_send_unix = t_send_unix
-                    queue_wait_ms = caller_elapsed(t_send)
                 request_attempts += 1
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
                 conn.sock.settimeout(self.cfg.read_timeout_s)

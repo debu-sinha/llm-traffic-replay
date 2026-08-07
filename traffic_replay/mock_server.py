@@ -5,7 +5,8 @@ anything real. The mock speaks OpenAI-compatible streaming chat completions
 and, per request:
 
   * simulates a block-level prefix cache over the system message text
-    (leading 1 KiB blocks, LRU capacity, TTL), so the pool's constructed
+    (leading 256-character blocks, about 64 mock tokens, LRU capacity, TTL),
+    so the pool's constructed
     cache structure is exercised end to end through real text;
   * sleeps a deterministic, parameterized latency:
         ttft_true_ms = ttft_base_ms
@@ -124,8 +125,6 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
             cached_tokens = min(int(round(matched_chars / MOCK_CPT)),
                                 prompt_tokens)
             uncached = prompt_tokens - cached_tokens
-            completion_tokens = max_tokens
-
             ttft_planned_ms = (params["ttft_base_ms"]
                                + params["ms_per_1k_uncached"] * uncached / 1000.0)
 
@@ -148,7 +147,17 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                                "finish_reason": None}]})
 
             time.sleep(ttft_planned_ms / 1000.0)
-            reasoning_n = int(params.get("reasoning_tokens", 0))
+            configured_reasoning = max(
+                int(params.get("reasoning_tokens", 0)), 0)
+            reasoning_only = bool(params.get("reasoning_only", 0))
+            # max_tokens is a cap on all generated tokens, including hidden
+            # reasoning. Preserve one visible token in ordinary mode; the
+            # explicit reasoning-only mode is allowed to consume the cap.
+            reasoning_n = min(
+                configured_reasoning,
+                max_tokens if reasoning_only else max(max_tokens - 1, 0))
+            visible_n = 0 if reasoning_only else max_tokens - reasoning_n
+            completion_tokens = reasoning_n + visible_n
             t_first_generated = None
             t_first_visible = None
             for i in range(reasoning_n):
@@ -160,7 +169,7 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                                    "finish_reason": None}]})
             if reasoning_n:
                 time.sleep(params["per_token_ms"] / 1000.0)
-            if int(params.get("reasoning_only", 0)):
+            if reasoning_only:
                 usage = {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": reasoning_n,
@@ -177,7 +186,7 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                     t_first_generated = t_first_visible
                 emit({"choices": [{"delta": {"content": "The"},
                                    "finish_reason": None}]})
-                for _ in range(completion_tokens - 1):
+                for _ in range(visible_n - 1):
                     time.sleep(params["per_token_ms"] / 1000.0)
                     emit({"choices": [{"delta": {"content": " next"},
                                        "finish_reason": None}]})

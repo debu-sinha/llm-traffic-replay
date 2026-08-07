@@ -8,6 +8,7 @@ cached tokens are, so thinking cost shows up in the report.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -95,6 +96,18 @@ def test_reasoning_tokens_reported_end_to_end():
         "completion_tokens_details.reasoning_tokens"
     assert s["run"]["request_params"]["extra_body"] == \
         {"reasoning_effort": "low"}
+    rows = [json.loads(line) for line in
+            Path(out["out_dir"], "requests.jsonl").read_text().splitlines()
+            if line.strip()]
+    replay = [row for row in rows if row.get("phase") == "replay"]
+    assert replay
+    assert all(row["completion_tokens"] <= 16 for row in replay)
+    assert all(row["reasoning_tokens"] <= row["completion_tokens"]
+               for row in replay)
+    truth_rows = [json.loads(line) for line in truth.read_text().splitlines()
+                  if line.strip()]
+    assert truth_rows
+    assert all(row["completion_tokens"] <= 16 for row in truth_rows)
     report = Path(out["out_dir"], "report.md").read_text()
     assert "reasoning tokens:" in report
     assert "reasoning_effort" in report  # provenance line echoes extra_body
@@ -105,16 +118,70 @@ def test_compare_table_has_reasoning_tokens_row():
 
     def run_dir(title, reasoning_total):
         d = Path(tempfile.mkdtemp())
-        summ = {"run": {"title": title, "endpoint_path": "/p"},
+        schedule = {"seconds": 1, "requests": 1, "rate_min": 1.0,
+                    "rate_p50": 1.0, "rate_p95": 1.0, "rate_max": 1.0,
+                    "source": "test"}
+        summ = {"run": {"title": title, "endpoint_path": "/p",
+                         "input_mode": "profile"},
                 "reasoning_tokens_total": reasoning_total,
+                "harness_version": "0.4.1",
+                "latency_basis": "send-to-first-token; connection excluded",
+                "schedule": schedule,
                 "throughput": {"input_tokens_per_min": 100,
                                "output_tokens_per_min": 50}}
-        (d / "summary.json").write_text(json.dumps(summ))
+        raw = json.dumps(summ).encode()
+        (d / "summary.json").write_bytes(raw)
+        manifest = {
+            "manifest_schema_version": 3,
+            "git_commit": "a" * 40,
+            "git_dirty": False,
+            "harness_version": "0.4.1",
+            "latency_basis": summ["latency_basis"],
+            "input_mode": "profile",
+            "profile_sha256": "b" * 64,
+            "seed": 7,
+            "request_params": {"temperature": 0.0},
+            "schedule": schedule,
+            "shard": "1/1",
+            "workload_id": "workload-test",
+            "logical_run_id": "logical-test",
+            "run_id": "logical-test",
+            "execution_id": f"execution-{title}",
+            "artifact_id": f"artifact-{title}",
+            "schedule_identity": {
+                "encoding": "float64-le-seconds-from-run-start",
+                "global_timestamps_sha256": "c" * 64,
+                "global_count": 1,
+                "global_min_s": 0.0,
+                "global_max_s": 0.0,
+                "shard_timestamps_sha256": "c" * 64,
+                "shard_count": 1,
+                "shard_min_s": 0.0,
+                "shard_max_s": 0.0,
+            },
+            "index_identity": {
+                "encoding": "int64-le",
+                "global_indices_sha256": "d" * 64,
+                "count": 1,
+                "min": 0,
+                "max": 0,
+                "global_count": 1,
+                "shard_index": 0,
+                "shard_total": 1,
+                "partition": "unsharded",
+            },
+            "artifacts": {"summary.json": {
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "bytes": len(raw),
+            }},
+        }
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        (d / ".traffic-replay-complete").touch()
         return str(d)
 
-    out = Path(tempfile.mkdtemp())
-    compare_runs(str(out), [run_dir("thinking-on", 1200),
-                            run_dir("thinking-off", 0)])
+    out = compare_runs(
+        Path(tempfile.mkdtemp()) / "comparison",
+        [run_dir("thinking-on", 1200), run_dir("thinking-off", 0)])
     md = (out / "comparison.md").read_text()
     assert "reasoning tokens (total)" in md
     assert "1,200" in md

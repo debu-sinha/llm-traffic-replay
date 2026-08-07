@@ -201,6 +201,40 @@ def test_exact_caller_clocks_preserve_uniform_schedule_delay():
     assert result.ttft_ms < 300
 
 
+def test_queue_wait_excludes_connection_setup_but_caller_latency_includes_it():
+    events = (
+        b'data: {"choices":[{"delta":{"content":"ok"},'
+        b'"finish_reason":"stop"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    class SlowConnection:
+        sock = _Sock()
+
+        def connect(self):
+            time.sleep(0.05)
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response(200, events=events)
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = SlowConnection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "slow-connect", 0.0, 0.0,
+        (0, 0, None, 0), 2, scheduled_monotonic=time.monotonic(),
+    )
+    assert result.connect_ms >= 40
+    assert result.queue_wait_ms < result.connect_ms
+    assert result.caller_ttft_ms >= result.connect_ms
+
+
 class _ConnectFailure:
     sock = _Sock()
 

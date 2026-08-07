@@ -295,6 +295,50 @@ def test_merged_run_does_not_report_wire_lateness():
     assert note in (out / "report.md").read_text()
 
 
+def test_merge_does_not_reconstruct_legacy_caller_latency():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 5)
+    _mkrun(base / "b", ep, [300] * 5)
+    out = merge_runs(
+        base / "pooled", [base / "a", base / "b"],
+        acceptance={"targets_are": "test", "ttft_ms": {"p50": 250}})
+    summary = json.loads((out / "summary.json").read_text())
+    for key in ("ttft_corrected_ms", "ttfv_corrected_ms",
+                "ttf_tool_call_corrected_ms", "e2e_corrected_ms"):
+        assert key not in summary
+    assert summary["sla"]["latency_basis"] == \
+        "service_time_no_schedule_wait_available"
+    assert "legacy schedule/send timestamps cannot be reconstructed" in \
+        summary["latency_correction_note"]
+
+
+def test_merge_pools_exact_caller_clocks_and_scores_them():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 5)
+    _mkrun(base / "b", ep, [300] * 5)
+    for directory, caller_ttft, caller_e2e in (
+            (base / "a", 150.0, 400.0),
+            (base / "b", 350.0, 600.0)):
+        for index in range(5):
+            _edit_replay_row(
+                directory, index, caller_ttft_ms=caller_ttft,
+                caller_e2e_ms=caller_e2e)
+    out = merge_runs(
+        base / "pooled", [base / "a", base / "b"],
+        acceptance={"targets_are": "test", "ttft_ms": {"p50": 300}})
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["ttft_corrected_ms"]["p50"] == 250.0
+    assert summary["e2e_corrected_ms"]["p50"] == 500.0
+    assert summary["sla"]["ttft_metric"] == "ttft_corrected_ms"
+    assert summary["sla"]["latency_basis"] == "caller_experienced"
+    assert summary["latency_correction_provenance"] == {
+        "exact_values": 20, "legacy_reconstructed_values": 0}
+    assert "pools only exact monotonic durations" in \
+        summary["latency_correction_note"]
+
+
 def test_merge_rejects_different_workload_hashes_and_force_marks_invalid():
     base = _tmp()
     ep = "/serving-endpoints/pt/invocations"

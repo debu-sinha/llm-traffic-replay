@@ -1061,6 +1061,12 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     }
     # cost is a per-run figure (rates can differ across pooled runs), so
     # it is not recomputed here; read each run report for its own cost.
+    # Legacy rows reconstruct caller delay from one epoch offset shared by the
+    # input list. That is invalid when runs began at different wall-clock
+    # times. Mark queue wait unavailable before summarize() so a merge pools
+    # only exact monotonic caller clocks already recorded on each row.
+    for row in rows:
+        row["queue_wait_ms"] = None
     summary = summarize(rows, run_meta=meta, acceptance=acceptance)
     # drift buckets on absolute send time from the pooled minimum. shards that
     # ran at different times produce windows spanning the gap between them, so
@@ -1075,23 +1081,26 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "lateness. read each run's own report. dispatch lag below is pooled "
         "and still meaningful, since it is measured within each run.")
     summary.pop("client", None)
-    # summarize() stamps queue_wait_ms on each row against one schedule
-    # offset. across runs that started at different times that number is
-    # meaningless, and leaving it on the rows would contradict the note
-    # below in the same output directory.
+    # A merged row must not imply that one cross-run epoch offset established
+    # its queue delay. Exact caller clocks remain on their own fields.
     for _r in rows:
         _r.pop("queue_wait_ms", None)
-    # corrected latency is computed against one schedule offset. pooling rows
-    # from runs that started at different wall-clock times makes that offset
-    # meaningless: two 200 ms runs an hour apart would report a corrected p95
-    # of an hour. same reason wire lateness is blanked.
-    for k in ("ttft_corrected_ms", "e2e_corrected_ms",
-              "latency_correction_note"):
-        summary.pop(k, None)
-    summary["latency_correction_note"] = (
-        "caller-experienced latency is not computed for a merged run, "
-        "because it measures against each run's own schedule and pooled "
-        "rows come from different ones. read each run's own report.")
+    corrected_fields = (
+        "ttft_corrected_ms", "ttfv_corrected_ms",
+        "ttf_tool_call_corrected_ms", "e2e_corrected_ms")
+    if any((summary.get(key) or {}).get("n") for key in corrected_fields):
+        summary["latency_correction_note"] = (
+            "merged caller-experienced latency pools only exact monotonic "
+            "durations recorded by each source row. Legacy schedule/send "
+            "timestamps are not reconstructed across runs because their "
+            "wall-clock offsets are not comparable.")
+    else:
+        summary.pop("latency_correction_provenance", None)
+        summary["latency_correction_note"] = (
+            "caller-experienced latency is unavailable for this merged run: "
+            "the source rows did not carry exact monotonic caller clocks, and "
+            "legacy schedule/send timestamps cannot be reconstructed across "
+            "different run epochs. Service-time latency remains available.")
     # concurrency is interval overlap across pooled rows. shards that never
     # ran at the same time have no overlap, so a merged run would report a
     # p50 of 0 in flight. same reason wire lateness and drift are blanked.

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from traffic_replay.cli import (_answer_is_complete, cmd_validate,
+from traffic_replay.cli import (_answer_is_complete, cmd_validate, main,
                                 _validation_error_stats,
                                 _validation_passes)
 
@@ -89,3 +89,15 @@ def test_validate_port_zero_uses_assigned_port_and_emits_one_json_document(
     payload = json.loads(stdout.getvalue())
     assert payload["passed"] is True
     assert payload["ttft_error_ms"]["absolute_p95"] == 1.0
+
+
+def test_validate_defaults_to_a_collision_free_ephemeral_port(monkeypatch):
+    seen = {}
+
+    def fake_validate(args):
+        seen["port"] = args.port
+        return 0
+
+    monkeypatch.setattr("traffic_replay.cli.cmd_validate", fake_validate)
+    assert main(["validate"]) == 0
+    assert seen["port"] == 0

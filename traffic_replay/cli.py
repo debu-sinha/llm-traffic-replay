@@ -1185,7 +1185,8 @@ def main(argv=None) -> int:
     s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("validate", help="instrument self-test vs bundled mock")
-    s.add_argument("--port", type=int, default=8808)
+    s.add_argument("--port", type=int, default=0,
+                   help="mock-server port; 0 asks the OS for a free port")
     s.add_argument("--duration", type=int, default=25)
     s.add_argument("--workdir", default="results/validation")
     s.add_argument("--tolerance-ms", type=float, default=60.0)

@@ -1050,7 +1050,8 @@ def main(argv=None) -> int:
                    help="only for shared /chat/completions routes")
     s.add_argument("--extra-body", default=None,
                    help='JSON merged into each request, e.g. '
-                        '\'{"reasoning_effort": "none"}\'')
+                        '\'{"reasoning_effort": "low"}\' when the target '
+                        'documents that control')
     s.add_argument("--ttft-p50", type=float, default=None,
                    help="your TTFT target in ms. same for --ttft-p90/p95/p99")
     s.add_argument("--ttft-p90", type=float, default=None)

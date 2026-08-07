@@ -1302,7 +1302,7 @@ def compare_runs(out_dir, input_dirs) -> Path:
     if thin:
         detail = ", ".join(f"{t} ({n} requests)" for t, n in thin)
         warns.append(
-            f"small samples: {detail}. p99 is unstable below about 100 "
+            f"small samples: {detail}. p99 is indicative below 1000 "
             "requests. Run longer before quoting a tail.")
 
     # stability. a run still warming up is not a steady-state number.

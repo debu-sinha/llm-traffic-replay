@@ -194,6 +194,7 @@ def test_small_sample_and_drift_are_surfaced_in_a_comparison():
     b["drift"] = {"drift_flag": True, "drift_kind": "warming"}
     md = _compare_summaries([a, b])
     assert "small samples" in md and "44 requests" in md
+    assert "p99 is indicative below 1000 requests" in md
     assert "not in steady state" in md and "warming" in md
 
 

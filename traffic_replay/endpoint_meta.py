@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import ssl
 import sys
 import urllib.parse
+
+from .client import validate_bearer_transport
+
+
+_MAX_RESPONSE_BYTES = 1024 * 1024
 
 
 def _note(msg: str) -> None:
@@ -28,23 +34,46 @@ def endpoint_name_from_path(path: str) -> str | None:
 
     Works for any name, including a customer's custom one.
     """
-    parts = [p for p in (path or "").split("/") if p]
-    if "serving-endpoints" in parts:
-        i = parts.index("serving-endpoints")
-        if i + 1 < len(parts):
-            return parts[i + 1]
+    if not isinstance(path, str):
+        return None
+    # This is a request path, not a full URL. Match the actual serving route
+    # prefix so an unrelated segment cannot trigger a control-plane request.
+    clean_path = path.split("?", 1)[0].split("#", 1)[0]
+    parts = [p for p in clean_path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "serving-endpoints":
+        try:
+            name = urllib.parse.unquote(parts[1], errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if name not in ("", ".", "..") and "/" not in name \
+                and not any(char in name for char in ("\r", "\n", "\x00")):
+            return name
     return None
 
 
 def _summarize(doc: dict) -> dict:
     """Keep the customer-relevant fields, drop the noise."""
+    if not isinstance(doc, dict):
+        raise ValueError("endpoint metadata response must be an object")
     # only the ACTIVE config served this run. pending_config carries the
     # new shape during an update, and naming it would describe capacity
     # that was never in the request path.
-    cfg = doc.get("config") or {}
-    entities = cfg.get("served_entities") or cfg.get("served_models") or []
+    cfg = doc.get("config")
+    if cfg is None:
+        cfg = {}
+    elif not isinstance(cfg, dict):
+        raise ValueError("endpoint metadata config must be an object")
+    entities = cfg.get("served_entities")
+    if entities is None:
+        entities = cfg.get("served_models")
+    if entities is None:
+        entities = []
+    if not isinstance(entities, list):
+        raise ValueError("endpoint metadata served entities must be a list")
     served = []
     for e in entities:
+        if not isinstance(e, dict):
+            raise ValueError("endpoint metadata served entity must be an object")
         # entity_name is the Unity Catalog three-level path. it identifies a
         # customer's catalog and schema, it adds nothing to "what was
         # measured", and this report is meant to be shared, so it is not kept.
@@ -71,15 +100,20 @@ def fetch_endpoint_metadata(base_url: str, path: str, token: str | None,
     name = endpoint_name_from_path(path)
     if not name or not token:
         return None
-    u = urllib.parse.urlparse(base_url)
-    host = u.hostname
-    if not host:
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+            or not math.isfinite(float(timeout)) or timeout <= 0:
         return None
-    port = u.port or (443 if (u.scheme or "https") == "https" else 80)
-    api = f"/api/2.0/serving-endpoints/{urllib.parse.quote(name)}"
+    try:
+        scheme, host, port = validate_bearer_transport(base_url)
+    except ValueError as exc:
+        _note(f"unsafe or invalid endpoint origin ({type(exc).__name__}), "
+              "skipping the endpoint card")
+        return None
+    api = ("/api/2.0/serving-endpoints/"
+           f"{urllib.parse.quote(name, safe='')}")
     conn = None
     try:
-        if (u.scheme or "https") == "https":
+        if scheme == "https":
             conn = http.client.HTTPSConnection(
                 host, port, timeout=timeout,
                 context=ssl.create_default_context())
@@ -91,7 +125,21 @@ def fetch_endpoint_metadata(base_url: str, path: str, token: str | None,
             _note(f"serving-endpoints API returned HTTP {resp.status} for "
                   f"'{name}', skipping the endpoint card")
             return None
-        doc = json.loads(resp.read())
+        length = resp.getheader("Content-Length")
+        if length is not None:
+            try:
+                if int(length) > _MAX_RESPONSE_BYTES:
+                    _note(f"serving-endpoints API response for '{name}' was "
+                          "too large, skipping the endpoint card")
+                    return None
+            except ValueError:
+                pass
+        raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            _note(f"serving-endpoints API response for '{name}' was too "
+                  "large, skipping the endpoint card")
+            return None
+        doc = json.loads(raw)
         return _summarize(doc)
     except Exception as exc:
         # never print the body or the token, only the failure class

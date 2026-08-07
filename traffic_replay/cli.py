@@ -47,8 +47,19 @@ def _finish(out, fail_on: str = "miss", fmt: str = "text") -> int:
     """
     from .metrics import _verdict
     d = Path(out["out_dir"])
+    kind, text = _verdict(out["summary"])
+    # An unknown verdict is an invalid result, never a successful gate.
+    code = _EXIT.get(kind, _EXIT["invalid"])
+    if fail_on == "none":
+        code = 0
+    elif fail_on == "caution" and kind == "caution":
+        code = 1
+
     if fmt == "json":
-        print(json.dumps(out["summary"], indent=2))
+        # stdout is a single standards-compliant JSON document so automation
+        # can parse it. Human navigation and verdict text belong to text mode.
+        print(json.dumps(out["summary"], indent=2, allow_nan=False))
+        return code
     else:
         # report.md already says exactly this, and it is the artifact people
         # paste into email, so the terminal and the file cannot disagree.
@@ -59,12 +70,6 @@ def _finish(out, fail_on: str = "miss", fmt: str = "text") -> int:
     print(f"open in a browser: {d / 'report.html'}")
     print(f"full outputs:      {d}")
 
-    kind, text = _verdict(out["summary"])
-    code = _EXIT.get(kind, 0)
-    if fail_on == "none":
-        code = 0
-    elif fail_on == "caution" and kind == "caution":
-        code = 1
     print()
     print(f"{kind.upper()}: {text}")
     if code:
@@ -80,29 +85,58 @@ def cmd_run(args) -> int:
               "'sizing_concurrency', which derives a fixed open-loop rate and "
               "does not hold concurrency.", file=sys.stderr)
     rc = RunConfig(**cfg)
-    out = run(rc)
+    out = run(rc, quiet=getattr(args, "format", "text") == "json")
     return _finish(out, getattr(args, "fail_on", "miss"),
                    getattr(args, "format", "text"))
+
+
+def _validation_error_stats(values) -> dict:
+    """Signed and absolute measurement-oracle error percentiles."""
+    import numpy as np
+    absolute = np.abs(values)
+    return {"p05": float(np.percentile(values, 5)),
+            "p50": float(np.percentile(values, 50)),
+            "p95": float(np.percentile(values, 95)),
+            "max": float(np.max(values)),
+            "absolute_p95": float(np.percentile(absolute, 95)),
+            "absolute_max": float(np.max(absolute))}
+
+
+def _validation_passes(report: dict, tolerance_ms: float) -> bool:
+    """Both TTFT and E2E clocks must agree with the oracle in magnitude."""
+    return all(report[name]["absolute_p95"] <= tolerance_ms
+               for name in ("ttft_error_ms", "e2e_error_ms"))
 
 
 def cmd_validate(args) -> int:
     """Instrument self-test: run the whole pipeline against the bundled mock
     and report client-measured vs server-true latency error."""
     import numpy as np
+    from importlib.resources import files
     from .mock_server import serve
     from .runner import RunConfig, run
 
-    port = args.port
+    import math
+    if isinstance(args.tolerance_ms, bool) \
+            or not isinstance(args.tolerance_ms, (int, float)) \
+            or not math.isfinite(float(args.tolerance_ms)) \
+            or args.tolerance_ms <= 0:
+        raise SystemExit("--tolerance-ms must be positive and finite")
+
     truth = Path(args.workdir) / "mock_truth.jsonl"
-    srv = serve(port, truth)
+    srv = serve(args.port, truth)
+    # Port zero asks the OS for a collision-free ephemeral port. The client
+    # must use the assigned port, not literal port 0 (which means port 80 in
+    # an HTTP URL parser).
+    port = int(srv.server_address[1])
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     time.sleep(0.3)
 
     try:
         rc = RunConfig(
-            profile_path=str(Path(__file__).parent.parent
-                             / "configs" / "profile_validation_small.json"),
+            profile_path=str(files("traffic_replay").joinpath(
+                "data/profile_validation_small.json")),
             endpoint={"base_url": f"http://127.0.0.1:{port}",
                       "path": "/serving-endpoints/mock/invocations",
                       "auth_token_env": "TRAFFIC_REPLAY_NO_TOKEN"},
@@ -114,9 +148,12 @@ def cmd_validate(args) -> int:
             label="VALIDATION RUN, mock endpoint, known latency model",
             max_output_tokens_cap=24,
         )
-        out = run(rc, quiet=args.quiet)
+        out = run(rc, quiet=(args.quiet or
+                             getattr(args, "format", "text") == "json"))
     finally:
         srv.shutdown()
+        srv.server_close()
+        t.join(timeout=5.0)
 
     # join client measurements to server truth
     truth_by_id = {}
@@ -133,18 +170,21 @@ def cmd_validate(args) -> int:
             rows.append((r["ttft_ms"], tr["ttft_true_ms"],
                          r["e2e_ms"], tr["e2e_true_ms"]))
     if not rows:
-        print("VALIDATE: no joinable rows, FAIL")
+        if getattr(args, "format", "text") == "json":
+            print(json.dumps({"passed": False, "joined_requests": 0,
+                              "error": "no joinable rows"},
+                             allow_nan=False))
+        else:
+            print("VALIDATE: no joinable rows, FAIL")
         return 1
     a = np.array(rows)
     ttft_err = a[:, 0] - a[:, 1]
     e2e_err = a[:, 2] - a[:, 3]
     rep = {
         "joined_requests": len(rows),
-        "ttft_error_ms": {"p50": float(np.percentile(ttft_err, 50)),
-                          "p95": float(np.percentile(ttft_err, 95)),
-                          "max": float(ttft_err.max())},
-        "e2e_error_ms": {"p50": float(np.percentile(e2e_err, 50)),
-                         "p95": float(np.percentile(e2e_err, 95))},
+        "ttft_error_ms": _validation_error_stats(ttft_err),
+        "e2e_error_ms": _validation_error_stats(e2e_err),
+        "tolerance_ms": float(args.tolerance_ms),
         "note": "error = client-measured minus server-true; includes real "
                 "localhost network+parse overhead, so small positive is "
                 "expected and honest",
@@ -152,12 +192,16 @@ def cmd_validate(args) -> int:
     # the verdict is the point of this command. dumping the full report
     # above it buried the answer under 16 lines of JSON, which is what a
     # first-time user meets on step one of the guide.
+    ok = _validation_passes(rep, args.tolerance_ms)
+    rep["passed"] = ok
     if getattr(args, "format", "text") == "json":
-        print(json.dumps(rep, indent=2))
-    ok = rep["ttft_error_ms"]["p95"] < args.tolerance_ms
-    print(f"VALIDATE: {'PASS' if ok else 'FAIL'} "
-          f"(ttft error p95 {rep['ttft_error_ms']['p95']:.1f} ms "
-          f"vs tolerance {args.tolerance_ms} ms)")
+        print(json.dumps(rep, indent=2, allow_nan=False))
+    else:
+        print(f"VALIDATE: {'PASS' if ok else 'FAIL'} "
+              f"(absolute error p95: TTFT "
+              f"{rep['ttft_error_ms']['absolute_p95']:.1f} ms, E2E "
+              f"{rep['e2e_error_ms']['absolute_p95']:.1f} ms; "
+              f"tolerance {args.tolerance_ms:g} ms)")
     return 0 if ok else 1
 
 
@@ -201,7 +245,11 @@ def _pair(text, what):
     passes both. Nobody should have to author a JSON file to say how big
     their prompts are.
     """
-    parts = [x.strip() for x in str(text).split(",") if x.strip()]
+    raw_parts = str(text).split(",")
+    if any(not x.strip() for x in raw_parts):
+        raise SystemExit(
+            f"--{what} wants one number or a p50,p95 pair, got {text!r}")
+    parts = [x.strip() for x in raw_parts]
     try:
         vals = [float(x) for x in parts]
     except ValueError:
@@ -277,15 +325,16 @@ def _preflight(cfg: dict) -> dict:
     out["usage_reported"] = all(r.prompt_tokens is not None for r in reached)
     out["cache_reported"] = all(r.cached_tokens is not None for r in reached)
     out["reasoning"] = any(r.reasoning_seen or r.reasoning_chunks for r in reached)
-    readable = [bool(r.visible_content_seen and r.stream_complete
-                     and not r.parse_errors) for r in reached]
+    readable = [_answer_is_complete(r) for r in reached]
     out["readable"] = sum(readable)
-    out["visible"] = len(reached) == len(rows) and all(readable)
+    out["visible"] = (len(reached) == len(rows)
+                      and all(r.visible_content_seen for r in reached))
+    out["tool_call_answers"] = sum(
+        1 for r in reached if getattr(r, "valid_tool_calls", 0))
     out["truncated"] = any(r.finish_reason == "length" for r in reached)
     failed_index = next((i for i, r in enumerate(rows)
                          if isinstance(r, Exception) or r.status != 200
-                         or not (r.visible_content_seen and r.stream_complete
-                                 and not r.parse_errors)), None)
+                         or not _answer_is_complete(r)), None)
     if failed_index is not None:
         out["failed_probe_index"] = failed_index
     budget_index = failed_index if failed_index is not None else len(plans) - 1
@@ -313,6 +362,13 @@ def _benchmark_config(args) -> dict:
             ep["extra_body"] = json.loads(args.extra_body)
         except json.JSONDecodeError as e:
             raise SystemExit(f"--extra-body is not valid JSON: {e}")
+        if not isinstance(ep["extra_body"], dict):
+            raise SystemExit("--extra-body must be a JSON object")
+        try:
+            json.dumps(ep["extra_body"], allow_nan=False)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SystemExit(
+                "--extra-body must contain finite JSON values") from exc
 
     sizing = getattr(args, "sizing_concurrency", None)
     legacy = (getattr(args, "legacy_concurrency", None)
@@ -394,10 +450,10 @@ def _benchmark_config(args) -> dict:
 
     ttft = {q: v for q, v in (("p50", args.ttft_p50), ("p90", args.ttft_p90),
                               ("p95", args.ttft_p95), ("p99", args.ttft_p99))
-            if v}
+            if v is not None}
     ttfg = {q: v for q, v in (("p50", args.ttfg_p50), ("p90", args.ttfg_p90),
                               ("p95", args.ttfg_p95), ("p99", args.ttfg_p99))
-            if v}
+            if v is not None}
     for name, targets in (("ttft", ttft), ("ttfg", ttfg)):
         if any(not math.isfinite(float(v)) or float(v) <= 0
                for v in targets.values()):
@@ -442,6 +498,13 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+def _answer_is_complete(result) -> bool:
+    """A completed answer may be visible text or valid structured tool use."""
+    return bool(result.stream_complete and not result.parse_errors
+                and (result.visible_content_seen
+                     or (getattr(result, "valid_tool_calls", 0) or 0) > 0))
 
 
 def _probe_reasoning_levers(cfg: dict, budget: int,
@@ -489,7 +552,7 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
             # the reason, and it rules the flag out for good.
             out.append({"name": name, "extra": extra, "verdict": "rejected",
                         "detail": (r.error or "")[:220]})
-        elif r.visible_content_seen and r.stream_complete and not r.parse_errors:
+        elif _answer_is_complete(r):
             out.append({"name": name, "extra": extra, "verdict": "works",
                         "detail": f"answered, finish {r.finish_reason}, "
                                   f"{r.completion_tokens} tokens"})
@@ -576,9 +639,9 @@ def _check_preflight(cfg: dict, args) -> int | None:
 
     if pf_res.get("readable") != pf_res.get("attempted"):
         print(f"[preflight] only {pf_res.get('readable', 0)}/"
-              f"{pf_res['attempted']} produced a complete readable answer. "
-              "This gate uses visible content + clean stream completion, not "
-              "a provider-specific reasoning schema.")
+              f"{pf_res['attempted']} produced a valid completed answer. "
+              "This gate accepts visible content or a structurally valid tool "
+              "call, plus clean stream completion.")
         levers: list[dict] = []
         if not getattr(args, "no_lever_probe", False):
             print()
@@ -602,20 +665,35 @@ def cmd_benchmark(args) -> int:
     from .runner import RunConfig, run
 
     cfg = _benchmark_config(args)
+    json_mode = getattr(args, "format", "text") == "json"
     if not args.skip_preflight:
-        refused = _check_preflight(cfg, args)
+        if json_mode:
+            import contextlib
+            with contextlib.redirect_stdout(sys.stderr):
+                refused = _check_preflight(cfg, args)
+        else:
+            refused = _check_preflight(cfg, args)
         if refused is not None:
+            if json_mode:
+                print(json.dumps({"passed": False,
+                                  "stage": "preflight",
+                                  "exit_code": refused},
+                                 allow_nan=False))
             return refused
 
+    # Validate the final (possibly preflight-adjusted) configuration before
+    # writing a rerun file or starting the measured workload.
+    rc = RunConfig(**cfg)
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     saved = Path(args.out_dir) / "run-config.json"
-    saved.write_text(json.dumps(cfg, indent=2) + "\n")
-    out = run(RunConfig(**cfg))
+    saved.write_text(json.dumps(cfg, indent=2, allow_nan=False) + "\n")
+    out = run(rc, quiet=json_mode)
     code = _finish(out, getattr(args, "fail_on", "miss"),
                    getattr(args, "format", "text"))
-    print()
-    print(f"config saved to {saved}, rerun it with:")
-    print(f"  python3 -m traffic_replay run --config {saved}")
+    stream = sys.stderr if json_mode else sys.stdout
+    print(file=stream)
+    print(f"config saved to {saved}, rerun it with:", file=stream)
+    print(f"  python3 -m traffic_replay run --config {saved}", file=stream)
     return code
 
 
@@ -644,7 +722,10 @@ def _rungs(spec: str) -> list[float]:
             if len(set(vals)) != len(vals):
                 raise ValueError
             return vals
-        vals = [float(x) for x in spec.split(",") if x.strip()]
+        raw = spec.split(",")
+        if any(not x.strip() for x in raw):
+            raise ValueError
+        vals = [float(x) for x in raw]
         if (not vals or any(not math.isfinite(v) or v <= 0 for v in vals)
                 or len(set(vals)) != len(vals)):
             raise ValueError
@@ -760,13 +841,16 @@ def _sweep_report(rungs: list[dict], out_root: Path, args) -> int:
     def _n(v, d=0):
         return "-" if v is None else f"{v:,.{d}f}"
 
+    def _pct(v):
+        return "-" if v is None else f"{v:.1%}"
+
     hdr = ("| rate asked | achieved | held | error | TTFT p50 | TTFT p95 "
            "| E2E p50 | verdict |")
     rows = [hdr, "|---|---|---|---|---|---|---|---|"]
     for r in rungs:
         rows.append(
             f"| {r['rate']:g} rps | {_n(r['achieved_rps'], 1)} | "
-            f"{_n(r['held'])} | {(r['err'] or 0):.1%} | "
+            f"{_n(r['held'])} | {_pct(r['err'])} | "
             f"{_n(r['ttft_p50'])} | {_n(r['ttft_p95'])} | "
             f"{_n(r['e2e_p50'])} | {r['kind'].upper()} |")
 
@@ -860,7 +944,7 @@ def cmd_quickstart(args) -> int:
             "Describe the capacity this ran on. Shared pay-per-token is not a "
             "performance claim for a dedicated endpoint."),
     }
-    if args.max_output_tokens:
+    if args.max_output_tokens is not None:
         cfg["max_output_tokens_cap"] = args.max_output_tokens
 
     # SLA targets. the whole reason to run this is "do we meet ours", so it
@@ -868,23 +952,38 @@ def cmd_quickstart(args) -> int:
     # profile's, which on a bundled profile are illustrative.
     ttft = {q: v for q, v in (("p50", args.ttft_p50), ("p90", args.ttft_p90),
                               ("p95", args.ttft_p95), ("p99", args.ttft_p99))
-            if v}
+            if v is not None}
     ttfg = {q: v for q, v in (("p50", args.ttfg_p50), ("p90", args.ttfg_p90),
                               ("p95", args.ttfg_p95), ("p99", args.ttfg_p99))
-            if v}
-    if ttft or ttfg or args.success_rate:
+            if v is not None}
+    if ttft or ttfg or args.success_rate is not None:
         targets: dict = {"targets_are": "yours, passed on the command line"}
         if ttft:
             targets["ttft_ms"] = ttft
         if ttfg:
             targets["ttfg_ms"] = ttfg
-        if args.success_rate:
+        if args.success_rate is not None:
             targets["success_rate"] = args.success_rate
         cfg["acceptance_targets"] = targets
 
+    # A config generator must not happily write a file that the runner will
+    # reject. Validate the endpoint, profile, workload controls, and policy
+    # before touching the requested output path.
+    try:
+        from .client import EndpointConfig
+        from .config_validation import validate_acceptance_targets
+        from .profile import Profile
+        from .runner import RunConfig
+        EndpointConfig(**ep)
+        Profile.from_json(args.profile)
+        validate_acceptance_targets(cfg.get("acceptance_targets"))
+        RunConfig(**cfg)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid quickstart configuration: {exc}") from exc
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(cfg, indent=2) + "\n")
+    out.write_text(json.dumps(cfg, indent=2, allow_nan=False) + "\n")
     print(f"wrote {out}")
     print()
     print("run it with:")

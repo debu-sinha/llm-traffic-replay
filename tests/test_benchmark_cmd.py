@@ -12,6 +12,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from traffic_replay.cli import _pair, main
 
 
@@ -143,6 +145,31 @@ def test_bad_extra_body_json_is_refused_before_the_run():
         assert "not valid JSON" in str(e)
     else:
         raise AssertionError("should have refused")
+
+
+def test_extra_body_must_be_a_finite_json_object():
+    from traffic_replay.cli import _benchmark_config
+    import argparse
+
+    base = dict(
+        host="https://example.invalid", endpoint="ep", auth_profile=None,
+        token_env="T", model=None, sizing_concurrency=1,
+        legacy_concurrency=None, duration=1, out_dir=str(_tmp()),
+        title=None, label=None, input_tokens="10", output_tokens="2",
+        cache_hit_rate="0", prompts=None,
+        profile="configs/profile_validation_small.json", ttft_p50=None,
+        ttft_p90=None, ttft_p95=None, ttft_p99=None, ttfg_p50=None,
+        ttfg_p90=None, ttfg_p95=None, ttfg_p99=None, success_rate=None,
+        max_concurrency=None, max_pending_requests=None, cmd="benchmark")
+    for raw in ('[1, 2]', '{"x": NaN}'):
+        with pytest.raises(SystemExit):
+            _benchmark_config(argparse.Namespace(**base, extra_body=raw))
+
+
+def test_malformed_quantile_pairs_are_not_silently_repaired():
+    for raw in ("1,,2", ",1", "1,"):
+        with pytest.raises(SystemExit):
+            _pair(raw, "input-tokens")
 
 
 # ---- provenance ---------------------------------------------------------
@@ -424,3 +451,28 @@ def test_the_terminal_prints_the_report_not_sliced_json():
     assert "requests:" in out          # the report, not a JSON blob
     assert "MISS:" in out
     assert not out.lstrip().startswith("{")
+
+
+def test_json_format_emits_exactly_one_parseable_document():
+    import contextlib
+    import io
+    from traffic_replay.cli import _finish
+    buf = io.StringIO()
+    result = _summary_dir("miss")
+    with contextlib.redirect_stdout(buf):
+        assert _finish(result, fmt="json") == 1
+    assert json.loads(buf.getvalue()) == result["summary"]
+    assert "open in a browser" not in buf.getvalue()
+
+
+def test_unknown_verdict_fails_closed(monkeypatch):
+    import contextlib
+    import io
+    from traffic_replay.cli import _finish
+    monkeypatch.setattr("traffic_replay.metrics._verdict",
+                        lambda summary: ("unexpected", "bad verdict"))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = _finish({"out_dir": str(_tmp()), "summary": {}}, fmt="json")
+    assert code == 2
+    assert json.loads(buf.getvalue()) == {}

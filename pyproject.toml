@@ -2,8 +2,12 @@
 name = "llm-traffic-replay"
 version = "0.4.1"
 description = "Replay your production traffic shape against an LLM serving endpoint: heavy-tailed prompt sizes, constructed prompt-cache hit ratios, bursty arrivals, honest measurement."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
+
+[project.scripts]
+traffic-replay = "traffic_replay.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -14,6 +18,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["traffic_replay*"]
+
+[tool.setuptools.package-data]
+traffic_replay = ["data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

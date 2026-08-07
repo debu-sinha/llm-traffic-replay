@@ -3,6 +3,10 @@ a run. The name handling matters because a customer's endpoint may not use
 the databricks- prefix (customer endpoints often do not)."""
 from __future__ import annotations
 
+import http.client
+
+import pytest
+
 from traffic_replay.endpoint_meta import (
     endpoint_name_from_path, fetch_endpoint_metadata, _summarize)
 
@@ -21,6 +25,17 @@ def test_name_extraction_handles_custom_names():
     assert endpoint_name_from_path("") is None
 
 
+def test_name_extraction_requires_the_real_route_prefix_and_is_canonical():
+    assert endpoint_name_from_path(
+        "/other/serving-endpoints/not-an-endpoint/invocations") is None
+    assert endpoint_name_from_path(
+        "/serving-endpoints/my%20endpoint/invocations?x=1") == "my endpoint"
+    assert endpoint_name_from_path(
+        "/serving-endpoints/%2e%2e/invocations") is None
+    assert endpoint_name_from_path(
+        "/serving-endpoints/a%2Fb/invocations") is None
+
+
 def test_fetch_returns_none_without_crashing():
     # no token -> None, no name -> None, unreachable host -> None
     assert fetch_endpoint_metadata("https://x.example.com",
@@ -31,6 +46,29 @@ def test_fetch_returns_none_without_crashing():
     assert fetch_endpoint_metadata("https://127.0.0.1:9",
                                    "/serving-endpoints/a/invocations", "tok",
                                    timeout=0.2) is None
+
+
+def test_metadata_never_sends_a_bearer_token_over_remote_cleartext(
+        monkeypatch):
+    def must_not_connect(*args, **kwargs):
+        raise AssertionError("HTTP connection should not be attempted")
+
+    monkeypatch.setattr(http.client, "HTTPConnection", must_not_connect)
+    assert fetch_endpoint_metadata(
+        "http://metadata.example", "/serving-endpoints/a/invocations",
+        "secret") is None
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), True])
+def test_invalid_metadata_timeout_is_rejected_without_network(timeout,
+                                                               monkeypatch):
+    monkeypatch.setattr(
+        http.client, "HTTPSConnection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("connection should not be attempted")))
+    assert fetch_endpoint_metadata(
+        "https://x.example", "/serving-endpoints/a/invocations", "secret",
+        timeout=timeout) is None
 
 
 def test_summarize_keeps_customer_relevant_fields():
@@ -46,6 +84,14 @@ def test_summarize_keeps_customer_relevant_fields():
     e = s["served_entities"][0]
     assert e["workload_type"] == "GPU_LARGE" and e["provisioned_model_units"] == 4
     assert "irrelevant" not in e
+
+
+@pytest.mark.parametrize("doc", [[], {"config": []},
+                                  {"config": {"served_entities": {}}},
+                                  {"config": {"served_entities": ["bad"]}}])
+def test_malformed_metadata_shapes_are_rejected(doc):
+    with pytest.raises(ValueError):
+        _summarize(doc)
 
 
 # Captured from a real Databricks serving-endpoints GET on 2026-08-02, against

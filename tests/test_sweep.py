@@ -29,7 +29,8 @@ def test_an_explicit_list_is_taken_as_given_and_sorted():
 
 def test_nonsense_is_refused_rather_than_producing_a_silent_ladder():
     # a loop rather than parametrize, because the stdlib runner has no marks
-    for bad in ("32:1", "0:10", "-5:10", "abc", "", "1:2:3:4", "0", "-3"):
+    for bad in ("32:1", "0:10", "-5:10", "abc", "", "1:2:3:4", "0", "-3",
+                "1,,2", ",1", "1,"):
         try:
             _rungs(bad)
         except SystemExit:
@@ -94,6 +95,16 @@ def test_no_rung_holding_is_reported_and_exits_nonzero():
     assert "No rung held" in body
     assert "lowest rate tested (1 rps)" in body
     assert code == 1
+
+
+def test_missing_error_rate_is_not_printed_as_zero():
+    from traffic_replay.cli import _sweep_report
+    tmp_path = Path(tempfile.mkdtemp(prefix='sweep-'))
+    rung = _rung(1, "invalid")
+    rung["err"] = None
+    _sweep_report([rung], tmp_path, _Args())
+    body = (tmp_path / "sweep.md").read_text()
+    assert "| 1 rps | 1.0 | - | - |" in body
 
 
 def test_concurrency_is_reported_as_measured_not_as_asked():
@@ -183,7 +194,7 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
         "sweep", "--host", "https://ws.example", "--endpoint", "ep",
         "--rate", "1,2", "--duration", "7", "--cooldown", "3",
         "--prompts", str(prompts), "--output-tokens", "40,90",
-        "--auth-profile", "yuchen-test",
+        "--auth-profile", "workspace-test",
         "--extra-body", '{"chat_template_kwargs":{"enable_thinking":false}}',
         "--max-concurrency", "17", "--max-pending-requests", "23",
         "--out-dir", str(root / "out")])
@@ -196,7 +207,7 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
     for rc in runs:
         assert rc.prompts_file == str(prompts)
         assert rc.max_output_tokens_cap == 135
-        assert rc.endpoint["auth_profile"] == "yuchen-test"
+        assert rc.endpoint["auth_profile"] == "workspace-test"
         assert rc.endpoint["extra_body"] == {
             "chat_template_kwargs": {"enable_thinking": False}}
         assert rc.max_concurrency == 17

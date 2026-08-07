@@ -7,6 +7,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from traffic_replay.cli import main
 from traffic_replay.runner import RunConfig, _token, _token_from_profile
 from traffic_replay.client import EndpointConfig
@@ -58,6 +60,26 @@ def test_sla_targets_are_expressible_on_the_command_line():
 def test_no_targets_means_no_acceptance_block_rather_than_a_guess():
     cfg = _run_quickstart(_tmp() / "q.json")
     assert "acceptance_targets" not in cfg
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--ttft-p95", "0"),
+    ("--success-rate", "0"),
+    ("--success-rate", "1.1"),
+])
+def test_quickstart_rejects_invalid_sla_instead_of_silently_dropping_it(
+        flag, value):
+    out = _tmp() / "invalid.json"
+    with pytest.raises(SystemExit, match="invalid quickstart"):
+        _run_quickstart(out, flag, value)
+    assert not out.exists()
+
+
+def test_quickstart_rejects_invalid_workload_before_writing(tmp_path):
+    out = tmp_path / "invalid.json"
+    with pytest.raises(SystemExit, match="invalid quickstart"):
+        _run_quickstart(out, "--duration", "0")
+    assert not out.exists()
 
 
 def test_auth_profile_replaces_the_token_env_var():

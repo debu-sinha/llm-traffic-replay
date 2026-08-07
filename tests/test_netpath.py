@@ -10,6 +10,7 @@ number was the width of the country. Nothing in the report said so.
 from __future__ import annotations
 
 import http.server
+import socket
 import threading
 
 from traffic_replay.metrics import render_html, render_markdown, summarize
@@ -27,8 +28,7 @@ def _rows(n, ttft, base=1_700_000_000.0):
 
 
 def _meta(rtt):
-    return {"network_path": {"client_egress_ip": "10.0.0.5",
-                             "endpoint_host": "ws.example.com",
+    return {"network_path": {"endpoint_host": "ws.example.com",
                              "endpoint_ips": ["44.234.192.45"],
                              "rtt_ms": rtt, "samples": 5}}
 
@@ -51,7 +51,8 @@ def test_it_measures_a_real_round_trip_to_a_local_server():
     assert r["endpoint_ips"] == ["127.0.0.1"]
     assert r["samples"] == 3
     assert r["rtt_ms"] < 50, r        # loopback is sub-millisecond in practice
-    assert r["client_hostname"]
+    assert "client_hostname" not in r
+    assert "client_egress_ip" not in r
 
 
 def test_an_unresolvable_host_does_not_break_the_run():
@@ -59,6 +60,40 @@ def test_an_unresolvable_host_does_not_break_the_run():
     network position."""
     assert measure_network_path("https://no-such-host.invalid.") is None
     assert measure_network_path("not a url at all") is None
+
+
+def test_invalid_probe_controls_fail_closed_without_connecting():
+    assert measure_network_path("https://example.invalid", samples=0) is None
+    assert measure_network_path("https://example.invalid", samples=True) is None
+    assert measure_network_path("https://example.invalid", timeout=0) is None
+
+
+def test_ipv6_is_supported_and_even_sample_median_is_arithmetic(monkeypatch):
+    connected = []
+
+    class FakeSocket:
+        def settimeout(self, value):
+            assert value == 5.0
+
+        def connect(self, address):
+            connected.append(address)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("traffic_replay.netpath.socket.getaddrinfo",
+                        lambda *args, **kwargs: [
+                            (socket.AF_INET6, socket.SOCK_STREAM,
+                             socket.IPPROTO_TCP, "", ("::1", 443, 0, 0))])
+    monkeypatch.setattr("traffic_replay.netpath.socket.socket",
+                        lambda *args: FakeSocket())
+    times = iter((0.0, 0.010, 1.0, 1.030))
+    monkeypatch.setattr("traffic_replay.netpath.time.perf_counter",
+                        lambda: next(times))
+    result = measure_network_path("https://[::1]", samples=2)
+    assert connected == [("::1", 443, 0, 0), ("::1", 443, 0, 0)]
+    assert result["rtt_ms"] == 10.0
+    assert result["rtt_median_ms"] == 20.0
 
 
 def test_the_share_of_ttft_is_computed_and_the_remainder_shown():

@@ -23,9 +23,12 @@ Stdlib only.
 
 from __future__ import annotations
 
+import math
 import socket
+import statistics
 import time
-import urllib.parse
+
+from .client import normalized_origin
 
 
 def measure_network_path(
@@ -37,41 +40,36 @@ def measure_network_path(
     it could not describe its own network position.
     """
     try:
-        u = urllib.parse.urlparse(base_url)
-        host = u.hostname
-        if not host:
+        if isinstance(samples, bool) or not isinstance(samples, int) \
+                or samples <= 0:
             return None
-        port = u.port or (443 if (u.scheme or "https") == "https" else 80)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) \
+                or not math.isfinite(float(timeout)) or timeout <= 0:
+            return None
+        _, host, port = normalized_origin(base_url)
 
-        infos = socket.getaddrinfo(host, port, socket.AF_INET,
+        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
-        ips = sorted({i[4][0] for i in infos})
-        if not ips:
+        endpoints = []
+        seen = set()
+        for family, socktype, proto, _, address in infos:
+            key = (family, address)
+            if key not in seen:
+                seen.add(key)
+                endpoints.append((family, socktype, proto, address))
+        endpoints.sort(key=lambda item: (item[0], item[3][0]))
+        if not endpoints:
             return None
-
-        # the address this machine actually sources traffic from, taken from
-        # the routing table rather than from a lookup service. a UDP connect
-        # sends nothing, it just asks the kernel which interface it would
-        # use for that destination.
-        egress = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect((ips[0], port))
-                egress = s.getsockname()[0]
-            finally:
-                s.close()
-        except OSError:
-            pass
+        ips = sorted({item[3][0] for item in endpoints})
 
         rtts: list[float] = []
-        for i in range(max(1, samples)):
-            ip = ips[i % len(ips)]
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for i in range(samples):
+            family, socktype, proto, address = endpoints[i % len(endpoints)]
+            s = socket.socket(family, socktype, proto)
             s.settimeout(timeout)
             try:
                 t0 = time.perf_counter()
-                s.connect((ip, port))
+                s.connect(address)
                 rtts.append((time.perf_counter() - t0) * 1000.0)
             except OSError:
                 continue
@@ -81,12 +79,10 @@ def measure_network_path(
             return None
 
         return {
-            "client_hostname": socket.gethostname(),
-            "client_egress_ip": egress,
             "endpoint_host": host,
             "endpoint_ips": ips,
             "rtt_ms": round(min(rtts), 1),
-            "rtt_median_ms": round(sorted(rtts)[len(rtts) // 2], 1),
+            "rtt_median_ms": round(statistics.median(rtts), 1),
             "samples": len(rtts),
             "note": (
                 "round trip is the minimum TCP connect over "

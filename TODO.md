@@ -1,39 +1,63 @@
 # Follow-up work
 
-## Decide what to do about the customer name in git history
+These are known product limits, not completed features.
 
-The working tree is scrubbed. Earlier history is not, and it carries
-customer-identifying and commercially sensitive material that the working
-tree never should have held. Neither the specifics nor where to find them
-are recorded here: this file is tracked and public, and a description
-precise enough to be useful is also precise enough to be a map. The owner
-knows what it is.
+## Add an explicit interrupted-run recovery command
 
-That history is on a public remote. Anyone running `git log -p`, opening a
-commit permalink, or cloning the repo sees all of it, so the working-tree
-scrub reduces exposure very little on its own.
+Interrupted runs preserve newline-complete rows in
+`requests.jsonl.partial`, but recovery is currently an inspection procedure,
+not a CLI workflow. A future command should:
 
-This is a decision for the repo owner, not something to do quietly. Removing
-it means `git filter-repo` plus a force push, plus a GitHub Support request to
-purge cached blob views, plus checking the fork network, since forks keep the
-old objects reachable after a rewrite.
+- verify the writing marker and regular-file boundaries;
+- copy, never mutate, the interrupted evidence;
+- ignore at most one truncated final fragment;
+- report recovered and lost/unknown coverage;
+- emit an explicitly diagnostic artifact that cannot be mistaken for a sealed
+  benchmark or merged as valid evidence.
 
-Until that decision is made and carried out, do not describe this repo as
-scrubbed.
+## Add semantic evaluators
 
-## Record which serving config was read
+The current answer policy validates visible content or tool-call structure and
+clean stream completion. It cannot judge factual correctness, instruction
+following, tool choice, argument semantics, safety behavior, or task success.
+Production qualification needs application-specific evaluators with their own
+versioned inputs and provenance.
 
-`endpoint_meta._summarize` reads the active `config` only. During an endpoint
-update the pending config carries the new workload shape. Recording a
-`config_source` field and rendering it would let the card say which one it
-described. Severity checked: with the `pending_config` fallback dropped, a
-mid-update endpoint reports NO served-entity rows at all and shows
-`ready: UPDATING`, so the card cannot make a false capacity claim. Cosmetic.
+## Expand provider conformance fixtures
 
-## Document the dispatch-lag and connect_ms interaction
+The streamed Chat Completions subset needs captured, scrubbed fixtures for more
+documented provider dialects, including SSE framing, usage-only terminal
+chunks, reasoning channels, tool-call deltas, cached-token fields, and explicit
+unsupported-field errors. Conformance should be proven before a provider is
+described as supported.
 
-Mostly answered by the wire-lateness work: `first_send_unix` is stamped
-before the handshake, so wire lateness covers dispatcher-to-wire. The
-residual is `connect_ms`, since arrival at the endpoint is roughly
-wire lateness plus the handshake. Both numbers are printed and labeled, so
-this is a wording question rather than a missing measurement.
+## Add first-class quota evidence
+
+HTTP 429 is observable, but the harness cannot determine which token, request,
+hourly, account, or provider policy caused it. A future provider adapter could
+attach quota headers and control-plane telemetry without persisting secrets or
+response content. Until then, quota diagnosis remains external.
+
+## Add scalable online quantiles
+
+Active client work and futures are bounded by workers and pending requests,
+but the complete global schedule and profile-mode sampled workload arrays are
+proportional to the global request count. Final exact percentile calculation
+also rereads all persisted replay rows. Very large runs need streaming schedule
+and workload construction plus a versioned approximate-quantile mode with
+explicit error bounds and a report label that prevents mixing exact and
+approximate summaries.
+
+## Add pricing-source provenance
+
+Pricing values are user supplied and the manifest records the effective rates,
+but not a source URL, region, model SKU, or effective date. A strict optional
+pricing provenance object would make cost evidence easier to audit while
+keeping automatic price retrieval out of the critical run path.
+
+## Improve target configuration evidence
+
+Endpoint metadata capture is best effort and specific to recognized serving
+routes. It does not prevent a target from changing after the pre-traffic
+snapshot. Provider-specific immutable deployment revision identifiers, when
+available, should be captured and compared with post-run state.

@@ -1,80 +1,79 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1360 620" width="1360" height="620" font-family="Helvetica, Arial, sans-serif">
-  <rect x="0" y="0" width="1360" height="620" fill="#ffffff"/>
-  <text x="40" y="44" font-size="26" font-weight="700" fill="#1e1e1e">how the load is shaped, and which settings control it</text>
-  <text x="40" y="72" font-size="14" fill="#495057">the harness rebuilds three properties of your production traffic. it fills them with meaningless synthetic text, so the only variable left is the endpoint.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="650" viewBox="0 0 1280 650" role="img" aria-labelledby="title desc">
+  <title id="title">Workload and open-loop load model</title>
+  <desc id="desc">Real prompts or profile schemas create request bodies. A synthetic burst schedule or shifted arrival trace creates monotonic target times. Global indices are assigned before sharding. A bounded open-loop dispatcher offers requests, while achieved token, cache, rate, and concurrency evidence are measured rather than assumed.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
+    <style>
+      .bg{fill:#f8fafc}.box{fill:#eff6ff;stroke:#2563eb;stroke-width:2}.green{fill:#ecfdf5;stroke:#059669;stroke-width:2}.amber{fill:#fff7ed;stroke:#c2410c;stroke-width:2}.violet{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2}.gray{fill:#f1f5f9;stroke:#64748b;stroke-width:2}.h{font:700 21px system-ui,sans-serif;fill:#0f172a}.t{font:700 15px system-ui,sans-serif;fill:#0f172a}.s{font:12px system-ui,sans-serif;fill:#334155}.note{font:italic 12px system-ui,sans-serif;fill:#475569}.a{fill:none;stroke:#334155;stroke-width:2;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1280" height="650"/>
+  <text class="h" x="35" y="42">Workload intent becomes offered load; achieved work is measured separately</text>
 
-  <!-- ================= PANEL 1: prompt sizes (blue) ================= -->
-  <rect x="40" y="96" width="404" height="404" rx="14" fill="#ffffff" stroke="#1971c2" stroke-width="2"/>
-  <text x="64" y="132" font-size="19" font-weight="700" fill="#1971c2">1. prompt sizes</text>
-  <text x="64" y="154" font-size="13" fill="#495057">heavy-tailed: most prompts mid-sized, a few very large</text>
+  <rect class="box" x="45" y="70" width="260" height="175" rx="12"/>
+  <text class="t" x="175" y="98" text-anchor="middle">Workload input: exactly one</text>
+  <text class="s" x="65" y="126">Real prompts:</text>
+  <text class="s" x="80" y="148">approved string content</text>
+  <text class="s" x="80" y="169">replayed as supplied</text>
+  <text class="s" x="65" y="197">Profile:</text>
+  <text class="s" x="80" y="219">v1 p50/p95 or v2 fidelity modes</text>
 
-  <!-- distribution curve -->
-  <line x1="72" y1="300" x2="416" y2="300" stroke="#adb5bd" stroke-width="1.5"/>
-  <path d="M80 300 C120 300 128 196 168 196 C210 196 226 238 268 262 C312 286 360 296 416 299 L416 300 L80 300 Z" fill="#e7f5ff" stroke="#1971c2" stroke-width="2.5"/>
-  <line x1="182" y1="300" x2="182" y2="206" stroke="#1971c2" stroke-width="1.5" stroke-dasharray="5 4"/>
-  <text x="182" y="318" font-size="12" fill="#1971c2" text-anchor="middle">p50</text>
-  <line x1="316" y1="300" x2="316" y2="278" stroke="#1971c2" stroke-width="1.5" stroke-dasharray="5 4"/>
-  <text x="316" y="318" font-size="12" fill="#1971c2" text-anchor="middle">p95</text>
-  <text x="404" y="292" font-size="12" fill="#868e96" text-anchor="end">long tail</text>
+  <rect class="green" x="360" y="70" width="310" height="175" rx="12"/>
+  <text class="t" x="515" y="98" text-anchor="middle">Profile sampling choices</text>
+  <text class="s" x="380" y="126">v1: independent fitted marginals</text>
+  <text class="s" x="380" y="150">v2 quantile_cdf:</text>
+  <text class="s" x="395" y="171">full marginal knot ladder, stratified ranks</text>
+  <text class="s" x="395" y="192">independent cross-field pairing, clamped tails</text>
+  <text class="s" x="380" y="216">v2 empirical_joint: weighted observed triples</text>
 
-  <text x="64" y="358" font-size="13" fill="#212529">method: fit a lognormal to your p50 and p95,</text>
-  <text x="64" y="377" font-size="13" fill="#212529">then draw every request size from that fit.</text>
+  <rect class="amber" x="725" y="85" width="235" height="145" rx="12"/>
+  <text class="t" x="842" y="113" text-anchor="middle">Request construction</text>
+  <text class="s" x="745" y="141">sampled input and output budgets</text>
+  <text class="s" x="745" y="165">shared prefix + unique suffix</text>
+  <text class="s" x="745" y="189">intended cache fraction is token share</text>
+  <text class="s" x="745" y="213">it is not request hit probability</text>
 
-  <rect x="64" y="400" width="356" height="34" rx="8" fill="#e7f5ff"/>
-  <text x="76" y="422" font-size="13" fill="#1971c2">profile: input_tokens.p50 / p95, output_tokens.p50 / p95</text>
-  <rect x="64" y="444" width="356" height="34" rx="8" fill="#f1f3f5"/>
-  <text x="76" y="466" font-size="13" fill="#495057">preview: python3 -m traffic_replay sample --profile ...</text>
+  <rect class="gray" x="1015" y="85" width="220" height="145" rx="12"/>
+  <text class="t" x="1125" y="113" text-anchor="middle">Request body plan</text>
+  <text class="s" x="1035" y="141">messages + max_tokens</text>
+  <text class="s" x="1035" y="165">fixed seed and global request ID</text>
+  <text class="s" x="1035" y="189">model-specific extra_body</text>
+  <text class="s" x="1035" y="213">provider conformance still required</text>
+  <path class="a" d="M305 158 H360"/><path class="a" d="M670 158 H725"/><path class="a" d="M960 158 H1015"/>
+  <text class="note" x="515" y="265" text-anchor="middle">Real-prompts mode bypasses profile sampling and synthetic text construction.</text>
 
-  <!-- ================= PANEL 2: cache reuse (green) ================= -->
-  <rect x="478" y="96" width="404" height="404" rx="14" fill="#ffffff" stroke="#2f9e44" stroke-width="2"/>
-  <text x="502" y="132" font-size="19" font-weight="700" fill="#2f9e44">2. cache reuse</text>
-  <text x="502" y="154" font-size="13" fill="#495057">requests share leading context, some docs are popular</text>
+  <rect class="box" x="45" y="325" width="260" height="120" rx="12"/>
+  <text class="t" x="175" y="353" text-anchor="middle">Arrival input: exactly one path</text>
+  <text class="s" x="65" y="382">Seeded two-state Poisson schedule</text>
+  <text class="s" x="65" y="405">or finite timestamps: sort + shift to 0</text>
+  <text class="s" x="65" y="428">duration_s caps shifted trace rows</text>
 
-  <!-- five request bars: shared green prefix + unique tail -->
-  <rect x="502" y="182" width="210" height="20" rx="4" fill="#ebfbee" stroke="#2f9e44" stroke-width="2"/>
-  <rect x="502" y="182" width="132" height="20" rx="4" fill="#2f9e44"/>
-  <rect x="502" y="212" width="250" height="20" rx="4" fill="#ebfbee" stroke="#2f9e44" stroke-width="2"/>
-  <rect x="502" y="212" width="132" height="20" rx="4" fill="#2f9e44"/>
-  <rect x="502" y="242" width="188" height="20" rx="4" fill="#ebfbee" stroke="#2f9e44" stroke-width="2"/>
-  <rect x="502" y="242" width="132" height="20" rx="4" fill="#2f9e44"/>
-  <rect x="502" y="272" width="232" height="20" rx="4" fill="#ebfbee" stroke="#adb5bd" stroke-width="2"/>
-  <rect x="502" y="272" width="80" height="20" rx="4" fill="#8ce99a"/>
-  <rect x="502" y="302" width="204" height="20" rx="4" fill="#ebfbee" stroke="#adb5bd" stroke-width="2"/>
-  <rect x="502" y="302" width="80" height="20" rx="4" fill="#8ce99a"/>
-  <line x1="634" y1="176" x2="634" y2="328" stroke="#2f9e44" stroke-width="1.2" stroke-dasharray="4 4"/>
-  <text x="640" y="345" font-size="12" fill="#2f9e44">shared prefix (cache-eligible)</text>
-  <text x="760" y="196" font-size="12" fill="#495057">unique tail</text>
+  <rect class="violet" x="360" y="325" width="260" height="120" rx="12"/>
+  <text class="t" x="490" y="353" text-anchor="middle">Global schedule identity</text>
+  <text class="s" x="380" y="382">assign global index before split</text>
+  <text class="s" x="380" y="405">SHA-256 of binary timestamp sequence</text>
+  <text class="s" x="380" y="428">round-robin modulo shard selection</text>
 
-  <text x="502" y="376" font-size="13" fill="#212529">method: a pool of shared-prefix docs, drawn</text>
-  <text x="502" y="393" font-size="13" fill="#212529">by Zipf popularity, sets a target hit ratio.</text>
+  <rect class="green" x="675" y="310" width="280" height="150" rx="12"/>
+  <text class="t" x="815" y="338" text-anchor="middle">Bounded open-loop dispatcher</text>
+  <text class="s" x="695" y="367">monotonic scheduled targets</text>
+  <text class="s" x="695" y="390">fixed arrival plan; no response pacing</text>
+  <text class="s" x="695" y="413">max_concurrency worker bound</text>
+  <text class="s" x="695" y="433">max_pending_requests bounds</text>
+  <text class="s" x="695" y="452">running + queued work</text>
 
-  <rect x="502" y="404" width="356" height="34" rx="8" fill="#ebfbee"/>
-  <text x="514" y="426" font-size="13" fill="#2f9e44">profile: cache_fraction.p50 / p95</text>
-  <rect x="502" y="444" width="356" height="34" rx="8" fill="#f1f3f5"/>
-  <text x="514" y="466" font-size="13" fill="#495057">config: pool_zipf_s, pool_docs_per_bucket</text>
+  <rect class="amber" x="1015" y="310" width="220" height="150" rx="12"/>
+  <text class="t" x="1125" y="338" text-anchor="middle">Endpoint outcomes</text>
+  <text class="s" x="1035" y="367">service time changes occupancy</text>
+  <text class="s" x="1035" y="390">quota or errors can shed work</text>
+  <text class="s" x="1035" y="413">usage/cache fields can be missing</text>
+  <text class="s" x="1035" y="436">retries can add physical POSTs</text>
+  <path class="a" d="M305 385 H360"/><path class="a" d="M620 385 H675"/><path class="a" d="M955 385 H1015"/>
 
-  <!-- ================= PANEL 3: arrivals (amber) ================= -->
-  <rect x="916" y="96" width="404" height="404" rx="14" fill="#ffffff" stroke="#e8590c" stroke-width="2"/>
-  <text x="940" y="132" font-size="19" font-weight="700" fill="#e8590c">3. arrival timing</text>
-  <text x="940" y="154" font-size="13" fill="#495057">bursty: quiet stretches broken by spikes</text>
-
-  <!-- burst curve -->
-  <line x1="948" y1="300" x2="1292" y2="300" stroke="#adb5bd" stroke-width="1.5"/>
-  <path d="M948 292 L988 290 L1010 292 L1030 196 L1052 200 L1074 288 L1140 290 L1176 292 L1198 186 L1216 192 L1236 289 L1292 291 L1292 300 L948 300 Z" fill="#fff4e6" stroke="#e8590c" stroke-width="2.5"/>
-  <text x="1030" y="182" font-size="12" fill="#e8590c" text-anchor="middle">burst</text>
-  <text x="1120" y="284" font-size="12" fill="#868e96" text-anchor="middle">quiet</text>
-  <text x="948" y="318" font-size="12" fill="#495057">time</text>
-
-  <text x="940" y="358" font-size="13" fill="#212529">method: a two-state on/off model (MMPP)</text>
-  <text x="940" y="377" font-size="13" fill="#212529">generates spikes, or replay your real trace.</text>
-
-  <rect x="940" y="400" width="356" height="34" rx="8" fill="#fff4e6"/>
-  <text x="952" y="422" font-size="13" fill="#e8590c">config: qps_base, qps_burst, qps_min / max, rate_scale</text>
-  <rect x="940" y="444" width="356" height="34" rx="8" fill="#f1f3f5"/>
-  <text x="952" y="466" font-size="13" fill="#495057">or exact replay: timestamps_file (one epoch per line)</text>
-
-  <!-- ================= synthesis strip ================= -->
-  <rect x="40" y="524" width="1280" height="70" rx="12" fill="#f8f9fa" stroke="#ced4da" stroke-width="1.5"/>
-  <text x="60" y="554" font-size="15" font-weight="700" fill="#212529">you configure the shape. the harness fills it with synthetic text that means nothing.</text>
-  <text x="60" y="578" font-size="15" fill="#495057">what is left to measure is the endpoint: TTFT, interchunk gaps, throughput, achieved cache rate, and the SLA scorecard.</text>
+  <rect class="violet" x="235" y="515" width="810" height="92" rx="12"/>
+  <text class="t" x="640" y="544" text-anchor="middle">Measured evidence, never inferred from requested settings</text>
+  <text class="s" x="640" y="569" text-anchor="middle">delivered rate and queue wait | observed in-flight concurrency | prompt/output token coverage</text>
+  <text class="s" x="640" y="591" text-anchor="middle">endpoint-reported cached prompt-token fraction | acceptable content/tool outcomes | caller latency</text>
+  <path class="a" d="M815 460 V492 H640 V515"/>
+  <text class="note" x="640" y="632" text-anchor="middle">A fixed seed reproduces the client plan, not endpoint timing, autoscaling, cache state, or network conditions.</text>
 </svg>

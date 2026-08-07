@@ -87,6 +87,20 @@ def test_missing_usage_makes_full_run_cost_unavailable_not_zero():
     assert c["dbu_total_measured_subset"] > 0
 
 
+def test_cached_tokens_above_prompt_tokens_invalidate_full_cost():
+    rows = _rows(1000, 400, 50, n=1)
+    rows.append({"ok": True, "prompt_tokens": 100,
+                 "cached_tokens": 101, "completion_tokens": 5})
+    c = _cost_block(
+        rows, dur=60, in_tok=1100, out_tok=55, cached_tok=501,
+        pricing={"mode": "per_token", "input_dbu_per_m": 10.0,
+                 "output_dbu_per_m": 30.0,
+                 "cache_read_dbu_per_m": 2.0})
+    assert c["priced_rows"] == 1
+    assert c["dbu_total"] is None
+    assert c["coverage_warning"]
+
+
 def test_cost_card_in_html():
     ok = [{"ok": True, "t_send_unix": 0.0, "prompt_tokens": 1000,
            "cached_tokens": 0, "completion_tokens": 100,

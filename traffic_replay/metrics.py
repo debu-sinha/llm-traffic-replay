@@ -1305,7 +1305,9 @@ def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
     # expensive rate and invents a total.
     priced_rows = [
         r for r in usage_rows
-        if r.get("cached_tokens") is not None or cache == inp]
+        if ((r.get("cached_tokens") is None and cache == inp)
+            or (r.get("cached_tokens") is not None
+                and 0 <= r["cached_tokens"] <= r["prompt_tokens"]))]
     per = []
     measured_cached = 0
     for r in priced_rows:
@@ -1339,9 +1341,10 @@ def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
         "coverage_warning": (
             None if complete or not ok else
             f"cost-required usage was present for {n} of {len(ok)} successful "
-            "responses. aggregate cost, cost per 1,000 requests, cost per "
-            "minute and cache savings are unavailable; the measured subset "
-            "is retained only for diagnosis"),
+            "responses and passed token-accounting checks. aggregate cost, "
+            "cost per 1,000 requests, cost per minute and cache savings are "
+            "unavailable; the measured subset is retained only for "
+            "diagnosis"),
         "note": "cost from endpoint-reported tokens times user-supplied DBU "
                 "rates (Databricks pricing page). cached input is billed at "
                 "the cache-read rate.",

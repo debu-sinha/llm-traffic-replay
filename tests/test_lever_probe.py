@@ -1,17 +1,13 @@
-"""Finding the control that turns reasoning down on THIS endpoint.
-
-Every vendor spells it differently and several accept a flag and then
-ignore it, so generic advice is not actionable. Measured on two Databricks
-endpoints on the same day: GLM-5.2 accepts reasoning_effort=none, and Kimi
-K2.7 rejects that exact value with "it is a thinking-only model" and needs
-minimal, which on a 10k-token prompt is still not enough.
-"""
+"""Explicit, provider-qualified reasoning-control probes and refusal UX."""
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 
-from traffic_replay.cli import _print_lever_report
+import pytest
+
+from traffic_replay.cli import _json_object_arg, _print_lever_report
 
 
 def _cap(levers, budget=512):
@@ -39,11 +35,10 @@ def test_a_rejection_keeps_the_reason_the_endpoint_gave():
     out = _cap([
         {"name": "reasoning_effort=none",
          "extra": {"reasoning_effort": "none"}, "verdict": "rejected",
-         "detail": 'http 400: reasoning_effort="none" is not supported by '
-                   'kimi-k2-7: it is a thinking-only model'},
+         "detail": 'http 400: reasoning_effort="none" is not supported'},
     ])
     assert "rejected" in out
-    assert "thinking-only model" in out
+    assert "is not supported" in out
 
 
 def test_when_nothing_works_it_says_so_and_names_the_next_move():
@@ -54,15 +49,14 @@ def test_when_nothing_works_it_says_so_and_names_the_next_move():
          "extra": {"reasoning_effort": "minimal"},
          "verdict": "ignored", "detail": "accepted, still no visible answer"},
     ])
-    assert "none of them produced an answer" in out
+    assert "none of the supplied candidates produced an answer" in out
     assert "--output-tokens" in out
     assert "wrong model for a budget this size" in out
-    assert "--extra-body" not in out.split("none of them")[1]
+    assert "--extra-body" not in out.split("none of the supplied")[1]
 
 
 def test_the_first_working_lever_wins_when_several_do():
-    """They are ordered least-reasoning-first, so the first hit is the one
-    that leaves the most budget for the answer."""
+    """Candidate order is user-controlled, so the first working one wins."""
     out = _cap([
         {"name": "reasoning_effort=none",
          "extra": {"reasoning_effort": "none"}, "verdict": "works",
@@ -80,7 +74,25 @@ def test_an_errored_probe_does_not_break_the_report():
                  "extra": {"thinking": {"type": "disabled"}},
                  "verdict": "error", "detail": "connection reset"}])
     assert "error" in out
-    assert "none of them produced an answer" in out
+    assert "none of the supplied candidates produced an answer" in out
+
+
+def test_probe_argument_requires_a_finite_json_object():
+    assert _json_object_arg('{"reasoning_effort":"none"}') == {
+        "reasoning_effort": "none"}
+    for value in ("[]", "null", '{"temperature": NaN}', "not-json",
+                  '{"api_key":"sensitive-value"}'):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _json_object_arg(value)
+
+
+def test_probe_report_redacts_secret_values():
+    secret = "sensitive-value-that-must-not-leak"
+    out = _cap([{"name": "candidate 1 (api_key)",
+                 "extra": {"api_key": secret},
+                 "verdict": "works", "detail": "answered"}])
+    assert secret not in out
+    assert "<redacted>" in out
 
 
 # ---- refusing a run we already know is void -----------------------------
@@ -120,6 +132,75 @@ def test_when_nothing_works_it_refuses_and_says_what_to_change():
                          "verdict": "ignored", "detail": "no answer"}], _Args())
     out = buf.getvalue()
     assert code == 3
-    assert "no reasoning control helped" in out
+    assert "no supplied reasoning-control candidate helped" in out
     assert "--output-tokens" in out
-    assert "wrong model for an output budget this size" in out
+    assert "fits this output budget" in out
+
+
+def test_when_nothing_was_probed_refusal_does_not_claim_a_probe_failed():
+    from traffic_replay.cli import _refuse
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = _refuse([], _Args())
+    out = buf.getvalue()
+    assert code == 3
+    assert "no reasoning controls were probed" in out
+    assert "--probe-extra-body" in out
+    assert "no supplied reasoning-control candidate helped" not in out
+
+
+def _no_answer_preflight():
+    return {
+        "attempted": 2,
+        "reachable": 2,
+        "readable": 0,
+        "usage_reported": True,
+        "cache_reported": True,
+        "reasoning": True,
+        "budgets": [40, 90],
+        "budget": 90,
+        "failed_probe_index": 1,
+    }
+
+
+def test_preflight_never_guesses_provider_controls(monkeypatch):
+    from traffic_replay.cli import _check_preflight
+    args = argparse.Namespace(force=False, probe_extra_body=[])
+
+    monkeypatch.setattr("traffic_replay.cli._preflight",
+                        lambda _cfg: _no_answer_preflight())
+
+    def unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("no control candidate was authorized")
+
+    monkeypatch.setattr("traffic_replay.cli._probe_reasoning_levers",
+                        unexpected_probe)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = _check_preflight({}, args)
+    assert code == 3
+    assert "no provider controls were guessed" in buf.getvalue()
+
+
+def test_preflight_probes_only_the_explicit_candidates(monkeypatch):
+    from traffic_replay.cli import _check_preflight
+
+    candidate = {"reasoning_effort": "none"}
+    args = argparse.Namespace(force=False, probe_extra_body=[candidate])
+
+    seen = {}
+    monkeypatch.setattr("traffic_replay.cli._preflight",
+                        lambda _cfg: _no_answer_preflight())
+
+    def probe(_cfg, budget, candidates, probe_index):
+        seen.update(budget=budget, candidates=candidates,
+                    probe_index=probe_index)
+        return [{"name": "candidate 1", "extra": candidate,
+                 "verdict": "works", "detail": "answered"}]
+
+    monkeypatch.setattr("traffic_replay.cli._probe_reasoning_levers", probe)
+    with contextlib.redirect_stdout(io.StringIO()):
+        code = _check_preflight({}, args)
+    assert code == 3
+    assert seen == {"budget": 90, "candidates": [candidate],
+                    "probe_index": 1}

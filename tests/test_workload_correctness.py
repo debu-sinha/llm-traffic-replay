@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -106,11 +105,10 @@ def test_readable_preflight_gate_does_not_depend_on_reasoning_schema(
     assert result["budget"] in result["budgets"]
 
 
-def test_known_reasoning_controls_include_nested_chat_template_flag():
-    from traffic_replay.cli import _REASONING_LEVERS
-    controls = dict(_REASONING_LEVERS)
-    assert controls["chat_template_kwargs.enable_thinking=false"] == {
-        "chat_template_kwargs": {"enable_thinking": False}}
+def test_reasoning_probe_label_is_stable_and_describes_supplied_json():
+    from traffic_replay.cli import _probe_label
+    control = {"thinking": {"type": "disabled"}}
+    assert _probe_label(control, 2) == "candidate 2 (thinking)"
 
 
 def test_global_profile_bodies_are_identical_before_and_after_sharding(tmp_path):

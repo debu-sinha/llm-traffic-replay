@@ -365,10 +365,10 @@ def _benchmark_config(args) -> dict:
         if not isinstance(ep["extra_body"], dict):
             raise SystemExit("--extra-body must be a JSON object")
         try:
-            json.dumps(ep["extra_body"], allow_nan=False)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise SystemExit(
-                "--extra-body must contain finite JSON values") from exc
+            from .client import validate_extra_body_safety
+            validate_extra_body_safety(ep["extra_body"])
+        except ValueError as exc:
+            raise SystemExit(f"invalid --extra-body: {exc}") from exc
 
     sizing = getattr(args, "sizing_concurrency", None)
     legacy = (getattr(args, "legacy_concurrency", None)
@@ -474,20 +474,30 @@ def _benchmark_config(args) -> dict:
     return cfg
 
 
-# the controls that turn reasoning down, in the order worth trying. every
-# vendor spells this differently and several accept a flag and then ignore
-# it, so the only way to know is to send one of each and look at what came
-# back. measured: GLM-5.2 accepts reasoning_effort=none, Kimi K2.7 rejects
-# that same value with "it is a thinking-only model" and wants minimal.
-_REASONING_LEVERS = (
-    ("reasoning_effort=none", {"reasoning_effort": "none"}),
-    ("reasoning_effort=minimal", {"reasoning_effort": "minimal"}),
-    ("reasoning_effort=low", {"reasoning_effort": "low"}),
-    ("thinking.type=disabled", {"thinking": {"type": "disabled"}}),
-    ("chat_template_kwargs.enable_thinking=false",
-     {"chat_template_kwargs": {"enable_thinking": False}}),
-    ("enable_thinking=false", {"enable_thinking": False}),
-)
+def _json_object_arg(value: str) -> dict:
+    """Parse one finite JSON object before any endpoint traffic is sent."""
+    try:
+        parsed = json.loads(value)
+        if not isinstance(parsed, dict):
+            raise ValueError("value is not an object")
+        json.dumps(parsed, allow_nan=False)
+        from .client import validate_extra_body_safety
+        validate_extra_body_safety(parsed)
+    except (json.JSONDecodeError, TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite JSON object, got {value!r}: {exc}") from exc
+    return parsed
+
+
+def _probe_label(extra: dict, position: int) -> str:
+    """Give a candidate a stable label without echoing request-body values."""
+    keys = ",".join(sorted(str(key) for key in extra))
+    return f"candidate {position} ({keys[:72] or 'empty object'})"
+
+
+def _safe_probe_detail(value: object) -> str:
+    from .artifacts import redact_secrets
+    return str(redact_secrets(str(value)))
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -508,13 +518,14 @@ def _answer_is_complete(result) -> bool:
 
 
 def _probe_reasoning_levers(cfg: dict, budget: int,
+                            candidates: list[dict],
                             probe_index: int = 1) -> list[dict]:
-    """Send one request per control and report what each one did.
+    """Send one request per user-supplied control and report what each did.
 
     This runs only when the endpoint has already proven it produces no
-    readable answer at the configured budget, which is a run the user cannot
-    use. A handful of requests to turn "turn reasoning down somehow" into
-    "use this exact flag" is a good trade at that point.
+    readable answer at the configured budget. The harness does not guess
+    provider fields or values: candidates must come from the target's current
+    documentation or an explicitly authorized experiment.
 
     The real prompt shape is used, not a short one. A one-line prompt gives
     a different and much rosier answer, which is a mistake worth not
@@ -532,7 +543,8 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
     # refactor cannot reintroduce a probe-only 512-token floor.
     budget = int(budget)
     out = []
-    for name, extra in _REASONING_LEVERS:
+    for position, extra in enumerate(candidates, start=1):
+        name = _probe_label(extra, position)
         ec = copy.deepcopy(cfg["endpoint"])
         ec["extra_body"] = _deep_merge(ec.get("extra_body") or {}, extra)
         ecfg = EndpointConfig(**ec)
@@ -545,13 +557,13 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
                 chars_sent=plan["chars"])
         except Exception as e:  # never let a probe break the run
             out.append({"name": name, "extra": extra, "verdict": "error",
-                        "detail": str(e)[:160]})
+                        "detail": _safe_probe_detail(e)[:160]})
             continue
         if r.status != 200:
             # a refusal is the most useful answer of all: it usually names
             # the reason, and it rules the flag out for good.
             out.append({"name": name, "extra": extra, "verdict": "rejected",
-                        "detail": (r.error or "")[:220]})
+                        "detail": _safe_probe_detail(r.error or "")[:220]})
         elif _answer_is_complete(r):
             out.append({"name": name, "extra": extra, "verdict": "works",
                         "detail": f"answered, finish {r.finish_reason}, "
@@ -565,18 +577,20 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
 
 def _print_lever_report(levers: list[dict], budget: int) -> None:
     works = [x for x in levers if x["verdict"] == "works"]
-    print("[preflight] trying the reasoning controls this endpoint might "
-          "accept, one request each:")
+    print("[preflight] trying the supplied reasoning-control candidates, "
+          "one request each:")
     for x in levers:
         mark = {"works": "WORKS", "rejected": "rejected",
                 "ignored": "ignored", "error": "error"}[x["verdict"]]
         print(f"[preflight]   {x['name']:24s} {mark:9s} {x['detail'][:96]}")
     if works:
         best = works[0]
-        flag = json.dumps(best["extra"])
+        from .artifacts import redact_secrets
+        flag = json.dumps(redact_secrets(best["extra"]))
         print(f"[preflight] use this: --extra-body '{flag}'")
     else:
-        print(f"[preflight] none of them produced an answer within {budget} "
+        print(f"[preflight] none of the supplied candidates produced an "
+              f"answer within {budget} "
               "tokens. this model needs a bigger output budget, or it is "
               "the wrong model for a budget this size. raise "
               "--output-tokens and re-run the preflight to find out which.")
@@ -597,14 +611,20 @@ def _refuse(levers: list[dict], args) -> int:
           "tokens for a verdict we can already give you.")
     print()
     if works:
-        flag = json.dumps(works[0]["extra"])
+        from .artifacts import redact_secrets
+        flag = json.dumps(redact_secrets(works[0]["extra"]))
         print("  re-run with the control that worked:")
         print()
         print(f"    --extra-body '{flag}'")
+    elif levers:
+        print("  no supplied reasoning-control candidate helped at this budget.")
+        print("  verify the exact model/provider contract, raise --output-tokens,")
+        print("  or choose a model that fits this output budget.")
     else:
-        print("  no reasoning control helped at this budget. either raise")
-        print("  --output-tokens well above what you asked for, or this is")
-        print("  the wrong model for an output budget this size.")
+        print("  no reasoning controls were probed. configure a control documented")
+        print("  by this exact model/provider with --extra-body, or explicitly test")
+        print("  candidates with --probe-extra-body. alternatively, raise")
+        print("  --output-tokens or choose a model that fits this budget.")
     print()
     print("  or pass --force to run it anyway and see the INVALID report.")
     return 3
@@ -643,13 +663,18 @@ def _check_preflight(cfg: dict, args) -> int | None:
               "This gate accepts visible content or a structurally valid tool "
               "call, plus clean stream completion.")
         levers: list[dict] = []
-        if not getattr(args, "no_lever_probe", False):
+        candidates = list(getattr(args, "probe_extra_body", None) or [])
+        if candidates:
             print()
             levers = _probe_reasoning_levers(
-                cfg, budget=pf_res["budget"],
+                cfg, budget=pf_res["budget"], candidates=candidates,
                 probe_index=pf_res.get("failed_probe_index", 1))
             _print_lever_report(levers, pf_res["budget"])
             print()
+        else:
+            print("[preflight] no provider controls were guessed. pass a "
+                  "model-documented control with --extra-body, or opt in to "
+                  "specific candidates with --probe-extra-body.")
         if not getattr(args, "force", False):
             return _refuse(levers, args)
     return None
@@ -762,6 +787,9 @@ def cmd_sweep(args) -> int:
     # The ladder controls arrival rate directly. It must not also run the
     # unloaded concurrency-sizing pass, which would overwrite every rung.
     base.pop("sizing_concurrency", None)
+    # Validate the complete fixed-rate config before persisting sweep configs.
+    # extra_body is reproducibility evidence, not a credential channel.
+    RunConfig(**base)
 
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -793,6 +821,7 @@ def cmd_sweep(args) -> int:
                    out_dir=str(out_root / f"rate_{rate:g}"),
                    title=(args.title or f"{args.endpoint} rate sweep")
                          + f" @ {rate:g} requests/second")
+        rung_rc = RunConfig(**cfg)
         rung_root = Path(cfg["out_dir"])
         rung_root.mkdir(parents=True, exist_ok=True)
         (rung_root / "run-config.json").write_text(
@@ -800,7 +829,7 @@ def cmd_sweep(args) -> int:
         print(f"[sweep] rung {i + 1}/{len(rates)}: {rate:g} rps")
         rung_started = _time.monotonic()
         try:
-            out = run(RunConfig(**cfg), quiet=False)
+            out = run(rung_rc, quiet=False)
             kind, verdict_text = _verdict(out["summary"])
             s = out["summary"]
             out_dir = out["out_dir"]
@@ -1073,9 +1102,11 @@ def main(argv=None) -> int:
     s.add_argument("--label", default=None)
     s.add_argument("--skip-preflight", action="store_true",
                    help="skip the 2-request endpoint check. not recommended")
-    s.add_argument("--no-lever-probe", action="store_true",
-                   help="skip trying reasoning controls when the endpoint "
-                        "produces no readable answer")
+    s.add_argument(
+        "--probe-extra-body", action="append", type=_json_object_arg,
+        default=[], metavar="JSON",
+        help="after a no-answer preflight, explicitly test this documented "
+             "reasoning-control JSON object; repeat for multiple candidates")
     s.add_argument("--force", action="store_true",
                    help="run even when the preflight has shown the run will "
                         "produce no readable answers")
@@ -1130,8 +1161,11 @@ def main(argv=None) -> int:
     s.add_argument("--label", default=None)
     s.add_argument("--skip-preflight", action="store_true",
                    help="skip the representative endpoint gate")
-    s.add_argument("--no-lever-probe", action="store_true",
-                   help="do not probe known reasoning controls")
+    s.add_argument(
+        "--probe-extra-body", action="append", type=_json_object_arg,
+        default=[], metavar="JSON",
+        help="after a no-answer preflight, explicitly test this documented "
+             "reasoning-control JSON object; repeat for multiple candidates")
     s.add_argument("--force", action="store_true",
                    help="run despite a preflight with no readable answer")
     s.set_defaults(fn=cmd_sweep)

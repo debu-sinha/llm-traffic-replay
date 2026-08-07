@@ -161,7 +161,8 @@ def test_extra_body_must_be_a_finite_json_object():
         ttft_p90=None, ttft_p95=None, ttft_p99=None, ttfg_p50=None,
         ttfg_p90=None, ttfg_p95=None, ttfg_p99=None, success_rate=None,
         max_concurrency=None, max_pending_requests=None, cmd="benchmark")
-    for raw in ('[1, 2]', '{"x": NaN}'):
+    for raw in ('[1, 2]', '{"x": NaN}',
+                '{"api_key":"sensitive-value"}'):
         with pytest.raises(SystemExit):
             _benchmark_config(argparse.Namespace(**base, extra_body=raw))
 

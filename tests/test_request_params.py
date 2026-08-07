@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from traffic_replay.client import EndpointClient, EndpointConfig
 from traffic_replay.mock_server import serve
 from traffic_replay.runner import RunConfig, run
@@ -55,6 +57,16 @@ def test_no_extra_body_is_unchanged():
         EndpointConfig(base_url="http://x", path="/p"), None)._body(
         [{"role": "user", "content": "hi"}], 64, False))
     assert set(body) == {"messages", "max_tokens", "temperature", "stream"}
+
+
+@pytest.mark.parametrize("extra", [
+    {"api_key": "sensitive-value"},
+    {"metadata": {"authorization": "sensitive-value"}},
+    {"metadata": "Bearer sensitive-value"},
+])
+def test_extra_body_rejects_credentials_because_it_is_persisted(extra):
+    with pytest.raises(ValueError, match="persisted as evidence"):
+        EndpointConfig(base_url="http://x", path="/p", extra_body=extra)
 
 
 def test_reasoning_tokens_extracted_from_usage():

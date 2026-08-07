@@ -34,6 +34,31 @@ from .sse import (StreamState, extract_usage, finalize_tool_calls,
                   iter_sse_events, update_state)
 
 
+def validate_extra_body_safety(value: dict | None) -> None:
+    """Reject credentials from a request-body field persisted as evidence."""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("endpoint extra_body must be an object")
+    try:
+        raw = json.dumps(value, allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "endpoint extra_body must contain finite JSON values") from exc
+
+    # The exact request parameters are written to run-config.json, start.json,
+    # summary.json, reports, and the manifest so a benchmark can be reproduced.
+    # Authentication belongs in auth_profile/auth_token_env, never this body.
+    from .artifacts import redact_secrets
+    safe = json.dumps(
+        redact_secrets(value), allow_nan=False, separators=(",", ":"))
+    if raw != safe:
+        raise ValueError(
+            "endpoint extra_body must not contain credentials or secret-like "
+            "values because request parameters are persisted as evidence; "
+            "use auth_profile or auth_token_env for authentication")
+
+
 @dataclass
 class EndpointConfig:
     base_url: str                    # e.g. https://<workspace-host>
@@ -75,13 +100,7 @@ class EndpointConfig:
             raise ValueError("endpoint max_retries must be a non-negative integer")
         if not isinstance(self.include_usage, bool):
             raise ValueError("endpoint include_usage must be boolean")
-        if self.extra_body is not None and not isinstance(self.extra_body, dict):
-            raise ValueError("endpoint extra_body must be an object")
-        try:
-            json.dumps(self.extra_body or {}, allow_nan=False)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "endpoint extra_body must contain finite JSON values") from exc
+        validate_extra_body_safety(self.extra_body)
 
 
 @dataclass

@@ -1,11 +1,13 @@
 """merge pools replay rows from several run dirs and re-summarizes the union,
 and refuses to merge different endpoints without force."""
-import json
 import hashlib
+import json
 import struct
 import tempfile
-import pytest
 from pathlib import Path
+
+import pytest
+
 from traffic_replay.aggregate import merge_runs
 
 
@@ -55,6 +57,23 @@ def _source_manifest(ep: str, *, input_mode="profile", profile_sha="b" * 64,
         "artifact_id": f"artifact-{shard_index}",
         "start_at_unix": 1_800_000_000.0, "shard": shard,
     }
+
+
+def _seal_completion(d: Path) -> None:
+    manifest = json.loads((d / "manifest.json").read_text())
+    manifest_raw = (d / "manifest.json").read_bytes()
+    (d / ".traffic-replay-complete").write_text(json.dumps({
+        "artifact_id": manifest["artifact_id"],
+        "status": "complete",
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "manifest_bytes": len(manifest_raw),
+        "request_rows": manifest["artifacts"]["requests.jsonl"]["row_count"],
+    }) + "\n")
+
+
+def _write_manifest(d: Path, manifest: dict) -> None:
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    _seal_completion(d)
 
 
 def _refresh_artifacts(d: Path) -> None:
@@ -110,6 +129,8 @@ def _refresh_artifacts(d: Path) -> None:
                       else "round_robin_modulo"),
     }
     manifest_path.write_text(json.dumps(manifest))
+    if (d / ".traffic-replay-complete").exists():
+        _seal_completion(d)
 
 
 def _mkrun(d: Path, ep: str, ttfts, title="run", profile_sha="b" * 64,
@@ -138,7 +159,7 @@ def _mkrun(d: Path, ep: str, ttfts, title="run", profile_sha="b" * 64,
             f.write(json.dumps(_row(global_index, float(t),
                                     float(t) + 200)) + "\n")
     _refresh_artifacts(d)
-    (d / ".traffic-replay-complete").touch()
+    _seal_completion(d)
 
 
 def test_merge_pools_and_percentiles_from_union():
@@ -224,7 +245,7 @@ def _mkprompts_run(d: Path, ep: str, n_rows: int, prompts_count: int):
             global_index = shard_index + local_index * 2
             f.write(json.dumps(_row(global_index, 100.0, 300.0)) + "\n")
     _refresh_artifacts(d)
-    (d / ".traffic-replay-complete").touch()
+    _seal_completion(d)
 
 
 def test_merged_prompts_run_keeps_the_replay_caution():
@@ -355,10 +376,9 @@ def test_merge_rejects_different_workload_hashes_and_force_marks_invalid():
 
 
 def _edit_manifest(d: Path, **changes):
-    path = d / "manifest.json"
-    manifest = json.loads(path.read_text())
+    manifest = json.loads((d / "manifest.json").read_text())
     manifest.update(changes)
-    path.write_text(json.dumps(manifest))
+    _write_manifest(d, manifest)
 
 
 def _edit_replay_row(d: Path, replay_index: int, **changes):
@@ -413,7 +433,7 @@ def test_merge_rejects_tampered_hashed_artifact():
         "sha256": hashlib.sha256(raw).hexdigest(),
         "bytes": len(raw), "row_count": len(raw.splitlines()),
     }
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     requests.write_bytes(raw + b"\n")
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         merge_runs(base / "out", [base / "a", base / "b"])
@@ -423,7 +443,7 @@ def test_merge_rejects_tampered_hashed_artifact():
         "bytes": len(changed),
         "row_count": changed.count(b"\n"),
     })
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="blank JSONL record"):
         merge_runs(base / "blank-row", [base / "a", base / "b"])
 
@@ -458,21 +478,21 @@ def test_merge_rejects_exact_index_and_schedule_identity_tampering():
     _mkrun(base / "b", ep, [100] * 3)
     manifest = json.loads((base / "b" / "manifest.json").read_text())
     manifest["index_identity"]["global_indices_sha256"] = "e" * 64
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="index_identity SHA-256"):
         merge_runs(base / "index", [base / "a", base / "b"])
 
     _refresh_artifacts(base / "b")
     manifest = json.loads((base / "b" / "manifest.json").read_text())
     manifest["schedule_identity"]["shard_timestamps_sha256"] = "e" * 64
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="schedule_identity shard SHA-256"):
         merge_runs(base / "shard-schedule", [base / "a", base / "b"])
 
     _refresh_artifacts(base / "b")
     manifest = json.loads((base / "b" / "manifest.json").read_text())
     manifest["schedule_identity"]["global_timestamps_sha256"] = "e" * 64
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="global schedule disagrees"):
         merge_runs(base / "global-schedule", [base / "a", base / "b"])
 
@@ -510,7 +530,7 @@ def test_merge_rejects_duplicate_or_inconsistent_shard_metadata():
     manifest["shard"] = "1/2"
     manifest["schedule"]["shard"] = "1/2"
     manifest["index_identity"]["shard_index"] = 0
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="duplicate shard indices"):
         merge_runs(base / "duplicate", [base / "a", base / "b"])
 
@@ -518,7 +538,7 @@ def test_merge_rejects_duplicate_or_inconsistent_shard_metadata():
     manifest["schedule"]["shard"] = "2/3"
     manifest["index_identity"]["shard_index"] = 1
     manifest["index_identity"]["shard_total"] = 3
-    (base / "b" / "manifest.json").write_text(json.dumps(manifest))
+    _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="inconsistent shard totals"):
         merge_runs(base / "totals", [base / "a", base / "b"])
 

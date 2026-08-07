@@ -336,6 +336,37 @@ def test_empirical_joint_fixed_seed_is_deterministic_and_order_canonical():
         first["cache_target_fraction"], second["cache_target_fraction"])
 
 
+def test_empirical_joint_report_uses_the_discrete_anchor_contract():
+    rows = [
+        {"input_tokens": 100, "output_tokens": 10,
+         "cache_fraction": 0.1, "weight": 50},
+        {"input_tokens": 500, "output_tokens": 50,
+         "cache_fraction": 0.5, "weight": 45},
+        {"input_tokens": 1000, "output_tokens": 100,
+         "cache_fraction": 0.9, "weight": 5},
+    ]
+    profile = prof.Profile(
+        schema_version=2, name="discrete-quantiles",
+        input_tokens={"p50": 100, "p95": 500},
+        output_tokens={"p50": 10, "p95": 50},
+        cache_fraction={"p50": 0.1, "p95": 0.5},
+        sampling={"mode": "empirical_joint", "rows": rows},
+    )
+    draw = prof.sample(profile, 100, seed=44)
+
+    # NumPy's default linear estimator invents values between observed rows at
+    # both anchors.  Those values are not the empirical distribution's inverse
+    # CDF and therefore are not the profile contract.
+    assert np.percentile(draw["input_tokens"], 50) == 300
+    assert np.percentile(draw["input_tokens"], 95) == pytest.approx(525)
+    assert draw["params"]["quantile_method"] == "inverted_cdf"
+    assert prof.quantile_report(draw) == {
+        "input_tokens": {"p50": 100.0, "p95": 500.0},
+        "output_tokens": {"p50": 10.0, "p95": 50.0},
+        "cache_fraction": {"p50": 0.1, "p95": 0.5},
+    }
+
+
 @pytest.mark.parametrize("rows,match", [
     ([{"input_tokens": 100, "output_tokens": 10,
        "cache_fraction": 0.0, "weight": 1, "raw_prompt": "secret"}],

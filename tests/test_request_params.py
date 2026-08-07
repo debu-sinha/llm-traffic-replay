@@ -131,6 +131,8 @@ def test_compare_table_has_reasoning_tokens_row():
                                "output_tokens_per_min": 50}}
         raw = json.dumps(summ).encode()
         (d / "summary.json").write_bytes(raw)
+        requests_raw = b""
+        (d / "requests.jsonl").write_bytes(requests_raw)
         manifest = {
             "manifest_schema_version": 3,
             "git_commit": "a" * 40,
@@ -170,13 +172,27 @@ def test_compare_table_has_reasoning_tokens_row():
                 "shard_total": 1,
                 "partition": "unsharded",
             },
-            "artifacts": {"summary.json": {
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "bytes": len(raw),
-            }},
+            "artifacts": {
+                "summary.json": {
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "bytes": len(raw),
+                },
+                "requests.jsonl": {
+                    "sha256": hashlib.sha256(requests_raw).hexdigest(),
+                    "bytes": len(requests_raw),
+                    "row_count": 0,
+                },
+            },
         }
         (d / "manifest.json").write_text(json.dumps(manifest))
-        (d / ".traffic-replay-complete").touch()
+        manifest_raw = (d / "manifest.json").read_bytes()
+        (d / ".traffic-replay-complete").write_text(json.dumps({
+            "artifact_id": manifest["artifact_id"],
+            "status": "complete",
+            "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "manifest_bytes": len(manifest_raw),
+            "request_rows": 0,
+        }) + "\n")
         return str(d)
 
     out = compare_runs(

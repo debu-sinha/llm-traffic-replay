@@ -603,12 +603,21 @@ def sample(profile: Profile, n: int, seed: int = 7,
 
 def quantile_report(draw: dict) -> dict:
     """Recovered quantiles of a draw, for comparison against the spec."""
+    params = draw.get("params", {})
+    quantile_method = params.get("quantile_method")
+
     def q(a, p):
         if len(a) == 0:
             raise ValueError("cannot report quantiles for an empty draw")
+        # Empirical-joint anchors are discrete inverse-CDF values.  Linear
+        # interpolation can report a token count or cache fraction that was
+        # never observed and can disagree with a profile that passed anchor
+        # validation.  Other samplers retain NumPy's historical linear method.
+        if quantile_method == "inverted_cdf":
+            return float(np.percentile(a, p, method="inverted_cdf"))
         return float(np.percentile(a, p))
 
-    probabilities = draw.get("params", {}).get("probabilities")
+    probabilities = params.get("probabilities")
     if probabilities is None:
         probabilities = [0.5, 0.95]
 

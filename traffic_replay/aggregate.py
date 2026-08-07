@@ -21,6 +21,8 @@ import struct
 import time
 import uuid
 
+from . import __version__
+from .artifacts import snapshot_source_state, strict_json_dumps
 from .metrics import _pct_table, summarize, write_outputs
 
 
@@ -473,6 +475,37 @@ def _validate_manifest_identity(d: Path, manifest: dict) -> None:
     _validate_identity_shapes(d, manifest)
 
 
+def _verify_run_completion_marker(d: Path, manifest: dict) -> None:
+    """Require the v3 marker to bind the manifest and request journal."""
+    completion = _load_json_object(
+        d / _COMPLETE_MARKER, "completion marker")
+    if completion.get("status") != "complete":
+        raise ValueError(f"completion marker status is not complete for {d}")
+    if completion.get("artifact_id") != manifest["artifact_id"]:
+        raise ValueError(
+            f"completion marker artifact_id disagrees with manifest for {d}")
+    actual_manifest, actual_bytes, _rows = _measure_regular(
+        d / "manifest.json")
+    expected_manifest = _identity_digest(
+        completion.get("manifest_sha256"),
+        "completion marker manifest_sha256", d)
+    if not hmac.compare_digest(actual_manifest, expected_manifest):
+        raise ValueError(f"completion marker manifest SHA-256 mismatch for {d}")
+    declared_bytes = completion.get("manifest_bytes")
+    if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int) \
+            or declared_bytes != actual_bytes:
+        raise ValueError(
+            f"completion marker manifest byte count mismatch for {d}")
+    request_metadata = _artifact_declarations(
+        manifest, d)["requests.jsonl"]
+    declared_rows = completion.get("request_rows")
+    if isinstance(declared_rows, bool) or not isinstance(declared_rows, int) \
+            or declared_rows != request_metadata["row_count"]:
+        raise ValueError(
+            f"completion marker request_rows disagrees with authenticated "
+            f"requests.jsonl for {d}")
+
+
 def _require_run_dir(d: Path, need: str) -> dict:
     try:
         info = d.stat()
@@ -486,6 +519,7 @@ def _require_run_dir(d: Path, need: str) -> dict:
     _require_regular(d / _COMPLETE_MARKER, "completion marker")
     _require_regular(d / need, need)
     _require_regular(d / "manifest.json", "manifest.json")
+    _require_regular(d / "requests.jsonl", "requests.jsonl")
     manifest = _load_manifest(d)
     assert manifest is not None
     schema = manifest.get("manifest_schema_version")
@@ -496,9 +530,9 @@ def _require_run_dir(d: Path, need: str) -> dict:
             f"unsupported manifest schema {schema!r} in {d}; supported: "
             f"{supported}")
     _validate_manifest_identity(d, manifest)
-    required_artifacts = (("summary.json", "requests.jsonl")
-                          if need == "requests.jsonl" else ("summary.json",))
+    required_artifacts = ("summary.json", "requests.jsonl")
     _verify_artifacts(d, manifest, required_artifacts)
+    _verify_run_completion_marker(d, manifest)
     if need == "summary.json":
         local_requests = manifest["schedule"].get("requests")
         shard_count = manifest["schedule_identity"]["shard_count"]
@@ -1175,7 +1209,17 @@ def _fsync_fd(fd: int) -> None:
             raise
 
 
-def _claim_compare_dir(requested: Path) -> tuple[Path, int]:
+def _write_compare_fd(fd: int, raw: bytes, name: str) -> None:
+    offset = 0
+    while offset < len(raw):
+        written = os.write(fd, raw[offset:])
+        if written <= 0:
+            raise OSError(f"short write while creating {name}")
+        offset += written
+
+
+def _claim_compare_dir(requested: Path, artifact_id: str,
+                       created_at: float) -> tuple[Path, int]:
     """Exclusively claim a fresh directory and return an open directory fd."""
     requested.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(10_000):
@@ -1195,7 +1239,17 @@ def _claim_compare_dir(requested: Path) -> tuple[Path, int]:
                 | getattr(os, "O_NOFOLLOW", 0)
             marker_fd = os.open(
                 _WRITING_MARKER, marker_flags, 0o644, dir_fd=dir_fd)
-            os.close(marker_fd)
+            try:
+                marker = strict_json_dumps({
+                    "artifact_id": artifact_id,
+                    "artifact_type": "comparison",
+                    "status": "writing",
+                    "created_at_unix": created_at,
+                }).encode("utf-8") + b"\n"
+                _write_compare_fd(marker_fd, marker, _WRITING_MARKER)
+                os.fsync(marker_fd)
+            finally:
+                os.close(marker_fd)
             _fsync_fd(dir_fd)
             _fsync_directory(candidate.parent)
             return candidate, dir_fd
@@ -1206,24 +1260,144 @@ def _claim_compare_dir(requested: Path) -> tuple[Path, int]:
     raise RuntimeError(f"could not claim a unique comparison directory: {requested}")
 
 
-def _atomic_compare_text(dir_fd: int, name: str, value: str) -> None:
+def _atomic_compare_text(dir_fd: int, name: str, value: str) -> dict:
     tmp = f".{name}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL \
         | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(tmp, flags, 0o644, dir_fd=dir_fd)
+    raw = value.encode("utf-8")
     try:
-        raw = value.encode("utf-8")
-        offset = 0
-        while offset < len(raw):
-            written = os.write(fd, raw[offset:])
-            if written <= 0:
-                raise OSError(f"short write while creating {name}")
-            offset += written
+        _write_compare_fd(fd, raw, name)
         os.fsync(fd)
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
     finally:
         os.close(fd)
     os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     _fsync_fd(dir_fd)
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+
+def _verified_comparison_summary(d: Path, manifest: dict) -> dict:
+    """Read exactly the summary bytes authenticated by the input manifest."""
+    expected = _artifact_declarations(manifest, d)["summary.json"]
+    raw = _read_regular_bytes(d / "summary.json")
+    actual = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(actual, expected["sha256"]):
+        raise ValueError(
+            f"artifact SHA-256 mismatch for {d / 'summary.json'}: expected "
+            f"{expected['sha256']}, got {actual}")
+    if len(raw) != expected["bytes"]:
+        raise ValueError(
+            f"artifact byte count mismatch for {d / 'summary.json'}: expected "
+            f"{expected['bytes']}, got {len(raw)}")
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"invalid summary.json in {d}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"summary.json must contain a JSON object: {d}")
+    return value
+
+
+def _comparison_source_reference(position: int, d: Path,
+                                 manifest: dict) -> dict:
+    """Bind the exact source manifest plus its authenticated summary."""
+    raw = _read_regular_bytes(d / "manifest.json")
+    try:
+        current = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"invalid manifest.json in {d}: {exc}") from exc
+    if current != manifest:
+        raise ValueError(
+            f"input manifest changed while constructing comparison: {d}")
+    summary = _artifact_declarations(manifest, d)["summary.json"]
+    return {
+        "position": position,
+        "artifact_id": manifest["artifact_id"],
+        "logical_run_id": manifest["logical_run_id"],
+        "execution_id": manifest["execution_id"],
+        "workload_id": manifest["workload_id"],
+        "manifest": {
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw),
+        },
+        "summary": {
+            "sha256": summary["sha256"],
+            "bytes": summary["bytes"],
+        },
+    }
+
+
+def _verify_comparison_source(source: object, position: int, d: Path) -> None:
+    if not isinstance(source, dict) or source.get("position") != position:
+        raise ValueError(f"invalid source position in comparison manifest for {d}")
+    for field in ("artifact_id", "logical_run_id", "execution_id", "workload_id"):
+        value = source.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"invalid source {field} in comparison manifest for {d}")
+    for field in ("manifest", "summary"):
+        metadata = source.get(field)
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"invalid source {field} metadata in comparison manifest for {d}")
+        _identity_digest(metadata.get("sha256"),
+                         f"sources[{position}].{field}.sha256", d)
+        size = metadata.get("bytes")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(
+                f"invalid source {field} byte count in comparison manifest for {d}")
+
+
+def verify_comparison_output(out_dir: str | Path) -> dict:
+    """Verify the completion chain and rendered artifact of a comparison."""
+    d = Path(out_dir)
+    try:
+        info = d.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError(f"comparison directory not found: {d}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"comparison directory is not a regular directory: {d}")
+    if _has_path(d / _WRITING_MARKER):
+        raise ValueError(f"comparison is still being written: {d}")
+    _require_regular(d / _COMPLETE_MARKER, "completion marker")
+    _require_regular(d / "manifest.json", "manifest.json")
+    _require_regular(d / "comparison.md", "comparison.md")
+    completion = _load_json_object(d / _COMPLETE_MARKER, "completion marker")
+    manifest = _load_json_object(d / "manifest.json", "manifest.json")
+    if manifest.get("manifest_schema_version") != 3 \
+            or manifest.get("artifact_type") != "comparison":
+        raise ValueError(f"unsupported comparison manifest in {d}")
+    artifact_id = manifest.get("artifact_id")
+    if not isinstance(artifact_id, str) or not artifact_id.strip():
+        raise ValueError(f"invalid comparison artifact_id in {d}")
+    if completion.get("status") != "complete" \
+            or completion.get("artifact_type") != "comparison" \
+            or completion.get("artifact_id") != artifact_id:
+        raise ValueError(f"completion marker and comparison manifest disagree in {d}")
+    actual_manifest, actual_bytes, _rows = _measure_regular(d / "manifest.json")
+    expected_manifest = _identity_digest(
+        completion.get("manifest_sha256"),
+        "completion marker manifest_sha256", d)
+    if not hmac.compare_digest(actual_manifest, expected_manifest):
+        raise ValueError(f"manifest SHA-256 mismatch for comparison {d}")
+    declared_bytes = completion.get("manifest_bytes")
+    if isinstance(declared_bytes, bool) or not isinstance(declared_bytes, int) \
+            or declared_bytes != actual_bytes:
+        raise ValueError(f"manifest byte count mismatch for comparison {d}")
+    sources = manifest.get("sources")
+    if not isinstance(sources, list) or len(sources) < 2 \
+            or manifest.get("input_count") != len(sources):
+        raise ValueError(f"invalid sources in comparison manifest for {d}")
+    for position, source in enumerate(sources):
+        _verify_comparison_source(source, position, d)
+    _verify_artifacts(d, manifest, ("comparison.md",))
+    return manifest
 
 
 def compare_runs(out_dir, input_dirs) -> Path:
@@ -1232,7 +1406,16 @@ def compare_runs(out_dir, input_dirs) -> Path:
     fractions or provenance diverge enough to make latency incomparable."""
     dirs, manifests = _validated_input_dirs(
         input_dirs, "summary.json", "compare")
-    summ = [_load_summary(d) for d in dirs]
+    summ = [_verified_comparison_summary(d, manifest)
+            for d, manifest in zip(dirs, manifests)]
+    source_state = snapshot_source_state(Path(__file__).parent)
+    source_commit = source_state.get("git_commit")
+    source_tree = source_state.get("source_tree_sha256")
+    generator_source_reconstructible = (
+        source_state.get("git_dirty") is False
+        and isinstance(source_commit, str) and bool(source_commit.strip())
+        and isinstance(source_tree, str) and bool(_SHA256_RE.fullmatch(source_tree))
+    )
     titles = [_run_title(d, s) for d, s in zip(dirs, summ)]
     n = len(titles)
     hdr = "| metric / quantile | " + " | ".join(titles) + " |"
@@ -1243,8 +1426,18 @@ def compare_runs(out_dir, input_dirs) -> Path:
 
     compatibility_issues = _compatibility_issues(
         dirs, summ, manifests, merging=False)
+    if not generator_source_reconstructible:
+        if source_state.get("git_dirty") is not False:
+            reason = "dirty or unknown Git state"
+        elif not isinstance(source_commit, str) or not source_commit.strip():
+            reason = "no source commit"
+        else:
+            reason = "no valid source-tree digest"
+        compatibility_issues.append(
+            f"the comparison generator has {reason}; the code that rendered "
+            "this table is not reconstructible")
     if compatibility_issues:
-        L += ["## INVALID COMPARISON — inputs are not proven like-for-like", "",
+        L += ["## INVALID COMPARISON - inputs are not proven like-for-like", "",
               "The tables below are retained for diagnosis only. Do not quote "
               "a winner or a relative latency until every incompatibility is "
               "resolved and the runs are repeated.", ""]
@@ -1417,14 +1610,59 @@ def compare_runs(out_dir, input_dirs) -> Path:
                      lambda s: ((s.get("arrivals") or {}).get("wire_lateness_ms")
                                 or {}).get("p95")), ""])
 
+    comparison_text = "\n".join(L) + "\n"
+    sources = [
+        _comparison_source_reference(position, d, manifest)
+        for position, (d, manifest) in enumerate(zip(dirs, manifests))
+    ]
+    created_at = time.time()
+    artifact_id = f"comparison-{uuid.uuid4().hex}"
     requested = Path(out_dir)
-    out, dir_fd = _claim_compare_dir(requested)
+    out, dir_fd = _claim_compare_dir(
+        requested, artifact_id, created_at)
     try:
-        _atomic_compare_text(dir_fd, "comparison.md", "\n".join(L) + "\n")
+        comparison_metadata = _atomic_compare_text(
+            dir_fd, "comparison.md", comparison_text)
+        manifest = {
+            "manifest_schema_version": 3,
+            "artifact_type": "comparison",
+            "artifact_id": artifact_id,
+            "artifact_created_at_utc": datetime.fromtimestamp(
+                created_at, timezone.utc).isoformat(),
+            "artifact_created_at_unix": created_at,
+            "operation": "compare",
+            "harness_version": __version__,
+            "git_commit": source_state.get("git_commit"),
+            "git_dirty": source_state.get("git_dirty"),
+            "source": source_state,
+            "source_tree_sha256": source_state.get("source_tree_sha256"),
+            "generator_source_reconstructible":
+                generator_source_reconstructible,
+            "input_count": len(sources),
+            "sources": sources,
+            "comparison_valid": not compatibility_issues,
+            "compatibility_issue_count": len(compatibility_issues),
+            "warning_count": len(warns),
+            "artifacts": {"comparison.md": comparison_metadata},
+        }
+        manifest_text = strict_json_dumps(manifest, indent=2) + "\n"
+        manifest_metadata = _atomic_compare_text(
+            dir_fd, "manifest.json", manifest_text)
+        completed_at = time.time()
+        completion_text = strict_json_dumps({
+            "artifact_id": artifact_id,
+            "artifact_type": "comparison",
+            "status": "complete",
+            "completed_at_unix": completed_at,
+            "manifest_sha256": manifest_metadata["sha256"],
+            "manifest_bytes": manifest_metadata["bytes"],
+        }) + "\n"
+        _atomic_compare_text(dir_fd, _WRITING_MARKER, completion_text)
         os.replace(_WRITING_MARKER, _COMPLETE_MARKER,
                    src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         _fsync_fd(dir_fd)
     finally:
         os.close(dir_fd)
     _fsync_directory(out.parent)
+    verify_comparison_output(out)
     return out

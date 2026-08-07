@@ -1,16 +1,29 @@
 """compare tabulates several runs one column each and warns in bold when their
 achieved cache p50 differ by more than 0.10 (the fake-comparison trap)."""
-import json
 import hashlib
+import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-import pytest
 from pathlib import Path
-from traffic_replay.aggregate import compare_runs
+
+import pytest
+
+from traffic_replay import aggregate
+from traffic_replay.aggregate import compare_runs, verify_comparison_output
 
 
 def _tmp() -> Path:
     return Path(tempfile.mkdtemp(prefix="compare-"))
+
+
+@pytest.fixture(autouse=True)
+def _reconstructible_comparison_source(monkeypatch):
+    monkeypatch.setattr(aggregate, "snapshot_source_state", lambda _path: {
+        "git_commit": "a" * 40,
+        "git_dirty": False,
+        "source_tree_sha256": "f" * 64,
+        "source_files": [],
+    })
 
 
 def _summary(title, cache_p50):
@@ -37,8 +50,29 @@ def _summary(title, cache_p50):
     }
 
 
+def _write_completion_marker(d: Path) -> None:
+    manifest = json.loads((d / "manifest.json").read_text())
+    manifest_raw = (d / "manifest.json").read_bytes()
+    request_rows = manifest["artifacts"]["requests.jsonl"]["row_count"]
+    (d / ".traffic-replay-complete").write_text(json.dumps({
+        "artifact_id": manifest["artifact_id"],
+        "status": "complete",
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "manifest_bytes": len(manifest_raw),
+        "request_rows": request_rows,
+    }) + "\n")
+
+
+def _replace_manifest(d: Path, manifest: dict) -> None:
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    _write_completion_marker(d)
+
+
 def _seal(d: Path, manifest: dict) -> None:
-    raw = (d / "summary.json").read_bytes()
+    summary_raw = (d / "summary.json").read_bytes()
+    requests = d / "requests.jsonl"
+    requests.write_bytes(b"")
+    requests_raw = requests.read_bytes()
     manifest.update({
         "workload_id": manifest.get("workload_id", "workload-test"),
         "logical_run_id": manifest.get("logical_run_id", f"logical-{d.name}"),
@@ -47,13 +81,18 @@ def _seal(d: Path, manifest: dict) -> None:
         "artifact_id": manifest.get("artifact_id", f"artifact-{d.name}"),
         "artifacts": {
             "summary.json": {
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "bytes": len(raw),
-            }
+                "sha256": hashlib.sha256(summary_raw).hexdigest(),
+                "bytes": len(summary_raw),
+            },
+            "requests.jsonl": {
+                "sha256": hashlib.sha256(requests_raw).hexdigest(),
+                "bytes": len(requests_raw),
+                "row_count": 0,
+            },
         },
     })
     (d / "manifest.json").write_text(json.dumps(manifest))
-    (d / ".traffic-replay-complete").touch()
+    _write_completion_marker(d)
 
 
 def _compare(caches):
@@ -353,12 +392,38 @@ def test_compare_rejects_incomplete_or_writing_inputs(state):
         compare_runs(base / "out", dirs)
 
 
+@pytest.mark.parametrize("field,value,match", [
+    ("status", "writing", "status"),
+    ("artifact_id", "artifact-copied", "artifact_id"),
+    ("manifest_sha256", "0" * 64, "manifest SHA-256 mismatch"),
+    ("manifest_bytes", 1, "manifest byte count mismatch"),
+    ("request_rows", 1, "request_rows"),
+])
+def test_compare_rejects_an_unbound_completion_marker(field, value, match):
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    marker_path = dirs[1] / ".traffic-replay-complete"
+    marker = json.loads(marker_path.read_text())
+    marker[field] = value
+    marker_path.write_text(json.dumps(marker))
+    with pytest.raises(ValueError, match=match):
+        compare_runs(base / "out", dirs)
+
+
+def test_compare_rejects_an_empty_legacy_completion_marker():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    (dirs[1] / ".traffic-replay-complete").write_bytes(b"")
+    with pytest.raises(ValueError, match="invalid completion marker"):
+        compare_runs(base / "out", dirs)
+
+
 def test_compare_rejects_unsupported_manifest_schema():
     base = _tmp()
     dirs = _comparison_inputs(base)
     manifest = json.loads((dirs[1] / "manifest.json").read_text())
     manifest["manifest_schema_version"] = 999
-    (dirs[1] / "manifest.json").write_text(json.dumps(manifest))
+    _replace_manifest(dirs[1], manifest)
     with pytest.raises(ValueError, match="unsupported manifest schema"):
         compare_runs(base / "out", dirs)
 
@@ -372,7 +437,7 @@ def test_compare_requires_v3_identity_fields(field):
     manifest[field] = None
     if field == "logical_run_id":
         manifest["run_id"] = None
-    (dirs[1] / "manifest.json").write_text(json.dumps(manifest))
+    _replace_manifest(dirs[1], manifest)
     with pytest.raises(ValueError, match=field):
         compare_runs(base / "out", dirs)
 
@@ -381,8 +446,8 @@ def test_compare_requires_verified_summary_artifact_entry():
     base = _tmp()
     dirs = _comparison_inputs(base)
     manifest = json.loads((dirs[1] / "manifest.json").read_text())
-    manifest["artifacts"] = {}
-    (dirs[1] / "manifest.json").write_text(json.dumps(manifest))
+    manifest["artifacts"].pop("summary.json")
+    _replace_manifest(dirs[1], manifest)
     with pytest.raises(ValueError, match="summary.json"):
         compare_runs(base / "out", dirs)
 
@@ -393,13 +458,11 @@ def test_compare_verifies_artifact_hash_and_byte_metadata():
     path = dirs[1] / "summary.json"
     raw = path.read_bytes()
     manifest = json.loads((dirs[1] / "manifest.json").read_text())
-    manifest["artifacts"] = {
-        "summary.json": {
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "bytes": len(raw),
-        }
+    manifest["artifacts"]["summary.json"] = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
     }
-    (dirs[1] / "manifest.json").write_text(json.dumps(manifest))
+    _replace_manifest(dirs[1], manifest)
     compare_runs(base / "valid", dirs)
 
     path.write_text(path.read_text() + " ")
@@ -413,7 +476,7 @@ def test_compare_rejects_a_copied_artifact_under_a_different_path():
     second_manifest = json.loads((dirs[1] / "manifest.json").read_text())
     first_manifest = json.loads((dirs[0] / "manifest.json").read_text())
     second_manifest["artifact_id"] = first_manifest["artifact_id"]
-    (dirs[1] / "manifest.json").write_text(json.dumps(second_manifest))
+    _replace_manifest(dirs[1], second_manifest)
     with pytest.raises(ValueError, match="duplicate input artifact_id"):
         compare_runs(base / "out", dirs)
 
@@ -423,11 +486,31 @@ def test_compare_marks_different_exact_global_schedules_invalid():
     dirs = _comparison_inputs(base)
     manifest = json.loads((dirs[1] / "manifest.json").read_text())
     manifest["schedule_identity"]["global_timestamps_sha256"] = "e" * 64
-    (dirs[1] / "manifest.json").write_text(json.dumps(manifest))
+    _replace_manifest(dirs[1], manifest)
     out = compare_runs(base / "out", dirs)
     md = (out / "comparison.md").read_text()
     assert "INVALID COMPARISON" in md
     assert "different arrival schedule" in md
+
+
+@pytest.mark.parametrize("dirty", [True, None])
+def test_dirty_or_unknown_generator_source_invalidates_comparison(
+        monkeypatch, dirty):
+    monkeypatch.setattr(aggregate, "snapshot_source_state", lambda _path: {
+        "git_commit": "a" * 40,
+        "git_dirty": dirty,
+        "source_tree_sha256": "f" * 64,
+        "source_files": [],
+    })
+    base = _tmp()
+    out = compare_runs(base / "out", _comparison_inputs(base))
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["comparison_valid"] is False
+    assert manifest["generator_source_reconstructible"] is False
+    report = (out / "comparison.md").read_text()
+    assert "INVALID COMPARISON" in report
+    assert "comparison generator has dirty or unknown Git state" in report
+    assert "not reconstructible" in report
 
 
 def test_compare_output_claim_is_repeated_and_concurrent_safe():
@@ -444,6 +527,39 @@ def test_compare_output_claim_is_repeated_and_concurrent_safe():
     assert not (first / ".traffic-replay-writing").exists()
     assert (second / ".traffic-replay-complete").is_file()
 
+    manifest = verify_comparison_output(first)
+    manifest_raw = (first / "manifest.json").read_bytes()
+    completion = json.loads(
+        (first / ".traffic-replay-complete").read_text())
+    assert manifest["manifest_schema_version"] == 3
+    assert manifest["artifact_type"] == "comparison"
+    assert manifest["comparison_valid"] is True
+    assert manifest["generator_source_reconstructible"] is True
+    assert manifest["artifact_id"] == completion["artifact_id"]
+    assert completion["manifest_sha256"] == \
+        hashlib.sha256(manifest_raw).hexdigest()
+    assert completion["manifest_bytes"] == len(manifest_raw)
+    report_raw = (first / "comparison.md").read_bytes()
+    assert manifest["artifacts"]["comparison.md"] == {
+        "sha256": hashlib.sha256(report_raw).hexdigest(),
+        "bytes": len(report_raw),
+    }
+    assert [source["artifact_id"] for source in manifest["sources"]] == [
+        json.loads((d / "manifest.json").read_text())["artifact_id"]
+        for d in dirs
+    ]
+    for source, d in zip(manifest["sources"], dirs):
+        source_manifest = (d / "manifest.json").read_bytes()
+        source_summary = (d / "summary.json").read_bytes()
+        assert source["manifest"] == {
+            "sha256": hashlib.sha256(source_manifest).hexdigest(),
+            "bytes": len(source_manifest),
+        }
+        assert source["summary"] == {
+            "sha256": hashlib.sha256(source_summary).hexdigest(),
+            "bytes": len(source_summary),
+        }
+
     concurrent_target = base / "concurrent"
     with ThreadPoolExecutor(max_workers=4) as pool:
         outputs = list(pool.map(
@@ -452,6 +568,35 @@ def test_compare_output_claim_is_repeated_and_concurrent_safe():
     assert all((out / "comparison.md").is_file() for out in outputs)
     assert all((out / ".traffic-replay-complete").is_file()
                for out in outputs)
+    assert all(verify_comparison_output(out) for out in outputs)
+
+
+def test_comparison_verifier_detects_rendered_artifact_tampering():
+    base = _tmp()
+    out = compare_runs(base / "comparison", _comparison_inputs(base))
+    report = out / "comparison.md"
+    report.write_text(report.read_text() + "tampered\n")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        verify_comparison_output(out)
+
+
+def test_compare_cannot_claim_completion_before_manifest_is_durable(
+        monkeypatch):
+    base = _tmp()
+    requested = base / "comparison"
+    original = aggregate._atomic_compare_text
+
+    def fail_manifest(dir_fd, name, value):
+        if name == "manifest.json":
+            raise OSError("injected manifest write failure")
+        return original(dir_fd, name, value)
+
+    monkeypatch.setattr(aggregate, "_atomic_compare_text", fail_manifest)
+    with pytest.raises(OSError, match="injected manifest write failure"):
+        compare_runs(requested, _comparison_inputs(base))
+    assert (requested / ".traffic-replay-writing").is_file()
+    assert not (requested / ".traffic-replay-complete").exists()
+    assert not (requested / "manifest.json").exists()
 
 
 def test_compare_never_follows_an_existing_output_symlink():

@@ -46,6 +46,7 @@ _SECRET_EXACT = {
     "accesstoken", "authtoken", "bearertoken", "refreshtoken", "idtoken",
     "jwt", "assertion", "clientassertion", "signature", "sig", "sas",
     "sastoken", "sharedaccesssignature", "privatekey", "privatekeydata",
+    "authprofile",
 }
 _SECRET_SUFFIXES = (
     "apikey", "accesskey", "secretkey", "clientsecret", "password",

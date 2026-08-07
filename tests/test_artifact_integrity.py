@@ -166,6 +166,32 @@ def test_repeated_runs_separate_execution_ids_but_reproduce_bodies(
                for value in _DeterministicClient.scheduled_targets)
 
 
+def test_sealed_evidence_does_not_persist_absolute_local_paths(
+        tmp_path, monkeypatch):
+    private_dir = tmp_path / "customer-local-directory"
+    private_dir.mkdir()
+    profile = private_dir / "profile.json"
+    _profile(profile)
+    monkeypatch.setattr("traffic_replay.runner.EndpointClient",
+                        _DeterministicClient)
+    monkeypatch.setattr("traffic_replay.runner.make_schedule",
+                        lambda **kwargs: _schedule(2))
+
+    result = run(_config(
+        private_dir, profile=profile,
+        out_dir=str(private_dir / "private-results")), quiet=True)
+    out = Path(result["out_dir"])
+    evidence = "\n".join(
+        (out / name).read_text()
+        for name in ("start.json", "summary.json", "manifest.json"))
+    assert str(tmp_path) not in evidence
+
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["inputs"]["profile"]["name"] == "profile.json"
+    assert manifest["profile_path"] == "profile.json"
+    assert manifest["effective_config"]["out_dir"] == "private-results"
+
+
 def test_workload_uses_private_prompt_snapshot_when_original_mutates(
         tmp_path, monkeypatch):
     prompt_path = tmp_path / "prompts.jsonl"
@@ -294,6 +320,7 @@ def test_redaction_covers_credentials_without_hiding_token_controls():
         "min_tokens": 8,
         "max_tokens": 64,
         "output_token_limit": 128,
+        "auth_profile": "customer-workspace-profile",
         "note": "basic benchmark methodology",
     }
     safe = redact_secrets(value)
@@ -303,6 +330,7 @@ def test_redaction_covers_credentials_without_hiding_token_controls():
     assert safe["min_tokens"] == 8
     assert safe["max_tokens"] == 64
     assert safe["output_token_limit"] == 128
+    assert safe["auth_profile"] == "<redacted>"
     assert safe["note"] == "basic benchmark methodology"
     title = sanitize_title(f"report\nAuthorization: Bearer {pat}")
     assert "\n" not in title and pat not in title

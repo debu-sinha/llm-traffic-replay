@@ -297,7 +297,10 @@ def _snapshot_run_inputs(rc: RunConfig, directory: Path) \
             os.close(fd)
         replacements[field] = str(snapshot)
         metadata[key] = {
-            "path": str(Path(original).absolute()),
+            # The digest identifies the exact bytes. Persisting an absolute
+            # local path adds no reproducibility after an artifact is moved,
+            # but does expose usernames and customer directory names.
+            "name": Path(original).name,
             "sha256": sha256_bytes(raw),
             "bytes": len(raw),
             "captured_size": int(info.st_size),
@@ -310,9 +313,11 @@ def _snapshot_run_inputs(rc: RunConfig, directory: Path) \
 def _effective_config(original: RunConfig, effective: RunConfig) -> dict:
     """Persist resolved values without leaking private temporary paths."""
     value = dataclasses.asdict(effective)
-    for field in ("profile_path", "prompts_file", "timestamps_file",
-                  "out_dir"):
-        value[field] = getattr(original, field)
+    for field in ("profile_path", "prompts_file", "timestamps_file"):
+        original_path = getattr(original, field)
+        value[field] = (Path(original_path).name
+                        if original_path is not None else None)
+    value["out_dir"] = Path(original.out_dir).name
     return redact_secrets(value)
 
 
@@ -939,7 +944,7 @@ def run(rc: RunConfig, token_override: str | None = None,
                 full_sched, sched, original_rc)
             sched_meta = schedule_report(sched)
             if original_rc.timestamps_file:
-                sched_meta["source"] = original_rc.timestamps_file
+                sched_meta["source"] = Path(original_rc.timestamps_file).name
             artifact.update_start(
                 status="schedule-snapshotted",
                 effective_config=_effective_config(original_rc, effective_rc),
@@ -1161,8 +1166,10 @@ def run(rc: RunConfig, token_override: str | None = None,
                           f"{effective_rc.shard_total}"),
                 "endpoint_base_url": ecfg.base_url,
                 "endpoint_model": ecfg.model,
-                "profile_path": original_rc.profile_path,
-                "prompts_file": original_rc.prompts_file,
+                "profile_path": (Path(original_rc.profile_path).name
+                                 if original_rc.profile_path else None),
+                "prompts_file": (Path(original_rc.prompts_file).name
+                                  if original_rc.prompts_file else None),
                 "seed": effective_rc.seed,
                 "ttft_definition": effective_rc.ttft_definition,
                 **load_meta,

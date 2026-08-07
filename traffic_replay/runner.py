@@ -61,6 +61,9 @@ from .schedule import load_trace, make_schedule, schedule_report, shard
 from .textgen import TextMaterializer, calibrate_cpt
 
 
+_DEFAULT_MAX_CONCURRENCY = 256
+
+
 @dataclasses.dataclass
 class RunConfig:
     endpoint: dict                    # EndpointConfig fields
@@ -72,7 +75,7 @@ class RunConfig:
     qps_min: float = 10.0
     qps_max: float = 500.0
     rate_scale: float = 1.0
-    max_concurrency: int = 256
+    max_concurrency: int | None = None  # omission uses a 256-thread safety cap
     max_pending_requests: int | None = None  # running + queued client work
     sizing_concurrency: int | None = None
                                       # derives a FIXED open-loop arrival rate
@@ -145,7 +148,10 @@ class RunConfig:
                 or not math.isfinite(float(self.rate_scale)) \
                 or not (0 < self.rate_scale <= 1):
             raise ValueError("rate_scale must be in (0, 1]")
-        if not isinstance(self.max_concurrency, int) \
+        if self.max_concurrency is None:
+            if self.sizing_concurrency is None:
+                self.max_concurrency = _DEFAULT_MAX_CONCURRENCY
+        elif not isinstance(self.max_concurrency, int) \
                 or isinstance(self.max_concurrency, bool) \
                 or self.max_concurrency <= 0:
             raise ValueError("max_concurrency must be a positive integer")
@@ -700,14 +706,24 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
     p50 = float(_np.percentile(e2e, 50)) / 1000.0
     p95 = float(_np.percentile(e2e, 95)) / 1000.0
     rate = rc.sizing_concurrency / max(p50, 1e-3)
-    pool_size = max(rc.sizing_concurrency * 2,
-                    int(math.ceil(rate * p95 * 1.5)))
+    derived_pool_size = max(rc.sizing_concurrency * 2,
+                            int(math.ceil(rate * p95 * 1.5)))
+    pool_cap = (rc.max_concurrency if rc.max_concurrency is not None
+                else _DEFAULT_MAX_CONCURRENCY)
+    pool_size = min(derived_pool_size, pool_cap)
     if not quiet:
         print(f"[runner] sizing from {len(e2e)} probe requests: e2e p50 "
               f"{p50 * 1000:.0f} ms, p95 {p95 * 1000:.0f} ms")
         print(f"[runner] sizing hint {rc.sizing_concurrency}: offering a fixed "
-              f"{rate:.2f} rps with pool {pool_size}; concurrency is measured, "
-              "not held")
+              f"{rate:.2f} rps with pool {pool_size}"
+              + (f" (derived {derived_pool_size}, capped by explicit "
+                 "max_concurrency)" if pool_size < derived_pool_size
+                 and rc.max_concurrency is not None else "")
+              + (f" (derived {derived_pool_size}, capped by the default "
+                 f"{_DEFAULT_MAX_CONCURRENCY}-thread safety limit)"
+                 if pool_size < derived_pool_size
+                 and rc.max_concurrency is None else "")
+              + "; concurrency is measured, not held")
     return dataclasses.replace(
         rc, qps_base=rate, qps_burst=rate, qps_min=rate, qps_max=rate,
         rate_scale=1.0, max_concurrency=pool_size)

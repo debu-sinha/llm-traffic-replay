@@ -1,104 +1,107 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1520 770" width="1520" height="770" font-family="Helvetica, Arial, sans-serif">
-<rect x="0" y="0" width="1520" height="770" fill="#ffffff"/>
-<marker id="ablue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1971c2"/></marker>
-<marker id="agreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2f9e44"/></marker>
-<marker id="agray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#495057"/></marker>
-<text x="40" y="40" font-size="26" font-weight="700" fill="#1e1e1e">llm-traffic-replay architecture</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
+  <title id="title">LLM traffic replay architecture and evidence lifecycle</title>
+  <desc id="desc">Private input capture and exact local prevalidation precede credential and network access. When quota limits are configured, conservative full-request-body planning and positive READY endpoint binding precede paid inference. The default CLI preflight sends two real requests before replay. Streaming clients may issue duplicate physical posts through explicit retry and fallback paths. Request-path and caller clocks feed a durable journal, reports, manifest version 3, and a completion marker promoted last.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <marker id="warnArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#b45309"/>
+    </marker>
+    <style>
+      .bg{fill:#f8fafc}.lane{fill:#ffffff;stroke:#cbd5e1;stroke-width:2}.box{fill:#eff6ff;stroke:#2563eb;stroke-width:2}.safe{fill:#ecfdf5;stroke:#059669;stroke-width:2}.warn{fill:#fff7ed;stroke:#c2410c;stroke-width:2}.evidence{fill:#f5f3ff;stroke:#7c3aed;stroke-width:2}.muted{fill:#f1f5f9;stroke:#64748b;stroke-width:2}.h{font:700 21px system-ui,sans-serif;fill:#0f172a}.lh{font:700 16px system-ui,sans-serif;fill:#334155}.t{font:600 14px system-ui,sans-serif;fill:#0f172a}.s{font:12px system-ui,sans-serif;fill:#334155}.tiny{font:11px system-ui,sans-serif;fill:#475569}.arrow{fill:none;stroke:#334155;stroke-width:2;marker-end:url(#arrow)}.dash{fill:none;stroke:#b45309;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#warnArrow)}
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1440" height="820"/>
+  <text class="h" x="36" y="42">llm-traffic-replay: bounded traffic, explicit clocks, sealed evidence</text>
 
-<!-- inputs -->
-<rect x="40" y="70" width="190" height="70" rx="10" fill="#ebfbee" stroke="#2f9e44" stroke-width="2" stroke-dasharray="6 4"/>
-<text x="135" y="96" font-size="15" font-weight="600" fill="#2f9e44" text-anchor="middle">your request logs</text>
-<text x="135" y="113" font-size="11" fill="#2f9e44" text-anchor="middle">profile_from_logs.py</text>
-<rect x="40" y="300" width="190" height="70" rx="10" fill="#ebfbee" stroke="#2f9e44" stroke-width="2" stroke-dasharray="6 4"/>
-<text x="135" y="326" font-size="15" font-weight="600" fill="#2f9e44" text-anchor="middle">your arrival trace</text>
-<text x="135" y="343" font-size="11" fill="#2f9e44" text-anchor="middle">timestamps_file</text>
-<rect x="40" y="510" width="190" height="70" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
-<text x="135" y="536" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">run config (JSON)</text>
-<text x="135" y="553" font-size="11" fill="#495057" text-anchor="middle">endpoint / seed / extra_body</text>
-<rect x="40" y="620" width="190" height="64" rx="10" fill="#ebfbee" stroke="#2f9e44" stroke-width="2" stroke-dasharray="6 4"/>
-<text x="135" y="646" font-size="15" font-weight="600" fill="#2f9e44" text-anchor="middle">your prompts</text>
-<text x="135" y="663" font-size="11" fill="#2f9e44" text-anchor="middle">prompts_file (real text)</text>
+  <rect class="lane" x="28" y="65" width="1384" height="150" rx="16"/>
+  <text class="lh" x="48" y="91">1. Freeze and validate exact inputs before credential, network, or inference access</text>
+  <rect class="safe" x="55" y="112" width="205" height="72" rx="10"/>
+  <text class="t" x="157" y="134" text-anchor="middle">External workload inputs</text>
+  <text class="s" x="157" y="155" text-anchor="middle">profile/prompts + optional trace</text>
+  <text class="s" x="157" y="174" text-anchor="middle">durable paths read once</text>
+  <rect class="box" x="315" y="112" width="190" height="72" rx="10"/>
+  <text class="t" x="410" y="133" text-anchor="middle">Freeze + prevalidate</text>
+  <text class="s" x="410" y="154" text-anchor="middle">private bytes; SHA-256 + size</text>
+  <text class="tiny" x="410" y="174" text-anchor="middle">exact schedule; every sweep rung</text>
+  <rect class="warn" x="560" y="104" width="260" height="88" rx="10"/>
+  <text class="t" x="690" y="132" text-anchor="middle">Optional quota + READY P2T gate</text>
+  <text class="s" x="690" y="154" text-anchor="middle">full JSON bytes + framing</text>
+  <text class="s" x="690" y="174" text-anchor="middle">CPT max(configured,12); tier absent/default</text>
+  <rect class="evidence" x="875" y="104" width="235" height="88" rx="10"/>
+  <text class="t" x="992" y="132" text-anchor="middle">Billable preflight (default)</text>
+  <text class="s" x="992" y="154" text-anchor="middle">2 representatives + optional probes</text>
+  <text class="s" x="992" y="174" text-anchor="middle">artifact rows omit prompt text</text>
+  <rect class="evidence" x="1165" y="104" width="210" height="88" rx="10"/>
+  <text class="t" x="1270" y="132" text-anchor="middle">Start journal claimed</text>
+  <text class="s" x="1270" y="154" text-anchor="middle">writing marker + start.json</text>
+  <text class="s" x="1270" y="174" text-anchor="middle">setup metadata appended first</text>
+  <path class="arrow" d="M260 148 H315"/><path class="arrow" d="M505 148 H560"/><path class="arrow" d="M820 148 H875"/><path class="arrow" d="M1110 148 H1165"/>
 
-<!-- generation column -->
-<rect x="300" y="60" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="408" y="86" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">profile.py</text>
-<text x="408" y="103" font-size="11" fill="#1971c2" text-anchor="middle">quantiles -&gt; token plan</text>
-<text x="408" y="118" font-size="11" fill="#1971c2" text-anchor="middle">(lognormal / logit-normal)</text>
-<rect x="300" y="180" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="408" y="206" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">prefix_pool.py</text>
-<text x="408" y="223" font-size="11" fill="#1971c2" text-anchor="middle">shared-prefix docs,</text>
-<text x="408" y="238" font-size="11" fill="#1971c2" text-anchor="middle">Zipf popularity</text>
-<rect x="300" y="300" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="408" y="326" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">textgen.py</text>
-<text x="408" y="343" font-size="11" fill="#1971c2" text-anchor="middle">prefix + unique text,</text>
-<text x="408" y="358" font-size="11" fill="#1971c2" text-anchor="middle">calibrated chars/token</text>
-<rect x="300" y="480" width="215" height="80" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="408" y="506" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">schedule.py</text>
-<text x="408" y="523" font-size="11" fill="#1971c2" text-anchor="middle">bursty arrivals</text>
-<text x="408" y="538" font-size="11" fill="#1971c2" text-anchor="middle">or your trace</text>
+  <rect class="lane" x="28" y="235" width="1384" height="245" rx="16"/>
+  <text class="lh" x="48" y="263">2. Prepare and dispatch a bounded open-loop workload</text>
+  <rect class="box" x="55" y="292" width="210" height="126" rx="10"/>
+  <text class="t" x="160" y="318" text-anchor="middle">Workload plan</text>
+  <text class="s" x="160" y="342" text-anchor="middle">profile v1 or v2, or prompts</text>
+  <text class="s" x="160" y="363" text-anchor="middle">synthetic schedule or trace</text>
+  <text class="s" x="160" y="384" text-anchor="middle">global indices → shard subset</text>
+  <text class="tiny" x="160" y="405" text-anchor="middle">sizing/calibration are extra traffic</text>
+  <rect class="box" x="325" y="292" width="220" height="126" rx="10"/>
+  <text class="t" x="435" y="318" text-anchor="middle">Monotonic dispatcher</text>
+  <text class="s" x="435" y="342" text-anchor="middle">waits for each scheduled target</text>
+  <text class="s" x="435" y="363" text-anchor="middle">fixed-rate open loop</text>
+  <text class="s" x="435" y="384" text-anchor="middle">max_concurrency workers</text>
+  <text class="s" x="435" y="405" text-anchor="middle">bounded max_pending_requests</text>
+  <rect class="warn" x="605" y="292" width="240" height="126" rx="10"/>
+  <text class="t" x="725" y="318" text-anchor="middle">Streaming client attempts</text>
+  <text class="s" x="725" y="342" text-anchor="middle">cancel shuts active sockets; blocks retries</text>
+  <text class="s" x="725" y="363" text-anchor="middle">transport retries default 0</text>
+  <text class="s" x="725" y="384" text-anchor="middle">usage fallback or auth refresh</text>
+  <text class="s" x="725" y="405" text-anchor="middle">may issue a duplicate physical POST</text>
+  <rect class="muted" x="905" y="292" width="200" height="126" rx="10"/>
+  <text class="t" x="1005" y="318" text-anchor="middle">Serving endpoint</text>
+  <text class="s" x="1005" y="342" text-anchor="middle">streamed chat subset</text>
+  <text class="s" x="1005" y="363" text-anchor="middle">provider dialect and quotas</text>
+  <text class="s" x="1005" y="384" text-anchor="middle">usage may be partial or absent</text>
+  <text class="s" x="1005" y="405" text-anchor="middle">semantic correctness is external</text>
+  <rect class="safe" x="1165" y="292" width="210" height="126" rx="10"/>
+  <text class="t" x="1270" y="318" text-anchor="middle">Stream parser</text>
+  <text class="s" x="1270" y="342" text-anchor="middle">content, reasoning, tool fragments</text>
+  <text class="s" x="1270" y="363" text-anchor="middle">corrupt/incomplete = failures</text>
+  <text class="s" x="1270" y="384" text-anchor="middle">not in latency/usage/cost populations</text>
+  <text class="s" x="1270" y="405" text-anchor="middle">response content not persisted</text>
+  <path class="arrow" d="M265 355 H325"/><path class="arrow" d="M545 355 H605"/><path class="arrow" d="M845 355 H905"/><path class="arrow" d="M1105 355 H1165"/>
+  <path class="dash" d="M1005 418 C1005 458 725 458 725 420"/>
+  <text class="tiny" x="865" y="468" text-anchor="middle">explicit retry/fallback path: possible repeated POST</text>
 
-<!-- runner -->
-<rect x="600" y="230" width="215" height="150" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="708" y="276" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">runner.py</text>
-<text x="708" y="295" font-size="11" fill="#1971c2" text-anchor="middle">calibration warmup,</text>
-<text x="708" y="310" font-size="11" fill="#1971c2" text-anchor="middle">then paced dispatch</text>
-<text x="708" y="325" font-size="11" fill="#1971c2" text-anchor="middle">(bounded thread pool)</text>
-<text x="708" y="348" font-size="11" fill="#868e96" text-anchor="middle">warmup recalibrates cpt</text>
+  <rect class="lane" x="28" y="500" width="1384" height="135" rx="16"/>
+  <text class="lh" x="48" y="528">3. Keep both timing families and journal every observed outcome</text>
+  <rect class="box" x="80" y="550" width="315" height="58" rx="10"/>
+  <text class="t" x="237" y="574" text-anchor="middle">Final-attempt request-path clocks</text>
+  <text class="s" x="237" y="594" text-anchor="middle">upload/network included; probe never subtracted</text>
+  <rect class="safe" x="465" y="550" width="360" height="58" rx="10"/>
+  <text class="t" x="645" y="574" text-anchor="middle">Exact caller clocks from scheduled target</text>
+  <text class="s" x="645" y="594" text-anchor="middle">queue + connect + fallback + refresh + retries + response</text>
+  <rect class="evidence" x="895" y="550" width="430" height="58" rx="10"/>
+  <text class="t" x="1110" y="574" text-anchor="middle">Durable requests.jsonl.partial</text>
+  <text class="s" x="1110" y="592" text-anchor="middle">attempts + outcomes + global indices + exact clocks</text>
+  <text class="tiny" x="1110" y="606" text-anchor="middle">redacted errors + batched fsync</text>
+  <path class="arrow" d="M395 579 H465"/><path class="arrow" d="M825 579 H895"/>
 
-<!-- io column -->
-<rect x="890" y="140" width="215" height="90" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="998" y="172" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">client.py</text>
-<text x="998" y="189" font-size="11" fill="#1971c2" text-anchor="middle">streaming HTTP: connect, ttft,</text>
-<text x="998" y="204" font-size="11" fill="#1971c2" text-anchor="middle">ttfr, ttfv, interchunk max</text>
-<rect x="890" y="420" width="215" height="90" rx="10" fill="#e7f5ff" stroke="#1971c2" stroke-width="2"/>
-<text x="998" y="452" font-size="15" font-weight="600" fill="#1971c2" text-anchor="middle">metrics.py</text>
-<text x="998" y="469" font-size="11" fill="#1971c2" text-anchor="middle">percentiles, believability,</text>
-<text x="998" y="484" font-size="11" fill="#1971c2" text-anchor="middle">SLA, cost, drift, sample</text>
-
-<!-- sinks -->
-<rect x="1245" y="140" width="230" height="90" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
-<text x="1360" y="172" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">endpoint</text>
-<text x="1360" y="189" font-size="11" fill="#495057" text-anchor="middle">OpenAI-compatible chat</text>
-<text x="1360" y="204" font-size="11" fill="#495057" text-anchor="middle">(Databricks PT / mock)</text>
-<rect x="1245" y="420" width="230" height="90" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
-<text x="1360" y="452" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">results/</text>
-<text x="1360" y="469" font-size="11" fill="#495057" text-anchor="middle">requests.jsonl / summary.json</text>
-<text x="1360" y="484" font-size="11" fill="#495057" text-anchor="middle">/ report.md / report.html</text>
-<rect x="1245" y="560" width="230" height="68" rx="10" fill="#f1f3f5" stroke="#495057" stroke-width="2"/>
-<text x="1360" y="586" font-size="15" font-weight="600" fill="#495057" text-anchor="middle">merge / compare</text>
-<text x="1360" y="603" font-size="11" fill="#495057" text-anchor="middle">offline: pool shards,</text>
-<text x="1360" y="618" font-size="11" fill="#495057" text-anchor="middle">compare providers</text>
-
-<!-- connectors: all orthogonal, routed through empty lanes -->
-<polyline points="230,100 300,100" fill="none" stroke="#2f9e44" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agreen)"/>
-<polyline points="230,335 255,335 255,520 300,520" fill="none" stroke="#2f9e44" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agreen)"/>
-<polyline points="230,545 280,545 280,610 575,610 575,355 600,355" fill="none" stroke="#495057" stroke-width="1.6" marker-end="url(#agray)"/>
-<polyline points="407,140 407,180" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="407,260 407,300" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="515,335 525,335 525,265 600,265" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="515,520 545,520 545,310 600,310" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="815,290 850,290 850,185 890,185" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="1105,180 1245,180" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="1245,205 1105,205" fill="none" stroke="#495057" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agray)"/>
-<polyline points="997,230 997,420" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="1105,465 1245,465" fill="none" stroke="#1971c2" stroke-width="1.6" marker-end="url(#ablue)"/>
-<polyline points="1360,510 1360,560" fill="none" stroke="#495057" stroke-width="1.6" marker-end="url(#agray)"/>
-<polyline points="230,652 720,652 720,380" fill="none" stroke="#2f9e44" stroke-width="1.6" stroke-dasharray="6 5" marker-end="url(#agreen)"/>
-
-<!-- edge labels, each in an empty lane -->
-<text x="413" y="156" font-size="11" fill="#1971c2">prefix tokens</text>
-<text x="413" y="284" font-size="11" fill="#1971c2">doc id + cut</text>
-<text x="530" y="258" font-size="11" fill="#1971c2">messages</text>
-<text x="551" y="420" font-size="11" fill="#1971c2">arrivals</text>
-<text x="392" y="604" font-size="11" fill="#495057">config</text>
-<text x="856" y="245" font-size="11" fill="#1971c2">paced submit</text>
-<text x="1150" y="172" font-size="11" fill="#1971c2">POST</text>
-<text x="1138" y="223" font-size="11" fill="#495057">SSE + usage</text>
-<text x="1002" y="330" font-size="11" fill="#1971c2">timings + usage</text>
-<text x="1160" y="457" font-size="11" fill="#1971c2">write</text>
-<text x="300" y="646" font-size="11" fill="#2f9e44">real text (prompts mode)</text>
-
-<!-- legend -->
-<text x="40" y="730" font-size="12" fill="#495057">green dashed = bring-your-own-data inputs (logs and trace feed generation, prompts go straight to the runner)</text>
-<text x="40" y="748" font-size="12" fill="#495057">gray dashed = endpoint return (SSE, usage)     gray solid = offline aggregation</text>
+  <rect class="lane" x="28" y="655" width="1384" height="132" rx="16"/>
+  <text class="lh" x="48" y="683">4. Seal evidence only after traffic drains</text>
+  <rect class="evidence" x="70" y="704" width="250" height="55" rx="10"/>
+  <text class="t" x="195" y="728" text-anchor="middle">requests.jsonl promoted</text>
+  <text class="s" x="195" y="748" text-anchor="middle">newline row count checked</text>
+  <rect class="evidence" x="370" y="704" width="255" height="55" rx="10"/>
+  <text class="t" x="497" y="728" text-anchor="middle">summary + reports</text>
+  <text class="s" x="497" y="748" text-anchor="middle">sample floors; cost withheld if ambiguous</text>
+  <rect class="evidence" x="675" y="704" width="275" height="55" rx="10"/>
+  <text class="t" x="812" y="728" text-anchor="middle">manifest schema v3 last</text>
+  <text class="s" x="812" y="748" text-anchor="middle">identity + SHA-256 + bytes + row count</text>
+  <rect class="safe" x="1000" y="704" width="335" height="55" rx="10"/>
+  <text class="t" x="1167" y="728" text-anchor="middle">.traffic-replay-complete promoted last</text>
+  <text class="s" x="1167" y="748" text-anchor="middle">merge and compare accept only sealed, verified inputs</text>
+  <path class="arrow" d="M320 731 H370"/><path class="arrow" d="M625 731 H675"/><path class="arrow" d="M950 731 H1000"/>
 </svg>

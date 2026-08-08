@@ -13,7 +13,32 @@ is how the same schedule serves both a laptop smoke test and a full run.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+from .json_input import loads_strict
+
+
+# The current scheduler and profile materializer are intentionally exact but
+# O(N). Fail closed before they can allocate an unbounded schedule. Supporting
+# larger runs requires a streaming scheduler/workload implementation, not an
+# undocumented memory gamble.
+MAX_SCHEDULE_REQUESTS = 1_000_000
+MAX_SCHEDULE_SECONDS = 604_800
+
+
+def validate_schedule_capacity(duration_s: int, qps_max: float) -> None:
+    if duration_s > MAX_SCHEDULE_SECONDS:
+        raise ValueError(
+            f"duration_s exceeds the {MAX_SCHEDULE_SECONDS}-second exact "
+            "scheduler limit")
+    projected = float(duration_s) * float(qps_max)
+    if projected > MAX_SCHEDULE_REQUESTS:
+        raise ValueError(
+            f"schedule can project up to {projected:,.0f} arrivals, above "
+            f"the exact scheduler limit of {MAX_SCHEDULE_REQUESTS:,}; lower "
+            "duration/rate or implement a streaming schedule")
 
 
 def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
@@ -21,8 +46,32 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
                   qps_max: float = 500.0, mean_base_dwell_s: float = 20.0,
                   mean_burst_dwell_s: float = 6.0, rate_scale: float = 1.0,
                   seed: int = 23) -> dict:
+    if not isinstance(duration_s, int) or isinstance(duration_s, bool) \
+            or duration_s <= 0:
+        raise ValueError("duration_s must be a positive integer")
+    numeric = {
+        "qps_base": qps_base, "qps_burst": qps_burst,
+        "qps_min": qps_min, "qps_max": qps_max,
+        "mean_base_dwell_s": mean_base_dwell_s,
+        "mean_burst_dwell_s": mean_burst_dwell_s,
+        "rate_scale": rate_scale,
+    }
+    for name, value in numeric.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(float(value)) or value <= 0:
+            raise ValueError(f"{name} must be positive and finite")
+    if qps_min > qps_max:
+        raise ValueError("qps_min cannot exceed qps_max")
+    if not qps_min <= qps_base <= qps_max:
+        raise ValueError("qps_base must be between qps_min and qps_max")
+    if not qps_min <= qps_burst <= qps_max:
+        raise ValueError("qps_burst must be between qps_min and qps_max")
     if not (0 < rate_scale <= 1.0):
         raise ValueError("rate_scale must be in (0, 1]")
+    if not isinstance(seed, (int, np.integer)) or isinstance(seed, bool) \
+            or seed < 0:
+        raise ValueError("seed must be a non-negative integer")
+    validate_schedule_capacity(duration_s, qps_max)
     rng = np.random.default_rng(seed)
     rates = np.empty(duration_s)
     t, state = 0, "base"
@@ -38,12 +87,24 @@ def make_schedule(duration_s: int = 300, qps_base: float = 25.0,
                                qps_min, qps_max)
         t, state = end, ("burst" if state == "base" else "base")
 
-    counts = rng.poisson(rates * rate_scale)
-    if counts.sum() == 0:
+    # Generate the full schedule first, then deterministically thin it. Runs
+    # with the same seed at lower scales are exact subsets of the full run,
+    # which makes smoke/full comparisons preserve individual arrival times.
+    full_counts = rng.poisson(rates)
+    total = int(full_counts.sum())
+    if total > MAX_SCHEDULE_REQUESTS:
+        raise ValueError(
+            f"sampled schedule contains {total:,} arrivals, above the exact "
+            f"scheduler limit of {MAX_SCHEDULE_REQUESTS:,}")
+    if total == 0:
+        counts = np.zeros(duration_s, dtype=int)
         return {"rates": rates * rate_scale, "counts": counts,
                 "timestamps": np.array([])}
-    ts = np.concatenate([i + np.sort(rng.uniform(0, 1, c))
-                         for i, c in enumerate(counts) if c > 0])
+    full_ts = np.concatenate([i + np.sort(rng.uniform(0, 1, c))
+                              for i, c in enumerate(full_counts) if c > 0])
+    keep = rng.random(len(full_ts)) < rate_scale
+    ts = full_ts[keep]
+    counts = np.bincount(ts.astype(int), minlength=duration_s)
     return {"rates": rates * rate_scale, "counts": counts,
             "timestamps": np.sort(ts)}
 
@@ -60,36 +121,77 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
     import json as _json
     from pathlib import Path as _Path
 
+    if duration_cap_s is not None and (
+            isinstance(duration_cap_s, bool)
+            or not isinstance(duration_cap_s, (int, float))
+            or not math.isfinite(float(duration_cap_s))
+            or duration_cap_s < 0):
+        raise ValueError("duration_cap_s must be non-negative and finite")
     ts = []
-    for line in _Path(path).read_text().splitlines():
-        line = line.strip()
+    for line_number, raw_line in enumerate(
+            _Path(path).read_text().splitlines(), 1):
+        line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("{"):
-            ts.append(float(_json.loads(line)["t"]))
-        else:
-            ts.append(float(line))
+        try:
+            if line.startswith("{"):
+                value = loads_strict(line)
+                if not isinstance(value, dict) or "t" not in value:
+                    raise ValueError("JSON row must be an object with a t field")
+                raw_timestamp = value["t"]
+                if isinstance(raw_timestamp, bool) or not isinstance(
+                        raw_timestamp, (int, float)):
+                    raise ValueError("JSON t field must be a number")
+                timestamp = float(raw_timestamp)
+            else:
+                timestamp = float(line)
+        except (KeyError, TypeError, ValueError, OverflowError,
+                _json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"invalid arrival timestamp at {path}:{line_number}: {exc}") \
+                from exc
+        if not math.isfinite(timestamp):
+            raise ValueError(
+                f"arrival timestamp at {path}:{line_number} must be finite")
+        ts.append(timestamp)
+        if len(ts) > MAX_SCHEDULE_REQUESTS:
+            raise ValueError(
+                f"arrival trace exceeds the exact scheduler limit of "
+                f"{MAX_SCHEDULE_REQUESTS:,} rows")
     if not ts:
         raise ValueError(f"no timestamps in {path}")
     arr = np.sort(np.asarray(ts, dtype=float))
     arr = arr - arr[0]
     if duration_cap_s is not None:
         arr = arr[arr <= duration_cap_s]
-    dur = int(np.ceil(arr[-1])) + 1 if len(arr) else 0
+    # One bucket covers each interval [second, second + 1).  ``ceil(max) + 1``
+    # creates a phantom trailing bucket whenever the last timestamp is not an
+    # integer (for example, a trace ending at 1.2 seconds needs buckets 0 and
+    # 1, not an empty bucket 2).  The integer part plus one is the exact bucket
+    # count for non-negative, zero-based timestamps.
+    dur = int(math.floor(arr[-1])) + 1 if len(arr) else 0
     counts = np.bincount(arr.astype(int), minlength=dur)
     return {"rates": counts.astype(float), "counts": counts,
             "timestamps": arr, "source": str(path)}
 
 
 def shard(schedule: dict, index: int, total: int) -> dict:
-    """Deterministic 1-of-n split for multi-process clients."""
-    if not (0 <= index < total):
+    """Deterministic 1-of-n split, retaining global workload indices."""
+    if not isinstance(total, int) or total <= 0 or not isinstance(index, int) \
+            or not (0 <= index < total):
         raise ValueError("need 0 <= index < total")
     ts = schedule["timestamps"]
+    existing = np.asarray(schedule.get("global_indices",
+                                       np.arange(len(ts))), dtype=int)
+    if len(existing) != len(ts):
+        raise ValueError("global_indices must align with timestamps")
     # rates and counts describe the WHOLE run. passing them through unchanged
     # made a shard's own summary.json report the unsharded request count, so
     # anyone opening it read a shortfall that was not there.
-    return {**schedule, "timestamps": ts[index::total],
+    chosen = np.arange(index, len(ts), total)
+    return {**schedule, "timestamps": ts[chosen],
+            "global_indices": existing[chosen],
+            "total_requests": int(schedule.get("total_requests", len(ts))),
             "shard": (index, total)}
 
 

@@ -1,6 +1,7 @@
 """Pool must construct the intended cache structure: right-sized documents,
 popularity skew, and constructed fractions near the sampled targets."""
 import numpy as np
+import pytest
 
 from traffic_replay import profile as prof
 from traffic_replay.prefix_pool import PrefixPool
@@ -45,9 +46,61 @@ def test_prefix_never_exceeds_want_or_doc():
             assert a.prefix_tokens[i] <= pool.doc_len[int(a.doc_id[i])]
 
 
+def test_large_prefix_is_not_silently_clipped_to_40k():
+    pool = PrefixPool(seed=13)
+    wants = np.array([40_001, 99_999, 199_999])
+    a = pool.assign(wants)
+    assert np.array_equal(a.prefix_tokens, wants)
+    assert all(pool.doc_len[int(doc)] >= want
+               for doc, want in zip(a.doc_id, wants))
+
+
+def test_out_of_range_prefix_is_rejected_not_misreported():
+    pool = PrefixPool(seed=13)
+    try:
+        pool.assign(np.array([200_001]))
+    except ValueError as exc:
+        assert "outside pool range" in str(exc)
+    else:
+        raise AssertionError("out-of-range prefix was silently clipped")
+
+
 def test_zero_prefix_handled():
     pool = PrefixPool(seed=13)
     a = pool.assign(np.array([0, 5_000, 0]))
     assert a.doc_id[0] == -1 and a.prefix_tokens[0] == 0
     assert a.doc_id[2] == -1 and a.prefix_tokens[2] == 0
     assert a.prefix_tokens[1] > 0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"bucket_edges": (0, 1.5, 10)},
+    {"bucket_edges": (0, True, 10)},
+    {"docs_per_bucket": True},
+    {"zipf_s": True},
+    {"seed": -1},
+])
+def test_pool_controls_are_strict(kwargs):
+    with pytest.raises(ValueError):
+        PrefixPool(**kwargs)
+
+
+@pytest.mark.parametrize("values", [
+    np.array([1.9]),
+    np.array([True]),
+    np.array([-1]),
+    np.array([[1, 2]]),
+])
+def test_prefix_targets_are_not_silently_coerced(values):
+    with pytest.raises(ValueError):
+        PrefixPool().assign(values)
+
+
+def test_structure_report_rejects_misaligned_or_impossible_assignments():
+    pool = PrefixPool()
+    assigned = pool.assign(np.array([5, 6], dtype=int))
+    with pytest.raises(ValueError, match="aligned"):
+        pool.structure_report(assigned, np.array([10], dtype=int))
+    assigned.prefix_tokens[0] = 11
+    with pytest.raises(ValueError, match="prefixes within"):
+        pool.structure_report(assigned, np.array([10, 10], dtype=int))

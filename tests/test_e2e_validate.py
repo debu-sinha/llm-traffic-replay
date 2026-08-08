@@ -45,10 +45,10 @@ def run_out(mock):
         title="e2e test", label="test", max_output_tokens_cap=16,
     )
     out = run(rc, quiet=True)
-    rows = [json.loads(l) for l in
+    rows = [json.loads(line) for line in
             (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
-    truth = {json.loads(l)["request_id"]: json.loads(l)
-             for l in mock["truth"].read_text().splitlines()}
+    truth = {json.loads(line)["request_id"]: json.loads(line)
+             for line in mock["truth"].read_text().splitlines()}
     return {"out": out, "rows": rows, "truth": truth}
 
 
@@ -113,7 +113,7 @@ def test_token_targeting_tight_when_cpt_matches(run_out):
 def test_report_carries_believability_block(run_out):
     report = (Path(run_out["out"]["out_dir"]) / "report.md").read_text()
     assert "Believability block" in report
-    assert "achieved cache fraction" in report
+    assert "achieved cached prompt-token fraction" in report
     assert "dispatch lag" in report
 
 

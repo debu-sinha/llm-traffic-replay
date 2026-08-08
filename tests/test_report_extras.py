@@ -252,8 +252,21 @@ def test_report_states_which_harness_version_and_latency_basis():
     # need a test edit and cannot silently stop being stamped
     assert s["harness_version"] == __version__
     assert "NOT included" in s["latency_basis"]
+    assert "immediately before conn.request" in s["latency_basis"]
+    assert "include request upload" in s["latency_basis"]
+    assert "first iterated response-body line" in s["latency_basis"]
+    assert "not necessarily the first response byte" in s["latency_basis"]
+    assert "visible or reasoning content delta" in s["latency_basis"]
+    assert "excludes tool-call fragments" in s["latency_basis"]
+    assert "first visible content and first tool-call fragment remain separate" \
+        in s["latency_basis"]
     assert "latency basis" in render_markdown(s, "v")
-    assert "Latency basis" in render_html(s, "v")
+    html = render_html(s, "v")
+    assert "Latency basis" in html
+    assert "TTFB (first response-body line)" in html
+    assert "TTFB (first byte)" not in html
+    assert "TTFT (first content delta)" in html
+    assert "TTFT (first token)" not in html
 
 
 def _fail(n, t0=0.0, dt=1.0):
@@ -307,7 +320,7 @@ def test_per_window_errors_render_in_both_formats():
     md = render_markdown(s, "errs")
     h = render_html(s, "errs")
     assert "errors" in md
-    assert "<th>errors</th>" in h
+    assert "<th scope='col'>errors</th>" in h
     assert "40 (" in md          # count and share shown together
 
 
@@ -442,16 +455,24 @@ def test_retry_exhausted_failures_keep_their_original_send_time():
     c._connect = lambda: SlowFailingConn()
 
     before = time.time()
+    scheduled_monotonic = time.monotonic()
     r = c.send([{"role": "user", "content": "hi"}], 8, "req-1",
                scheduled_s=0.0, dispatch_lag_ms=0.0, intended=(0, 0, None, 0),
-               chars_sent=2)
+               chars_sent=2, scheduled_monotonic=scheduled_monotonic)
     after = time.time()
 
     assert r.ok is False
     # the whole call spanned at least two sleeps, so a final-failure stamp
     # would sit well after the first send
     assert after - before > 0.25
-    assert r.t_send_unix < before + 0.15
+    assert r.first_send_unix < before + 0.15
+    assert r.t_send_unix > r.first_send_unix
+    assert r.connection_attempts == 3
+    assert r.request_attempts == 3
+    assert r.retry_reasons == ["transport_error_after_post",
+                               "transport_error_after_post"]
+    assert r.queue_wait_ms is not None
+    assert r.caller_e2e_ms >= 400
 
 
 def test_a_total_outage_actually_renders_its_verdict():
@@ -513,7 +534,8 @@ def test_the_window_table_is_a_real_markdown_table():
     rows += _rows(60, base_ttft=210.0, t0=140.0, dt=0.2)
     md = render_markdown(summarize(rows), "tbl")
     block = md[md.index("stability over time"):].splitlines()
-    header = next(i for i, l in enumerate(block) if l.startswith("| window |"))
+    header = next(
+        i for i, line in enumerate(block) if line.startswith("| window |"))
     assert block[header - 1].strip() == ""      # blank line before the table
 
 
@@ -569,7 +591,8 @@ def test_the_caution_is_above_the_tables_in_both_formats():
     rows = _paced(240, offered_qps=8.0, service_s=1.0, pool=2)
     s = summarize(rows)
     md = render_markdown(s, "sat")
-    assert md.index("CAUTION (client saturation)") < md.index("| metric (ms) |")
+    assert md.index("CAUTION (client saturation)") < md.index(
+        "| endpoint service metric (ms, from send) |")
     assert "banner warn" in render_html(s, "sat")
 
 
@@ -723,11 +746,9 @@ def test_rows_without_the_field_fall_back_to_t_send_unix():
     assert s["arrivals"]["wire_lateness_ms"]["n"] == len(rows)
 
 
-def test_the_client_stamps_first_send_on_every_return_path():
-    """Drives the real EndpointClient rather than hand-built dicts, so
-    deleting first_send_unix from any _finish call fails here. Covers the
-    non-200 path and the exhausted-retry path."""
-    import json as _json
+def test_the_client_distinguishes_connection_attempts_from_http_sends():
+    """Drives the real EndpointClient rather than hand-built dicts. A response
+    proves an HTTP send occurred; a connection refusal proves one did not."""
     import threading
     import time as _time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -742,7 +763,8 @@ def test_the_client_stamps_first_send_on_every_return_path():
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers(); self.wfile.write(body)
+            self.end_headers()
+            self.wfile.write(body)
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     port = srv.server_address[1]
@@ -757,12 +779,11 @@ def test_the_client_stamps_first_send_on_every_return_path():
                    intended=(0, 0, None, 0), chars_sent=2)
         assert r.ok is False and r.status == 503          # the non-200 path
         assert r.first_send_unix is not None
-        # strictly earlier: the stamp is taken before the handshake, while
-        # t_send_unix is taken after. equality means the call site dropped it
-        # and _finish fell back to t_send_unix.
-        assert r.first_send_unix < r.t_send_unix
+        assert r.first_attempt_unix <= r.first_send_unix
+        assert r.request_attempts == 1
     finally:
-        srv.shutdown(); srv.server_close()
+        srv.shutdown()
+        srv.server_close()
 
     # exhausted-retry path: nothing listening at all
     cfg2 = EndpointConfig(base_url="http://127.0.0.1:1",
@@ -773,7 +794,9 @@ def test_the_client_stamps_first_send_on_every_return_path():
                  scheduled_s=0.0, dispatch_lag_ms=0.0,
                  intended=(0, 0, None, 0), chars_sent=2)
     assert r2.ok is False
-    assert r2.first_send_unix is not None
+    assert r2.first_attempt_unix is not None
+    assert r2.first_send_unix is None
+    assert r2.request_attempts == 0
 
 
 # ---- concurrency actually reached -----------------------------------------
@@ -795,7 +818,8 @@ def test_concurrency_measures_actual_overlap():
     rows = _spans(600, start_rate=20.0, service_s=1.5)
     c = _concurrency_block(rows, asked=30)
     assert 28 <= c["in_flight_p50"] <= 32
-    assert "warning" not in c            # it reached what it asked for
+    assert "warning" not in c
+    assert c["sizing_concurrency_requested"] == 30
 
 
 def test_concurrency_warns_when_the_load_never_arrived():
@@ -805,15 +829,16 @@ def test_concurrency_warns_when_the_load_never_arrived():
     rows = _spans(600, start_rate=20.0, service_s=0.15)   # only ~3 in flight
     c = _concurrency_block(rows, asked=30)
     assert c["in_flight_p50"] < 10
-    assert "asked to hold 30" in c["warning"]
-    assert "not carrying the concurrency on the label" in c["warning"]
+    assert "sized from an unloaded estimate of 30" in c["warning"]
+    assert "not a held concurrency target" in c["warning"]
 
 
 def test_concurrency_caution_renders_above_the_tables():
     rows = _spans(600, start_rate=20.0, service_s=0.15)
     s = summarize(rows, concurrency_target=30)
     md = render_markdown(s, "conc")
-    assert md.index("CAUTION (concurrency not reached)") < md.index("| metric (ms) |")
+    assert md.index("CAUTION (concurrency not reached)") < md.index(
+        "| endpoint service metric (ms, from send) |")
     assert "banner warn" in render_html(s, "conc")
 
 
@@ -890,12 +915,22 @@ def _reasoning_rows(n_visible, n_truncated):
 
 
 def test_ttfv_percentiles_say_how_many_requests_they_leave_out():
-    s = summarize(_reasoning_rows(55, 132))
+    s = summarize(
+        _reasoning_rows(55, 132),
+        acceptance={"ttft_ms": {"p50": 500}},
+    )
     assert s["ttfv_ms"]["missing"] == 132
     assert s["ttfv_ms"]["of"] == 187
     note = render_markdown(s, "note")
     assert "55 of 187" in note
     assert "fastest subset" in note
+    assert "first visible-or-reasoning content delta" in note
+    assert "first visible content" in note
+    assert "first token of" not in note
+    html = render_html(s, "note")
+    assert "first visible-or-reasoning content delta" in html
+    assert "first visible content" in html
+    assert "first token of" not in html
 
 
 def test_scoring_first_visible_warns_when_most_requests_never_got_there():
@@ -957,6 +992,11 @@ def test_a_200_with_no_visible_content_is_not_a_successful_answer():
     assert a["answered"] == 55
     assert a["no_visible_content"] == 132
     assert a["answer_rate"] == round(55 / 187, 6)
+    assert s["ttft_ms"]["n"] == 55
+    assert s["latency_population"]["kind"] == "readable_answers"
+    md = render_markdown(s, "answers")
+    assert "produced at least one visible or reasoning content delta" in md
+    assert "returned HTTP 200:" not in md  # status was not retained by rows
 
 
 def test_silent_responses_count_against_the_success_rate():
@@ -1023,8 +1063,8 @@ def _mixed(silent, good):
 
 
 def _md_verdict(s):
-    return [l for l in render_markdown(s, "x").splitlines()
-            if l.startswith("verdict:")][0]
+    return [line for line in render_markdown(s, "x").splitlines()
+            if line.startswith("verdict:")][0]
 
 
 def test_an_answer_collapse_is_not_green_without_a_success_rate_target():
@@ -1072,6 +1112,20 @@ def test_the_invalid_sentence_names_the_counter_that_drove_it():
     assert s["answers"]["no_visible_content"] == 0
     assert "never terminated their stream" in inv
     assert "60 of 60" in inv
+
+
+def test_parse_errors_do_not_get_misreported_as_missing_visible_content():
+    rows = _mixed(0, 12)
+    for row in rows:
+        row["parse_errors"] = 1
+    summary = summarize(rows, acceptance={"ttft_ms": {"p50": 5000}})
+
+    invalid = summary["answers"]["invalid"]
+    assert summary["answers"]["no_visible_content"] == 0
+    assert "produced a reportable completed answer" in invalid
+    assert "hit unrecoverable parse errors" in invalid
+    assert "12 of 12" in invalid
+    assert "produced visible content or a valid tool call" not in invalid
 
 
 def test_old_rows_are_not_retroactively_failed_by_the_answers_block():
@@ -1146,6 +1200,52 @@ def test_the_arrival_rate_uses_the_send_span_not_the_drain():
     # 1000 output tokens over a 14.9s observation interval, not 9.9s
     expected = 1000 / (14.9 / 60.0)
     assert abs(s["throughput"]["output_tokens_per_min"] - expected) < 1.0
+
+
+def test_failed_tail_extends_the_observation_window_instead_of_zero_duration():
+    base = 1_700_000_000.0
+    rows = [
+        {"ok": True, "phase": "replay", "ttft_ms": 50.0,
+         "e2e_ms": 100.0, "prompt_tokens": 100, "completion_tokens": 10,
+         "t_send_unix": base + i * 0.1,
+         "first_send_unix": base + i * 0.1,
+         "finished_unix": base + i * 0.1 + 0.1}
+        for i in range(10)
+    ]
+    rows.append(
+        {"ok": False, "phase": "replay", "error": "read timeout",
+         "e2e_ms": None, "caller_e2e_ms": 60_000.0,
+         "t_send_unix": base + 0.95, "first_send_unix": base + 0.95,
+         "finished_unix": base + 60.95})
+    s = summarize(rows)
+    expected = 1000 / (60.95 / 60.0)
+    assert abs(s["throughput"]["input_tokens_per_min"] - expected) < 0.1
+    assert s["throughput"]["completion_time_coverage"] == 1.0
+
+
+def test_failed_requests_are_included_in_in_flight_occupancy():
+    from traffic_replay.metrics import _concurrency_block
+
+    base = 1_700_000_000.0
+    successes = [
+        {"ok": True, "e2e_ms": 100.0,
+         "first_send_unix": base + i * 0.1,
+         "t_send_unix": base + i * 0.1,
+         "finished_unix": base + i * 0.1 + 0.1}
+        for i in range(10)
+    ]
+    timeouts = [
+        {"ok": False, "error": "read timeout", "e2e_ms": None,
+         "first_send_unix": base + 0.95 + i * 0.001,
+         "t_send_unix": base + 0.95 + i * 0.001,
+         "finished_unix": base + 60.95 + i * 0.001}
+        for i in range(20)
+    ]
+    c = _concurrency_block(successes + timeouts, asked=30)
+    assert c["in_flight_max"] >= 21
+    assert c["sent_requests"] == 30
+    assert c["measured_requests"] == 30
+    assert c["coverage"] == 1.0
 
 
 def test_truncation_by_the_global_cap_is_counted_separately():
@@ -1237,9 +1337,9 @@ def test_a_retried_request_occupies_a_worker_for_its_whole_life():
 
 # ---- a PASS on service time is not a PASS for the caller ----------------
 
-def test_a_service_time_pass_is_downgraded_when_callers_waited():
-    """The SLA rows score service time. If the client queued the work, a row
-    can read PASS while the person who asked waited ten seconds."""
+def test_caller_experienced_latency_is_the_sla_measurement_not_a_warning():
+    """A queued request must fail in the scorecard itself, not show a service
+    time PASS with a warning elsewhere on the page."""
     base = 1_700_000_000.0
     rows = []
     for i in range(300):
@@ -1251,11 +1351,12 @@ def test_a_service_time_pass_is_downgraded_when_callers_waited():
                      "first_send_unix": base + sched + lag,
                      "prompt_tokens": 100, "completion_tokens": 10})
     s = summarize(rows, acceptance={"ttfg_ms": {"p95": 1500}})
-    assert s["sla"]["ttfg_vs_target"][0]["met"] is True   # service time passes
+    scored = s["sla"]["ttfg_vs_target"][0]
+    assert scored["met"] is False
+    assert scored["scored_metric"] == "e2e_corrected_ms"
+    assert scored["actual_ms"] > 9000
     assert "Meets every acceptance target" not in render_html(s, "x")
-    md = [x for x in render_markdown(s, "x").splitlines()
-          if x.startswith("verdict:")][0]
-    assert "callers waited" in md
+    assert "latency basis: caller experienced" in render_markdown(s, "x")
 
 
 def test_missing_token_usage_is_shown_and_downgrades_the_verdict():
@@ -1330,9 +1431,7 @@ def test_sparse_concurrency_does_not_claim_a_load_it_never_held():
     assert _concurrency_block(steady, None)["in_flight_p50"] == 50.0
 
 
-def test_a_ttft_target_scored_on_service_time_is_caught():
-    """The caller-latency gate compared only end-to-end, so a TTFT target
-    could pass while the caller's first token was far later."""
+def test_ttft_target_is_scored_on_caller_time():
     base = 1_700_000_000.0
     rows = []
     for i in range(300):
@@ -1346,8 +1445,25 @@ def test_a_ttft_target_scored_on_service_time_is_caught():
                      "stream_complete": True, "visible_content_seen": True,
                      "truncated": False, "parse_errors": 0})
     s = summarize(rows, acceptance={"ttft_ms": {"p95": 500}})
+    scored = s["sla"]["ttft_vs_target"][0]
+    assert scored["met"] is False
+    assert scored["scored_metric"] == "ttft_corrected_ms"
+    assert scored["actual_ms"] > 1900
     assert "Meets every acceptance target" not in render_html(s, "x")
-    assert "callers waited" in _v(s)
+
+
+def test_cache_shape_mismatch_cannot_render_green():
+    rows = _clean(400, intended_cache_fraction=0.60, cached_tokens=0,
+                  cached_tokens_source="prompt_tokens_details.cached_tokens")
+    # Stretch the sends enough to establish stable windows, isolating cache.
+    for i, row in enumerate(rows):
+        row["t_send_unix"] = 1_700_000_000.0 + i * 0.5
+        row["first_send_unix"] = row["t_send_unix"]
+    s = summarize(rows, acceptance={"ttfg_ms": {"p95": 5000}})
+    assert s["cache_fidelity"]["status"] == "unverified"
+    assert "did not reproduce" in s["cache_fidelity"]["warning"]
+    assert "Meets every acceptance target" not in render_html(s, "x")
+    assert "CAUTION (cache fidelity)" in render_markdown(s, "x")
 
 
 def test_usage_missing_only_on_the_output_side_is_still_partial():
@@ -1394,8 +1510,27 @@ def test_a_run_whose_stability_was_never_established_is_not_green():
 def test_a_success_rate_target_needs_enough_requests_to_miss_it():
     """Two requests cannot demonstrate a 99 percent success rate."""
     s = summarize(_clean(2), acceptance={"success_rate": 0.99})
-    assert "cannot demonstrate it" in _v(s)
-    assert "at least 99" in _v(s)
+    assert "cannot demonstrate" in _v(s)
+    sr = s["sla"]["success_rate"]
+    assert sr["actual"] == 1.0
+    assert sr["met"] is True
+    assert sr["statistically_demonstrated"] is False
+    assert sr["one_sided_95pct_wilson_lower"] < 0.99
+
+
+def test_success_rate_green_requires_confidence_bound_to_clear_target():
+    thin = summarize(_clean(1_899), acceptance={"success_rate": 0.999})
+    thin_sr = thin["sla"]["success_rate"]
+    assert thin_sr["actual"] == 1.0
+    assert thin_sr["one_sided_95pct_wilson_lower"] < 0.999
+    assert thin_sr["statistically_demonstrated"] is False
+    assert "cannot demonstrate" in _v(thin)
+
+    sufficient = summarize(_clean(3_000),
+                           acceptance={"success_rate": 0.999})
+    sufficient_sr = sufficient["sla"]["success_rate"]
+    assert sufficient_sr["one_sided_95pct_wilson_lower"] >= 0.999
+    assert sufficient_sr["statistically_demonstrated"] is True
 
 
 def test_the_arrival_rate_counts_only_rows_it_measured_the_span_over():

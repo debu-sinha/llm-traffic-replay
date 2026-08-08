@@ -83,11 +83,11 @@ def test_report_matches_independent_recomputation():
     # the observation interval ends at the last COMPLETION, not the last
     # send. token totals include generations that finish during the drain,
     # so ending the window at the last send overstates throughput.
-    # a retried row ends at the SUCCESSFUL attempt's send plus its duration.
-    # first_send_unix is the first attempt, so pairing it with e2e_ms would
-    # end the row before it really finished.
-    t1 = max((r.get("t_send_unix") or sent(r)) + (r.get("e2e_ms") or 0) / 1000.0
-             for r in rep)
+    # finished_unix closes every sent interval, including retries and failed
+    # requests. A service e2e duration belongs only to the final attempt and
+    # cannot reconstruct the whole worker lifetime.
+    assert all(r.get("finished_unix") is not None for r in rep)
+    t1 = max(r["finished_unix"] for r in rep)
     dmin = max(t1 - t0, 1e-9) / 60.0
     intok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
     outtok = sum(r["completion_tokens"] for r in ok

@@ -108,7 +108,11 @@ def test_reasoning_split_end_to_end():
     assert s["ttfr_ms"]["p50"] < s["ttfv_ms"]["p50"], \
         f"ttfr {s['ttfr_ms']['p50']} not < ttfv {s['ttfv_ms']['p50']}"
     scored = {r["quantile"]: r["actual_ms"] for r in s["sla"]["ttft_vs_target"]}
-    assert abs(scored["p50"] - s["ttfv_ms"]["p50"]) < 0.6   # scored the ttfv table
+    # Acceptance is evaluated as the caller experienced it, including time a
+    # scheduled request waited in the load generator.  The raw TTFV table is
+    # retained separately to diagnose endpoint service time.
+    assert s["sla"]["ttft_metric"] == "ttfv_corrected_ms"
+    assert abs(scored["p50"] - s["ttfv_corrected_ms"]["p50"]) < 0.6
     report = (Path(out["out_dir"]) / "report.md").read_text()
     assert "reasoning model detected" in report
 
@@ -160,6 +164,13 @@ def test_a_reasoning_only_stream_is_not_counted_as_a_successful_answer():
             (Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
     replay = [r for r in rows if r.get("phase") == "replay"]
     assert replay, "no replay rows"
+    truth = [json.loads(x) for x in (wd / "truth.jsonl").read_text().splitlines()]
+    truth_by_id = {r["request_id"]: r for r in truth}
+    assert all(r["request_id"] in truth_by_id for r in replay)
+    assert all(truth_by_id[r["request_id"]]["ttfv_true_ms"] is None
+               for r in replay)
+    assert all(truth_by_id[r["request_id"]]["ttfr_true_ms"] is not None
+               for r in replay)
 
     # the transport was fine on every one of them
     assert all(r["ok"] for r in replay)

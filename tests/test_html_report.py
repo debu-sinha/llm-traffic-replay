@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from traffic_replay.metrics import render_html, write_outputs
+from traffic_replay.metrics import render_html
 from traffic_replay.mock_server import serve
 from traffic_replay.runner import RunConfig, run
 
@@ -49,6 +49,8 @@ def _summary(met_p95, label="run", n=250):
                 "ttft_vs_target": [{"quantile": "p95", "target_ms": 150,
                                     "actual_ms": 180, "met": met_p95}],
                 "ttfg_vs_target": [],
+                "hard_timeout_basis": {
+                    "ttft_cap_ms": 1000, "ttfg_cap_ms": 2000},
                 "hard_timeout_breaches": 0,
                 "success_rate": {"target": 0.99, "actual": 1.0, "met": True}},
     }
@@ -61,7 +63,7 @@ def test_html_is_self_contained_and_has_units():
     assert "http://" not in h and "https://" not in h
     assert "<link" not in h and "<script" not in h
     # units are spelled out for every metric family
-    for unit in ("milliseconds", "(ms)", "hit fraction (0-1)",
+    for unit in ("milliseconds", "(ms)", "fraction (0-1)",
                  "requests/second (QPS)", "tok/min", "(count)",
                  "fraction 0-1"):
         assert unit in h, f"missing unit label: {unit}"
@@ -108,7 +110,7 @@ def test_write_outputs_emits_html_end_to_end():
     html_path = Path(out["out_dir"], "report.html")
     assert html_path.exists()
     body = html_path.read_text()
-    assert "e2e html" in body and "Latency (milliseconds)" in body
+    assert "e2e html" in body and "Endpoint service latency (milliseconds" in body
     assert body.startswith("<!doctype html>")
 
 

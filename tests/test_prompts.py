@@ -48,13 +48,22 @@ def test_load_txt_one_per_line_skips_blanks():
     p = _write("p.txt", "first prompt\n\n  second prompt  \n")
     got = load_prompts(p)
     assert got == [[{"role": "user", "content": "first prompt"}],
-                   [{"role": "user", "content": "second prompt"}]]
+                   [{"role": "user", "content": "  second prompt  "}]]
 
 
 def test_load_json_array():
     p = _write("p.json", json.dumps(["a", {"text": "b"}]))
     assert load_prompts(p) == [[{"role": "user", "content": "a"}],
                                [{"role": "user", "content": "b"}]]
+
+
+def test_extensions_are_case_insensitive_and_unknown_ones_fail():
+    assert load_prompts(_write("p.JSON", '["a"]')) == [
+        [{"role": "user", "content": "a"}]]
+    assert load_prompts(_write("p.NDJSON", '"a"\n')) == [
+        [{"role": "user", "content": "a"}]]
+    with pytest.raises(ValueError, match="unsupported prompts extension"):
+        load_prompts(_write("p.yaml", "hello"))
 
 
 def test_loader_rejects_bad_inputs():
@@ -68,6 +77,18 @@ def test_loader_rejects_bad_inputs():
         load_prompts(_write("noshape.jsonl", json.dumps({"foo": "bar"}) + "\n"))
     with pytest.raises(ValueError):
         load_prompts(_write("arr.json", json.dumps({"not": "an array"})))
+    with pytest.raises(ValueError, match="item 1"):
+        load_prompts(_write("bad-item.json", json.dumps(["ok", {"bad": 1}])))
+    with pytest.raises(ValueError, match="line 2"):
+        load_prompts(_write("bad-shape.jsonl", '"ok"\n{"bad":1}\n'))
+    with pytest.raises(ValueError, match="duplicate key 'prompt'"):
+        load_prompts(_write(
+            "duplicate.jsonl", '{"prompt":"safe","prompt":"changed"}\n'))
+    with pytest.raises(ValueError, match="duplicate key 'content'"):
+        load_prompts(_write(
+            "duplicate.json",
+            '[{"messages":[{"role":"user","content":"safe",'
+            '"content":"changed"}]}]'))
     # content must be a string: null and multimodal (list of parts) fail loud
     with pytest.raises(ValueError):
         load_prompts(_write("null.jsonl", json.dumps(
@@ -82,6 +103,24 @@ def test_inline_role_content_message_preserves_role():
     p = _write("p.jsonl", json.dumps(
         {"role": "assistant", "content": "prior turn"}) + "\n")
     assert load_prompts(p) == [[{"role": "assistant", "content": "prior turn"}]]
+
+
+def test_utf8_bom_is_accepted_without_changing_prompt_text():
+    p = _write("p.json", "\ufeff" + json.dumps(["café"]))
+    assert load_prompts(p) == [[{"role": "user", "content": "café"}]]
+
+
+def test_empty_message_role_is_rejected():
+    p = _write("p.jsonl", json.dumps({
+        "messages": [{"role": "  ", "content": "hello"}],
+    }) + "\n")
+    with pytest.raises(ValueError, match="non-empty"):
+        load_prompts(p)
+
+
+def test_directory_is_not_misreported_as_a_prompts_file(tmp_path):
+    with pytest.raises(ValueError, match="not a readable file"):
+        load_prompts(str(tmp_path))
 
 
 # ---- config guards -------------------------------------------------------
@@ -153,6 +192,6 @@ def test_prompts_mode_sends_the_real_text_end_to_end():
     # the targets came from RunConfig, not the profile, and the
     # scorecard has to say so
     assert "targets from the run config" in report
-    assert "the profile" not in report.split("## SLA scorecard")[1][:80]
+    assert "the profile" not in report.split("## Acceptance scorecard")[1][:80]
     assert out["summary"]["run"]["input_mode"] == "prompts"
     assert out["summary"]["run"]["prompts_count"] == 3

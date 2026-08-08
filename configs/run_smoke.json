@@ -12,10 +12,11 @@
   "qps_max": 6.0,
   "rate_scale": 1.0,
   "max_concurrency": 16,
+  "max_pending_requests": 32,
   "cpt": 4.0,
   "calibrate_n": 8,
   "out_dir": "results/smoke",
   "title": "smoke test: client correctness only",
-  "label": "SMOKE TEST on shared capacity: verifies auth, streaming, TTFT capture and usage parsing. LATENCY NUMBERS FROM THIS RUN ARE NOT PERFORMANCE EVIDENCE.",
+  "label": "SMOKE TEST ONLY: verifies auth, streaming, timing capture, outcome parsing, and usage coverage. This validation profile is not a production workload, so its latency is not performance evidence.",
   "max_output_tokens_cap": 32
 }

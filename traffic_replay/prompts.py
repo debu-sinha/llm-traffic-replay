@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .json_input import loads_strict
+
 
 def _coerce(item) -> list[dict]:
     """Turn one loaded item into a chat messages list.
@@ -40,12 +42,14 @@ def _coerce(item) -> list[dict]:
             for m in msgs:
                 if not (isinstance(m, dict)
                         and isinstance(m.get("role"), str)
+                        and bool(m["role"].strip())
                         and isinstance(m.get("content"), str)):
                     raise ValueError(
-                        "each message needs a string 'role' and 'content'")
+                        "each message needs a non-empty string 'role' and "
+                        "string 'content'")
             return msgs
         # a single message given inline, with its role preserved
-        if isinstance(item.get("role"), str) \
+        if isinstance(item.get("role"), str) and item["role"].strip() \
                 and isinstance(item.get("content"), str):
             return [{"role": item["role"], "content": item["content"]}]
         for key in ("prompt", "text"):
@@ -60,31 +64,52 @@ def _coerce(item) -> list[dict]:
 def load_prompts(path: str) -> list[list[dict]]:
     """Read a prompts file into a list of chat messages lists."""
     p = Path(path)
-    if not p.exists():
-        raise ValueError(f"prompts file not found: {path}")
-    raw = p.read_text()
+    if not p.is_file():
+        raise ValueError(f"prompts path is not a readable file: {path}")
+    try:
+        # utf-8-sig accepts ordinary UTF-8 and strips a leading BOM, which is
+        # common in files exported from spreadsheet and Windows tooling.
+        raw = p.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"could not read prompts file {path}: {exc}") from exc
     prompts: list[list[dict]] = []
-    if p.suffix == ".json":
-        data = json.loads(raw)
+    suffix = p.suffix.lower()
+    if suffix == ".json":
+        try:
+            data = loads_strict(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"{path}: not valid JSON ({exc})") from exc
         if not isinstance(data, list):
             raise ValueError(".json prompts file must be a JSON array")
-        for item in data:
-            prompts.append(_coerce(item))
-    elif p.suffix == ".txt":
+        for index, item in enumerate(data):
+            try:
+                prompts.append(_coerce(item))
+            except ValueError as exc:
+                raise ValueError(f"item {index}: {exc}") from exc
+    elif suffix == ".txt":
         for line in raw.splitlines():
-            line = line.strip()
-            if line:
+            # A text prompt is still real customer input. Use strip only to
+            # decide whether the line is blank; do not silently mutate leading
+            # or trailing whitespace in a file advertised as verbatim replay.
+            if line.strip():
                 prompts.append([{"role": "user", "content": line}])
-    else:  # .jsonl and anything else: one json value per line
+    elif suffix in (".jsonl", ".ndjson"):
         for ln, line in enumerate(raw.splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                item = json.loads(line)
-            except json.JSONDecodeError as e:
+                item = loads_strict(line)
+            except (json.JSONDecodeError, ValueError) as e:
                 raise ValueError(f"line {ln}: not valid JSON ({e})") from e
-            prompts.append(_coerce(item))
+            try:
+                prompts.append(_coerce(item))
+            except ValueError as exc:
+                raise ValueError(f"line {ln}: {exc}") from exc
+    else:
+        raise ValueError(
+            f"unsupported prompts extension {p.suffix!r}; use .jsonl, "
+            ".ndjson, .json, or .txt")
     if not prompts:
         raise ValueError(f"no prompts found in {path}")
     return prompts

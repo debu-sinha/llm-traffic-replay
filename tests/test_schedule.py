@@ -1,8 +1,12 @@
 """Schedule must be genuinely spiky, span the configured range, respect
 rate_scale, and shard deterministically."""
-import numpy as np
+import math
 
-from traffic_replay.schedule import make_schedule, schedule_report, shard
+import numpy as np
+import pytest
+
+from traffic_replay.schedule import (MAX_SCHEDULE_REQUESTS, make_schedule,
+                                     schedule_report, shard)
 
 
 def test_shape_spans_range_and_is_spiky():
@@ -30,14 +34,46 @@ def test_rate_scale_thins_volume_preserving_shape():
     assert 0.02 < n_thin / n_full < 0.10  # ~5% with Poisson noise
     # shape preserved: same underlying rate curve up to the scale factor
     assert np.allclose(thin["rates"] * 20, full["rates"], rtol=1e-9)
+    # It is actual thinning, not a fresh Poisson draw: every reduced-rate
+    # arrival is one of the exact full-run arrivals.
+    assert set(thin["timestamps"]).issubset(set(full["timestamps"]))
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"duration_s": 0},
+    {"duration_s": 1.5},
+    {"qps_base": math.nan},
+    {"qps_min": 20, "qps_max": 10},
+    {"qps_base": 5, "qps_min": 10},
+    {"qps_burst": 501, "qps_max": 500},
+    {"mean_base_dwell_s": 0},
+    {"rate_scale": True},
+    {"seed": -1},
+])
+def test_invalid_schedule_parameters_fail_before_allocation(kwargs):
+    with pytest.raises(ValueError):
+        make_schedule(**kwargs)
+
+
+def test_schedule_projection_is_bounded_before_large_arrays_are_allocated():
+    with pytest.raises(ValueError, match="exact scheduler limit"):
+        make_schedule(duration_s=300, qps_base=1_000_000,
+                      qps_burst=1_000_000, qps_min=1_000_000,
+                      qps_max=1_000_000)
+    assert MAX_SCHEDULE_REQUESTS == 1_000_000
 
 
 def test_shard_partitions_exactly():
     s = make_schedule(duration_s=60, seed=11)
-    parts = [shard(s, i, 3)["timestamps"] for i in range(3)]
+    sharded = [shard(s, i, 3) for i in range(3)]
+    parts = [part["timestamps"] for part in sharded]
     together = np.sort(np.concatenate(parts))
     assert np.array_equal(together, s["timestamps"])
     assert abs(len(parts[0]) - len(parts[1])) <= 1
+    indices = np.concatenate([part["global_indices"] for part in sharded])
+    assert np.array_equal(np.sort(indices), np.arange(len(s["timestamps"])))
+    assert all(part["total_requests"] == len(s["timestamps"])
+               for part in sharded)
 
 
 def test_load_trace_replaces_synthetic(tmp_path_factory=None):
@@ -58,3 +94,62 @@ def test_load_trace_replaces_synthetic(tmp_path_factory=None):
         f'{{"t": {t}}}' for t in [10.0, 11.0, 12.0, 40.0]))
     s2 = load_trace(d / "trace.jsonl", duration_cap_s=5.0)
     assert len(s2["timestamps"]) == 3        # the 40s arrival capped out
+
+
+def test_fractional_trace_end_has_no_phantom_trailing_second(tmp_path):
+    from traffic_replay.schedule import load_trace, schedule_report
+
+    path = tmp_path / "fractional.trace"
+    path.write_text("10.0\n11.2\n")
+
+    schedule = load_trace(path)
+
+    assert schedule["timestamps"].tolist() == pytest.approx([0.0, 1.2])
+    assert schedule["counts"].tolist() == [1, 1]
+    report = schedule_report(schedule)
+    assert report["seconds"] == 2
+    assert report["rate_min"] == 1.0
+    assert report["spiky"] is False
+
+
+@pytest.mark.parametrize("content", [
+    "nan\n", "inf\n", '{"missing": 1}\n', '{"t": "bad"}\n', "{bad}\n",
+    '{"t": true}\n', '{"t": "1.25"}\n',
+])
+def test_invalid_trace_rows_have_context_and_never_reach_numpy(content,
+                                                                tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "bad.trace"
+    path.write_text(content)
+    with pytest.raises(ValueError, match=r"bad\.trace:1"):
+        load_trace(path)
+
+
+def test_huge_json_timestamp_has_context_instead_of_overflowing(tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "huge.trace"
+    path.write_text('{"t":' + "9" * 400 + "}\n")
+
+    with pytest.raises(ValueError, match=r"huge\.trace:1"):
+        load_trace(path)
+
+
+def test_trace_json_rejects_duplicate_timestamp_keys(tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "duplicate.jsonl"
+    path.write_text('{"t":1,"t":999}\n')
+    with pytest.raises(ValueError, match="duplicate key 't'"):
+        load_trace(path)
+
+
+@pytest.mark.parametrize("cap", [-1, math.nan, math.inf, True])
+def test_invalid_trace_duration_cap_is_rejected(cap, tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "trace.txt"
+    path.write_text("1\n")
+    with pytest.raises(ValueError, match="duration_cap_s"):
+        load_trace(path, duration_cap_s=cap)

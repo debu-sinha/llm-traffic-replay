@@ -11,11 +11,12 @@
   "qps_min": 10.0,
   "qps_max": 500.0,
   "rate_scale": 0.1,
-  "max_concurrency": 2048,
+  "max_concurrency": 256,
+  "max_pending_requests": 512,
   "cpt": 4.0,
   "calibrate_n": 12,
   "out_dir": "results/pt",
-  "title": "provisioned throughput replay, agent traffic shape",
-  "label": "Built to a profile of stated figures rather than a measured dataset. Replace the profile with one derived from your own logs. Raise rate_scale stepwise (0.1 -> 0.25 -> 0.5 -> 1.0) per the run plan in docs/PRODUCTION_TESTING.md. max_concurrency is sized for the final rate_scale step: 500 QPS at a ~2s p95 needs ~1000 in flight, so 2048 leaves headroom. Undersizing it makes the client the bottleneck and the report will say so. A single process bends near 270 requests/second, so the last rate_scale step needs the schedule sharded across machines, see PRODUCTION_TESTING.",
+  "title": "guarded provisioned-throughput replay template",
+  "label": "Guarded template for a model and region explicitly supported on provisioned throughput. The bundled profile and its acceptance targets are illustrative. Replace both with measured workload and agreed targets. This file starts at rate_scale 0.1 with 256 workers and 512 pending requests. Do not raise load until preflight, delivered-rate, queue, endpoint, quota, and cost evidence are healthy. Size mean occupancy from measured mean service time; tail latency is headroom evidence, not Little's Law. Shard only after one generator is proven insufficient.",
   "max_output_tokens_cap": 512
 }

@@ -96,8 +96,25 @@ def test_load_trace_replaces_synthetic(tmp_path_factory=None):
     assert len(s2["timestamps"]) == 3        # the 40s arrival capped out
 
 
+def test_fractional_trace_end_has_no_phantom_trailing_second(tmp_path):
+    from traffic_replay.schedule import load_trace, schedule_report
+
+    path = tmp_path / "fractional.trace"
+    path.write_text("10.0\n11.2\n")
+
+    schedule = load_trace(path)
+
+    assert schedule["timestamps"].tolist() == pytest.approx([0.0, 1.2])
+    assert schedule["counts"].tolist() == [1, 1]
+    report = schedule_report(schedule)
+    assert report["seconds"] == 2
+    assert report["rate_min"] == 1.0
+    assert report["spiky"] is False
+
+
 @pytest.mark.parametrize("content", [
     "nan\n", "inf\n", '{"missing": 1}\n', '{"t": "bad"}\n', "{bad}\n",
+    '{"t": true}\n', '{"t": "1.25"}\n',
 ])
 def test_invalid_trace_rows_have_context_and_never_reach_numpy(content,
                                                                 tmp_path):
@@ -106,6 +123,16 @@ def test_invalid_trace_rows_have_context_and_never_reach_numpy(content,
     path = tmp_path / "bad.trace"
     path.write_text(content)
     with pytest.raises(ValueError, match=r"bad\.trace:1"):
+        load_trace(path)
+
+
+def test_huge_json_timestamp_has_context_instead_of_overflowing(tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "huge.trace"
+    path.write_text('{"t":' + "9" * 400 + "}\n")
+
+    with pytest.raises(ValueError, match=r"huge\.trace:1"):
         load_trace(path)
 
 

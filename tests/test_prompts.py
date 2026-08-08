@@ -192,6 +192,6 @@ def test_prompts_mode_sends_the_real_text_end_to_end():
     # the targets came from RunConfig, not the profile, and the
     # scorecard has to say so
     assert "targets from the run config" in report
-    assert "the profile" not in report.split("## SLA scorecard")[1][:80]
+    assert "the profile" not in report.split("## Acceptance scorecard")[1][:80]
     assert out["summary"]["run"]["input_mode"] == "prompts"
     assert out["summary"]["run"]["prompts_count"] == 3

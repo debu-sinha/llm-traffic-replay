@@ -1,8 +1,13 @@
 """Security and accounting invariants at the credential/transport boundary."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import subprocess
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +20,61 @@ def _profile_file(tmp_path, text: str) -> str:
     path = tmp_path / "databrickscfg"
     path.write_text(text)
     return str(path)
+
+
+class _OAuthResponse:
+    def __init__(self, status=200, body=None, *, content_type="application/json",
+                 content_length="auto"):
+        if body is None:
+            body = (b'{"access_token":"m2m-token","token_type":"Bearer",'
+                    b'"expires_in":3600,"scope":"all-apis"}')
+        self.status = status
+        self.body = body
+        self.read_calls = []
+        self.headers = {}
+        if content_type is not None:
+            self.headers["content-type"] = content_type
+        if content_length == "auto":
+            self.headers["content-length"] = str(len(body))
+        elif content_length is not None:
+            self.headers["content-length"] = content_length
+
+    def getheader(self, name):
+        return self.headers.get(name.casefold())
+
+    def read(self, limit=-1):
+        self.read_calls.append(limit)
+        return self.body if limit < 0 else self.body[:limit]
+
+
+def _install_m2m_transport(monkeypatch, response=None, *, failure=None):
+    """Install a recording HTTPSConnection without touching the network."""
+    seen = {"instances": []}
+    response = response or _OAuthResponse()
+
+    class Connection:
+        def __init__(self, host, port, timeout, context):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+            self.context = context
+            self.closed = False
+            self.request_args = None
+            seen["instances"].append(self)
+
+        def request(self, method, path, body, headers):
+            self.request_args = (method, path, body, headers)
+            if failure is not None:
+                raise failure
+
+        def getresponse(self):
+            return response
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("http.client.HTTPSConnection", Connection)
+    return seen
 
 
 def test_profile_token_is_bound_to_its_normalized_origin(tmp_path, monkeypatch):
@@ -84,6 +144,390 @@ def test_missing_profile_host_fails_closed_without_invoking_cli(
     assert called is False
 
 
+def test_oauth_profile_accepts_one_strict_cli_token_envelope(
+        tmp_path, monkeypatch):
+    cfg = _profile_file(
+        tmp_path,
+        "[oauth]\nhost = https://workspace.example\n"
+        "auth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=b'{"access_token":"minted"}'),
+    )
+
+    assert _token_from_profile(
+        "oauth", "https://workspace.example") == "minted"
+
+
+@pytest.mark.parametrize("payload", [
+    b'[{"access_token":"minted"}]',
+    b'{"access_token":7}',
+    b'{"access_token":"first","access_token":"second"}',
+    b'{"access_token":"minted","expires_on":NaN}',
+])
+def test_oauth_profile_rejects_ambiguous_cli_token_envelope(
+        tmp_path, monkeypatch, payload):
+    cfg = _profile_file(
+        tmp_path,
+        "[oauth]\nhost = https://workspace.example\n"
+        "auth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=payload),
+    )
+
+    with pytest.raises(AuthProfileError, match="token JSON|access token"):
+        _token_from_profile("oauth", "https://workspace.example")
+
+
+def test_u2m_cli_is_explicit_and_environment_auth_is_scrubbed(
+        tmp_path, monkeypatch):
+    cfg = _profile_file(
+        tmp_path,
+        "[u2m]\nhost = https://workspace.example\n"
+        "auth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setenv("DATABRICKS_TOKEN", "must-not-be-inherited")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://wrong.example")
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return SimpleNamespace(
+            returncode=0, stdout=b'{"access_token":"minted"}')
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert _token_from_profile("u2m", "https://workspace.example") == \
+        "minted"
+    assert captured["command"] == [
+        "databricks", "auth", "token", "-p", "u2m"]
+    assert captured["timeout"] == 30.0
+    assert captured["stderr"] is subprocess.DEVNULL
+    assert captured["check"] is False
+    assert captured["env"]["DATABRICKS_CONFIG_FILE"] == cfg
+    assert "DATABRICKS_TOKEN" not in captured["env"]
+    assert "DATABRICKS_HOST" not in captured["env"]
+
+
+def test_host_only_profile_never_falls_back_to_cli_or_environment(
+        tmp_path, monkeypatch):
+    cfg = _profile_file(
+        tmp_path, "[u2m]\nhost = https://workspace.example\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setenv("DATABRICKS_TOKEN", "environment-secret")
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("host-only profile must not invoke the CLI")
+
+    monkeypatch.setattr("subprocess.run", forbidden)
+    with pytest.raises(AuthProfileError, match="auth_type=databricks-cli") \
+            as err:
+        _token_from_profile("u2m", "https://workspace.example")
+    assert called is False
+    assert "environment-secret" not in str(err.value)
+
+
+@pytest.mark.parametrize("auth_type", [None, "pat"])
+def test_pat_profile_is_direct_with_or_without_explicit_type(
+        tmp_path, monkeypatch, auth_type):
+    type_line = "" if auth_type is None else f"auth_type = {auth_type}\n"
+    cfg = _profile_file(
+        tmp_path,
+        "[pat]\nhost = https://workspace.example\n"
+        f"{type_line}token = dapi-not-real\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: pytest.fail("PAT must not invoke CLI"))
+    monkeypatch.setattr(
+        "http.client.HTTPSConnection",
+        lambda *args, **kwargs: pytest.fail("PAT must not mint OAuth"))
+    assert _token_from_profile("pat", "https://workspace.example") == \
+        "dapi-not-real"
+
+
+def test_default_is_a_real_profile_and_never_inherits_into_other_profiles(
+        tmp_path, monkeypatch):
+    default_secret = "dapi-default-secret"
+    cfg = _profile_file(
+        tmp_path,
+        "[DEFAULT]\nhost = https://default.example\n"
+        f"token = {default_secret}\n"
+        "[work]\nhost = https://work.example\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+
+    assert _token_from_profile("DEFAULT", "https://default.example") == \
+        default_secret
+    with pytest.raises(AuthProfileError, match="no supported credentials") \
+            as err:
+        _token_from_profile("work", "https://work.example")
+    assert default_secret not in str(err.value)
+
+
+@pytest.mark.parametrize("profile,match", [
+    ("auth_type = pat\n", "requires a token"),
+    ("token = pat\nclient_id = id\nclient_secret = secret\n", "mixes"),
+    ("client_id = id\n", "add client_secret"),
+    ("client_secret = secret\n", "add client_id"),
+    ("auth_type = databricks-cli\ntoken = pat\n", "must not contain"),
+    ("auth_type = oauth-m2m\ntoken = pat\n", "requires client_id"),
+    ("auth_type = browser\n", "unsupported auth_type"),
+    ("auth_type = pat\naccount_id = account\ntoken = pat\n",
+     "unsupported workspace"),
+])
+def test_ambiguous_incomplete_and_unsupported_profiles_fail_closed(
+        tmp_path, monkeypatch, profile, match):
+    cfg = _profile_file(
+        tmp_path,
+        "[bad]\nhost = https://workspace.example\n" + profile,
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: pytest.fail("invalid profile invoked CLI"))
+    monkeypatch.setattr(
+        "http.client.HTTPSConnection",
+        lambda *args, **kwargs: pytest.fail("invalid profile used network"))
+    with pytest.raises(AuthProfileError, match=match):
+        _token_from_profile("bad", "https://workspace.example")
+
+
+@pytest.mark.parametrize("auth_type", [None, "oauth-m2m"])
+def test_workspace_m2m_uses_bound_https_basic_client_credentials(
+        tmp_path, monkeypatch, auth_type):
+    type_line = "" if auth_type is None else f"auth_type = {auth_type}\n"
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://WORKSPACE.example.:443/\n"
+        f"{type_line}client_id = client-id\n"
+        "client_secret = client:secret\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    seen = _install_m2m_transport(monkeypatch)
+
+    assert _token_from_profile(
+        "m2m", "https://workspace.example") == "m2m-token"
+    assert len(seen["instances"]) == 1
+    conn = seen["instances"][0]
+    assert (conn.host, conn.port, conn.timeout) == (
+        "workspace.example", 443, 15.0)
+    method, path, body, headers = conn.request_args
+    assert method == "POST"
+    assert path == "/oidc/v1/token"
+    assert body == b"grant_type=client_credentials&scope=all-apis"
+    assert headers["Accept"] == "application/json"
+    assert headers["Content-Type"] == "application/x-www-form-urlencoded"
+    assert headers["Connection"] == "close"
+    assert base64.b64decode(
+        headers["Authorization"].removeprefix("Basic ")) == \
+        b"client-id:client:secret"
+    assert conn.closed is True
+
+
+def test_m2m_origin_mismatch_precedes_credential_use_and_network(
+        tmp_path, monkeypatch):
+    client_secret = "client-secret-must-not-leak"
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://trusted.example\nclient_id = id\n"
+        f"client_secret = {client_secret}\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    monkeypatch.setattr(
+        "http.client.HTTPSConnection",
+        lambda *args, **kwargs: pytest.fail("mismatched origin used network"))
+    with pytest.raises(AuthProfileError, match="is bound to") as err:
+        _token_from_profile("m2m", "https://attacker.example")
+    assert client_secret not in str(err.value)
+
+
+def test_m2m_requires_https_even_for_a_loopback_test_origin(
+        tmp_path, monkeypatch):
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = http://127.0.0.1:8080\nclient_id = id\n"
+        "client_secret = secret\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    with pytest.raises(AuthProfileError, match="requires an HTTPS workspace"):
+        _token_from_profile("m2m", "http://127.0.0.1:8080")
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 429, 500])
+def test_m2m_http_failures_are_fingerprinted_without_body_or_credentials(
+        tmp_path, monkeypatch, status):
+    client_secret = "profile-secret-never-print"
+    response_secret = "server-secret-never-print"
+    body = response_secret.encode()
+    response = _OAuthResponse(status=status, body=body,
+                              content_type="text/plain")
+    seen = _install_m2m_transport(monkeypatch, response)
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://workspace.example\nclient_id = client\n"
+        f"client_secret = {client_secret}\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+
+    with pytest.raises(AuthProfileError, match=f"HTTP {status}") as err:
+        _token_from_profile("m2m", "https://workspace.example")
+    message = str(err.value)
+    assert f"bytes={len(body)}" in message
+    assert hashlib.sha256(body).hexdigest() in message
+    assert client_secret not in message
+    assert response_secret not in message
+    assert seen["instances"][0].closed is True
+
+
+@pytest.mark.parametrize("body,content_type,match", [
+    (b"not-json", "application/json", "invalid JSON"),
+    (b'[{"access_token":"secret"}]', "application/json", "non-object"),
+    (b'{"access_token":"first","access_token":"secret",'
+     b'"token_type":"Bearer"}', "application/json", "invalid JSON"),
+    (b'{"access_token":"secret","token_type":"Bearer",'
+     b'"expires_in":NaN}', "application/json", "invalid JSON"),
+    (b'{"access_token":"secret","token_type":"mac"}',
+     "application/json", "Bearer token_type"),
+    (b'{"access_token":"secret","token_type":"Bearer",'
+     b'"scope":"wrong"}', "application/json", "unexpected scope"),
+    (b'{"access_token":"secret","token_type":"Bearer",'
+     b'"expires_in":false}', "application/json", "invalid expires_in"),
+    (b'{"access_token":"secret","token_type":"Bearer"}',
+     "text/html", "non-JSON Content-Type"),
+    (b'{"access_token":"secret","token_type":"Bearer"}',
+     None, "non-JSON Content-Type"),
+])
+def test_m2m_rejects_malformed_or_semantically_invalid_responses_without_leak(
+        tmp_path, monkeypatch, body, content_type, match):
+    response = _OAuthResponse(body=body, content_type=content_type)
+    _install_m2m_transport(monkeypatch, response)
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://workspace.example\nclient_id = client\n"
+        "client_secret = profile-secret\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+
+    with pytest.raises(AuthProfileError, match=match) as err:
+        _token_from_profile("m2m", "https://workspace.example")
+    message = str(err.value)
+    assert "profile-secret" not in message
+    assert "secret" not in message
+    assert err.value.__cause__ is None
+
+
+@pytest.mark.parametrize("content_length", ["65537", "-1", "NaN", "1, 2"])
+def test_m2m_rejects_oversized_or_malformed_content_length_before_read(
+        tmp_path, monkeypatch, content_length):
+    response = _OAuthResponse(content_length=content_length)
+    _install_m2m_transport(monkeypatch, response)
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://workspace.example\nclient_id = client\n"
+        "client_secret = secret\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+
+    with pytest.raises(AuthProfileError, match="safety limit|malformed"):
+        _token_from_profile("m2m", "https://workspace.example")
+    assert response.read_calls == []
+
+
+def test_m2m_rejects_chunked_response_beyond_the_bound(tmp_path, monkeypatch):
+    response = _OAuthResponse(
+        body=b"x" * (64 * 1024 + 1), content_length=None)
+    _install_m2m_transport(monkeypatch, response)
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://workspace.example\nclient_id = client\n"
+        "client_secret = secret\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+
+    with pytest.raises(AuthProfileError, match="safety limit"):
+        _token_from_profile("m2m", "https://workspace.example")
+    assert response.read_calls == [64 * 1024 + 1]
+
+
+@pytest.mark.parametrize("failure,match", [
+    (TimeoutError("network-secret"), "timed out"),
+    (OSError("network-secret"), "request failed"),
+])
+def test_m2m_transport_failures_are_actionable_and_never_echo_exception_text(
+        tmp_path, monkeypatch, failure, match):
+    seen = _install_m2m_transport(monkeypatch, failure=failure)
+    cfg = _profile_file(
+        tmp_path,
+        "[m2m]\nhost = https://workspace.example\nclient_id = client\n"
+        "client_secret = profile-secret\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+
+    with pytest.raises(AuthProfileError, match=match) as err:
+        _token_from_profile("m2m", "https://workspace.example")
+    assert "network-secret" not in str(err.value)
+    assert "profile-secret" not in str(err.value)
+    assert err.value.__cause__ is None
+    assert seen["instances"][0].closed is True
+
+
+def test_u2m_cli_failures_never_echo_stdout_stderr_or_exception_payload(
+        tmp_path, monkeypatch):
+    cfg = _profile_file(
+        tmp_path,
+        "[u2m]\nhost = https://workspace.example\n"
+        "auth_type = databricks-cli\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    secret = "cli-secret-never-print"
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=17, stdout=secret.encode(), stderr=secret.encode()),
+    )
+
+    with pytest.raises(AuthProfileError, match="status 17") as err:
+        _token_from_profile("u2m", "https://workspace.example")
+    assert secret not in str(err.value)
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            args[0], 30, output=secret.encode(), stderr=secret.encode())
+
+    monkeypatch.setattr("subprocess.run", timeout)
+    with pytest.raises(AuthProfileError, match="timed out") as err:
+        _token_from_profile("u2m", "https://workspace.example")
+    assert secret not in str(err.value)
+    assert err.value.__cause__ is None
+
+
+def test_malformed_config_error_does_not_echo_the_offending_line(
+        tmp_path, monkeypatch):
+    secret = "config-secret-never-print"
+    cfg = _profile_file(
+        tmp_path,
+        "[bad]\nhost = https://workspace.example\n" + secret + "\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    with pytest.raises(AuthProfileError, match="syntax and permissions") as err:
+        _token_from_profile("bad", "https://workspace.example")
+    assert secret not in str(err.value)
+    assert err.value.__cause__ is None
+
+
 @pytest.mark.parametrize("url", [
     "http://example.com",
     "http://localhost.example.com",
@@ -112,6 +556,129 @@ def test_total_timeout_must_be_positive_and_finite(value):
             base_url="http://127.0.0.1:1", path="/p",
             total_timeout_s=value,
         )
+
+
+@pytest.mark.parametrize("value", [-1, True, 3, 10 ** 400])
+def test_physical_inference_retries_are_strictly_bounded(value):
+    with pytest.raises(ValueError, match="integer from 0 to 2"):
+        EndpointConfig(
+            base_url="https://workspace.example", path="/p",
+            max_retries=value,
+        )
+
+
+def test_huge_retry_count_is_rejected_when_run_config_is_validated():
+    from traffic_replay.runner import RunConfig
+
+    with pytest.raises(ValueError, match="integer from 0 to 2"):
+        RunConfig(
+            endpoint={
+                "base_url": "https://workspace.example",
+                "path": "/serving-endpoints/model/invocations",
+                "max_retries": 10 ** 400,
+            },
+            profile_path="not-read-during-config-validation.json",
+        )
+
+
+def _mixed_profile_with_secrets(tmp_path, monkeypatch):
+    secret = "dapi-cli-secret-never-print"
+    cfg = _profile_file(
+        tmp_path,
+        "[bad]\nhost = https://workspace.example\n"
+        f"token = {secret}\nclient_id = client-id\n"
+        "client_secret = oauth-secret-never-print\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
+    return secret
+
+
+def test_benchmark_json_auth_failure_is_one_document_without_traceback(
+        tmp_path, monkeypatch, capsys):
+    from traffic_replay.cli import main
+
+    secret = _mixed_profile_with_secrets(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "traffic_replay.runner.make_schedule",
+        lambda **_kwargs: {
+            "rates": [1.0], "counts": [1], "timestamps": [0.0]})
+    rc = main([
+        "benchmark", "--host", "https://workspace.example",
+        "--endpoint", "model", "--auth-profile", "bad",
+        "--fixed-rate", "1", "--duration", "1",
+        "--out-dir", str(tmp_path / "benchmark"), "--format", "json",
+    ])
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert rc == 2
+    assert doc == {
+        "passed": False,
+        "stage": "authentication",
+        "exit_code": 2,
+        "error": (
+            "Databricks auth profile 'bad' mixes a PAT token with OAuth "
+            "client credentials; use one authentication method per profile"),
+    }
+    assert secret not in captured.out + captured.err
+    assert "oauth-secret-never-print" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_run_json_auth_failure_is_one_document_without_traceback(
+        tmp_path, monkeypatch, capsys):
+    from traffic_replay.cli import main
+
+    secret = _mixed_profile_with_secrets(tmp_path, monkeypatch)
+    repo = Path(__file__).resolve().parents[1]
+    config = {
+        "endpoint": {
+            "base_url": "https://workspace.example",
+            "path": "/serving-endpoints/model/invocations",
+            "auth_profile": "bad",
+        },
+        "profile_path": str(repo / "configs/profile_validation_small.json"),
+        "duration_s": 1,
+        "sizing_concurrency": 1,
+        "calibrate_n": 0,
+        "capture_endpoint_metadata": False,
+        "measure_network_path": False,
+        "out_dir": str(tmp_path / "run"),
+    }
+    config_path = tmp_path / "run.json"
+    config_path.write_text(json.dumps(config))
+    rc = main(["run", "--config", str(config_path), "--format", "json"])
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)
+    assert rc == 2
+    assert doc["stage"] == "authentication"
+    assert doc["exit_code"] == 2
+    assert secret not in captured.out + captured.err
+    assert "oauth-secret-never-print" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+
+def test_sweep_auth_failure_is_concise_stderr_without_traceback(
+        tmp_path, monkeypatch, capsys):
+    from traffic_replay.cli import main
+
+    secret = _mixed_profile_with_secrets(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "traffic_replay.runner.make_schedule",
+        lambda **_kwargs: {
+            "rates": [1.0], "counts": [1], "timestamps": [0.0]})
+    rc = main([
+        "sweep", "--host", "https://workspace.example",
+        "--endpoint", "model", "--auth-profile", "bad",
+        "--rate", "1,2", "--duration", "1", "--cooldown", "0",
+        "--out-dir", str(tmp_path / "sweep"),
+    ])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err.startswith("authentication failed: ")
+    combined = captured.out + captured.err
+    assert secret not in combined
+    assert "oauth-secret-never-print" not in combined
+    assert "Traceback" not in combined
 
 
 class _Sock:
@@ -379,6 +946,7 @@ def test_failure_before_http_send_is_not_claimed_as_a_wire_send():
 
     assert result.first_attempt_unix is not None
     assert result.first_send_unix is None
+    assert result.t_send_unix is None
     assert result.connection_attempts == 2
     assert result.request_attempts == 0
     assert result.retries == 1

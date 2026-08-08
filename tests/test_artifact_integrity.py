@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from traffic_replay import artifacts as artifact_module
 from traffic_replay.artifacts import (
     COMPLETE_MARKER,
     PARTIAL_REQUESTS,
@@ -19,6 +20,7 @@ from traffic_replay.artifacts import (
     ArtifactError,
     RunArtifacts,
     redact_secrets,
+    sanitize_display_text,
     sanitize_title,
     strict_json_dumps,
 )
@@ -303,8 +305,88 @@ def test_artifact_claim_refuses_symlink_leaf(tmp_path):
     assert not list(target.iterdir())
 
 
+def test_new_artifact_directory_entry_is_fsynced_before_child_files(
+        tmp_path, monkeypatch):
+    target = tmp_path / "durable-claim"
+    original = artifact_module._fsync_directory_path
+    observed = []
+
+    def inspect_parent(path):
+        observed.append(Path(path))
+        if len(observed) == 1:
+            assert target.is_dir()
+            assert list(target.iterdir()) == []
+        return original(path)
+
+    monkeypatch.setattr(
+        artifact_module, "_fsync_directory_path", inspect_parent)
+    artifacts = RunArtifacts.claim(target, {"case": "parent-fsync"})
+    try:
+        assert observed[0] == tmp_path
+        assert (target / WRITING_MARKER).is_file()
+        assert (target / "start.json").is_file()
+    finally:
+        artifacts.abort()
+
+
+def test_artifact_claim_supports_symlinked_parent_but_refuses_leaf_alias(
+        tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "parent-alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    target = alias_parent / "run"
+
+    artifacts = RunArtifacts.claim(target, {"case": "parent-alias"})
+    try:
+        assert artifacts.path == target
+        assert target.resolve().parent == real_parent.resolve()
+        assert (target / WRITING_MARKER).is_file()
+    finally:
+        artifacts.abort()
+
+
+def test_parent_fsync_failure_removes_new_claim_directory(
+        tmp_path, monkeypatch):
+    target = tmp_path / "parent-fsync-failure"
+    calls = []
+
+    def fail_parent_fsync(path):
+        calls.append(Path(path))
+        raise ArtifactError("forced parent fsync failure")
+
+    monkeypatch.setattr(
+        artifact_module, "_fsync_directory_path", fail_parent_fsync)
+    with pytest.raises(ArtifactError, match="forced parent fsync failure"):
+        RunArtifacts.claim(target, {"case": "parent-fsync-failure"})
+
+    assert calls
+    assert not target.exists()
+
+
+def test_claim_initialization_failure_cleans_only_a_new_directory(
+        tmp_path, monkeypatch):
+    new_target = tmp_path / "new-initialization-failure"
+
+    def fail_start(_self, name, _value):
+        if name == "start.json":
+            raise OSError("forced start persistence failure")
+
+    monkeypatch.setattr(RunArtifacts, "_atomic_json", fail_start)
+    with pytest.raises(OSError, match="forced start persistence failure"):
+        RunArtifacts.claim(new_target, {"case": "new-failure"})
+    assert not new_target.exists()
+
+    existing_target = tmp_path / "caller-owned-empty-directory"
+    existing_target.mkdir()
+    with pytest.raises(OSError, match="forced start persistence failure"):
+        RunArtifacts.claim(existing_target, {"case": "existing-failure"})
+    assert existing_target.is_dir()
+    assert list(existing_target.iterdir()) == []
+
+
 def test_redaction_covers_credentials_without_hiding_token_controls():
-    pat = "dapi0123456789supersecret"
+    pat = "dapi" + "0123456789" + "supersecret"
     def encode(raw):
         return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
@@ -348,9 +430,75 @@ def test_redaction_covers_credentials_without_hiding_token_controls():
     assert "\n" not in title and pat not in title
 
 
+def test_display_text_removes_direction_spoofing_and_controls():
+    hostile = "trusted\u202eLIAF\u2066\nnext\x00value"
+
+    assert sanitize_display_text(hostile) == "trustedLIAF next value"
+    assert sanitize_title(hostile) == "trustedLIAF next value"
+
+
 def test_strict_json_rejects_nonfinite_numbers():
     with pytest.raises(ValueError):
         strict_json_dumps({"latency_ms": float("nan")})
+
+
+def test_durable_request_journal_rejects_duplicate_keys(tmp_path):
+    artifacts = RunArtifacts.claim(
+        tmp_path / "duplicate-journal", {"status": "starting"})
+    try:
+        (artifacts.path / PARTIAL_REQUESTS).write_text(
+            '{"request_id":"first","request_id":"second"}\n')
+        with pytest.raises(
+                ArtifactError,
+                match=(r"invalid durable JSON row 1 .*requests\.jsonl\.partial: "
+                       r"JSON contains duplicate key 'request_id'")):
+            list(artifacts.read_rows())
+    finally:
+        artifacts.abort()
+
+
+@pytest.mark.parametrize("row,diagnostic", [
+    ('{"latency_ms":NaN}\n', "non-finite number"),
+    ('{"latency_ms":1e999}\n', "non-finite number"),
+    ('{"value":' + "[" * 10_000 + "0" + "]" * 10_000 + '}\n',
+     "safe nesting depth"),
+])
+def test_durable_request_journal_reports_safe_strict_json_reason(
+        tmp_path, row, diagnostic):
+    artifacts = RunArtifacts.claim(
+        tmp_path / f"strict-journal-{hashlib.sha256(row.encode()).hexdigest()[:8]}",
+        {"status": "starting"})
+    try:
+        (artifacts.path / PARTIAL_REQUESTS).write_text(row)
+        with pytest.raises(ArtifactError) as caught:
+            list(artifacts.read_rows())
+        message = str(caught.value)
+        assert "row 1" in message
+        assert str(artifacts.path / PARTIAL_REQUESTS) in message
+        assert diagnostic in message
+    finally:
+        artifacts.abort()
+
+
+def test_durable_duplicate_key_diagnostic_does_not_echo_private_key(
+        tmp_path):
+    artifacts = RunArtifacts.claim(
+        tmp_path / "private-key-journal", {"status": "starting"})
+    # Keep the source payload free of a contiguous credential-shaped literal;
+    # the notebook packer must reject those even when they appear in tests.
+    private_key = "Bearer " + "dapi0123456789" + "-private-customer-material"
+    encoded_key = json.dumps(private_key)
+    try:
+        (artifacts.path / PARTIAL_REQUESTS).write_text(
+            f'{{{encoded_key}:1,{encoded_key}:2}}\n')
+        with pytest.raises(ArtifactError) as caught:
+            list(artifacts.read_rows())
+        message = str(caught.value)
+        assert private_key not in message
+        assert "duplicate key <redacted; bytes=" in message
+        assert "sha256=" in message
+    finally:
+        artifacts.abort()
 
 
 def test_manifest_binds_every_final_artifact_and_detects_tamper(tmp_path):
@@ -424,7 +572,10 @@ def test_invalid_profile_policy_fails_before_auth_or_endpoint(
         run(cfg, quiet=True)
     assert called == {"token": 0, "client": 0}
     incomplete = list((tmp_path / "results").glob("*/failure.json"))
-    assert len(incomplete) == 1
+    # Endpoint-free input validation now precedes artifact creation. An
+    # invalid profile must leave no run-shaped directory that could be
+    # mistaken for a started benchmark.
+    assert incomplete == []
 
 
 def test_valid_tool_call_only_stream_is_an_acceptable_timed_outcome():

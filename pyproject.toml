@@ -1,10 +1,18 @@
 [project]
 name = "llm-traffic-replay"
-version = "0.5.1"
-description = "Replay your production traffic shape against an LLM serving endpoint: heavy-tailed prompt sizes, constructed prompt-cache hit ratios, bursty arrivals, honest measurement."
+version = "0.6.0"
+description = "Replay production-derived or explicitly synthetic LLM traffic shapes with cache-eligible prefix reuse and evidence-qualified measurement."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
+authors = [
+  {name = "Debu Sinha", email = "debusinha2009@gmail.com"},
+]
+
+[project.urls]
+Homepage = "https://github.com/debu-sinha/llm-traffic-replay"
+Repository = "https://github.com/debu-sinha/llm-traffic-replay.git"
+Issues = "https://github.com/debu-sinha/llm-traffic-replay/issues"
 
 [project.scripts]
 traffic-replay = "traffic_replay.cli:main"

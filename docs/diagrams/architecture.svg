@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
   <title id="title">LLM traffic replay architecture and evidence lifecycle</title>
-  <desc id="desc">Validation and immutable input capture feed bounded open-loop dispatch. Streaming clients may issue duplicate physical posts through explicit retry and fallback paths. Service and caller clocks feed a durable journal, reports, manifest version 3, and a completion marker promoted last.</desc>
+  <desc id="desc">Private input capture and exact local prevalidation precede credential and network access. When quota limits are configured, conservative full-request-body planning and positive READY endpoint binding precede paid inference. The default CLI preflight sends two real requests before replay. Streaming clients may issue duplicate physical posts through explicit retry and fallback paths. Request-path and caller clocks feed a durable journal, reports, manifest version 3, and a completion marker promoted last.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
@@ -16,26 +16,27 @@
   <text class="h" x="36" y="42">llm-traffic-replay: bounded traffic, explicit clocks, sealed evidence</text>
 
   <rect class="lane" x="28" y="65" width="1384" height="150" rx="16"/>
-  <text class="lh" x="48" y="91">1. Validate, preflight, and freeze before measured replay</text>
+  <text class="lh" x="48" y="91">1. Freeze and validate exact inputs before credential, network, or inference access</text>
   <rect class="safe" x="55" y="112" width="205" height="72" rx="10"/>
-  <text class="t" x="157" y="134" text-anchor="middle">pytest + localhost oracle</text>
-  <text class="s" x="157" y="155" text-anchor="middle">instrument evidence only</text>
-  <text class="s" x="157" y="174" text-anchor="middle">not endpoint performance</text>
+  <text class="t" x="157" y="134" text-anchor="middle">External workload inputs</text>
+  <text class="s" x="157" y="155" text-anchor="middle">profile/prompts + optional trace</text>
+  <text class="s" x="157" y="174" text-anchor="middle">durable paths read once</text>
   <rect class="box" x="315" y="112" width="190" height="72" rx="10"/>
-  <text class="t" x="410" y="137" text-anchor="middle">Strict validation</text>
-  <text class="s" x="410" y="159" text-anchor="middle">config, profile, policy, origin</text>
+  <text class="t" x="410" y="133" text-anchor="middle">Freeze + prevalidate</text>
+  <text class="s" x="410" y="154" text-anchor="middle">private bytes; SHA-256 + size</text>
+  <text class="tiny" x="410" y="174" text-anchor="middle">exact schedule; every sweep rung</text>
   <rect class="warn" x="560" y="104" width="260" height="88" rx="10"/>
-  <text class="t" x="690" y="132" text-anchor="middle">Benchmark preflight</text>
-  <text class="s" x="690" y="154" text-anchor="middle">2 real representative inference POSTs</text>
-  <text class="s" x="690" y="174" text-anchor="middle">explicit user-supplied probes add POSTs</text>
+  <text class="t" x="690" y="132" text-anchor="middle">Optional quota + READY P2T gate</text>
+  <text class="s" x="690" y="154" text-anchor="middle">full JSON bytes + framing</text>
+  <text class="s" x="690" y="174" text-anchor="middle">CPT max(configured,12); tier absent/default</text>
   <rect class="evidence" x="875" y="104" width="235" height="88" rx="10"/>
-  <text class="t" x="992" y="132" text-anchor="middle">Immutable snapshots</text>
-  <text class="s" x="992" y="154" text-anchor="middle">private workload bytes + SHA-256</text>
-  <text class="s" x="992" y="174" text-anchor="middle">source and execution identities</text>
+  <text class="t" x="992" y="132" text-anchor="middle">Billable preflight (default)</text>
+  <text class="s" x="992" y="154" text-anchor="middle">2 representatives + optional probes</text>
+  <text class="s" x="992" y="174" text-anchor="middle">artifact rows omit prompt text</text>
   <rect class="evidence" x="1165" y="104" width="210" height="88" rx="10"/>
   <text class="t" x="1270" y="132" text-anchor="middle">Start journal claimed</text>
   <text class="s" x="1270" y="154" text-anchor="middle">writing marker + start.json</text>
-  <text class="s" x="1270" y="174" text-anchor="middle">partial rows before target evidence</text>
+  <text class="s" x="1270" y="174" text-anchor="middle">setup metadata appended first</text>
   <path class="arrow" d="M260 148 H315"/><path class="arrow" d="M505 148 H560"/><path class="arrow" d="M820 148 H875"/><path class="arrow" d="M1110 148 H1165"/>
 
   <rect class="lane" x="28" y="235" width="1384" height="245" rx="16"/>
@@ -44,8 +45,8 @@
   <text class="t" x="160" y="318" text-anchor="middle">Workload plan</text>
   <text class="s" x="160" y="342" text-anchor="middle">profile v1 or v2, or prompts</text>
   <text class="s" x="160" y="363" text-anchor="middle">synthetic schedule or trace</text>
-  <text class="s" x="160" y="384" text-anchor="middle">global indices, then shard subset</text>
-  <text class="s" x="160" y="405" text-anchor="middle">optional sizing + calibration are extra</text>
+  <text class="s" x="160" y="384" text-anchor="middle">global indices → shard subset</text>
+  <text class="tiny" x="160" y="405" text-anchor="middle">sizing/calibration are extra traffic</text>
   <rect class="box" x="325" y="292" width="220" height="126" rx="10"/>
   <text class="t" x="435" y="318" text-anchor="middle">Monotonic dispatcher</text>
   <text class="s" x="435" y="342" text-anchor="middle">waits for each scheduled target</text>
@@ -54,7 +55,7 @@
   <text class="s" x="435" y="405" text-anchor="middle">bounded max_pending_requests</text>
   <rect class="warn" x="605" y="292" width="240" height="126" rx="10"/>
   <text class="t" x="725" y="318" text-anchor="middle">Streaming client attempts</text>
-  <text class="s" x="725" y="342" text-anchor="middle">one fresh connection per attempt</text>
+  <text class="s" x="725" y="342" text-anchor="middle">cancel shuts active sockets; blocks retries</text>
   <text class="s" x="725" y="363" text-anchor="middle">transport retries default 0</text>
   <text class="s" x="725" y="384" text-anchor="middle">usage fallback or auth refresh</text>
   <text class="s" x="725" y="405" text-anchor="middle">may issue a duplicate physical POST</text>
@@ -67,8 +68,8 @@
   <rect class="safe" x="1165" y="292" width="210" height="126" rx="10"/>
   <text class="t" x="1270" y="318" text-anchor="middle">Stream parser</text>
   <text class="s" x="1270" y="342" text-anchor="middle">content, reasoning, tool fragments</text>
-  <text class="s" x="1270" y="363" text-anchor="middle">clean completion + parse status</text>
-  <text class="s" x="1270" y="384" text-anchor="middle">usage field source paths</text>
+  <text class="s" x="1270" y="363" text-anchor="middle">corrupt/incomplete = failures</text>
+  <text class="s" x="1270" y="384" text-anchor="middle">not in latency/usage/cost populations</text>
   <text class="s" x="1270" y="405" text-anchor="middle">response content not persisted</text>
   <path class="arrow" d="M265 355 H325"/><path class="arrow" d="M545 355 H605"/><path class="arrow" d="M845 355 H905"/><path class="arrow" d="M1105 355 H1165"/>
   <path class="dash" d="M1005 418 C1005 458 725 458 725 420"/>
@@ -77,8 +78,8 @@
   <rect class="lane" x="28" y="500" width="1384" height="135" rx="16"/>
   <text class="lh" x="48" y="528">3. Keep both timing families and journal every observed outcome</text>
   <rect class="box" x="80" y="550" width="315" height="58" rx="10"/>
-  <text class="t" x="237" y="574" text-anchor="middle">Final-attempt service clocks</text>
-  <text class="s" x="237" y="594" text-anchor="middle">TTFB, TTFT, TTFV, tool, E2E after connect</text>
+  <text class="t" x="237" y="574" text-anchor="middle">Final-attempt request-path clocks</text>
+  <text class="s" x="237" y="594" text-anchor="middle">upload/network included; probe never subtracted</text>
   <rect class="safe" x="465" y="550" width="360" height="58" rx="10"/>
   <text class="t" x="645" y="574" text-anchor="middle">Exact caller clocks from scheduled target</text>
   <text class="s" x="645" y="594" text-anchor="middle">queue + connect + fallback + refresh + retries + response</text>
@@ -95,7 +96,7 @@
   <text class="s" x="195" y="748" text-anchor="middle">newline row count checked</text>
   <rect class="evidence" x="370" y="704" width="255" height="55" rx="10"/>
   <text class="t" x="497" y="728" text-anchor="middle">summary + reports</text>
-  <text class="s" x="497" y="748" text-anchor="middle">sample floors + Wilson bound + cost</text>
+  <text class="s" x="497" y="748" text-anchor="middle">sample floors; cost withheld if ambiguous</text>
   <rect class="evidence" x="675" y="704" width="275" height="55" rx="10"/>
   <text class="t" x="812" y="728" text-anchor="middle">manifest schema v3 last</text>
   <text class="s" x="812" y="748" text-anchor="middle">identity + SHA-256 + bytes + row count</text>

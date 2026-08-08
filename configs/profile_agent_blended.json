@@ -38,7 +38,7 @@
     "hard_timeouts": {
       "ttft_s": 15,
       "ttfg_s": 45,
-      "note": "requests over budget count as failures against SLA"
+      "note": "requests over budget count as failures against these illustrative acceptance targets"
     },
     "success_rate": 0.999,
     "priority": "TTFT and throughput, sensitive to interchunk stalls and timeouts",

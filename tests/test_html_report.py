@@ -49,6 +49,8 @@ def _summary(met_p95, label="run", n=250):
                 "ttft_vs_target": [{"quantile": "p95", "target_ms": 150,
                                     "actual_ms": 180, "met": met_p95}],
                 "ttfg_vs_target": [],
+                "hard_timeout_basis": {
+                    "ttft_cap_ms": 1000, "ttfg_cap_ms": 2000},
                 "hard_timeout_breaches": 0,
                 "success_rate": {"target": 0.99, "actual": 1.0, "met": True}},
     }

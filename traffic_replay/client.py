@@ -7,14 +7,15 @@ fine, and the runner MEASURES client-side lateness rather than assuming
 the client kept up (see runner.py / metrics.py).
 
 Timing definitions, used consistently everywhere:
-  t_send           just before the request is written to the socket
-  ttfb_ms          first response line received (any SSE event)
-  ttft_ms          first content delta received  <- the headline number
+  t_send           immediately before ``conn.request``; includes upload
+  ttfb_ms          first iterated response-body/SSE line (not first byte)
+  ttft_ms          first visible or reasoning content delta; excludes tools
   e2e_ms           stream finished ([DONE] or final chunk)
 
 Usage (prompt/completion/cached token counts) is read from the endpoint's
-final usage block when present. stream_options.include_usage is requested
-and automatically retried without it for endpoints that reject the field.
+latest internally consistent cumulative usage block when present.
+stream_options.include_usage is requested and automatically retried without
+it for endpoints that reject the field.
 """
 from __future__ import annotations
 
@@ -23,15 +24,22 @@ import http.client
 import ipaddress
 import json
 import math
+import socket
 import ssl
 import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, asdict, field
 
 from .sse import (StreamState, extract_usage, finalize_tool_calls,
                   iter_sse_events, update_state)
+
+
+_MAX_PHYSICAL_RETRIES = 2
+_OUTPUT_BUDGET_ALIASES = (
+    "max_completion_tokens", "max_output_tokens", "max_new_tokens")
 
 
 def validate_extra_body_safety(value: dict | None) -> None:
@@ -65,16 +73,18 @@ class EndpointConfig:
     path: str                        # e.g. /serving-endpoints/<name>/invocations
     auth_token_env: str = "DATABRICKS_TOKEN"
     auth_profile: str | None = None   # a ~/.databrickscfg profile name. takes
-                                      # precedence over auth_token_env, and
-                                      # handles OAuth profiles by asking the
-                                      # Databricks CLI for a fresh token.
+                                      # precedence over auth_token_env: PAT is
+                                      # direct, databricks-cli is U2M, and a
+                                      # client pair is workspace OAuth M2M.
+                                      # Route-optimized endpoint-scoped OAuth
+                                      # is not implemented by this resolver.
     model: str | None = None         # set for shared /chat/completions routes
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 120.0
     total_timeout_s: float = 180.0   # absolute worker/request deadline; SSE
                                      # traffic cannot extend it
     temperature: float = 0.0
-    max_retries: int = 0             # physical inference retry; opt in only
+    max_retries: int = 0             # physical inference retries; 0-2 only
     include_usage: bool = True       # request streamed usage when supported
     extra_body: dict | None = None   # passthrough request params (see _body)
 
@@ -106,11 +116,25 @@ class EndpointConfig:
                 or not math.isfinite(float(self.temperature)):
             raise ValueError("endpoint temperature must be finite")
         if not isinstance(self.max_retries, int) \
-                or isinstance(self.max_retries, bool) or self.max_retries < 0:
-            raise ValueError("endpoint max_retries must be a non-negative integer")
+                or isinstance(self.max_retries, bool) \
+                or not 0 <= self.max_retries <= _MAX_PHYSICAL_RETRIES:
+            raise ValueError(
+                "endpoint max_retries must be an integer from 0 to "
+                f"{_MAX_PHYSICAL_RETRIES}; retries replay inference, consume "
+                "quota, and can bias a load test")
         if not isinstance(self.include_usage, bool):
             raise ValueError("endpoint include_usage must be boolean")
         validate_extra_body_safety(self.extra_body)
+        if self.extra_body is not None:
+            aliases = [
+                key for key in _OUTPUT_BUDGET_ALIASES
+                if key in self.extra_body
+            ]
+            if aliases:
+                raise ValueError(
+                    "endpoint extra_body must not set output-token budget "
+                    "aliases (" + ", ".join(aliases) + "); the harness owns "
+                    "max_tokens and the run's max_output_tokens_cap")
         if self.extra_body is not None and "n" in self.extra_body:
             choices = self.extra_body["n"]
             if isinstance(choices, bool) or not isinstance(choices, int) \
@@ -118,6 +142,31 @@ class EndpointConfig:
                 raise ValueError(
                     "endpoint extra_body.n must be exactly 1 because one "
                     "benchmark request must produce one measured choice")
+
+
+def serialize_request_body(cfg: EndpointConfig, messages: list[dict],
+                           max_tokens: int, include_usage: bool) -> bytes:
+    """Build the exact JSON bytes submitted by :class:`EndpointClient`.
+
+    Quota planning uses this same function so roles, message metadata, model,
+    tool schemas, provider controls, and JSON framing cannot be omitted from
+    its conservative input bound while still appearing on the wire.
+    """
+    owned = ("messages", "max_tokens", "temperature", "stream",
+             "model", "stream_options")
+    payload: dict = {k: v for k, v in (cfg.extra_body or {}).items()
+                     if k not in owned}
+    payload["messages"] = messages
+    payload["max_tokens"] = int(max_tokens)
+    payload["temperature"] = cfg.temperature
+    payload["stream"] = True
+    if cfg.model:
+        payload["model"] = cfg.model
+    if include_usage:
+        payload["stream_options"] = {"include_usage": True}
+    return json.dumps(
+        payload, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":")).encode("utf-8")
 
 
 @dataclass
@@ -150,6 +199,7 @@ class RequestResult:
     doc_id: int                      # pooled document; -1 = no shared prefix
     chars_sent: int
     retries: int = 0
+    service_tier: str | None = None        # exact stable tier from SSE chunks
     reasoning_tokens: int | None = None   # thinking tokens, when reported
     reasoning_tokens_source: str | None = None  # usage field it was read from
     reasoning_chunks: int = 0             # reasoning deltas seen in the stream
@@ -163,6 +213,10 @@ class RequestResult:
     reasoning_seen: bool = False
     truncated: bool = False          # finish_reason == "length"
     parse_errors: int = 0            # unrecoverable SSE parse failures
+    # Content-free parser diagnostics. The SSE layer never includes streamed
+    # text in these strings; malformed payloads are represented only by byte
+    # length and a short SHA-256 digest. Bound the list again at persistence.
+    parse_error_details: list[str] = field(default_factory=list)
     max_tokens_requested: int | None = None
     first_send_unix: float | None = None  # when the FIRST HTTP request began.
                                           # t_send_unix belongs to whichever
@@ -181,7 +235,7 @@ class RequestResult:
     # Exact caller-experienced clocks, measured from the runner's monotonic
     # scheduled target. These include pool wait, connection setup, and every
     # automatic retry/fallback. They are intentionally separate from the
-    # final-attempt service clocks above.
+    # final-attempt request-path clocks above.
     queue_wait_ms: float | None = None
     caller_ttfb_ms: float | None = None
     caller_ttft_ms: float | None = None
@@ -303,7 +357,7 @@ def _credential_may_be_expired(status: int, body: bytes) -> bool:
 
 class EndpointClient:
     def __init__(self, cfg: EndpointConfig, token: str | None,
-                 refresh: "callable | None" = None):
+                 refresh: Callable[[], str | None] | None = None):
         """`refresh` returns a fresh token, or None if it cannot.
 
         An OAuth token is minted once and a load test can outlive it. When
@@ -318,6 +372,8 @@ class EndpointClient:
         self.token = token
         self._refresh = refresh
         self._lock = threading.Lock()
+        self._active_connections_lock = threading.Lock()
+        self._active_connections: dict[int, object] = {}
         self.scheme, self.host, self.port = normalized_origin(cfg.base_url)
         # A refresh callback means this is a bearer-auth flow even when the
         # initial token is absent or expired. Reject its transport before the
@@ -336,6 +392,41 @@ class EndpointClient:
         return http.client.HTTPConnection(
             self.host, self.port, timeout=self.cfg.connect_timeout_s)
 
+    def _register_connection(self, conn) -> None:
+        with self._active_connections_lock:
+            self._active_connections[id(conn)] = conn
+
+    def _discard_connection(self, conn) -> None:
+        with self._active_connections_lock:
+            self._active_connections.pop(id(conn), None)
+
+    def cancel_active_requests(self) -> int:
+        """Best-effort interruption of sockets already blocked in I/O.
+
+        The runner sets each request's cooperative cancellation event before
+        calling this method. Shutting down the socket wakes a blocked read;
+        the worker then observes cancellation and cannot retry. A POST that
+        was already on the wire remains an unknown provider outcome and is
+        reported as such.
+
+        Do not call ``HTTPConnection.close`` from this thread. ``close`` sets
+        ``conn.sock`` to ``None``; a worker in the narrow interval between its
+        cancellation check and ``conn.request`` would then auto-connect a new
+        socket and could emit a late POST. Keeping the shut-down socket attached
+        makes that request fail instead. The worker owns the final close in its
+        ``finally`` block.
+        """
+        with self._active_connections_lock:
+            active = list(self._active_connections.values())
+        for conn in active:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except (OSError, ValueError):
+                    pass
+        return len(active)
+
     def _body(self, messages: list[dict], max_tokens: int,
               include_usage: bool) -> bytes:
         # extra_body is user passthrough (top_p, stop, response_format, and
@@ -344,27 +435,16 @@ class EndpointClient:
         # popped first so nothing in extra_body can survive, then set from
         # their dedicated config, so a run stays measurable no matter what
         # the user put in extra_body.
-        owned = ("messages", "max_tokens", "temperature", "stream",
-                 "model", "stream_options")
-        payload: dict = {k: v for k, v in (self.cfg.extra_body or {}).items()
-                         if k not in owned}
-        payload["messages"] = messages
-        payload["max_tokens"] = int(max_tokens)
-        payload["temperature"] = self.cfg.temperature
-        payload["stream"] = True
-        if self.cfg.model:
-            payload["model"] = self.cfg.model
-        if include_usage:
-            payload["stream_options"] = {"include_usage": True}
-        return json.dumps(
-            payload, ensure_ascii=False, allow_nan=False,
-            separators=(",", ":")).encode("utf-8")
+        return serialize_request_body(
+            self.cfg, messages, max_tokens, include_usage)
 
     def send(self, messages: list[dict], max_tokens: int, request_id: str,
              scheduled_s: float, dispatch_lag_ms: float,
              intended: tuple[int, int, float, int],
              chars_sent: int, *,
-             scheduled_monotonic: float | None = None) -> RequestResult:
+             scheduled_monotonic: float | None = None,
+             cancellation_event: threading.Event | None = None) \
+            -> RequestResult:
         """One request, fully measured. Never raises; errors land in result."""
         attempt = 0
         include_usage = self._include_usage_supported is not False
@@ -442,8 +522,34 @@ class EndpointClient:
         # schedule-to-worker delay here; connection setup is a separate clock
         # and must not be mislabeled as queue wait.
         queue_wait_ms = caller_elapsed()
+        state = StreamState()
+
+        def is_cancelled() -> bool:
+            return bool(cancellation_event is not None
+                        and cancellation_event.is_set())
+
+        def cancelled_result() -> RequestResult:
+            stage = ("before HTTP POST" if request_attempts == 0 else
+                     "before retry; an earlier POST may have reached the "
+                     "provider")
+            return self._finish(
+                request_id, scheduled_s, dispatch_lag_ms,
+                last_send_unix, None, None, None, None, False,
+                f"request cancelled {stage}", state, intended, chars_sent,
+                len(retry_reasons), None, None, None, None,
+                first_send_unix, max_tokens,
+                first_attempt_unix=first_attempt_unix,
+                connection_attempts=connection_attempts,
+                request_attempts=request_attempts,
+                retry_reasons=retry_reasons,
+                **caller_kwargs())
 
         while attempt <= self.cfg.max_retries:
+            # Checked at worker entry and at the top of every retry. The
+            # runner sets this before cancelling queued futures, so a task
+            # racing out of the queue still cannot emit a POST.
+            if is_cancelled():
+                return cancelled_result()
             attempt += 1
             conn = None
             posts_before_attempt = request_attempts
@@ -473,6 +579,7 @@ class EndpointClient:
                         retry_reasons=retry_reasons,
                         **caller_kwargs())
                 conn = self._connect()
+                self._register_connection(conn)
                 connection_attempts += 1
                 if first_attempt_unix is None:
                     first_attempt_unix = time.time()
@@ -493,13 +600,26 @@ class EndpointClient:
                     validate_bearer_transport(self.cfg.base_url)
                     headers["Authorization"] = f"Bearer {tok_used}"
 
+                # Socket timeout setup is normally non-blocking, but keep it
+                # ahead of the last cancellation check. This closes the race
+                # where cancellation becomes visible while the connection is
+                # being prepared for its POST.
+                if is_cancelled():
+                    return cancelled_result()
+                cap_socket_timeout(conn)
+                if is_cancelled():
+                    return cancelled_result()
+
+                # The final-attempt clock begins immediately before the
+                # blocking conn.request call. It therefore includes request
+                # upload; it does not claim to begin when the last request
+                # byte reaches the socket or provider.
                 t_send = time.monotonic()
                 t_send_unix = time.time()
                 last_send_unix = t_send_unix
                 if first_send_unix is None:
                     first_send_unix = t_send_unix
                 request_attempts += 1
-                cap_socket_timeout(conn)
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
                 remaining_s()
                 cap_socket_timeout(conn)
@@ -668,9 +788,22 @@ class EndpointClient:
                 remaining_s(finished_stream_at)
                 e2e_ms = (finished_stream_at - t_send) * 1000.0
                 finalize_tool_calls(state)
-                ok = state.saw_first_content or state.valid_tool_calls > 0
-                err = (None if ok else
-                       "stream ended with no content or valid tool call")
+                has_output = (
+                    state.saw_first_content or state.valid_tool_calls > 0)
+                stream_complete = bool(state.done or state.finish_reason)
+                if state.errors:
+                    ok = False
+                    err = "stream protocol validation failed"
+                elif not stream_complete:
+                    ok = False
+                    err = (
+                        "stream ended without [DONE] or a finish_reason")
+                elif not has_output:
+                    ok = False
+                    err = "stream ended with no content or valid tool call"
+                else:
+                    ok = True
+                    err = None
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                                     200, ok, err, state, intended, chars_sent,
@@ -703,6 +836,8 @@ class EndpointClient:
                     ttf_tool_call_ms=ttf_tool_call_ms,
                     **caller_kwargs())
             except (OSError, http.client.HTTPException) as exc:
+                if is_cancelled():
+                    return cancelled_result()
                 if time.monotonic() >= deadline_monotonic:
                     finished_at = time.monotonic()
                     e2e_ms = (
@@ -730,14 +865,14 @@ class EndpointClient:
                 continue
             finally:
                 if conn is not None:
+                    self._discard_connection(conn)
                     try:
                         conn.close()
                     except (OSError, http.client.HTTPException):
                         pass
 
         return self._finish(request_id, scheduled_s, dispatch_lag_ms,
-                            last_send_unix if last_send_unix is not None
-                            else (first_attempt_unix or time.time()),
+                            last_send_unix,
                             None, None, None, None, False,
                             last_err or "exhausted retries", StreamState(),
                             intended, chars_sent, len(retry_reasons),
@@ -772,17 +907,33 @@ class EndpointClient:
             and worker_started_monotonic is not None
             else time.time())
         u = extract_usage(state.usage)
+        stream_complete = bool(state.done or state.finish_reason)
+        if ok and state.errors:
+            ok = False
+            error = error or "stream protocol validation failed"
+        if ok and not stream_complete:
+            ok = False
+            error = error or (
+                "stream ended without [DONE] or a finish_reason")
+        distinct_parse_errors = list(dict.fromkeys(
+            str(item)[:240] for item in state.errors))
+        parse_error_details = distinct_parse_errors[:16]
+        if len(distinct_parse_errors) > 16:
+            parse_error_details.append(
+                f"{len(distinct_parse_errors) - 16} additional distinct "
+                "parser error(s) omitted")
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
             dispatch_lag_ms=dispatch_lag_ms, t_send_unix=t_send_unix,
             ttfb_ms=ttfb_ms, ttft_ms=ttft_ms, ttfr_ms=ttfr_ms,
             ttfv_ms=ttfv_ms, e2e_ms=e2e_ms, status=status,
             ok=ok, error=error, content_chunks=state.content_chunks,
-            stream_complete=bool(state.done or state.finish_reason),
+            stream_complete=stream_complete,
             visible_content_seen=bool(state.saw_first_visible),
             reasoning_seen=bool(state.saw_first_reasoning),
             truncated=(state.finish_reason == "length"),
             parse_errors=len(state.errors),
+            parse_error_details=parse_error_details,
             max_tokens_requested=max_tokens_requested,
             interchunk_max_ms=interchunk_max_ms,
             finish_reason=state.finish_reason,
@@ -795,6 +946,7 @@ class EndpointClient:
             intended_cache_fraction=intended[2],
             doc_id=intended[3] if len(intended) > 3 else -1,
             chars_sent=chars_sent, retries=retries,
+            service_tier=state.service_tier,
             reasoning_tokens=u["reasoning_tokens"],
             reasoning_tokens_source=u["reasoning_tokens_source"],
             reasoning_chunks=state.reasoning_chunks,

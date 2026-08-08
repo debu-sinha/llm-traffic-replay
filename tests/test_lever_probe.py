@@ -17,8 +17,8 @@ def _cap(levers, budget=512):
     return buf.getvalue()
 
 
-def test_the_working_flag_is_printed_ready_to_paste():
-    """The whole point: the user should be able to copy one line."""
+def test_the_answering_candidate_is_printed_ready_to_test():
+    """The user can copy one line without treating one answer as proof."""
     out = _cap([
         {"name": "reasoning_effort=none",
          "extra": {"reasoning_effort": "none"},
@@ -27,7 +27,8 @@ def test_the_working_flag_is_printed_ready_to_paste():
          "verdict": "ignored", "detail": "accepted, still no visible answer"},
     ])
     assert """--extra-body '{"reasoning_effort": "none"}'""" in out
-    assert "WORKS" in out
+    assert "ANSWERED" in out
+    assert "does not prove the provider applied" in out
 
 
 def test_a_rejection_keeps_the_reason_the_endpoint_gave():
@@ -66,7 +67,7 @@ def test_the_first_working_lever_wins_when_several_do():
          "detail": "answered, finish length, 512 tokens"},
     ])
     assert '{"reasoning_effort": "none"}' in out
-    assert '{"reasoning_effort": "low"}' not in out.split("use this:")[1]
+    assert '{"reasoning_effort": "low"}' not in out.split("test this:")[1]
 
 
 def test_an_errored_probe_does_not_break_the_report():
@@ -120,6 +121,7 @@ def test_it_refuses_and_hands_back_the_working_command():
     assert code == 3
     assert "STOPPING before the load starts" in out
     assert """--extra-body '{"reasoning_effort": "none"}'""" in out
+    assert "not proof that the provider applied" in out
     assert "--force" in out
 
 

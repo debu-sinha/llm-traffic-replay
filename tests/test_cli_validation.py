@@ -10,10 +10,21 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from traffic_replay.cli import (_answer_is_complete, cmd_validate, main,
                                 _validation_error_stats,
                                 _validation_passes)
+
+
+def test_cli_reports_the_installed_package_version(capsys):
+    from traffic_replay import __version__
+
+    with pytest.raises(SystemExit) as stopped:
+        main(["--version"])
+
+    assert stopped.value.code == 0
+    assert capsys.readouterr().out == f"traffic_replay {__version__}\n"
 
 
 def test_instrument_profile_is_a_packaged_resource_and_matches_example():
@@ -101,3 +112,67 @@ def test_validate_defaults_to_a_collision_free_ephemeral_port(monkeypatch):
     monkeypatch.setattr("traffic_replay.cli.cmd_validate", fake_validate)
     assert main(["validate"]) == 0
     assert seen["port"] == 0
+
+
+@pytest.mark.parametrize("corrupt_file,corrupt_bytes,match", [
+    (
+        "truth",
+        b'{"request_id":"r1","request_id":"r2",'
+        b'"ttft_true_ms":10,"e2e_true_ms":20}\n',
+        r"mock_truth\.jsonl:1.*duplicate key 'request_id'",
+    ),
+    (
+        "requests",
+        b'{"phase":"replay","ok":true,"request_id":"r1",'
+        b'"ttft_ms":NaN,"e2e_ms":20}\n',
+        r"requests\.jsonl:1.*non-finite",
+    ),
+    (
+        "requests",
+        b'{"phase":"replay","ok":true,"request_id":"r1",'
+        b'"ttft_ms":"\xff","e2e_ms":20}\n',
+        r"requests\.jsonl:1.*not UTF-8",
+    ),
+])
+def test_validate_strictly_parses_both_oracle_and_result_jsonl(
+        tmp_path, monkeypatch, corrupt_file, corrupt_bytes, match):
+    """Even the local oracle is evidence input once it crosses a file edge."""
+    requests = tmp_path / "run" / "requests.jsonl"
+    requests.parent.mkdir()
+    valid_truth = (
+        b'{"request_id":"r1","ttft_true_ms":10,"e2e_true_ms":20}\n')
+    valid_requests = (
+        b'{"phase":"replay","ok":true,"request_id":"r1",'
+        b'"ttft_ms":11,"e2e_ms":20}\n')
+
+    class FakeServer:
+        server_address = ("127.0.0.1", 43127)
+
+        def serve_forever(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def server_close(self):
+            return None
+
+    def fake_serve(_port, truth_path):
+        Path(truth_path).write_bytes(
+            corrupt_bytes if corrupt_file == "truth" else valid_truth)
+        return FakeServer()
+
+    def fake_run(_rc, quiet=False):
+        assert quiet is True
+        requests.write_bytes(
+            corrupt_bytes if corrupt_file == "requests" else valid_requests)
+        return {"out_dir": str(requests.parent), "summary": {}}
+
+    monkeypatch.setattr("traffic_replay.mock_server.serve", fake_serve)
+    monkeypatch.setattr("traffic_replay.runner.run", fake_run)
+    monkeypatch.setattr("traffic_replay.cli.time.sleep", lambda _: None)
+    args = argparse.Namespace(
+        port=0, workdir=str(tmp_path), duration=1, quiet=True,
+        format="json", tolerance_ms=60.0)
+    with pytest.raises(ValueError, match=match):
+        cmd_validate(args)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -99,6 +100,29 @@ def test_jsonl_duplicate_keys_are_rejected_with_location(tmp_path):
     path.write_text('{"input_tokens":1,"input_tokens":2}\n')
     with pytest.raises(ValueError, match=r"logs\.jsonl:1.*duplicate key"):
         _load_records(path)
+
+
+@pytest.mark.parametrize("content,match", [
+    (b'{"input_tokens":NaN}\n', "non-finite"),
+    (b'{"input_tokens":1e999}\n', "non-finite"),
+    (b'{"input_tokens":"\xff"}\n', "not UTF-8"),
+])
+def test_jsonl_uses_strict_json_for_numeric_and_encoding_ambiguity(
+        tmp_path, content, match):
+    path = tmp_path / "logs.jsonl"
+    path.write_bytes(content)
+    with pytest.raises(ValueError, match=match):
+        _load_records(path)
+
+
+def test_jsonl_duplicate_secret_key_is_not_echoed_in_error(tmp_path):
+    secret = "Bearer " + "dapi" + ("x" * 40)
+    path = tmp_path / "logs.jsonl"
+    path.write_text(json.dumps({secret: 1})[:-1] + f',"{secret}":2}}\n')
+    with pytest.raises(ValueError) as caught:
+        _load_records(path)
+    assert secret not in str(caught.value)
+    assert "sha256=" in str(caught.value)
 
 
 @pytest.mark.parametrize("content,match", [
@@ -199,14 +223,52 @@ def test_empirical_joint_cli_hashes_exact_source_bytes(tmp_path, capsys):
     raw = json.loads(capsys.readouterr().out)
     digest = hashlib.sha256(source_bytes).hexdigest()
     assert raw["source"]["sha256"] == digest
+    assert raw["source"]["bytes"] == len(source_bytes)
     assert digest in raw["provenance"]
+    assert f"bytes: {len(source_bytes)}" in raw["provenance"]
     assert "never emit me" not in json.dumps(raw)
+
+
+def test_cli_hashes_and_parses_one_frozen_source_snapshot(
+        tmp_path, capsys, monkeypatch):
+    source = tmp_path / "changing.jsonl"
+    first = (
+        b'{"input_tokens":100,"output_tokens":10,"cached_tokens":0}\n')
+    second = (
+        b'{"input_tokens":900,"output_tokens":90,"cached_tokens":450}\n')
+    source.write_bytes(first)
+    original_read_bytes = Path.read_bytes
+    source_reads = 0
+
+    def read_then_change(path):
+        nonlocal source_reads
+        raw = original_read_bytes(path)
+        if path == source:
+            source_reads += 1
+            if source_reads == 1:
+                source.write_bytes(second)
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_change)
+    assert main(["--input", str(source), "--name", "frozen"]) == 0
+
+    raw = json.loads(capsys.readouterr().out)
+    assert source_reads == 1
+    assert raw["input_tokens"] == {"p50": 100, "p95": 100}
+    assert raw["source"] == {
+        "digest_algorithm": "sha256",
+        "sha256": hashlib.sha256(first).hexdigest(),
+        "bytes": len(first),
+    }
 
 
 @pytest.mark.parametrize("kwargs,match", [
     ({"mode": "unknown"}, "mode must"),
     ({"mode": "empirical-joint", "source_sha256": "ABC"},
      "64 lowercase"),
+    ({"source_sha256": "a" * 64, "source_byte_count": True},
+     "non-negative integer"),
+    ({"source_byte_count": 1}, "requires source_sha256"),
 ])
 def test_profile_extractor_controls_are_strict(kwargs, match):
     records = [{"input_tokens": 100, "output_tokens": 10,

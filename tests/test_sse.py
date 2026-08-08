@@ -48,6 +48,84 @@ def test_parse_error_recorded_not_raised():
     assert "sha256=" in st.errors[0]
 
 
+def test_duplicate_sse_keys_are_parse_errors_for_line_and_event_parsers():
+    payload = ('{"choices":[{"delta":{"content":"first",'
+               '"content":"second"}}]}')
+    parsed = [
+        parse_sse_line("data: " + payload),
+        *iter_sse_events(["data: " + payload + "\n\n"]),
+    ]
+
+    assert len(parsed) == 2
+    for event in parsed:
+        st = StreamState()
+        assert update_state(st, event) is False
+        assert st.saw_first_content is False
+        assert len(st.errors) == 1
+        assert "invalid SSE JSON" in st.errors[0]
+        assert "first" not in st.errors[0]
+        assert "second" not in st.errors[0]
+        assert "sha256=" in st.errors[0]
+
+
+def test_nonfinite_sse_numbers_are_parse_errors_not_json_values():
+    for payload in ('{"usage":{"prompt_tokens":NaN}}',
+                    '{"usage":{"prompt_tokens":1e999}}'):
+        parsed = [
+            parse_sse_line("data: " + payload),
+            *iter_sse_events(["data: " + payload + "\n\n"]),
+        ]
+        assert len(parsed) == 2
+        for event in parsed:
+            st = StreamState()
+            update_state(st, event)
+            assert st.usage is None
+            assert st.errors and "invalid SSE JSON" in st.errors[0]
+
+
+def test_invalid_utf8_is_hash_only_parse_error_never_visible_content():
+    wire = b'data: {"choices":[{"delta":{"content":"\xff"}}]}\n\n'
+    parsed = [
+        parse_sse_line(wire.splitlines()[0]),
+        *iter_sse_events([wire]),
+    ]
+
+    assert len(parsed) == 2
+    for event in parsed:
+        st = StreamState()
+        assert update_state(st, event) is False
+        assert st.saw_first_content is False
+        assert st.saw_first_visible is False
+        assert len(st.errors) == 1
+        assert "invalid SSE UTF-8" in st.errors[0]
+        assert "sha256=" in st.errors[0]
+        assert "\ufffd" not in st.errors[0]
+
+
+def test_split_invalid_utf8_sequence_fails_the_event_safely():
+    chunks = [b'data: {"choices":[{"delta":{"content":"\xc3',
+              b'("}}]}\n\n']
+    events = list(iter_sse_events(chunks))
+    assert len(events) == 1
+    st = StreamState()
+    update_state(st, events[0])
+    assert st.saw_first_visible is False
+    assert st.errors and "invalid SSE UTF-8" in st.errors[0]
+
+
+def test_excessive_sse_nesting_degrades_to_parse_error():
+    payload = "[" * 10_000 + "0" + "]" * 10_000
+    parsed = [
+        parse_sse_line("data: " + payload),
+        *iter_sse_events(["data: " + payload + "\n\n"]),
+    ]
+    assert len(parsed) == 2
+    for event in parsed:
+        st = StreamState()
+        update_state(st, event)
+        assert st.errors and "invalid SSE JSON" in st.errors[0]
+
+
 def test_non_object_json_is_a_parse_error_not_a_crash():
     for payload in ("[]", "null", '"text"', "3"):
         st = StreamState()
@@ -196,6 +274,253 @@ def test_invalid_tool_arguments_are_redacted_and_not_valid():
     assert "invalid JSON" in st.errors[-1]
     assert "sha256=" in st.errors[-1]
     assert secret not in st.errors[-1]
+
+
+def test_duplicate_tool_argument_keys_are_redacted_and_not_valid():
+    st = StreamState()
+    first = "private-first-value"
+    second = "private-second-value"
+    update_state(st, {"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "function": {
+            "name": "lookup",
+            "arguments": f'{{"account":"{first}","account":"{second}"}}',
+        },
+    }]}}]})
+
+    finalize_tool_calls(st)
+
+    assert st.valid_tool_calls == 0
+    assert "invalid JSON" in st.errors[-1]
+    assert "sha256=" in st.errors[-1]
+    assert first not in st.errors[-1]
+    assert second not in st.errors[-1]
+
+
+def test_nonfinite_tool_arguments_are_not_structurally_valid_json():
+    for arguments in ('{"account":NaN}', '{"account":1e999}'):
+        st = StreamState()
+        update_state(st, {"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"name": "lookup", "arguments": arguments},
+        }]}}]})
+        finalize_tool_calls(st)
+        assert st.valid_tool_calls == 0
+        assert st.errors and "invalid JSON" in st.errors[-1]
+        assert "sha256=" in st.errors[-1]
+
+
+def test_excessively_nested_tool_arguments_fail_without_recursion_error():
+    arguments = "[" * 10_000 + "0" + "]" * 10_000
+    st = StreamState()
+    update_state(st, {"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "function": {"name": "lookup", "arguments": arguments},
+    }]}}]})
+    finalize_tool_calls(st)
+    assert st.valid_tool_calls == 0
+    assert st.errors and "invalid JSON" in st.errors[-1]
+    assert "sha256=" in st.errors[-1]
+
+
+def test_identical_singletons_may_repeat_but_conflicts_fail_closed():
+    st = StreamState()
+    finish = {"choices": [{"index": 0, "delta": {},
+                            "finish_reason": "length"}]}
+    usage = {"usage": {"prompt_tokens": 1000, "completion_tokens": 100}}
+    update_state(st, finish)
+    update_state(st, finish)
+    update_state(st, usage)
+    update_state(st, usage)
+    assert st.finish_reason == "length"
+    assert st.usage == usage["usage"]
+    assert st.errors == []
+
+    conflicting_finish = {"choices": [{"index": 0, "delta": {},
+                                        "finish_reason": "stop"}]}
+    conflicting_usage = {
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    update_state(st, conflicting_finish)
+    update_state(st, conflicting_finish)
+    update_state(st, conflicting_usage)
+    update_state(st, conflicting_usage)
+
+    assert st.finish_reason == "length"
+    assert st.usage == usage["usage"]
+    assert st.errors == [
+        "stream reported conflicting finish_reason values",
+        "stream reported conflicting usage blocks",
+    ]
+
+
+def test_usage_repeat_comparison_is_json_type_sensitive():
+    st = StreamState()
+    update_state(st, {"usage": {"prompt_tokens": True}})
+    update_state(st, {"usage": {"prompt_tokens": 1}})
+    assert st.usage == {"prompt_tokens": 1}
+    assert st.errors == [
+        "stream usage prompt_tokens must be a non-negative integer"]
+
+
+def test_progressive_databricks_usage_keeps_latest_cumulative_snapshot():
+    """GLM reports one complete, cumulative usage object on every chunk."""
+    st = StreamState()
+    for completion_tokens in (1, 7, 13, 18, 24, 29, 33, 39, 45, 48, 64):
+        update_state(st, {"service_tier": "default", "usage": {
+            "prompt_tokens": 16,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 16 + completion_tokens,
+            "cache_read_input_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }})
+
+    assert st.errors == []
+    assert st.service_tier == "default"
+    assert st.usage == {
+        "prompt_tokens": 16,
+        "completion_tokens": 64,
+        "total_tokens": 80,
+        "cache_read_input_tokens": 0,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    assert extract_usage(st.usage) == {
+        "prompt_tokens": 16,
+        "completion_tokens": 64,
+        "cached_tokens": 0,
+        "cached_tokens_source": "prompt_tokens_details.cached_tokens",
+        "reasoning_tokens": None,
+        "reasoning_tokens_source": None,
+    }
+
+
+def test_progressive_usage_allows_later_output_details_but_not_input_changes():
+    st = StreamState()
+    update_state(st, {"usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 1,
+        "total_tokens": 21,
+        "completion_tokens_details": {"reasoning_tokens": None},
+        "prompt_tokens_details": {"cached_tokens": 4},
+    }})
+    update_state(st, {"usage": {
+        "prompt_tokens": 20,
+        "completion_tokens": 9,
+        "total_tokens": 29,
+        "completion_tokens_details": {
+            "reasoning_tokens": 7,
+            "accepted_prediction_tokens": 2,
+        },
+        "prompt_tokens_details": {"cached_tokens": 4},
+        "reasoning_tokens": 7,
+    }})
+    assert st.errors == []
+    assert st.usage["completion_tokens"] == 9
+    assert st.usage["completion_tokens_details"]["reasoning_tokens"] == 7
+
+    changed_input = dict(st.usage)
+    changed_input["prompt_tokens"] = 21
+    update_state(st, {"usage": changed_input})
+    assert st.usage["prompt_tokens"] == 20
+    assert st.errors == [
+        "stream usage total_tokens does not equal prompt_tokens plus "
+        "completion_tokens"]
+
+
+def test_progressive_usage_rejects_counter_regressions_and_missing_fields():
+    base = {
+        "prompt_tokens": 20,
+        "completion_tokens": 9,
+        "total_tokens": 29,
+        "prompt_tokens_details": {"cached_tokens": 4},
+    }
+    for conflicting, expected in (
+        ({**base, "completion_tokens": 8},
+         "stream usage total_tokens does not equal prompt_tokens plus "
+         "completion_tokens"),
+        ({key: value for key, value in base.items() if key != "total_tokens"},
+         "stream reported conflicting usage blocks"),
+        ({**base, "prompt_tokens_details": {"cached_tokens": 5}},
+         "stream reported conflicting usage blocks"),
+    ):
+        st = StreamState()
+        update_state(st, {"usage": base})
+        update_state(st, {"usage": conflicting})
+        assert st.usage == base
+        assert st.errors == [expected]
+
+
+def test_service_tier_is_preserved_only_when_nonempty_and_stable():
+    st = StreamState()
+    update_state(st, {"service_tier": "default", "choices": []})
+    update_state(st, {"service_tier": "default", "choices": []})
+    assert st.service_tier == "default"
+    assert st.errors == []
+
+    update_state(st, {"service_tier": "priority", "choices": []})
+    update_state(st, {"service_tier": "priority", "choices": []})
+    assert st.service_tier == "default"
+    assert st.errors == ["stream reported conflicting service_tier values"]
+
+
+def test_invalid_service_tier_values_are_protocol_errors():
+    for value in (None, "", "  ", 7, True, []):
+        st = StreamState()
+        update_state(st, {"service_tier": value, "choices": []})
+        assert st.service_tier is None
+        assert st.errors == [
+            "stream event service_tier must be a non-empty string"]
+
+
+def test_usage_arithmetic_invariants_fail_closed():
+    cases = [
+        ({"prompt_tokens": 10, "completion_tokens": 2,
+          "total_tokens": 12,
+          "prompt_tokens_details": {"cached_tokens": 11}},
+         "cached tokens exceed prompt_tokens"),
+        ({"prompt_tokens": 10, "completion_tokens": 2,
+          "total_tokens": 12, "prompt_cache_hit_tokens": 11},
+         "cached tokens exceed prompt_tokens"),
+        ({"prompt_tokens": 10, "completion_tokens": 2,
+          "total_tokens": 12,
+          "completion_tokens_details": {"reasoning_tokens": 3}},
+         "reasoning tokens exceed completion_tokens"),
+        ({"prompt_tokens": 10, "completion_tokens": 2,
+          "total_tokens": 12, "reasoning_tokens": 3},
+         "reasoning tokens exceed completion_tokens"),
+        ({"prompt_tokens": 10, "completion_tokens": 2,
+          "total_tokens": 13},
+         "total_tokens does not equal"),
+        ({"prompt_tokens": -1, "completion_tokens": 2},
+         "prompt_tokens must be a non-negative integer"),
+        ({"prompt_tokens": 10, "completion_tokens_details": []},
+         "completion_tokens_details must be an object or null"),
+    ]
+    for usage, expected in cases:
+        st = StreamState()
+        update_state(st, {"usage": usage})
+        assert st.usage is None
+        assert any(expected in error for error in st.errors)
+
+
+def test_invalid_later_cumulative_usage_preserves_last_valid_snapshot():
+    st = StreamState()
+    valid = {
+        "prompt_tokens": 16,
+        "completion_tokens": 7,
+        "total_tokens": 23,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    update_state(st, {"usage": valid})
+    update_state(st, {"usage": {
+        **valid,
+        "completion_tokens": 9,
+        "total_tokens": 25,
+        "completion_tokens_details": {"reasoning_tokens": 10},
+    }})
+    assert st.usage == valid
+    assert st.errors == [
+        "stream usage reasoning tokens exceed completion_tokens at "
+        "completion_tokens_details.reasoning_tokens"]
 
 
 def test_multiline_sse_data_is_joined_and_eof_is_dispatched():
@@ -382,9 +707,220 @@ def test_client_rejects_tool_call_spliced_across_stream_choices():
     assert result.status == 200
     assert result.ok is False
     assert result.parse_errors == 1
+    assert result.parse_error_details == [
+        "stream returned multiple distinct choices; the benchmark requires "
+        "exactly one response per request"
+    ]
     assert result.tool_call_seen is True
     assert result.valid_tool_calls == 0
     assert result.stream_complete is True
+
+
+def test_client_uses_final_progressive_usage_without_a_parse_error():
+    usage_blocks = [
+        {"prompt_tokens": 16, "completion_tokens": 1, "total_tokens": 17},
+        {"prompt_tokens": 16, "completion_tokens": 7, "total_tokens": 23},
+        {"prompt_tokens": 16, "completion_tokens": 7, "total_tokens": 23},
+    ]
+    events = [
+        {"choices": [{"index": 0,
+                      "delta": {"reasoning_content": "fragment"},
+                      "finish_reason": None}],
+         "service_tier": "default",
+         "usage": usage_blocks[0]},
+        {"choices": [{"index": 0,
+                      "delta": {"reasoning_content": "fragment"},
+                      "finish_reason": None}],
+         "service_tier": "default",
+         "usage": usage_blocks[1]},
+        {"choices": [{"index": 0, "delta": {},
+                      "finish_reason": "length"}],
+         "service_tier": "default",
+         "usage": usage_blocks[2]},
+    ]
+
+    class _Socket:
+        def settimeout(self, value):
+            self.timeout = value
+
+    class _Response:
+        status = 200
+
+        def __iter__(self):
+            lines = [
+                ("data: " + json.dumps(event) + "\n\n").encode()
+                for event in events
+            ]
+            return iter([*lines, b"data: [DONE]\n\n"])
+
+    class _Connection:
+        def __init__(self):
+            self.sock = _Socket()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/chat",
+                       max_retries=0),
+        token=None,
+        refresh=None,
+    )
+    client._connect = _Connection
+    result = client.send(
+        [{"role": "user", "content": "answer"}],
+        7,
+        "progressive-usage",
+        0.0,
+        0.0,
+        (16, 7, None, -1),
+        6,
+    )
+
+    assert result.status == 200
+    assert result.ok is True
+    assert result.prompt_tokens == 16
+    assert result.completion_tokens == 7
+    assert result.service_tier == "default"
+    assert result.reasoning_chunks == 2
+    assert result.truncated is True
+    assert result.parse_errors == 0
+    assert result.parse_error_details == []
+
+
+def _send_protocol_events(events, *, done: bool):
+    class _Socket:
+        def settimeout(self, value):
+            self.timeout = value
+
+    class _Response:
+        status = 200
+
+        def __iter__(self):
+            lines = [
+                ("data: " + json.dumps(event) + "\n\n").encode()
+                for event in events
+            ]
+            if done:
+                lines.append(b"data: [DONE]\n\n")
+            return iter(lines)
+
+    class _Connection:
+        def __init__(self):
+            self.sock = _Socket()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/chat"), None)
+    client._connect = _Connection
+    return client.send(
+        [{"role": "user", "content": "answer"}],
+        16, "protocol", 0.0, 0.0, (8, 16, None, -1), 6)
+
+
+def test_client_rejects_content_from_an_incomplete_stream():
+    result = _send_protocol_events([{
+        "choices": [{"index": 0, "delta": {"content": "answer"},
+                     "finish_reason": None}],
+        "service_tier": "default",
+    }], done=False)
+
+    assert result.status == 200
+    assert result.ok is False
+    assert result.error == "stream ended without [DONE] or a finish_reason"
+    assert result.stream_complete is False
+    assert result.visible_content_seen is True
+    assert result.service_tier == "default"
+    assert result.parse_errors == 0
+
+
+def test_client_rejects_usage_corruption_even_with_content_and_terminal_event():
+    result = _send_protocol_events([{
+        "choices": [{"index": 0, "delta": {"content": "answer"},
+                     "finish_reason": "stop"}],
+        "service_tier": "priority",
+        "usage": {
+            "prompt_tokens": 8,
+            "completion_tokens": 2,
+            "total_tokens": 11,
+        },
+    }], done=True)
+
+    assert result.status == 200
+    assert result.ok is False
+    assert result.error == "stream protocol validation failed"
+    assert result.stream_complete is True
+    assert result.visible_content_seen is True
+    assert result.service_tier == "priority"
+    assert result.prompt_tokens is None
+    assert result.completion_tokens is None
+    assert result.parse_errors == 1
+    assert result.parse_error_details == [
+        "stream usage total_tokens does not equal prompt_tokens plus "
+        "completion_tokens"]
+
+
+def test_client_rejects_conflicting_service_tier_and_preserves_first_value():
+    result = _send_protocol_events([
+        {
+            "choices": [{"index": 0, "delta": {"content": "answer"},
+                         "finish_reason": None}],
+            "service_tier": "default",
+        },
+        {
+            "choices": [{"index": 0, "delta": {},
+                         "finish_reason": "stop"}],
+            "service_tier": "priority",
+        },
+    ], done=True)
+
+    assert result.ok is False
+    assert result.error == "stream protocol validation failed"
+    assert result.stream_complete is True
+    assert result.service_tier == "default"
+    assert result.parse_error_details == [
+        "stream reported conflicting service_tier values"]
+
+
+def test_client_preserves_a_clean_stable_service_tier():
+    result = _send_protocol_events([
+        {
+            "choices": [{"index": 0, "delta": {"content": "answer"},
+                         "finish_reason": None}],
+            "service_tier": "priority",
+        },
+        {
+            "choices": [{"index": 0, "delta": {},
+                         "finish_reason": "stop"}],
+            "service_tier": "priority",
+        },
+    ], done=True)
+
+    assert result.ok is True
+    assert result.error is None
+    assert result.stream_complete is True
+    assert result.service_tier == "priority"
+    assert result.parse_errors == 0
 
 
 def test_usage_openai_style():

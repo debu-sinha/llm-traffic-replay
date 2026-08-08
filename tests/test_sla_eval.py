@@ -1,4 +1,4 @@
-"""SLA scorecard: targets from the profile config are scored against
+"""Acceptance scorecard: targets from the profile config are scored against
 measured percentiles, hard timeouts count as failures, and the report
 renders the verdicts."""
 from traffic_replay.metrics import _verdict, render_markdown, summarize
@@ -39,7 +39,7 @@ def test_targets_met_and_missed_are_scored():
     assert ttft["p50"]["met"] is True and ttft["p95"]["met"] is True
     assert ttfg["p50"]["met"] is False and ttfg["p95"]["met"] is False
     report = render_markdown(s, "t")
-    assert "SLA scorecard" in report
+    assert "Acceptance scorecard" in report
     assert "| TTFG | p50 | 700 | 2000.0 | NO |" in report
 
 
@@ -107,7 +107,7 @@ def test_no_acceptance_no_sla_section():
     rows = [_row(i, 400.0, 800.0) for i in range(10)]
     s = summarize(rows)
     assert "sla" not in s
-    assert "SLA scorecard" not in render_markdown(s, "t")
+    assert "Acceptance scorecard" not in render_markdown(s, "t")
 
 
 def test_interchunk_threshold_counts_as_breach():
@@ -183,6 +183,56 @@ def test_matching_workload_token_shape_can_reach_green():
     s = summarize(_stable_target_rows(), acceptance=ACCEPT)
     assert _verdict(s) == ("ok", "meets every acceptance target")
     assert s["token_targeting"]["status"] == "verified"
+
+
+def test_failed_profile_rows_make_token_fidelity_incomplete():
+    rows = _stable_target_rows()
+    for row in rows[300:]:
+        row.update({
+            "ok": False,
+            "status": 500,
+            "error": "http 500",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+        })
+
+    summary = summarize(rows, acceptance=ACCEPT)
+    targeting = summary["token_targeting"]
+    assert targeting["input_intended_requests"] == 600
+    assert targeting["input_eligible_successes"] == 300
+    assert targeting["input_coverage"] == 0.5
+    assert targeting["output_intended_requests"] == 600
+    assert targeting["output_coverage"] == 0.5
+    assert targeting["status"] == "mismatch"
+    assert "300 of 600 captured profile requests" in targeting["warning"]
+
+
+def test_parse_corrupt_usage_cannot_verify_token_or_cache_fidelity():
+    rows = _stable_target_rows()
+    for row in rows[300:]:
+        row.update({
+            "parse_errors": 1,
+            "cached_tokens": 0,
+            "cached_tokens_source":
+                "prompt_tokens_details.cached_tokens",
+            "intended_cache_fraction": 0.0,
+        })
+    for row in rows[:300]:
+        row.update({
+            "parse_errors": 0,
+            "cached_tokens": 0,
+            "cached_tokens_source":
+                "prompt_tokens_details.cached_tokens",
+            "intended_cache_fraction": 0.0,
+        })
+
+    summary = summarize(rows, acceptance=ACCEPT)
+    assert summary["token_targeting"]["input_coverage"] == 0.5
+    assert summary["token_targeting"]["output_coverage"] == 0.5
+    assert summary["cache_fidelity"]["coverage"] == 0.5
+    assert summary["cache_fidelity"]["status"] == "unverified"
+    assert "300 of 600 captured profile requests" in \
+        summary["cache_fidelity"]["warning"]
 
 
 def test_illustrative_targets_can_never_produce_an_unqualified_green():

@@ -252,8 +252,21 @@ def test_report_states_which_harness_version_and_latency_basis():
     # need a test edit and cannot silently stop being stamped
     assert s["harness_version"] == __version__
     assert "NOT included" in s["latency_basis"]
+    assert "immediately before conn.request" in s["latency_basis"]
+    assert "include request upload" in s["latency_basis"]
+    assert "first iterated response-body line" in s["latency_basis"]
+    assert "not necessarily the first response byte" in s["latency_basis"]
+    assert "visible or reasoning content delta" in s["latency_basis"]
+    assert "excludes tool-call fragments" in s["latency_basis"]
+    assert "first visible content and first tool-call fragment remain separate" \
+        in s["latency_basis"]
     assert "latency basis" in render_markdown(s, "v")
-    assert "Latency basis" in render_html(s, "v")
+    html = render_html(s, "v")
+    assert "Latency basis" in html
+    assert "TTFB (first response-body line)" in html
+    assert "TTFB (first byte)" not in html
+    assert "TTFT (first content delta)" in html
+    assert "TTFT (first token)" not in html
 
 
 def _fail(n, t0=0.0, dt=1.0):
@@ -307,7 +320,7 @@ def test_per_window_errors_render_in_both_formats():
     md = render_markdown(s, "errs")
     h = render_html(s, "errs")
     assert "errors" in md
-    assert "<th>errors</th>" in h
+    assert "<th scope='col'>errors</th>" in h
     assert "40 (" in md          # count and share shown together
 
 
@@ -902,12 +915,22 @@ def _reasoning_rows(n_visible, n_truncated):
 
 
 def test_ttfv_percentiles_say_how_many_requests_they_leave_out():
-    s = summarize(_reasoning_rows(55, 132))
+    s = summarize(
+        _reasoning_rows(55, 132),
+        acceptance={"ttft_ms": {"p50": 500}},
+    )
     assert s["ttfv_ms"]["missing"] == 132
     assert s["ttfv_ms"]["of"] == 187
     note = render_markdown(s, "note")
     assert "55 of 187" in note
     assert "fastest subset" in note
+    assert "first visible-or-reasoning content delta" in note
+    assert "first visible content" in note
+    assert "first token of" not in note
+    html = render_html(s, "note")
+    assert "first visible-or-reasoning content delta" in html
+    assert "first visible content" in html
+    assert "first token of" not in html
 
 
 def test_scoring_first_visible_warns_when_most_requests_never_got_there():
@@ -972,7 +995,7 @@ def test_a_200_with_no_visible_content_is_not_a_successful_answer():
     assert s["ttft_ms"]["n"] == 55
     assert s["latency_population"]["kind"] == "readable_answers"
     md = render_markdown(s, "answers")
-    assert "produced at least one content delta" in md
+    assert "produced at least one visible or reasoning content delta" in md
     assert "returned HTTP 200:" not in md  # status was not retained by rows
 
 
@@ -1089,6 +1112,20 @@ def test_the_invalid_sentence_names_the_counter_that_drove_it():
     assert s["answers"]["no_visible_content"] == 0
     assert "never terminated their stream" in inv
     assert "60 of 60" in inv
+
+
+def test_parse_errors_do_not_get_misreported_as_missing_visible_content():
+    rows = _mixed(0, 12)
+    for row in rows:
+        row["parse_errors"] = 1
+    summary = summarize(rows, acceptance={"ttft_ms": {"p50": 5000}})
+
+    invalid = summary["answers"]["invalid"]
+    assert summary["answers"]["no_visible_content"] == 0
+    assert "produced a reportable completed answer" in invalid
+    assert "hit unrecoverable parse errors" in invalid
+    assert "12 of 12" in invalid
+    assert "produced visible content or a valid tool call" not in invalid
 
 
 def test_old_rows_are_not_retroactively_failed_by_the_answers_block():

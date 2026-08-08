@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1320" height="760" viewBox="0 0 1320 760" role="img" aria-labelledby="title desc">
   <title id="title">Logical request, physical attempts, and timing clocks</title>
-  <desc id="desc">A scheduled logical request waits for a worker, connects, posts, and consumes an SSE stream. An optional compatibility, credential, or transport path can create another physical POST. Final-attempt service clocks and exact caller clocks use different start points. The completed row is appended to a durable journal.</desc>
+  <desc id="desc">A scheduled logical request waits for a worker, connects, posts, and consumes an SSE stream. An optional compatibility, credential, or transport path can create another physical POST. Final-attempt request-path clocks and exact caller clocks use different start points. The completed row is appended to a durable journal.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
     <marker id="warnArrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#b45309"/></marker>
@@ -23,26 +23,28 @@
   <text class="tiny" x="395" y="207">worker start: queue_wait_ms</text>
   <line class="msg" x1="380" y1="230" x2="630" y2="230"/><text class="s" x="505" y="222" text-anchor="middle">connect()</text>
   <line class="ret" x1="630" y1="260" x2="380" y2="260"/><text class="s" x="505" y="252" text-anchor="middle">DNS + TCP + TLS complete: connect_ms</text>
-  <line class="msg" x1="380" y1="300" x2="630" y2="300"/><text class="s" x="505" y="292" text-anchor="middle">begin final-attempt clock; increment request_attempts</text>
-  <line class="msg" x1="630" y1="330" x2="880" y2="330"/><text class="s" x="755" y="322" text-anchor="middle">POST streamed request</text>
+  <line class="msg" x1="380" y1="300" x2="630" y2="300"/><text class="s" x="505" y="292" text-anchor="middle">start clock immediately before conn.request</text>
+  <line class="msg" x1="630" y1="330" x2="880" y2="330"/><text class="s" x="755" y="322" text-anchor="middle">conn.request uploads POST body</text>
 
-  <path class="warn" d="M880 360 C970 390 970 430 880 450"/>
+  <line class="warn" x1="880" y1="360" x2="630" y2="360"/>
+  <line class="warn" x1="630" y1="450" x2="880" y2="450"/>
   <text class="s" x="985" y="391">400 explicitly rejects usage option,</text>
   <text class="s" x="985" y="409">qualifying auth expiry, or configured</text>
-  <text class="s" x="985" y="427">transport retry: another physical POST</text>
+  <text class="s" x="985" y="427">transport retry can add a physical POST</text>
   <text class="tiny" x="985" y="445">possible duplicate inference and billing</text>
 
   <line class="ret" x1="880" y1="480" x2="630" y2="480"/><text class="s" x="755" y="472" text-anchor="middle">SSE response lines</text>
   <line class="msg" x1="630" y1="510" x2="1145" y2="510"/><text class="s" x="887" y="502" text-anchor="middle">first response line; content/tool events; [DONE] or EOF ends E2E</text>
   <line class="ret" x1="1145" y1="550" x2="380" y2="550"/><text class="s" x="762" y="542" text-anchor="middle">structural outcome + timings + attempt evidence</text>
   <line class="msg" x1="380" y1="585" x2="1145" y2="585"/><text class="s" x="762" y="577" text-anchor="middle">append redacted result to requests.jsonl.partial</text>
+  <text class="tiny" x="660" y="612" text-anchor="middle">cancellation shuts active sockets; workers close them; future POSTs are blocked; an in-flight POST may have reached the provider</text>
 
   <rect class="caller" x="45" y="635" width="570" height="88" rx="10"/>
   <text class="t" x="330" y="660" text-anchor="middle">Exact caller clocks: scheduled target to observed event</text>
   <text class="s" x="330" y="683" text-anchor="middle">include worker queue + connection + fallback/refresh/retry + request + stream</text>
-  <text class="s" x="330" y="704" text-anchor="middle">SLA scoring prefers caller timing when the scored population has coverage</text>
+  <text class="s" x="330" y="704" text-anchor="middle">acceptance scoring prefers caller timing when the scored population has coverage</text>
   <rect class="service" x="655" y="635" width="620" height="88" rx="10"/>
-  <text class="t" x="965" y="660" text-anchor="middle">Final-attempt service clocks: immediately before POST to observed event</text>
+  <text class="t" x="965" y="660" text-anchor="middle">Final-attempt request-path clocks: before conn.request to event</text>
   <text class="s" x="965" y="683" text-anchor="middle">exclude final connection setup; include upload, network/edge, endpoint work, and response transit</text>
-  <text class="s" x="965" y="704" text-anchor="middle">diagnostic endpoint path time, not pure server compute and not exactly-once work</text>
+  <text class="s" x="965" y="704" text-anchor="middle">diagnostic path time; network probe is never subtracted; not exactly-once work</text>
 </svg>

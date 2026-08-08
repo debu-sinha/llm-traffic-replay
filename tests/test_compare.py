@@ -2,6 +2,7 @@
 achieved cache p50 differ by more than 0.10 (the fake-comparison trap)."""
 import hashlib
 import json
+import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,10 +33,26 @@ def _summary(title, cache_p50):
                 "p99": p50 * 1.6, "n": 100}
     return {
         "run": {"title": title, "input_mode": "profile"}, "error_rate": 0.0,
+        "requests_total": 1,
         "ttft_ms": tab(400), "e2e_ms": tab(800), "interchunk_max_ms": tab(6),
         "achieved_cache_fraction": {"p50": cache_p50, "p95": cache_p50 + 0.05},
         "throughput": {"input_tokens_per_min": 1_000_000,
                        "output_tokens_per_min": 5000},
+        "token_targeting": {
+            "status": "verified",
+            "warning": None,
+            "input_coverage": 1.0,
+            "output_coverage": 1.0,
+            "input_reported_over_intended": {"p50": 1.0, "p95": 1.0},
+            "output_reported_over_intended": {"p50": 1.0, "p95": 1.0},
+        },
+        "cache_fidelity": {
+            "status": "verified", "warning": None, "coverage": 1.0,
+        },
+        "latency_population": {
+            "kind": "readable_answers", "n": 400, "warning": None,
+        },
+        "answers": {"answer_rate": 1.0},
         "arrivals": {"dispatch_lag_ms": {"p95": 8.0}},
         # a clean baseline for every comparability check except cache, so the
         # cache tests below isolate the thing they name
@@ -71,7 +88,12 @@ def _replace_manifest(d: Path, manifest: dict) -> None:
 def _seal(d: Path, manifest: dict) -> None:
     summary_raw = (d / "summary.json").read_bytes()
     requests = d / "requests.jsonl"
-    requests.write_bytes(b"")
+    requests.write_text(json.dumps({
+        "phase": "replay",
+        "status": 200,
+        "ok": True,
+        "request_id": "request-0",
+    }, sort_keys=True) + "\n")
     requests_raw = requests.read_bytes()
     manifest.update({
         "workload_id": manifest.get("workload_id", "workload-test"),
@@ -87,12 +109,38 @@ def _seal(d: Path, manifest: dict) -> None:
             "requests.jsonl": {
                 "sha256": hashlib.sha256(requests_raw).hexdigest(),
                 "bytes": len(requests_raw),
-                "row_count": 0,
+                "row_count": 1,
             },
         },
     })
     (d / "manifest.json").write_text(json.dumps(manifest))
     _write_completion_marker(d)
+
+
+def _replace_requests(d: Path, rows: list[dict]) -> None:
+    raw = b"".join(
+        json.dumps(row, sort_keys=True).encode("utf-8") + b"\n"
+        for row in rows
+    )
+    (d / "requests.jsonl").write_bytes(raw)
+    manifest = json.loads((d / "manifest.json").read_text())
+    manifest["artifacts"]["requests.jsonl"] = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+        "row_count": len(rows),
+    }
+    _replace_manifest(d, manifest)
+
+
+def _add_sealed_source_report(d: Path) -> None:
+    raw = b"<!doctype html><title>sealed source report</title>\n"
+    (d / "report.html").write_bytes(raw)
+    manifest = json.loads((d / "manifest.json").read_text())
+    manifest["artifacts"]["report.html"] = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
+    _replace_manifest(d, manifest)
 
 
 def _compare(caches):
@@ -118,6 +166,184 @@ def test_table_shape_and_columns():
         assert f"| {q} |" in md
 
 
+def test_self_contained_html_names_first_input_baseline_and_binds_both_reports():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    for source in dirs:
+        _add_sealed_source_report(source)
+
+    out = compare_runs(base / "comparison", dirs)
+    report = (out / "comparison.html").read_text()
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    assert report.startswith("<!doctype html>")
+    assert report.index("VALID COMPARISON") < report.index("Compatibility matrix")
+    assert "Baseline:&#x27;" not in report
+    assert "<strong>Baseline:</strong> run-0 (first input)" in report
+    assert "Baseline is explicitly the first input" in report
+    assert "<table class='compat'>" in report
+    assert "<caption>" in report
+    assert "scope='col'" in report and "scope='row'" in report
+    assert "lower preferred; untested" in report and "context only" in report
+    assert "not statistically demonstrated improvements or regressions" in report
+    assert "UNSEALED PRINT/PDF DERIVATIVE" in report
+    assert "internal hashes are not a digital signature" in report
+    assert "Baseline absolute" in report
+    assert "Candidate absolute" in report
+    assert "Absolute delta" in report and "Percent delta" in report
+    assert "<dt>Artifact ID</dt><dd><code>artifact-input-0</code></dd>" \
+        in report
+    assert "<dt>UTC window</dt><dd>not recorded</dd>" in report
+    assert "<dt>Deployment context</dt><dd>not recorded</dd>" in report
+    assert "<dt>Sample count</dt><dd>400</dd>" in report
+    assert "href='../input-0/report.html'" in report
+    assert "href='../input-1/report.html'" in report
+    assert report.index("How to read this report") < report.index(
+        "Absolute values and deltas")
+    assert report.count("tabindex='0' role='region'") == 2
+    assert "aria-describedby='compatibility-scroll-hint'" in report
+    assert "aria-describedby='metrics-scroll-hint'" in report
+    assert "Scroll horizontally; the Dimension column stays visible." \
+        in report
+    assert "Scroll horizontally; the Metric column stays visible." in report
+    assert ".table-wrap .sticky-col{position:sticky" in report
+    assert ".table-wrap .sticky-col{position:static;box-shadow:none}" \
+        in report
+    assert "<script" not in report.lower()
+    assert "<link" not in report.lower()
+    assert "@import" not in report.lower()
+    assert "url(" not in report.lower()
+    assert "http://" not in report.lower()
+    assert "https://" not in report.lower()
+
+    assert set(manifest["artifacts"]) == {"comparison.md", "comparison.html"}
+    for name in ("comparison.md", "comparison.html"):
+        raw = (out / name).read_bytes()
+        assert manifest["artifacts"][name] == {
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw),
+        }
+    assert verify_comparison_output(out) == manifest
+
+
+def test_comparison_source_cards_and_markdown_show_only_sealed_run_facts():
+    base = _tmp()
+    dirs = []
+    digest = "9" * 64
+    metadata = {
+        "name": "glm-5-2-prod",
+        "task": "llm/v1/chat",
+        "route_optimized": False,
+        "ready": "READY",
+        "served_entities": [{
+            "name": "glm-5-2",
+            "entity_version": "7",
+            "workload_type": "GPU_LARGE",
+            "workload_size": "2x",
+            "min_provisioned_throughput": 1200,
+            "max_provisioned_throughput": 3600,
+            "scale_to_zero_enabled": False,
+        }],
+    }
+    for index, sample_n in enumerate((321, 654)):
+        directory = base / f"source-{index}"
+        directory.mkdir()
+        summary = _summary(f"source-{index}", 0.60)
+        summary["sample"]["n"] = sample_n
+        summary["run"].update({
+            "endpoint_base_url": "https://dbc.example.databricks.com",
+            "endpoint_path": "/serving-endpoints/glm-5-2-prod/invocations",
+            "endpoint_model": "glm-5-2-prod",
+            "endpoint_metadata": metadata,
+        })
+        (directory / "summary.json").write_text(json.dumps(summary))
+        _seal(directory, _manifest(
+            summary,
+            profile_sha256=digest,
+            run_started_at_utc=(
+                f"2027-01-15T08:0{index}:00Z"),
+            run_ended_at_unix=1_800_000_060 + index * 60,
+            endpoint_base_url="https://dbc.example.databricks.com",
+            endpoint_path="/serving-endpoints/glm-5-2-prod/invocations",
+            endpoint_model="glm-5-2-prod",
+            endpoint_metadata=metadata,
+        ))
+        dirs.append(directory)
+
+    out = compare_runs(base / "comparison", dirs)
+    report = (out / "comparison.html").read_text()
+    markdown = (out / "comparison.md").read_text()
+
+    assert "2027-01-15T08:00:00Z → 2027-01-15T08:01:00Z" in report
+    assert "2027-01-15T08:01:00Z → 2027-01-15T08:02:00Z" in report
+    assert "route=https://dbc.example.databricks.com/serving-endpoints/" \
+        "glm-5-2-prod/invocations; model=glm-5-2-prod" in report
+    assert "endpoint=glm-5-2-prod; task=llm/v1/chat; route optimized=False; " \
+        "ready=READY; served entity: name=glm-5-2, version=7, " \
+        "workload=GPU_LARGE, size=2x, min throughput=1200, " \
+        "max throughput=3600, scale to zero=False" in report
+    assert f"<dt>Workload digest</dt><dd><code>{digest}</code></dd>" \
+        in report
+    assert "<dt>Sample count</dt><dd>321</dd>" in report
+    assert "<dt>Sample count</dt><dd>654</dd>" in report
+    assert "pay_per_token" not in report and "pay per token" not in report
+
+    assert "## source runs" in markdown
+    assert "- UTC window: 2027-01-15T08:00:00Z → " \
+        "2027-01-15T08:01:00Z" in markdown
+    assert f"- Workload digest: {digest}" in markdown
+    assert "- Sample count: 321" in markdown
+    assert "- Sample count: 654" in markdown
+
+
+def test_valid_html_deltas_are_arithmetic_not_regression_verdicts():
+    baseline = _summary("baseline", 0.60)
+    candidate = _summary("candidate", 0.60)
+    candidate["ttft_ms"]["p50"] = 300
+    clean = [{"phase": "replay", "status": 200, "ok": True}]
+    out, _md = _compare_with_rows([baseline, candidate], [clean, clean])
+
+    report = (out / "comparison.html").read_text()
+
+    assert "300.0 ms" in report
+    assert "-100.0 ms" in report
+    assert "-25.0%" in report
+    assert "<td class='delta signal-change'>" in report
+    assert "numerically preferred" in report
+    assert "improved" not in report and "regressed" not in report
+    assert "no repeat-run uncertainty or practical-effect threshold" in report
+    assert "winner" not in report.lower()
+    assert "fastest" not in report.lower()
+
+
+def test_missing_endpoint_identity_and_request_evidence_qualify_comparison():
+    base = _tmp()
+    dirs = []
+    for index in range(2):
+        summary = _summary(f"unknown-{index}", 0.60)
+        summary["requests_total"] = 0
+        directory = base / f"input-{index}"
+        directory.mkdir()
+        (directory / "summary.json").write_text(json.dumps(summary))
+        manifest = _manifest(summary)
+        manifest.pop("endpoint_model")
+        _seal(directory, manifest)
+        _replace_requests(directory, [])
+        dirs.append(directory)
+
+    out = compare_runs(base / "comparison", dirs)
+    report = (out / "comparison.html").read_text()
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    assert "QUALIFIED COMPARISON" in report
+    assert "endpoint identity is not recorded" in report
+    assert "no manifest-bound request rows are available" in report
+    assert "direction withheld" in report
+    assert manifest["comparison_state"] == "qualified"
+    assert manifest["comparison_valid"] is False
+    assert manifest["numeric_direction_labels_allowed"] is False
+
+
 def test_warns_only_when_cache_gap_exceeds_threshold():
     assert "WARNING" not in _compare([0.60, 0.62, 0.65])   # gap 0.05
     wide = _compare([0.60, 0.60, 0.85])                    # gap 0.25
@@ -127,6 +353,59 @@ def test_warns_only_when_cache_gap_exceeds_threshold():
 def test_boundary_just_over_and_under():
     assert "WARNING" not in _compare([0.50, 0.60])   # gap exactly 0.10
     assert "WARNING" in _compare([0.50, 0.61])       # gap 0.11
+
+
+def test_cache_mismatch_qualifies_and_neutralizes_comparison():
+    base = _tmp()
+    baseline = _summary("baseline", 0.50)
+    candidate = _summary("candidate", 0.75)
+    candidate["ttft_ms"]["p50"] = 300
+
+    dirs = []
+    for index, summary in enumerate((baseline, candidate)):
+        d = base / f"input-{index}"
+        d.mkdir()
+        (d / "summary.json").write_text(json.dumps(summary))
+        _seal(d, _manifest(summary))
+        dirs.append(d)
+
+    out = compare_runs(base / "comparison", dirs)
+    md = (out / "comparison.md").read_text()
+    report = (out / "comparison.html").read_text()
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    reason = "cached prompt-token fraction p50 spans 0.500 to 0.750"
+    assert "QUALIFIED COMPARISON" in md
+    assert md.index(reason) < md.index("## TTFT (ms)")
+    assert report.index("QUALIFIED COMPARISON") < report.index(reason)
+    assert report.index(reason) < report.index("Absolute values and deltas")
+    assert "All deltas are neutral diagnostic values" in report
+    assert "<td class='delta signal-good'>" not in report
+    assert "<td class='delta signal-bad'>" not in report
+    assert "<span class='assessment'>improved</span>" not in report
+    assert "<span class='assessment'>regressed</span>" not in report
+    assert manifest["comparison_state"] == "qualified"
+    assert manifest["comparison_valid"] is False
+    assert manifest["directional_judgment_allowed"] is False
+    assert manifest["numeric_direction_labels_allowed"] is False
+
+
+def test_canonical_caution_qualifies_comparison():
+    baseline = _summary("baseline", 0.60)
+    candidate = _summary("candidate", 0.60)
+    candidate["decision"] = {
+        "measurement_validity": {
+            "code": "CAUTION",
+            "reason": "client delivery drift requires review",
+        },
+    }
+
+    md = _compare_summaries([baseline, candidate])
+
+    assert "QUALIFIED COMPARISON" in md
+    assert "canonical measurement state is CAUTION" in md
+    assert md.index("client delivery drift requires review") < md.index(
+        "## TTFT (ms)")
 
 
 def test_compare_missing_input_dir_gives_clean_error():
@@ -147,6 +426,7 @@ def _manifest(summary, **overrides):
         "harness_version": summary["harness_version"],
         "latency_basis": summary["latency_basis"],
         "input_mode": "profile", "profile_sha256": "b" * 64,
+        "endpoint_model": "databricks-test-endpoint",
         "seed": 7, "request_params": {"temperature": 0.0,
                                        "max_output_tokens_cap": 512},
         "schedule": summary["schedule"],
@@ -191,6 +471,20 @@ def _compare_summaries(summaries, manifest_overrides=None):
         dirs.append(d)
     out = compare_runs(base / "cmp", dirs)
     return (out / "comparison.md").read_text()
+
+
+def _compare_with_rows(summaries, rows_by_source):
+    base = _tmp()
+    dirs = []
+    for i, (summary, rows) in enumerate(zip(summaries, rows_by_source)):
+        d = base / f"r{i}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "summary.json").write_text(json.dumps(summary))
+        _seal(d, _manifest(summary))
+        _replace_requests(d, rows)
+        dirs.append(d)
+    out = compare_runs(base / "cmp", dirs)
+    return out, (out / "comparison.md").read_text()
 
 
 def test_a_provider_reporting_no_cache_at_all_is_warned_loudly():
@@ -354,6 +648,158 @@ def test_compare_never_treats_a_forced_invalid_aggregate_as_evidence():
     assert "explicitly INVALID aggregate" in md
 
 
+def test_one_http_429_in_one_thousand_rows_invalidates_comparison():
+    clean = _summary("clean", 0.60)
+    limited = _summary("GLM 5.2 | customer", 0.60)
+    for summary in (clean, limited):
+        summary["schedule"]["requests"] = 1000
+    rows = [
+        {"phase": "replay", "status": 200, "ok": True,
+         "request_id": f"request-{index}"}
+        for index in range(1000)
+    ]
+    rows[731].update(status=429, ok=False)
+
+    out, md = _compare_with_rows([clean, limited], [[], rows])
+
+    assert "INVALID COMPARISON" in md
+    assert "INCONCLUSIVE" in md
+    assert "diagnostic-only" in md
+    assert "GLM 5.2 &#124; customer" in md
+    assert "1/1000 manifest-bound request rows returned HTTP 429" in md
+    assert "phases: replay=1" in md
+    assert "supports no endpoint-capacity conclusion" in md
+    assert md.index("1/1000 manifest-bound") < md.index("## TTFT (ms)")
+    assert "Comparability checks" not in md
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["comparison_valid"] is False
+
+
+def test_invalid_html_is_diagnostic_only_escapes_input_and_neutralizes_deltas():
+    payload = "candidate <img src='https://tracker.invalid/pixel'> | unsafe"
+    baseline = _summary("baseline", 0.60)
+    candidate = _summary(payload, 0.60)
+    candidate["ttft_ms"]["p50"] = 300
+    rows = [
+        {"phase": "preflight", "status": 429, "ok": False},
+        {"phase": "replay", "status": 200, "ok": True},
+    ]
+
+    out, _md = _compare_with_rows([baseline, candidate], [[], rows])
+    report = (out / "comparison.html").read_text()
+
+    assert report.index("INVALID COMPARISON") < report.index(
+        "Compatibility matrix")
+    assert "Diagnostic-only." in report
+    assert "HTTP 429: <strong>1/2</strong>" in report
+    assert "phases: preflight=1" in report
+    assert "1/2 manifest-bound request rows returned HTTP 429" in report
+    assert "candidate &lt;img src=&#x27;https://tracker.invalid/pixel&#x27;&gt;" \
+        in report
+    assert "<img" not in report.lower()
+    assert "<script" not in report.lower()
+    assert "<td class='delta signal-good'>" not in report
+    assert "<td class='delta signal-bad'>" not in report
+    assert "All deltas are neutral diagnostic values" in report
+    assert "300.0 ms" in report and "-100.0 ms" in report
+    assert "winner" not in report.lower()
+
+
+def test_setup_phase_http_429s_cannot_hide_behind_clean_replay():
+    a = _summary("baseline", 0.60)
+    b = _summary("setup-limited", 0.60)
+    rows = [
+        {"phase": "preflight", "status": 429, "ok": False},
+        {"phase": "calibration", "status": 429, "ok": False},
+        {"phase": "replay", "status": 200, "ok": True},
+        {"phase": "replay", "status": 200, "ok": True},
+    ]
+
+    _out, md = _compare_with_rows([a, b], [[], rows])
+
+    assert "2/4 manifest-bound request rows returned HTTP 429" in md
+    assert "phases: calibration=1, preflight=1" in md
+    assert "INVALID COMPARISON" in md
+    assert "Comparability checks" not in md
+
+
+def test_authenticated_summary_429_is_invalid_even_if_journal_disagrees():
+    a = _summary("baseline", 0.60)
+    b = _summary("summary-limited", 0.60)
+    b.update({
+        "http_429_count": 1,
+        "quota_limited": True,
+        "http_429": {
+            "count": 1,
+            "request_rows_examined": 1000,
+            "phases": {"probe": 1},
+        },
+    })
+
+    md = _compare_summaries([a, b])
+
+    assert "manifest-bound summary reports 1/1000 request rows" in md
+    assert "phases: probe=1" in md
+    assert "sealed journal contains no matching 429" in md
+    assert "INVALID COMPARISON" in md
+    assert "Comparability checks" not in md
+
+
+@pytest.mark.parametrize("invalid_shape", [
+    {"answers": {"invalid": "answer timing evidence is incomplete"}},
+    {"measurement_valid": False},
+    {"run": {"measurement_valid": False}},
+    {"validity": {"valid": False, "status": "inconclusive"}},
+])
+def test_explicit_source_invalidity_is_diagnostic_only(invalid_shape):
+    a = _summary("baseline", 0.60)
+    b = _summary("invalid-source", 0.60)
+    if "run" in invalid_shape:
+        b["run"].update(invalid_shape["run"])
+    else:
+        b.update(invalid_shape)
+
+    md = _compare_summaries([a, b])
+
+    assert "INVALID COMPARISON" in md
+    assert "diagnostic-only" in md
+    assert "explicit" in md
+    assert "Comparability checks" not in md
+    assert md.index("INVALID COMPARISON") < md.index("## TTFT (ms)")
+
+
+def test_customer_markdown_cannot_change_comparison_structure():
+    payload = (
+        "evil|column\n# injected <img src=https://tracker.invalid/pixel> "
+        "`code` ![remote](https://tracker.invalid/image) "
+        "[link](https://tracker.invalid/click)"
+    )
+    a = _summary("baseline", 0.60)
+    b = _summary(payload, 0.60)
+    b["drift"] = {
+        "drift_flag": False,
+        "drift_kind": None,
+        "note": payload,
+    }
+
+    md = _compare_summaries(
+        [a, b], manifest_overrides={
+            1: {"request_params": {"customer_label": payload}},
+        })
+
+    header = next(
+        line for line in md.splitlines()
+        if line.startswith("| metric / quantile |"))
+    assert header.count("|") == 4
+    assert "evil&#124;column # injected" in header
+    assert "<img" not in md
+    assert not re.search(r"(?<!\\)!\[", md)
+    assert not re.search(r"(?<!\\)\]\(", md)
+    assert not any(line.startswith("# injected") for line in md.splitlines())
+    assert "\\`code\\`" in md
+    assert "&lt;img src=https://tracker.invalid/pixel&gt;" in md
+
+
 def _comparison_inputs(base: Path) -> list[Path]:
     dirs = []
     for i in range(2):
@@ -397,7 +843,7 @@ def test_compare_rejects_incomplete_or_writing_inputs(state):
     ("artifact_id", "artifact-copied", "artifact_id"),
     ("manifest_sha256", "0" * 64, "manifest SHA-256 mismatch"),
     ("manifest_bytes", 1, "manifest byte count mismatch"),
-    ("request_rows", 1, "request_rows"),
+    ("request_rows", 2, "request_rows"),
 ])
 def test_compare_rejects_an_unbound_completion_marker(field, value, match):
     base = _tmp()
@@ -415,6 +861,64 @@ def test_compare_rejects_an_empty_legacy_completion_marker():
     dirs = _comparison_inputs(base)
     (dirs[1] / ".traffic-replay-complete").write_bytes(b"")
     with pytest.raises(ValueError, match="invalid completion marker"):
+        compare_runs(base / "out", dirs)
+
+
+@pytest.mark.parametrize("name,label", [
+    ("manifest.json", "manifest.json"),
+    (".traffic-replay-complete", "completion marker"),
+])
+def test_compare_rejects_duplicate_keys_in_evidence_envelopes(name, label):
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    path = dirs[1] / name
+    raw = path.read_text().rstrip()
+    path.write_text(raw[:-1] + ',"artifact_id":"ambiguous"}\n')
+
+    with pytest.raises(
+            ValueError,
+            match=rf"invalid {re.escape(label)} .*duplicate key 'artifact_id'"):
+        compare_runs(base / "out", dirs)
+
+
+def test_compare_rejects_duplicate_keys_in_authenticated_summary():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    path = dirs[1] / "summary.json"
+    raw = path.read_text().rstrip()
+    path.write_text(raw[:-1] + ',"run":{"title":"ambiguous"}}\n')
+    changed = path.read_bytes()
+    manifest = json.loads((dirs[1] / "manifest.json").read_text())
+    manifest["artifacts"]["summary.json"] = {
+        "sha256": hashlib.sha256(changed).hexdigest(),
+        "bytes": len(changed),
+    }
+    _replace_manifest(dirs[1], manifest)
+
+    with pytest.raises(
+            ValueError,
+            match=r"invalid summary\.json .*duplicate key 'run'"):
+        compare_runs(base / "out", dirs)
+
+
+def test_compare_rejects_nonfinite_authenticated_summary_value():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    path = dirs[1] / "summary.json"
+    summary = json.loads(path.read_text())
+    summary["error_rate"] = float("nan")
+    path.write_text(json.dumps(summary) + "\n")
+    changed = path.read_bytes()
+    manifest = json.loads((dirs[1] / "manifest.json").read_text())
+    manifest["artifacts"]["summary.json"] = {
+        "sha256": hashlib.sha256(changed).hexdigest(),
+        "bytes": len(changed),
+    }
+    _replace_manifest(dirs[1], manifest)
+
+    with pytest.raises(
+            ValueError,
+            match=r"invalid summary\.json .*non-finite number"):
         compare_runs(base / "out", dirs)
 
 
@@ -534,6 +1038,9 @@ def test_compare_output_claim_is_repeated_and_concurrent_safe():
     assert manifest["manifest_schema_version"] == 3
     assert manifest["artifact_type"] == "comparison"
     assert manifest["comparison_valid"] is True
+    assert manifest["comparison_state"] == "valid"
+    assert manifest["numeric_direction_labels_allowed"] is True
+    assert manifest["directional_judgment_allowed"] is False
     assert manifest["generator_source_reconstructible"] is True
     assert manifest["artifact_id"] == completion["artifact_id"]
     assert completion["manifest_sha256"] == \
@@ -543,6 +1050,11 @@ def test_compare_output_claim_is_repeated_and_concurrent_safe():
     assert manifest["artifacts"]["comparison.md"] == {
         "sha256": hashlib.sha256(report_raw).hexdigest(),
         "bytes": len(report_raw),
+    }
+    html_raw = (first / "comparison.html").read_bytes()
+    assert manifest["artifacts"]["comparison.html"] == {
+        "sha256": hashlib.sha256(html_raw).hexdigest(),
+        "bytes": len(html_raw),
     }
     assert [source["artifact_id"] for source in manifest["sources"]] == [
         json.loads((d / "manifest.json").read_text())["artifact_id"]
@@ -566,17 +1078,61 @@ def test_compare_output_claim_is_repeated_and_concurrent_safe():
             lambda _i: compare_runs(concurrent_target, dirs), range(4)))
     assert len(set(outputs)) == 4
     assert all((out / "comparison.md").is_file() for out in outputs)
+    assert all((out / "comparison.html").is_file() for out in outputs)
     assert all((out / ".traffic-replay-complete").is_file()
                for out in outputs)
     assert all(verify_comparison_output(out) for out in outputs)
 
 
-def test_comparison_verifier_detects_rendered_artifact_tampering():
+@pytest.mark.parametrize("name", ["comparison.md", "comparison.html"])
+def test_comparison_verifier_detects_rendered_artifact_tampering(name):
     base = _tmp()
     out = compare_runs(base / "comparison", _comparison_inputs(base))
-    report = out / "comparison.md"
+    report = out / name
     report.write_text(report.read_text() + "tampered\n")
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        verify_comparison_output(out)
+
+
+def test_comparison_verifier_requires_html_as_a_first_class_artifact():
+    base = _tmp()
+    out = compare_runs(base / "comparison", _comparison_inputs(base))
+    (out / "comparison.html").unlink()
+
+    with pytest.raises(ValueError, match="missing comparison.html"):
+        verify_comparison_output(out)
+
+
+def test_comparison_verifier_requires_html_integrity_metadata():
+    base = _tmp()
+    out = compare_runs(base / "comparison", _comparison_inputs(base))
+    manifest = json.loads((out / "manifest.json").read_text())
+    manifest["artifacts"].pop("comparison.html")
+    manifest_raw = (json.dumps(manifest) + "\n").encode()
+    (out / "manifest.json").write_bytes(manifest_raw)
+    completion = json.loads((out / ".traffic-replay-complete").read_text())
+    completion["manifest_sha256"] = hashlib.sha256(manifest_raw).hexdigest()
+    completion["manifest_bytes"] = len(manifest_raw)
+    (out / ".traffic-replay-complete").write_text(json.dumps(completion) + "\n")
+
+    with pytest.raises(ValueError, match="missing required artifact integrity"):
+        verify_comparison_output(out)
+
+
+@pytest.mark.parametrize("name,label", [
+    ("manifest.json", "manifest.json"),
+    (".traffic-replay-complete", "completion marker"),
+])
+def test_comparison_verifier_rejects_duplicate_envelope_keys(name, label):
+    base = _tmp()
+    out = compare_runs(base / "comparison", _comparison_inputs(base))
+    path = out / name
+    raw = path.read_text().rstrip()
+    path.write_text(raw[:-1] + ',"artifact_type":"ambiguous"}\n')
+
+    with pytest.raises(
+            ValueError,
+            match=rf"invalid {re.escape(label)} .*duplicate key 'artifact_type'"):
         verify_comparison_output(out)
 
 
@@ -609,4 +1165,20 @@ def test_compare_never_follows_an_existing_output_symlink():
     out = compare_runs(requested, dirs)
     assert out != requested
     assert list(victim.iterdir()) == []
+    assert (out / ".traffic-replay-complete").is_file()
+
+
+def test_compare_supports_a_symlinked_parent_but_not_a_symlinked_leaf():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    real_parent = base / "real-parent"
+    real_parent.mkdir()
+    alias_parent = base / "parent-alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    requested = alias_parent / "comparison"
+    out = compare_runs(requested, dirs)
+
+    assert out == requested
+    assert out.resolve().parent == real_parent.resolve()
     assert (out / ".traffic-replay-complete").is_file()

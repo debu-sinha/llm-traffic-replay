@@ -76,7 +76,10 @@ def test_sizing_honors_explicit_and_default_worker_caps(monkeypatch):
         runner, "_send_request", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
         runner, "_annotate_result",
-        lambda *_args: {"ok": True, "e2e_ms": 1000.0})
+        lambda *_args: {
+            "ok": True, "e2e_ms": 1000.0,
+            "stream_complete": True, "parse_errors": 0,
+        })
 
     def size(max_concurrency):
         rc = _cfg(1, sizing_concurrency=129, calibrate_n=4,
@@ -89,6 +92,48 @@ def test_sizing_honors_explicit_and_default_worker_caps(monkeypatch):
     # to the safe default, while a caller-supplied lower ceiling wins exactly.
     assert size(None).max_concurrency == 256
     assert size(17).max_concurrency == 17
+
+
+def test_sizing_refuses_survivor_biased_partial_probe(monkeypatch):
+    from traffic_replay import runner
+
+    class Workload:
+        def __init__(self, _rc, _n):
+            pass
+
+        def plan(self, i, request_id):
+            return {
+                "messages": [], "max_output": 1,
+                "intended": (1, 1, 0.0, i), "chars": 1,
+                "global_index": i, "sample_index": i,
+                "prompt_index": None, "construction": None,
+                "body_request_id": request_id,
+            }
+
+    calls = {"n": 0}
+
+    def annotate(*_args):
+        calls["n"] += 1
+        clean = calls["n"] == 1
+        return {
+            "ok": clean, "e2e_ms": 1.0 if clean else None,
+            "stream_complete": clean, "parse_errors": 0,
+        }
+
+    monkeypatch.setattr(runner, "_PreparedWorkload", Workload)
+    monkeypatch.setattr(runner, "_payload_hash", lambda *_args: "0" * 64)
+    monkeypatch.setattr(
+        runner, "_send_request", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner, "_annotate_result", annotate)
+    rc = _cfg(1, sizing_concurrency=8, calibrate_n=8)
+
+    try:
+        runner._size_for_concurrency(
+            rc, object(), object(), lambda _row: None, True,
+            "workload-test", "execution-test")
+        assert False, "partial sizing evidence must be refused"
+    except RuntimeError as exc:
+        assert "1 clean, complete responses from 8 probes" in str(exc)
 
 
 def test_sizing_concurrency_derives_a_fixed_rate_and_pool():

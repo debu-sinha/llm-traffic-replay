@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hashlib
 import json
 import os
@@ -27,6 +28,8 @@ import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Iterator
+
+from .json_input import json_error_detail, loads_strict
 
 
 WRITING_MARKER = ".traffic-replay-writing"
@@ -87,6 +90,16 @@ _PEM_PRIVATE_KEY = re.compile(
     r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?"
     r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
     re.IGNORECASE | re.DOTALL)
+_BIDI_CONTROLS = frozenset(
+    chr(value)
+    for value in (
+        *range(0x202A, 0x202F),
+        *range(0x2066, 0x206A),
+        0x061C,
+        0x200E,
+        0x200F,
+    )
+)
 
 
 def _normalized_key(key: object) -> str:
@@ -207,10 +220,33 @@ def redact_secrets(value, key: str | None = None, *, header_context=False):
     return value
 
 
+def sanitize_display_text(value: object) -> str:
+    """Collapse untrusted display text and remove direction spoofing.
+
+    HTML escaping is a separate output-boundary responsibility. This helper
+    removes C0/DEL and Unicode bidirectional controls, which do not execute
+    code but can visually reorder verdicts, labels, paths, and identities.
+    """
+    pieces: list[str] = []
+    pending_space = False
+    for char in str(value):
+        codepoint = ord(char)
+        if char in _BIDI_CONTROLS or codepoint == 0x7F:
+            continue
+        if char.isspace() or codepoint < 0x20:
+            pending_space = bool(pieces)
+            continue
+        if pending_space:
+            pieces.append(" ")
+            pending_space = False
+        pieces.append(char)
+    return re.sub(r" +", " ", "".join(pieces)).strip()
+
+
 def sanitize_title(value: object) -> str:
-    """A one-line, credential-redacted report title."""
-    safe = str(redact_secrets(str(value)))
-    return re.sub(r"[\x00-\x1f\x7f]+", " ", safe).strip()[:500]
+    """A one-line, credential-redacted, direction-safe report title."""
+    safe = redact_secrets(str(value))
+    return sanitize_display_text(safe)[:500]
 
 
 def strict_json_dumps(value, *, indent: int | None = None) -> str:
@@ -235,6 +271,56 @@ def _fsync_dir_fd(fd: int) -> None:
         # Some filesystems do not support directory fsync. That means they
         # cannot provide the durability contract this harness promises.
         raise ArtifactError(f"cannot fsync artifact directory: {exc}") from exc
+
+
+def _fsync_directory_path(path: Path) -> None:
+    """Durably record entries in one directory without following a symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno not in {errno.ELOOP, errno.ENOTDIR}:
+            raise ArtifactError(
+                f"cannot open artifact parent directory safely {path}: {exc}") \
+                from exc
+        try:
+            expected = path.stat()
+            resolved = path.resolve(strict=True)
+            fd = os.open(resolved, flags)
+            actual = os.fstat(fd)
+        except OSError as alias_exc:
+            raise ArtifactError(
+                f"cannot open artifact parent directory safely {path}: "
+                f"{alias_exc}") from alias_exc
+        if not stat.S_ISDIR(expected.st_mode) \
+                or (actual.st_dev, actual.st_ino) != (
+                    expected.st_dev, expected.st_ino):
+            os.close(fd)
+            raise ArtifactError(
+                f"artifact parent directory alias changed while opening {path}")
+    try:
+        _fsync_dir_fd(fd)
+    except ArtifactError as exc:
+        raise ArtifactError(
+            f"cannot durably sync artifact parent directory {path}: {exc}") \
+            from exc
+    finally:
+        os.close(fd)
+
+
+def _cleanup_created_directory(path: Path) -> None:
+    """Best-effort removal of a directory created by a failed claim."""
+    try:
+        path.rmdir()
+    except OSError:
+        return
+    try:
+        _fsync_directory_path(path.parent)
+    except (ArtifactError, OSError):
+        # Preserve the initialization failure. The directory is absent from
+        # the live namespace even if the cleanup entry itself could not fsync.
+        pass
 
 
 def _write_all(fd: int, value: bytes) -> None:
@@ -342,6 +428,14 @@ class RunArtifacts:
             try:
                 candidate.mkdir(mode=0o700)
                 created = True
+                try:
+                    # fsync the parent immediately: syncing files inside the
+                    # new directory does not make the directory entry itself
+                    # durable after a host crash.
+                    _fsync_directory_path(candidate.parent)
+                except Exception:
+                    _cleanup_created_directory(candidate)
+                    raise
             except FileExistsError:
                 info = candidate.lstat()
                 if stat.S_ISLNK(info.st_mode):
@@ -371,10 +465,7 @@ class RunArtifacts:
                 dir_fd = os.open(candidate, flags)
             except OSError as exc:
                 if created:
-                    try:
-                        candidate.rmdir()
-                    except OSError:
-                        pass
+                    _cleanup_created_directory(candidate)
                 raise ArtifactError(
                     f"cannot open artifact directory safely {candidate}: {exc}") from exc
             try:
@@ -391,6 +482,8 @@ class RunArtifacts:
                 continue
             except OSError as exc:
                 os.close(dir_fd)
+                if created:
+                    _cleanup_created_directory(candidate)
                 raise ArtifactError(
                     f"artifact directory is not writable {candidate}: {exc}") from exc
             try:
@@ -410,6 +503,8 @@ class RunArtifacts:
                 except OSError:
                     pass
                 os.close(dir_fd)
+                if created:
+                    _cleanup_created_directory(candidate)
                 raise
             try:
                 partial_fd = -1
@@ -444,6 +539,8 @@ class RunArtifacts:
                 except OSError:
                     pass
                 os.close(dir_fd)
+                if created:
+                    _cleanup_created_directory(candidate)
                 raise
 
     def _atomic_bytes(self, name: str, value: bytes) -> None:
@@ -559,15 +656,17 @@ class RunArtifacts:
                 if not raw.endswith(b"\n") and not include_truncated_final:
                     break
                 try:
-                    value = json.loads(raw)
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                    value = loads_strict(raw)
+                except (ValueError, UnicodeDecodeError) as exc:
                     if not raw.endswith(b"\n"):
                         break
                     raise ArtifactError(
-                        f"invalid durable JSON row {line_number} in {path}")
+                        f"invalid durable JSON row {line_number} in {path}: "
+                        f"{json_error_detail(exc)}") from exc
                 if not isinstance(value, dict):
                     raise ArtifactError(
-                        f"durable JSON row {line_number} is not an object")
+                        f"durable JSON row {line_number} is not an object in "
+                        f"{path}")
                 yield value
 
     def metadata(self, names: list[str]) -> dict[str, dict]:

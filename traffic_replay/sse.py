@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import codecs
 import hashlib
-import json
 import math
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator
+
+from .json_input import loads_strict
 
 
 @dataclass
@@ -27,6 +28,7 @@ class StreamState:
     valid_tool_calls: int = 0
     finish_reason: str | None = None
     usage: dict | None = None
+    service_tier: str | None = None
     done: bool = False
     errors: list[str] = field(default_factory=list)
     _tool_names: dict[tuple[int, int], list[str]] = field(
@@ -35,11 +37,16 @@ class StreamState:
         default_factory=dict, repr=False)
     _choice_indexes_seen: set[int] = field(default_factory=set, repr=False)
     _multiple_choices_reported: bool = field(default=False, repr=False)
+    _conflicting_finish_reported: bool = field(default=False, repr=False)
+    _conflicting_usage_reported: bool = field(default=False, repr=False)
+    _conflicting_service_tier_reported: bool = field(
+        default=False, repr=False)
 
 
-def _safe_parse_error(kind: str, payload: str) -> dict:
+def _safe_parse_error(kind: str, payload: str | bytes) -> dict:
     """Return diagnostic metadata without persisting streamed content."""
-    encoded = payload.encode("utf-8", "replace")
+    encoded = (payload if isinstance(payload, bytes)
+               else payload.encode("utf-8", "surrogatepass"))
     digest = hashlib.sha256(encoded).hexdigest()[:16]
     return {"__parse_error__":
             f"{kind} (payload bytes={len(encoded)}, sha256={digest})"}
@@ -49,7 +56,11 @@ def parse_sse_line(line: bytes | str) -> dict | None:
     """Return the JSON payload of a `data:` line, {'__done__': True} for
     [DONE], or None for blanks/comments/other fields."""
     if isinstance(line, bytes):
-        line = line.decode("utf-8", errors="replace")
+        raw_line = line
+        try:
+            line = line.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return _safe_parse_error("invalid SSE UTF-8", raw_line)
     line = line.strip()
     if not line or line.startswith(":"):
         return None
@@ -59,8 +70,8 @@ def parse_sse_line(line: bytes | str) -> dict | None:
     if payload == "[DONE]":
         return {"__done__": True}
     try:
-        event = json.loads(payload)
-    except json.JSONDecodeError:
+        event = loads_strict(payload)
+    except ValueError:
         return _safe_parse_error("invalid SSE JSON", payload)
     if not isinstance(event, dict):
         return _safe_parse_error(
@@ -91,7 +102,7 @@ def iter_sse_events(lines: Iterable[bytes | str],
     data_chars = 0
     discard_event = False
     buffered = ""
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
     at_stream_start = True
 
     def dispatch() -> dict | None:
@@ -112,8 +123,8 @@ def iter_sse_events(lines: Iterable[bytes | str],
         if payload.strip() == "[DONE]":
             return {"__done__": True}
         try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
+            event = loads_strict(payload)
+        except ValueError:
             return _safe_parse_error("invalid SSE JSON", payload)
         if not isinstance(event, dict):
             return _safe_parse_error(
@@ -145,24 +156,40 @@ def iter_sse_events(lines: Iterable[bytes | str],
         data_chars += added
         return None
 
-    def decoded_chunks() -> Iterator[str]:
+    def decoded_chunks() -> Iterator[str | dict]:
         """Decode bytes incrementally so UTF-8 code points may cross chunks."""
         nonlocal decoder
         for raw in lines:
             if isinstance(raw, bytes):
-                yield decoder.decode(raw, final=False)
+                try:
+                    yield decoder.decode(raw, final=False)
+                except UnicodeDecodeError as exc:
+                    yield _safe_parse_error(
+                        "invalid SSE UTF-8", bytes(exc.object))
+                    return
             elif isinstance(raw, str):
                 # Mixed byte/string streams are unusual, but flushing pending
                 # byte state avoids joining half a code point to native text.
-                pending = decoder.decode(b"", final=True)
+                try:
+                    pending = decoder.decode(b"", final=True)
+                except UnicodeDecodeError as exc:
+                    yield _safe_parse_error(
+                        "invalid SSE UTF-8", bytes(exc.object))
+                    return
                 decoder = codecs.getincrementaldecoder("utf-8")(
-                    errors="replace")
+                    errors="strict")
                 yield pending + raw
             else:
                 raise TypeError("SSE chunks must be bytes or strings")
-        yield decoder.decode(b"", final=True)
+        try:
+            yield decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            yield _safe_parse_error("invalid SSE UTF-8", bytes(exc.object))
 
     for text in decoded_chunks():
+        if isinstance(text, dict):
+            yield text
+            return
         if at_stream_start and text:
             text = text.removeprefix("\ufeff")
             at_stream_start = False
@@ -228,6 +255,130 @@ def _nonempty_delta(value: object) -> bool:
     if isinstance(value, (list, dict)):
         return bool(value)
     return False
+
+
+def _usage_counter_may_increase(path: tuple[str | int, ...]) -> bool:
+    """Whether ``path`` is an output counter in a cumulative usage block.
+
+    Databricks-hosted GLM emits a complete usage object on every streamed
+    chunk. Prompt/cache counts stay fixed while generated-token counters grow.
+    OpenAI-compatible providers can put the output breakdown in a nested
+    ``*_tokens_details`` object, so those numeric leaves are cumulative too.
+    All other existing values must remain exactly equal.
+    """
+    if not path or not isinstance(path[0], str):
+        return False
+    return path[0] in {
+        "completion_tokens",
+        "completion_tokens_details",
+        "output_tokens",
+        "output_tokens_details",
+        "reasoning_tokens",
+        "total_tokens",
+    }
+
+
+def _usage_is_monotonic_extension(previous: dict, current: dict) -> bool:
+    """Accept a later complete/cumulative usage snapshot, fail closed otherwise.
+
+    Existing fields may not disappear. New fields and values replacing a
+    prior ``null`` are evidence becoming more complete. Known output counters
+    may increase, but input/cache metadata and unknown fields are immutable.
+    The iterative walk avoids recursion failures on adversarial nesting.
+    """
+    stack: list[tuple[tuple[str | int, ...], object, object, bool]] = [
+        ((), previous, current, True)
+    ]
+    while stack:
+        path, left, right, allow_counter_progress = stack.pop()
+        if left is None and right is not None:
+            continue
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            if not left.keys() <= right.keys():
+                return False
+            stack.extend(
+                (path + (key,), left[key], right[key],
+                 allow_counter_progress)
+                for key in left
+            )
+            continue
+        if isinstance(left, list):
+            if len(left) != len(right):
+                return False
+            stack.extend(
+                (path + (position,), old, new, False)
+                for position, (old, new) in enumerate(zip(left, right))
+            )
+            continue
+        if left == right:
+            continue
+        if allow_counter_progress and _usage_counter_may_increase(path):
+            old_count = _token_count(left)
+            new_count = _token_count(right)
+            if old_count is not None and new_count is not None \
+                    and new_count >= old_count:
+                continue
+        return False
+    return True
+
+
+def _usage_path_value(usage: dict,
+                      path: tuple[str, ...]) -> tuple[bool, object]:
+    """Return whether one exact usage path exists, including a null leaf."""
+    node: object = usage
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False, None
+        node = node[key]
+    return True, node
+
+
+def _usage_invariant_errors(usage: dict) -> list[str]:
+    """Validate recognized counters and their provider-independent algebra."""
+    errors: list[str] = []
+
+    for container in ("prompt_tokens_details", "completion_tokens_details"):
+        if container in usage and usage[container] is not None \
+                and not isinstance(usage[container], dict):
+            errors.append(
+                f"stream usage {container} must be an object or null")
+
+    def count(path: tuple[str, ...]) -> int | None:
+        present, raw = _usage_path_value(usage, path)
+        if not present or raw is None:
+            return None
+        parsed = _token_count(raw)
+        if parsed is None:
+            errors.append(
+                "stream usage " + ".".join(path)
+                + " must be a non-negative integer")
+        return parsed
+
+    prompt = count(("prompt_tokens",))
+    completion = count(("completion_tokens",))
+    total = count(("total_tokens",))
+
+    for path in CACHED_TOKEN_PATHS:
+        cached = count(path)
+        if cached is not None and prompt is not None and cached > prompt:
+            errors.append(
+                "stream usage cached tokens exceed prompt_tokens at "
+                + ".".join(path))
+    for path in REASONING_TOKEN_PATHS:
+        reasoning = count(path)
+        if reasoning is not None and completion is not None \
+                and reasoning > completion:
+            errors.append(
+                "stream usage reasoning tokens exceed completion_tokens at "
+                + ".".join(path))
+    if prompt is not None and completion is not None and total is not None \
+            and total != prompt + completion:
+        errors.append(
+            "stream usage total_tokens does not equal prompt_tokens plus "
+            "completion_tokens")
+    return errors
 
 
 def _update_tool_calls(state: StreamState, value: object,
@@ -323,8 +474,8 @@ def finalize_tool_calls(state: StreamState) -> None:
             state.errors.append(f"{label} did not provide JSON arguments")
             continue
         try:
-            parsed = json.loads(arguments)
-        except json.JSONDecodeError:
+            parsed = loads_strict(arguments)
+        except ValueError:
             # Never persist argument content; it may contain customer data.
             encoded = arguments.encode("utf-8", "replace")
             digest = hashlib.sha256(encoded).hexdigest()[:16]
@@ -355,6 +506,21 @@ def update_state(state: StreamState, event: object) -> bool:
     if "__parse_error__" in event:
         state.errors.append(event["__parse_error__"])
         return False
+
+    if "service_tier" in event:
+        service_tier = event["service_tier"]
+        if not isinstance(service_tier, str) or not service_tier.strip():
+            if "stream event service_tier must be a non-empty string" \
+                    not in state.errors:
+                state.errors.append(
+                    "stream event service_tier must be a non-empty string")
+        elif state.service_tier is None:
+            state.service_tier = service_tier
+        elif service_tier != state.service_tier \
+                and not state._conflicting_service_tier_reported:
+            state.errors.append(
+                "stream reported conflicting service_tier values")
+            state._conflicting_service_tier_reported = True
 
     choices = event.get("choices")
     if choices is None:
@@ -415,7 +581,13 @@ def update_state(state: StreamState, event: object) -> bool:
             state.saw_first_tool_call = True
         fr = choice.get("finish_reason")
         if isinstance(fr, str) and fr:
-            state.finish_reason = fr
+            if state.finish_reason is None:
+                state.finish_reason = fr
+            elif fr != state.finish_reason \
+                    and not state._conflicting_finish_reported:
+                state.errors.append(
+                    "stream reported conflicting finish_reason values")
+                state._conflicting_finish_reported = True
         elif fr is not None:
             state.errors.append(
                 f"stream choice {choice_index} finish_reason must be a string")
@@ -423,7 +595,22 @@ def update_state(state: StreamState, event: object) -> bool:
     usage = event.get("usage")
     if usage is not None:
         if isinstance(usage, dict):
-            state.usage = usage
+            invariant_errors = _usage_invariant_errors(usage)
+            for detail in invariant_errors:
+                if detail not in state.errors:
+                    state.errors.append(detail)
+            if not invariant_errors:
+                if state.usage is None:
+                    state.usage = usage
+                elif _usage_is_monotonic_extension(state.usage, usage):
+                    # Retain the newest cumulative snapshot. Keeping the first
+                    # block undercounts Databricks GLM streams because the first
+                    # streamed delta reports only the tokens generated so far.
+                    state.usage = usage
+                elif not state._conflicting_usage_reported:
+                    state.errors.append(
+                        "stream reported conflicting usage blocks")
+                    state._conflicting_usage_reported = True
         else:
             state.errors.append("stream event usage must be an object")
     return first_content

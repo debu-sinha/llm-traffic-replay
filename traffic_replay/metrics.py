@@ -9,6 +9,7 @@ module makes the pairing unavoidable.
 """
 from __future__ import annotations
 
+from datetime import datetime
 import html
 import json
 import math
@@ -23,6 +24,7 @@ from .artifacts import (
     RunArtifacts,
     canonical_sha256,
     redact_secrets as _redact_secrets,
+    sanitize_display_text,
     sanitize_title,
     sha256_bytes,
     snapshot_source_state,
@@ -30,6 +32,167 @@ from .artifacts import (
 )
 
 PCTS = (50, 90, 95, 99)
+
+
+def _external_report_context(summary: dict, value: dict | None) -> dict | None:
+    """Validate the explicit trust context for a verified derivative view.
+
+    Normal source reports never supply this value and therefore remain
+    VERIFY_REQUIRED. Only the external receipt builder supplies it, after it
+    has verified the manifest and canonical artifacts. Reject unknown fields
+    and unrelated decisions so this presentation hook cannot become a general
+    way to paint an arbitrary summary green.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("verification_context must be a dict or None")
+    required = {
+        "view_label", "receipt_id", "source_artifact_id",
+        "source_manifest_sha256", "verifier_version", "verified_at_utc",
+        "assurance", "decision", "source_reproducibility",
+        "verifier_reproducibility",
+    }
+    unknown = set(value) - required
+    missing = required - set(value)
+    if unknown or missing:
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(sorted(missing)))
+        if unknown:
+            detail.append("unknown " + ", ".join(sorted(unknown)))
+        raise ValueError("invalid verification_context: " + "; ".join(detail))
+    if value.get("view_label") != "EXTERNAL VERIFIED VIEW":
+        raise ValueError(
+            "verification_context.view_label must be EXTERNAL VERIFIED VIEW")
+    normalized = {}
+    for field in (
+            "receipt_id", "source_artifact_id", "verifier_version",
+            "verified_at_utc", "assurance"):
+        raw = value.get(field)
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError(f"verification_context.{field} must be non-empty")
+        normalized[field] = sanitize_display_text(raw)
+    digest = value.get("source_manifest_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 \
+            or any(char not in "0123456789abcdefABCDEF" for char in digest):
+        raise ValueError(
+            "verification_context.source_manifest_sha256 must be SHA-256")
+    normalized["source_manifest_sha256"] = digest.lower()
+    try:
+        verified_at = datetime.fromisoformat(
+            normalized["verified_at_utc"].replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "verification_context.verified_at_utc must be ISO-8601") from exc
+    if verified_at.tzinfo is None:
+        raise ValueError(
+            "verification_context.verified_at_utc must include a timezone")
+    assurance_lower = normalized["assurance"].lower()
+    if "sha-256" not in assurance_lower \
+            or "not a digital signature" not in assurance_lower:
+        raise ValueError(
+            "verification_context.assurance must state internal SHA-256 "
+            "consistency and that it is not a digital signature")
+
+    def reproducibility_state(field: str) -> dict:
+        state = value.get(field)
+        if not isinstance(state, dict) or set(state) != {
+                "code", "reason", "reason_codes"}:
+            raise ValueError(
+                f"verification_context.{field} must contain exactly code, "
+                "reason, and reason_codes")
+        code = state.get("code")
+        reason = state.get("reason")
+        reason_codes = state.get("reason_codes")
+        if code not in {"PASS", "FAILED"}:
+            raise ValueError(
+                f"verification_context.{field}.code must be PASS or FAILED")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f"verification_context.{field}.reason must be non-empty")
+        if not isinstance(reason_codes, list) or any(
+                not isinstance(item, str) or not item.strip()
+                for item in reason_codes):
+            raise ValueError(
+                f"verification_context.{field}.reason_codes must be strings")
+        if (code == "PASS") != (not reason_codes):
+            raise ValueError(
+                f"verification_context.{field} code and reason_codes "
+                "disagree")
+        return {
+            "code": code,
+            "reason": sanitize_display_text(reason),
+            "reason_codes": [
+                sanitize_display_text(item) for item in reason_codes],
+        }
+
+    source_reproducibility = reproducibility_state(
+        "source_reproducibility")
+    verifier_reproducibility = reproducibility_state(
+        "verifier_reproducibility")
+
+    decision = value.get("decision")
+    if not isinstance(decision, dict) \
+            or decision.get("decision_schema_version") != 1:
+        raise ValueError("verification_context.decision is invalid")
+    evidence = decision.get("evidence_integrity")
+    if not isinstance(evidence, dict) or evidence.get("code") != "VERIFIED":
+        raise ValueError(
+            "verification_context.decision must carry VERIFIED integrity")
+    from .report_decision import IntegrityContext, build_report_decision
+    baseline = build_report_decision(
+        summary,
+        IntegrityContext(
+            "verified",
+            "The external verifier established internal hash consistency; "
+            "this is not a digital signature.",
+        ),
+    )
+    for key in (
+            "measurement_validity", "customer_sla", "quota_state",
+            "tested_load"):
+        if decision.get(key) != baseline.get(key):
+            raise ValueError(
+                f"verification_context.decision.{key} does not match summary")
+    capacity = decision.get("endpoint_capacity")
+    baseline_capacity = baseline.get("endpoint_capacity")
+    required_provenance_gate = None
+    if source_reproducibility["code"] == "FAILED":
+        required_provenance_gate = "SOURCE_NOT_RECONSTRUCTIBLE"
+    elif verifier_reproducibility["code"] == "FAILED":
+        required_provenance_gate = "VERIFIER_SOURCE_NOT_RECONSTRUCTIBLE"
+    if required_provenance_gate is not None \
+            and isinstance(baseline_capacity, dict) \
+            and baseline_capacity.get("code") == "HELD_AT_TESTED_LOAD" \
+            and capacity == baseline_capacity:
+        raise ValueError(
+            "verification_context.decision cannot claim held capacity when "
+            "source or verifier reproducibility failed")
+    if capacity != baseline_capacity:
+        reason_codes = (capacity or {}).get("reason_codes")
+        provenance_gate = (
+            required_provenance_gate is not None
+            and isinstance(reason_codes, list)
+            and required_provenance_gate in reason_codes)
+        if not (
+                isinstance(capacity, dict)
+                and capacity.get("code") == "INCONCLUSIVE"
+                and isinstance(baseline_capacity, dict)
+                and baseline_capacity.get("code") == "HELD_AT_TESTED_LOAD"
+                and provenance_gate
+                and capacity.get("endpoint_ceiling_established") is False
+                and capacity.get("provider_headroom_established") is False):
+            raise ValueError(
+                "verification_context.decision.endpoint_capacity does not "
+                "match summary or an allowed reconstructibility gate")
+    normalized.update({
+        "view_label": "EXTERNAL VERIFIED VIEW",
+        "decision": decision,
+        "source_reproducibility": source_reproducibility,
+        "verifier_reproducibility": verifier_reproducibility,
+    })
+    return normalized
 
 
 def _tcp_connect_floor(network_path: dict) -> float | None:
@@ -210,9 +373,11 @@ def _sent_at(r: dict) -> float | None:
     first attempt, which is when the load was actually offered. Rows written
     by an older harness only have the former.
     """
-    if "first_send_unix" in r:
-        return r.get("first_send_unix")
-    return r.get("t_send_unix")
+    value = (r.get("first_send_unix") if "first_send_unix" in r
+             else r.get("t_send_unix"))
+    if _nonnegative_finite(value):
+        return float(value)
+    return None
 
 
 def _completed_at(r: dict) -> float | None:
@@ -246,6 +411,457 @@ def _completed_at(r: dict) -> float | None:
                 and not isinstance(last, bool) else start)
         return max(base + max(float(service), 0.0) / 1000.0, start)
     return None
+
+
+def _nonnegative_finite(value) -> bool:
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value)) and value >= 0)
+
+
+def _protocol_clean_success(row: dict) -> bool:
+    """Whether a response is safe to use as successful protocol evidence.
+
+    Current artifacts always carry ``stream_complete``.  Legacy artifacts do
+    not, so absence is tolerated for backwards-compatible descriptive views;
+    callers that make a completeness claim must separately require the field
+    to be present.  An explicitly incomplete or corrupt stream is never
+    eligible, even when an older client left ``ok`` set after seeing content.
+    """
+    parse_errors = row.get("parse_errors", 0)
+    if (not isinstance(parse_errors, int)
+            or isinstance(parse_errors, bool)
+            or parse_errors < 0):
+        return False
+    if not row.get("ok") or parse_errors != 0:
+        return False
+    return ("stream_complete" not in row
+            or row.get("stream_complete") is True)
+
+
+def _usage_is_trustworthy(row: dict) -> bool:
+    """Validate the recognized token-accounting invariants on a clean row."""
+    if not _protocol_clean_success(row):
+        return False
+    prompt = row.get("prompt_tokens")
+    completion = row.get("completion_tokens")
+    if not _nonnegative_finite(prompt) or not _nonnegative_finite(completion):
+        return False
+    cached = row.get("cached_tokens")
+    if cached is not None and (
+            not _nonnegative_finite(cached) or float(cached) > float(prompt)):
+        return False
+    reasoning = row.get("reasoning_tokens")
+    if reasoning is not None and (
+            not _nonnegative_finite(reasoning)
+            or float(reasoning) > float(completion)):
+        return False
+    total = row.get("total_tokens")
+    if total is not None and (
+            not _nonnegative_finite(total)
+            or float(total) != float(prompt) + float(completion)):
+        return False
+    return True
+
+
+def _rolling_peak(entries: list[tuple[float, float]],
+                  window_seconds: float) -> dict:
+    """Exact maximum sum over trailing half-open time windows.
+
+    An event exactly ``window_seconds`` before another is outside the same
+    window.  This matches a continuously sliding interval rather than a pair
+    of inclusive endpoints whose elapsed duration is longer than the label.
+    """
+    if not _nonnegative_finite(window_seconds) or window_seconds <= 0:
+        raise ValueError("rolling window must be positive and finite")
+    ordered = []
+    for stamp, value in entries:
+        if not _nonnegative_finite(stamp) \
+                or not _nonnegative_finite(value):
+            raise ValueError(
+                "rolling entries need finite non-negative timestamps and "
+                "values")
+        ordered.append((float(stamp), float(value)))
+    ordered.sort()
+    if not ordered:
+        return {
+            "max": None, "window_start_unix": None,
+            "window_end_unix": None, "events_in_peak": 0,
+            "events_total": 0,
+        }
+    left = 0
+    running = 0.0
+    peak = -1.0
+    peak_left = 0
+    peak_right = 0
+    for right, (stamp, value) in enumerate(ordered):
+        running += value
+        while left <= right and stamp - ordered[left][0] >= window_seconds:
+            running -= ordered[left][1]
+            left += 1
+        if running > peak:
+            peak = running
+            peak_left = left
+            peak_right = right
+
+    def clean(number: float):
+        return int(number) if number.is_integer() else number
+
+    end = ordered[peak_right][0]
+    return {
+        "max": clean(peak),
+        "window_start_unix": end - window_seconds,
+        "window_end_unix": end,
+        "events_in_peak": peak_right - peak_left + 1,
+        "events_total": len(ordered),
+    }
+
+
+def _rate_limit_evidence(results: list[dict], limits: dict | None,
+                         run_meta: dict | None = None) -> tuple[dict, dict | None]:
+    """Reconstruct this run's token/query windows and compare an as-of limit.
+
+    Databricks counts input at request admission and reserves ``max_tokens``
+    before admission, then credits unused output reservation back.  Persisted
+    rows do not expose provider token-bucket state, the small burst buffer,
+    other workspace traffic, or the exact timestamps of retry attempts.  The
+    block therefore keeps observations and limitations separate and refuses a
+    headroom conclusion when required coverage is incomplete.
+    """
+    rows = [row for row in results if isinstance(row, dict)]
+    sent_rows = [r for r in rows if _sent_at(r) is not None]
+    request_phases = {"preflight", "probe", "sizing", "calibration", "replay"}
+    request_params = ((run_meta or {}).get("request_params") or {})
+    extra_body = request_params.get("extra_body") or {}
+    configured_service_tier = extra_body.get("service_tier", "default")
+    observed_service_tiers = sorted({
+        str(r.get("service_tier")) for r in sent_rows
+        if isinstance(r.get("service_tier"), str)
+        and r.get("service_tier").strip()
+    })
+    unexpected_service_tiers = [
+        tier for tier in observed_service_tiers if tier != "default"]
+    service_tier_consistent = (
+        configured_service_tier == "default"
+        and not unexpected_service_tiers)
+
+    def raw_sent_value(row: dict):
+        return (row.get("first_send_unix") if "first_send_unix" in row
+                else row.get("t_send_unix"))
+
+    invalid_timestamp_rows = sum(
+        raw_sent_value(row) is not None and _sent_at(row) is None
+        for row in rows if row.get("phase") in request_phases)
+    unknown_outcome_rows = 0
+    for row in rows:
+        if row.get("phase") not in request_phases:
+            continue
+        attempt_value = row.get("request_attempts")
+        if _sent_at(row) is None and (
+                attempt_value is None
+                or (isinstance(attempt_value, int)
+                    and not isinstance(attempt_value, bool)
+                    and attempt_value > 0)):
+            unknown_outcome_rows += 1
+
+    def attempt_observation(row: dict) -> tuple[int, bool]:
+        """Return a conservative attempt count and whether it is exact.
+
+        Current rows carry ``request_attempts``.  Legacy ``retries`` did not
+        distinguish a connection failure before POST from a request that may
+        have reached the provider, so it can size offered demand but can never
+        make a rolling comparison complete.
+        """
+        value = row.get("request_attempts")
+        if isinstance(value, int) and not isinstance(value, bool) \
+                and value > 0:
+            return value, True
+        legacy = row.get("retries")
+        if isinstance(legacy, int) and not isinstance(legacy, bool) \
+                and legacy >= 0:
+            return legacy + 1, False
+        return 1, False
+
+    attempt_info = [(row, *attempt_observation(row)) for row in sent_rows]
+    attempt_counts_exact = all(exact for _row, _count, exact in attempt_info)
+    attempt_timestamps_exact = all(
+        exact and count == 1 for _row, count, exact in attempt_info)
+    single_attempt = bool(sent_rows) and attempt_timestamps_exact
+    clean_usage_rows = {id(row) for row in sent_rows
+                        if _usage_is_trustworthy(row)}
+    protocol_evidence_complete = all(
+        "stream_complete" in row for row in sent_rows)
+    input_entries = [
+        (_sent_at(r), float(r["prompt_tokens"]) * count)
+        for r, count, _exact in attempt_info
+        if id(r) in clean_usage_rows]
+    output_entries = [
+        (_completed_at(r),
+         (float(r["completion_tokens"])
+          if id(r) in clean_usage_rows else 0.0))
+        for r, _count, _exact in attempt_info
+        if _completed_at(r) is not None
+        and (id(r) in clean_usage_rows or r.get("status") == 429)]
+    reservation_entries = [
+        (_sent_at(r), float(r["max_tokens_requested"]) * count)
+        for r, count, _exact in attempt_info
+        if _nonnegative_finite(r.get("max_tokens_requested"))]
+    query_entries = [
+        (_sent_at(r), float(count)) for r, count, _exact in attempt_info]
+
+    sent_n = len(sent_rows)
+    input_coverage = len(input_entries) / sent_n if sent_n else None
+    output_coverage = len(output_entries) / sent_n if sent_n else None
+    reservation_coverage = len(reservation_entries) / sent_n if sent_n else None
+
+    def add_horizon(evidence: dict, entries: list[tuple[float, float]],
+                    window_seconds: float) -> dict:
+        stamps = [float(stamp) for stamp, _value in entries]
+        horizon = max(stamps) - min(stamps) if len(stamps) >= 2 else None
+        projection = None
+        if horizon is not None and horizon > 0:
+            projection = sum(float(value) for _stamp, value in entries) \
+                / horizon * window_seconds
+        evidence.update({
+            "window_seconds": window_seconds,
+            "observation_horizon_seconds": horizon,
+            "observation_covers_full_window": (
+                horizon is not None and horizon >= window_seconds),
+            "steady_state_projection": projection,
+            "projection_note": (
+                "total observed demand divided by the first-to-last event "
+                "span and projected over the configured window; this is a "
+                "diagnostic sustained-rate projection, not provider state"),
+        })
+        return evidence
+
+    phases: dict[str, dict] = {}
+    for row in rows:
+        phase = str(row.get("phase") or "unlabeled")
+        item = phases.setdefault(
+            phase, {"rows": 0, "sent_rows": 0,
+                    "unknown_outcome_rows": 0,
+                    "physical_attempts_estimate": 0,
+                    "attempt_counts_exact": True})
+        item["rows"] += 1
+        if _sent_at(row) is not None:
+            count, exact = attempt_observation(row)
+            item["sent_rows"] += 1
+            item["physical_attempts_estimate"] += count
+            item["attempt_counts_exact"] = (
+                item["attempt_counts_exact"] and exact)
+        elif phase in request_phases:
+            attempt_value = row.get("request_attempts")
+            if attempt_value is None or (
+                    isinstance(attempt_value, int)
+                    and not isinstance(attempt_value, bool)
+                    and attempt_value > 0):
+                item["unknown_outcome_rows"] += 1
+    observed = {
+        "traffic_scope": {
+            "rows": len(rows),
+            "sent_rows": sent_n,
+            "physical_attempts_estimate": sum(
+                count for _row, count, _exact in attempt_info),
+            "attempt_count_unknown_rows": sum(
+                not exact for _row, _count, exact in attempt_info),
+            "unknown_outcome_rows": unknown_outcome_rows,
+            "invalid_timestamp_rows": invalid_timestamp_rows,
+            "phases": phases,
+            "note": (
+                "quota windows include every sealed request phase supplied "
+                "by the runner, not only measured replay"),
+        },
+        "input_tokens_by_first_send": add_horizon(
+            _rolling_peak(input_entries, 60.0) | {
+            "reported_rows": len(input_entries),
+            "sent_rows": sent_n,
+            "coverage": input_coverage,
+            "is_lower_bound": bool(sent_n and input_coverage != 1.0),
+            "attempts_grouped_at_first_send": True,
+        }, input_entries, 60.0),
+        "actual_output_tokens_by_completion": add_horizon(
+            _rolling_peak(output_entries, 60.0) | {
+                "reported_rows": len(output_entries),
+                "sent_rows": sent_n,
+                "coverage": output_coverage,
+                "timing_is_approximate": True,
+            }, output_entries, 60.0),
+        "offered_output_token_reservation_demand_by_first_send": add_horizon(
+            _rolling_peak(reservation_entries, 60.0) | {
+                "reported_rows": len(reservation_entries),
+                "sent_rows": sent_n,
+                "coverage": reservation_coverage,
+                "includes_credit_back": False,
+                "is_observed_provider_consumption": False,
+                "note": (
+                    "gross max_tokens offered to pre-admission checks; a "
+                    "rejected request is demand, not a consumed reservation"),
+            }, reservation_entries, 60.0),
+        "physical_queries_by_first_send": add_horizon(
+            _rolling_peak(query_entries, 3600.0) | {
+                "logical_rows": sent_n,
+                "attempt_counts_exact": attempt_counts_exact,
+                "all_attempt_timestamps_exact": attempt_timestamps_exact,
+                "confirmed_http_200_rows": sum(
+                    row.get("status") == 200 for row in sent_rows),
+                "provider_processing_ambiguous_rows": sum(
+                    row.get("status") != 200 for row in sent_rows),
+                "is_observed_provider_processed_count": False,
+            }, query_entries, 3600.0),
+        "single_physical_attempt_per_row": single_attempt,
+        "protocol_evidence_complete": protocol_evidence_complete,
+        "service_tier": {
+            "configured": configured_service_tier,
+            "observed": observed_service_tiers,
+            "consistent_with_standard_pay_per_token": service_tier_consistent,
+            "note": (
+                "the standard pay-per-token quota model in this report "
+                "requires an absent/default request tier; an observed "
+                "non-default response tier invalidates that accounting "
+                "model"),
+        },
+        "note": (
+            "input tokens are endpoint-reported request totals attributed to "
+            "first send. actual output is attributed to request completion "
+            "because per-token generation timestamps are unavailable. offered "
+            "output demand groups requested max_tokens at first send and does "
+            "not claim rejected demand was reserved or model provider "
+            "credit-back. retry timestamps, provider burst-buffer state, and "
+            "traffic from other callers are not observable in a run artifact"),
+    }
+    if limits is None:
+        return observed, None
+
+    warning_at = float(limits["warning_utilization"])
+    comparisons = {}
+    warnings = []
+    from .endpoint_meta import rate_limit_endpoint_binding
+    binding = rate_limit_endpoint_binding(
+        limits,
+        (run_meta or {}).get("endpoint_metadata"),
+    )
+    if not binding["binding_complete"]:
+        warnings.append(
+            "the configured rate-limit model/deployment could not be bound "
+            "to captured endpoint metadata")
+    if not service_tier_consistent:
+        warnings.append(
+            "the request or response service tier was not exact default, so "
+            "the standard pay-per-token quota model does not apply")
+
+    def compare(name: str, limit_key: str, evidence: dict, *,
+                trustworthy: bool, qualifier: str) -> None:
+        if limit_key not in limits:
+            return
+        configured = float(limits[limit_key])
+        display_name = name.replace("_", " ")
+        measured = evidence.get("max")
+        projected = evidence.get("steady_state_projection")
+        short_horizon = not evidence.get("observation_covers_full_window")
+        comparison_value = measured
+        if short_horizon and projected is not None:
+            comparison_value = max(float(measured or 0.0), float(projected))
+        utilization = (float(comparison_value) / configured
+                       if comparison_value is not None else None)
+        scope_complete = not unknown_outcome_rows and not invalid_timestamp_rows
+        trustworthy = (trustworthy and scope_complete
+                       and binding["binding_complete"]
+                       and service_tier_consistent)
+        if measured is None:
+            status = "unmeasured"
+        elif not trustworthy:
+            status = "incomplete_run_evidence"
+        elif float(measured) / configured >= 1.0:
+            status = "run_evidence_at_or_above_nominal_limit"
+        elif short_horizon:
+            status = ("short_observation_projection_at_or_above_warning"
+                      if projected is not None and utilization is not None
+                      and utilization >= warning_at else
+                      "short_observation_incomplete")
+        elif utilization >= warning_at:
+            status = "run_evidence_warning_threshold_reached"
+        else:
+            status = "run_evidence_below_warning_threshold"
+        comparisons[name] = {
+            "configured_limit": configured,
+            "observed_max": measured,
+            "observed_ratio_to_nominal_limit": (
+                float(measured) / configured if measured is not None else None),
+            "steady_state_projection": projected,
+            "comparison_value": comparison_value,
+            "ratio_to_nominal_limit": utilization,
+            # Kept for one release as an explicitly non-provider alias.
+            "utilization": utilization,
+            "warning_utilization": warning_at,
+            "status": status,
+            "comparison_is_complete": trustworthy and not short_horizon,
+            "provider_headroom_established": False,
+            "observation_horizon_seconds": evidence.get(
+                "observation_horizon_seconds"),
+            "window_seconds": evidence.get("window_seconds"),
+            "qualifier": qualifier,
+        }
+        if status == "unmeasured":
+            warnings.append(f"{display_name} could not be measured")
+        elif status == "incomplete_run_evidence":
+            warnings.append(
+                f"{display_name} cannot establish headroom because required "
+                "request "
+                "usage or physical-attempt timing is incomplete")
+        elif status.startswith("short_observation"):
+            projected_text = (
+                " unavailable" if projected is None else
+                f" {projected:,.1f} ({utilization:.1%} of the nominal limit)")
+            warnings.append(
+                f"{display_name} was observed for less than its "
+                f"{evidence.get('window_seconds', 0):g}-second window; "
+                f"the sustained-rate projection is{projected_text}. this "
+                "short run cannot establish sustained quota headroom")
+        elif status == "run_evidence_at_or_above_nominal_limit":
+            warnings.append(
+                f"this run's {qualifier} was {utilization:.1%} of the "
+                "configured nominal limit")
+        elif status == "run_evidence_warning_threshold_reached":
+            warnings.append(
+                f"this run's {qualifier} was {utilization:.1%} of the "
+                "configured nominal limit, "
+                f"above the {warning_at:.0%} warning threshold")
+
+    compare(
+        "input_tokens_per_minute", "input_tokens_per_minute",
+        observed["input_tokens_by_first_send"],
+        trustworthy=(sent_n > 0 and input_coverage == 1.0 and single_attempt
+                     and protocol_evidence_complete),
+        qualifier="endpoint-reported input-token contribution")
+    compare(
+        "output_tokens_per_minute", "output_tokens_per_minute",
+        observed["offered_output_token_reservation_demand_by_first_send"],
+        trustworthy=(sent_n > 0 and reservation_coverage == 1.0
+                     and single_attempt),
+        qualifier=("conservative gross max_tokens demand offered to "
+                   "pre-admission checks before rejection or credit-back"))
+    compare(
+        "queries_per_hour", "queries_per_hour",
+        observed["physical_queries_by_first_send"],
+        trustworthy=(sent_n > 0 and single_attempt
+                     and not observed["physical_queries_by_first_send"][
+                         "provider_processing_ambiguous_rows"]),
+        qualifier=("physical POST demand grouped at client first send; not "
+                   "the provider's processed-query counter"))
+    block = {
+        "configured": _redact_secrets(limits),
+        "binding": binding,
+        "comparisons": comparisons,
+        "warning": "; ".join(warnings) if warnings else None,
+        "external_usage_warning": (
+            "these comparisons cover only traffic recorded by this run. "
+            "provider token-bucket state, burst allowance, and other callers "
+            "are not observed, and offered reservation demand is not consumed "
+            "quota. no comparison establishes provider headroom; confirm "
+            "provider telemetry before a production capacity claim"),
+    }
+    return observed, block
 
 
 def _pct_table(values: list[float | None]) -> dict:
@@ -285,6 +901,26 @@ def _verdict(s: dict) -> tuple[str, str]:
         misses += 1
     unmeasured = sum(1 for r in rows
                      if r["met"] is None and r.get("target_ms") is not None)
+
+    # A 429 is not evidence that the endpoint itself reached a serving
+    # capacity limit. It says only that some rate-limit or quota policy
+    # rejected a request; the limiting dimension and the component that
+    # enforced it require provider telemetry. Keep this ahead of the ordinary
+    # success/error-rate gates: a low 429 rate can still satisfy a customer's
+    # success-rate target, but it can never support a clean capacity claim.
+    http_429_count = s.get("http_429_count")
+    if isinstance(http_429_count, int) \
+            and not isinstance(http_429_count, bool) \
+            and http_429_count > 0:
+        evidence = s.get("http_429") or {}
+        examined = evidence.get("request_rows_examined")
+        denominator = (f" of {examined}" if isinstance(examined, int)
+                       and examined >= http_429_count else "")
+        return "invalid", (
+            f"quota-limited: {http_429_count}{denominator} request "
+            f"{'row returned' if http_429_count == 1 else 'rows returned'} "
+            "HTTP 429. this run supports no endpoint-capacity conclusion; "
+            "identify the enforcing limit and dimension in provider telemetry")
 
     if a.get("invalid"):
         return "invalid", a["invalid"]
@@ -346,9 +982,15 @@ def _verdict(s: dict) -> tuple[str, str]:
     if (s.get("throughput") or {}).get("coverage_warning"):
         doubts.append("token usage was missing on many responses, so "
                       "throughput and cost cover a subset")
+    if (s.get("rate_limits") or {}).get("warning"):
+        doubts.append(str((s.get("rate_limits") or {})["warning"]))
     if (s.get("cost") or {}).get("coverage_warning"):
-        doubts.append("cost could not be computed for every successful "
-                      "response because required usage fields were missing")
+        doubts.append("aggregate or effective cost could not be computed "
+                      "because usage or physical-attempt evidence was "
+                      "incomplete")
+    if (s.get("cost") or {}).get("applicability_warning"):
+        doubts.append("the supplied pricing rates were not provenance-bound "
+                      "to this provider/model/product/tier run")
     if (s.get("cache_fidelity") or {}).get("warning"):
         doubts.append((s.get("cache_fidelity") or {})["warning"])
     if (s.get("token_targeting") or {}).get("warning"):
@@ -435,21 +1077,34 @@ def _answered(r: dict) -> bool:
                 and not r.get("parse_errors"))
 
 
+def _content_delta_seen(r: dict) -> bool:
+    """Whether a current-format row emitted visible or reasoning content.
+
+    A valid tool-call-only stream is a successful request, but it did not
+    emit a content delta. Keeping this predicate separate prevents reports
+    from turning tool-call success into a false content-count claim.
+    """
+    return bool(r.get("visible_content_seen") or r.get("reasoning_seen"))
+
+
 def _answer_block(results: list[dict]) -> dict | None:
     """Answer completion, separately from HTTP and content-stream success.
 
-    ``ok`` is a harness field meaning that at least one visible or reasoning
-    content delta arrived. It is not an HTTP-status counter. Keep the three
-    populations separate so a reasoning-only HTTP 200 cannot be presented as
-    a readable answer, and a content-bearing stream cannot be mislabeled as
-    "returned HTTP 200" when status was not retained by a legacy row.
+    ``ok`` is a harness success field: current rows may satisfy it with a
+    visible/reasoning content delta or a structurally valid tool call. It is
+    not an HTTP-status or content-delta counter. Keep those populations
+    separate so a tool-only response is not called content, a reasoning-only
+    HTTP 200 is not presented as a readable answer, and a response-bearing
+    stream is not called HTTP 200 when status was not retained by a legacy
+    row.
     """
-    ok = [r for r in results if r.get("ok")]
-    scored = [r for r in results
-              if "visible_content_seen" in r or "valid_tool_calls" in r]
+    ok = [r for r in results if _protocol_clean_success(r)]
+    observed_fields = {
+        "visible_content_seen", "reasoning_seen", "valid_tool_calls"}
+    scored = [r for r in results if observed_fields.intersection(r)]
     legacy_failures = [r for r in results
                        if not r.get("ok")
-                       and "visible_content_seen" not in r]
+                       and not observed_fields.intersection(r)]
     if not scored and not legacy_failures:
         return None          # rows written before this was recorded
     n_observed = len(scored)
@@ -458,10 +1113,20 @@ def _answer_block(results: list[dict]) -> dict | None:
     statuses = [r.get("status") for r in results if r.get("status") is not None]
     out = {
         "attempted": len(results),
-        # Backward-compatible field name. Its definition is now explicit and
-        # renderers never call it an HTTP counter.
+        # Clean harness-success count, retained under its historical key for
+        # automation compatibility. It is not necessarily an HTTP 200 or a
+        # content-bearing stream; corrupt/incomplete rows are excluded.
         "transport_ok": len(ok),
-        "content_streams": len(ok),
+        "harness_successful": len(ok),
+        "content_delta_streams": sum(
+            1 for r in scored if _content_delta_seen(r)),
+        # Backward-compatible alias, corrected to its literal meaning for
+        # current rows. Legacy successes without observability are excluded.
+        "content_streams": sum(
+            1 for r in scored if _content_delta_seen(r)),
+        "unclassified_legacy_successes": sum(
+            1 for r in results
+            if r.get("ok") and not observed_fields.intersection(r)),
         "http_status_observed_for": len(statuses),
         "http_200": sum(1 for status in statuses if status == 200),
         "scored": n_observed,
@@ -523,7 +1188,9 @@ def _answer_block(results: list[dict]) -> dict | None:
                     key=lambda kv: kv[1])
         out["invalid"] = (
             f"not one of the {judged} requests with answer observability "
-            f"produced visible content or a valid tool call. most of them "
+            "produced a reportable completed answer. a reportable answer "
+            "requires visible content or a valid tool call, a complete "
+            "stream, and no unrecoverable parse error. most requests "
             f"{cause[0]} "
             f"({cause[1]} of {judged}). there is no latency-to-answer in this "
             "run and nothing "
@@ -536,9 +1203,11 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
               acceptance: dict | None = None,
               ttft_definition: str = "first_content",
               pricing: dict | None = None,
-              concurrency_target: int | None = None) -> dict:
-    ok = [r for r in results if r.get("ok")]
-    failed = [r for r in results if not r.get("ok")]
+              concurrency_target: int | None = None,
+              rate_limits: dict | None = None,
+              rate_limit_results: list[dict] | None = None) -> dict:
+    ok = [r for r in results if _protocol_clean_success(r)]
+    failed = [r for r in results if not _protocol_clean_success(r)]
     safe_run_meta = _redact_secrets(run_meta or {})
 
     # Current rows say whether visible content arrived and the stream ended
@@ -580,22 +1249,27 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "primary answer-latency population")
 
     # achieved cache, endpoint-reported only
+    usage_trustworthy = [r for r in ok if _usage_is_trustworthy(r)]
     ach = [(r["cached_tokens"] / r["prompt_tokens"])
-           for r in ok
+           for r in usage_trustworthy
            if r.get("cached_tokens") is not None
            and r.get("prompt_tokens")]
-    cache_sources = sorted({r.get("cached_tokens_source") for r in ok
+    cache_sources = sorted({r.get("cached_tokens_source")
+                            for r in usage_trustworthy
                             if r.get("cached_tokens_source")})
     intended_cache = [r.get("intended_cache_fraction") for r in results
                       if r.get("intended_cache_fraction") is not None]
+    cache_intended_rows = [
+        r for r in results
+        if r.get("intended_cache_fraction") is not None]
     paired_cache_error = [
         abs((r["cached_tokens"] / r["prompt_tokens"])
             - r["intended_cache_fraction"])
-        for r in ok
+        for r in usage_trustworthy
         if r.get("cached_tokens") is not None and r.get("prompt_tokens")
         and r.get("intended_cache_fraction") is not None]
     invalid_cache_rows = sum(
-        1 for r in ok
+        1 for r in usage_trustworthy
         if r.get("cached_tokens") is not None and r.get("prompt_tokens")
         and not 0 <= r["cached_tokens"] / r["prompt_tokens"] <= 1)
 
@@ -614,16 +1288,24 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 and not isinstance(value, bool)
                 and math.isfinite(float(value)) and value >= 0)
 
-    input_eligible = [r for r in ok
-                      if positive_number(r.get("intended_input_tokens"))]
+    input_intended_rows = [
+        r for r in results
+        if positive_number(r.get("intended_input_tokens"))]
+    input_eligible = [
+        r for r in input_intended_rows
+        if _usage_is_trustworthy(r)]
     input_pairs = [
         (float(r["prompt_tokens"]), float(r["intended_input_tokens"]))
         for r in input_eligible if positive_number(r.get("prompt_tokens"))]
     ratios = [actual / intended for actual, intended in input_pairs]
     input_errors_pct = [abs(ratio - 1.0) * 100.0 for ratio in ratios]
 
-    output_eligible = [r for r in ok
-                       if positive_number(r.get("intended_output_tokens"))]
+    output_intended_rows = [
+        r for r in results
+        if positive_number(r.get("intended_output_tokens"))]
+    output_eligible = [
+        r for r in output_intended_rows
+        if _usage_is_trustworthy(r)]
     output_pairs = [
         (float(r["completion_tokens"]), float(r["intended_output_tokens"]))
         for r in output_eligible
@@ -632,18 +1314,18 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     output_errors_pct = [abs(ratio - 1.0) * 100.0 for ratio in out_ratios]
     targeting_warnings = []
     tolerance_pct = 10.0
-    input_coverage = (len(input_pairs) / len(input_eligible)
-                      if input_eligible else None)
-    output_coverage = (len(output_pairs) / len(output_eligible)
-                       if output_eligible else None)
+    input_coverage = (len(input_pairs) / len(input_intended_rows)
+                      if input_intended_rows else None)
+    output_coverage = (len(output_pairs) / len(output_intended_rows)
+                       if output_intended_rows else None)
     input_error_table = _pct_table(input_errors_pct)
     output_error_table = _pct_table(output_errors_pct)
-    if input_eligible:
+    if input_intended_rows:
         if input_coverage is not None and input_coverage < 0.99:
             targeting_warnings.append(
                 f"prompt-token usage was reported for only "
-                f"{len(input_pairs)} of {len(input_eligible)} successful "
-                "profile requests")
+                f"{len(input_pairs)} of {len(input_intended_rows)} captured "
+                "profile requests with declared input targets")
         elif ((input_error_table.get("p50") or 0.0) > tolerance_pct
               or (input_error_table.get("p95") or 0.0) > tolerance_pct):
             targeting_warnings.append(
@@ -652,12 +1334,12 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 f"(absolute relative error p50 "
                 f"{input_error_table['p50']:.1f}%, p95 "
                 f"{input_error_table['p95']:.1f}%)")
-    if output_eligible:
+    if output_intended_rows:
         if output_coverage is not None and output_coverage < 0.99:
             targeting_warnings.append(
                 f"completion-token usage was reported for only "
-                f"{len(output_pairs)} of {len(output_eligible)} successful "
-                "profile requests")
+                f"{len(output_pairs)} of {len(output_intended_rows)} captured "
+                "profile requests with declared output targets")
         elif ((output_error_table.get("p50") or 0.0) > tolerance_pct
               or (output_error_table.get("p95") or 0.0) > tolerance_pct):
             targeting_warnings.append(
@@ -744,18 +1426,24 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             send_span = max(max(sent) - min(sent), 1e-9)
 
     # throughput in the customer's own vocabulary (tokens per minute)
-    in_tok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
-    out_tok = sum(r["completion_tokens"] for r in ok
-                  if r.get("completion_tokens"))
-    cached_tok = sum(r["cached_tokens"] for r in ok if r.get("cached_tokens"))
+    usage_rows = [r for r in results if _usage_is_trustworthy(r)]
+    in_tok = sum(float(r["prompt_tokens"]) for r in usage_rows)
+    out_tok = sum(float(r["completion_tokens"]) for r in usage_rows)
+    cached_tok = sum(float(r.get("cached_tokens") or 0) for r in usage_rows)
     dur_min = (dur / 60.0) if dur else None
     # how many successful responses actually reported usage. a run where
     # only a tenth of them do would otherwise understate token throughput
     # and per-token cost tenfold with nothing said about it.
-    usage_n = sum(1 for r in ok
-                  if r.get("prompt_tokens") is not None
-                  and r.get("completion_tokens") is not None)
-    usage_coverage = (usage_n / len(ok)) if ok else None
+    usage_n = len(usage_rows)
+    usage_coverage = (usage_n / len(results)) if results else None
+    complete_request_evidence = (
+        results if rate_limit_results is None else rate_limit_results)
+    http_429 = _http_429_evidence(
+        complete_request_evidence,
+        scope=("measured replay rows" if rate_limit_results is None else
+               "all supplied request phases"))
+    token_windows, rate_limit_block = _rate_limit_evidence(
+        complete_request_evidence, rate_limits, safe_run_meta)
 
     summary = {
         "requests_total": len(results),
@@ -764,6 +1452,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "requests_retried": retried,
         "error_rate": len(failed) / len(results) if results else None,
         "failures_by_error": _top_errors(failed),
+        "failures_by_http_status": _failures_by_http_status(failed),
+        # Top-level aliases keep simple report/automation consumers from
+        # having to understand the richer evidence block. The count/rate can
+        # include preflight, probe, sizing, and calibration requests when the
+        # runner supplied those captured, later manifest-bound request rows.
+        "http_429_count": http_429["count"],
+        "http_429_rate": http_429["rate"],
+        "http_429": http_429,
+        "quota_limited": http_429["quota_limited"],
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in latency_ok]),
         "ttf_tool_call_ms": _pct_table(
             [r.get("ttf_tool_call_ms") for r in latency_ok]),
@@ -788,15 +1485,18 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                  "throughput is withheld rather than treating failed "
                  "requests as zero-duration")
                 if sent and len(done) != len(sent) else
-                (None if usage_coverage is None or usage_coverage > 0.99 else
-                 f"only {usage_n} of {len(ok)} successful responses reported "
-                 "token usage, so these totals and any per-token cost below "
-                 "cover that subset, not the run")),
+                (None if usage_coverage is None or usage_coverage == 1.0 else
+                 f"only {usage_n} of {len(results)} attempted requests "
+                 "returned a clean, complete stream with internally sane "
+                 "token usage, so these totals cover that subset, not the "
+                 "run")),
         },
+        "observed_rate_windows": token_windows,
         "achieved_cache_fraction": _pct_table(ach) | {
             "reported_for_n": len(ach),
-            "eligible_successes": len(ok),
-            "coverage": (len(ach) / len(ok)) if ok else None,
+            "eligible_successes": len(usage_trustworthy),
+            "eligible_requests": len(results),
+            "coverage": (len(ach) / len(results)) if results else None,
             "source_fields": (cache_sources
                               or (["SOURCE FIELD NOT RECORDED"] if ach else
                                   ["NOT REPORTED BY ENDPOINT"])),
@@ -804,6 +1504,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "intended_cache_fraction": _pct_table(intended_cache),
         "latency_population": latency_population,
         "token_targeting": {
+            "input_intended_requests": len(input_intended_rows),
             "input_eligible_successes": len(input_eligible),
             "input_reported_n": len(input_pairs),
             "input_coverage": input_coverage,
@@ -814,6 +1515,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "abs_error_pct_p50":
                 float(np.percentile([abs(x - 1.0) for x in ratios], 50) * 100)
                 if ratios else None,
+            "output_intended_requests": len(output_intended_rows),
             "output_eligible_successes": len(output_eligible),
             "output_reported_n": len(output_pairs),
             "output_coverage": output_coverage,
@@ -826,8 +1528,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                       * 100) if out_ratios else None,
             "finish_reasons": finish_reasons,
             "tolerance_pct": tolerance_pct,
-            "status": ("not_applicable" if not input_eligible
-                       and not output_eligible else
+            "status": ("not_applicable" if not input_intended_rows
+                       and not output_intended_rows else
                        "verified" if not targeting_warnings else "mismatch"),
             "warning": "; ".join(targeting_warnings)
             if targeting_warnings else None,
@@ -855,6 +1557,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": safe_run_meta,
     }
+    if rate_limit_block is not None:
+        summary["rate_limits"] = rate_limit_block
     for field in ("ttft_ms", "ttf_tool_call_ms"):
         values = [r.get(field) for r in latency_ok]
         summary[field]["missing"] = sum(v is None for v in values)
@@ -862,7 +1566,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     if intended_cache:
         tolerance = 0.10
         err = _pct_table(paired_cache_error)
-        coverage = (len(ach) / len(ok)) if ok else None
+        coverage = (len(paired_cache_error) / len(cache_intended_rows)
+                    if cache_intended_rows else None)
         warnings = []
         if not paired_cache_error:
             warnings.append(
@@ -880,12 +1585,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 f"(absolute error p50 {err['p50']:.3f}, p95 {err['p95']:.3f})")
         if coverage is not None and coverage < 0.99:
             warnings.append(
-                f"cache usage was reported for only {len(ach)} of {len(ok)} "
-                "content-bearing successful responses")
+                f"cache usage was reported for only "
+                f"{len(paired_cache_error)} of {len(cache_intended_rows)} "
+                "captured profile requests with declared cache targets")
         summary["cache_fidelity"] = {
             "status": "verified" if not warnings else "unverified",
             "tolerance_abs": tolerance,
             "paired_n": len(paired_cache_error),
+            "intended_requests": len(cache_intended_rows),
             "coverage": coverage,
             "absolute_error": err,
             "warning": "; ".join(warnings) if warnings else None,
@@ -941,7 +1648,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         if any(v is not None for v in vals):
             summary[fld] = _pct_table(vals)
             # a reasoning model that runs out of max_tokens mid-thought
-            # returns a successful response with no visible token at all.
+            # returns a successful response with no visible content at all.
             # those rows carry no ttfv, so the percentiles above describe
             # only the requests that finished thinking soonest. that is the
             # same survivorship the error path already guards against, and
@@ -982,19 +1689,19 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "scheduled target through the observed event, including worker "
             "queueing, connection setup, retries and fallbacks. Legacy rows "
             "without exact clocks are reconstructed as service time plus "
-            "queue wait. SLA latency targets and hard caps prefer these "
+            "queue wait. Configured latency targets and hard caps prefer these "
             "figures whenever available.")
         summary["latency_correction_provenance"] = {
             "exact_values": exact_caller_n,
             "legacy_reconstructed_values": reconstructed_caller_n,
         }
-    reason_vals = [r.get("reasoning_tokens") for r in ok]
+    reason_vals = [r.get("reasoning_tokens") for r in usage_rows]
     if any(v is not None for v in reason_vals):
         total = sum(v for v in reason_vals if v)
         summary["reasoning_tokens"] = _pct_table(reason_vals)
         summary["reasoning_tokens_total"] = total
         summary["reasoning_tokens_source"] = next(
-            (r.get("reasoning_tokens_source") for r in ok
+            (r.get("reasoning_tokens_source") for r in usage_rows
              if r.get("reasoning_tokens_source")), None)
         if dur_min:
             summary["throughput"]["reasoning_tokens_per_min"] = total / dur_min
@@ -1002,7 +1709,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         # endpoint did not report a reasoning-token count (some models do
         # not). fall back to counting reasoning_content deltas in the stream,
         # clearly labeled as an estimate.
-        chunk_vals = [r.get("reasoning_chunks") for r in ok]
+        chunk_rows = [r for r in results if _protocol_clean_success(r)]
+        chunk_vals = [r.get("reasoning_chunks") for r in chunk_rows]
         if any(chunk_vals):
             ctotal = sum(v for v in chunk_vals if v)
             summary["reasoning_stream_deltas"] = _pct_table(chunk_vals)
@@ -1132,10 +1840,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # and must not be put in one column.
     summary["harness_version"] = __version__
     summary["latency_basis"] = (
-        "ttft/ttfb/ttfg are timed from the moment the request bytes are sent "
-        "on an already-established connection. TCP and TLS setup is measured "
-        "separately as connect_ms and is NOT included. changed in 0.3.0: "
-        "0.2.x and earlier included connection setup in these numbers.")
+        "final-attempt clocks begin immediately before conn.request on an "
+        "already-established connection, so they include request upload. "
+        "ttfb ends at the first iterated response-body line (not necessarily "
+        "the first response byte). ttft ends at the first nonempty visible or "
+        "reasoning content delta and excludes tool-call fragments; first "
+        "visible content and first tool-call fragment remain separate metrics. "
+        "TCP and TLS setup is measured separately as connect_ms and is NOT "
+        "included. changed in 0.3.0: 0.2.x and earlier included connection "
+        "setup in these numbers.")
 
     # prompts mode cycles the supplied prompts (runner: prompt_msgs[i % m]).
     # once the set has been through once, every later request is a verbatim
@@ -1164,7 +1877,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 if n_ok > pc else None),
         }
     if pricing:
-        summary["cost"] = _cost_block(ok, dur, in_tok, out_tok, cached_tok,
+        summary["cost"] = _cost_block(results, dur, in_tok, out_tok, cached_tok,
                                       pricing)
     if acceptance:
         summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance,
@@ -1228,7 +1941,8 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
         errs[w] = errs.get(w, 0) + 1
     short = {"windows": [], "window_seconds": window_s,
              "note": f"run shorter than two {window_s}s windows, cannot show "
-                     "drift. run for minutes to test sustained SLA."}
+                     "drift. run for minutes to test sustained acceptance "
+                     "targets."}
     if len(buckets) < 2:
         return short
     rows = []
@@ -1288,7 +2002,8 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
             "direction, so warmup and mid-run spikes both show up. E2E p95 is "
             "printed alongside but not scored. a window is left out of the "
             f"latency comparison when it has fewer than {p95_floor:.0f} "
-            "successful requests, when no request returned a first token, or "
+            "successful requests, when no request returned a content delta, "
+            "or "
             "when it lost more than a fifth of its requests.")
     worst_err = max((r["error_rate"] for r in err_counted), default=0.0)
     base_err = min((r["error_rate"] for r in err_counted), default=0.0)
@@ -1385,53 +2100,158 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     }
 
 
-def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
+def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
                 cached_tok: int, pricing: dict) -> dict:
-    """Cost from endpoint-reported tokens times user-supplied DBU rates.
+    """Diagnostic arithmetic over replay rows using unverified input rates.
 
-    Rates come from the Databricks pricing page and are supplied in the run
-    config, never fetched, so the report states the arithmetic and the numbers
-    you gave it. Pay-per-token bills input, output, and cache-read separately
-    (three DBU/M rates). Provisioned throughput bills capacity by the hour, so
-    the useful figure is effective DBU per 1M tokens at the measured load.
+    The harness does not fetch a price, bind the supplied rate to a commercial
+    product, or observe provider billing for every physical POST.  Exact-looking
+    aggregate fields are therefore emitted only when every logical replay row
+    has a known zero-send outcome or one clean, single-attempt response with
+    sane usage.  The applicability warning is unconditional until a future
+    pricing schema seals provider/model/product/region/tier/date provenance.
     """
     mode = pricing.get("mode", "per_token")
     usd = pricing.get("usd_per_dbu")
-    tok_total = in_tok + out_tok
-    usage_rows = [r for r in ok
-                  if r.get("prompt_tokens") is not None
-                  and r.get("completion_tokens") is not None]
-    usage_coverage = ((len(usage_rows) / len(ok)) if ok
+    attempted = len(rows)
+    successful = sum(_protocol_clean_success(r) for r in rows)
+    indexed_usage_rows = [
+        (i, r) for i, r in enumerate(rows) if _usage_is_trustworthy(r)]
+    usage_rows = [r for _i, r in indexed_usage_rows]
+    tok_total = sum(float(r["prompt_tokens"])
+                    + float(r["completion_tokens"]) for r in usage_rows)
+    usage_coverage = ((len(usage_rows) / attempted) if attempted
                       else (1.0 if tok_total else None))
+
+    # A final response reports usage only for that response.  It cannot prove
+    # whether an earlier POST reached the provider, generated tokens, or was
+    # billed.  Keep these classes disjoint so contradictory rows such as
+    # request_attempts=0 plus a retry marker can never be treated as unsent.
+    def attempt_class(row: dict) -> str:
+        value = row.get("request_attempts")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return "unknown"
+
+        if "connection_attempts" in row:
+            connections = row.get("connection_attempts")
+            if (not isinstance(connections, int)
+                    or isinstance(connections, bool)
+                    or connections < value):
+                return "unknown"
+
+        retries_present = "retries" in row
+        reasons_present = "retry_reasons" in row
+        retries = row.get("retries")
+        reasons = row.get("retry_reasons")
+        if retries_present != reasons_present:
+            return "unknown"
+        if retries_present and (
+                not isinstance(retries, int)
+                or isinstance(retries, bool)
+                or retries < 0):
+            return "unknown"
+        if reasons_present and (
+                not isinstance(reasons, list)
+                or any(not isinstance(reason, str) or not reason
+                       for reason in reasons)):
+            return "unknown"
+        if retries_present and reasons_present and retries != len(reasons):
+            return "unknown"
+        if ((retries_present and retries > 0)
+                or (reasons_present and reasons)):
+            return "ambiguous"
+        if value == 0:
+            response_evidence = (
+                row.get("ok") is True
+                or _sent_at(row) is not None
+                or row.get("status") is not None
+                or any(row.get(name) is not None for name in (
+                    "prompt_tokens", "completion_tokens", "total_tokens")))
+            if response_evidence:
+                return "unknown"
+            return "unsent"
+        if value == 1:
+            return "single"
+        return "ambiguous"
+
+    attempt_classes = [attempt_class(r) for r in rows]
+    known_unsent = attempt_classes.count("unsent")
+    exact_single_attempts = attempt_classes.count("single")
+    ambiguous_retry_rows = attempt_classes.count("ambiguous")
+    unknown_attempt_rows = attempt_classes.count("unknown")
+    exact_usage_rows = [
+        r for i, r in indexed_usage_rows if attempt_classes[i] == "single"]
+
+    def completeness(eligible_count: int) -> tuple[bool, float | None, list[str]]:
+        complete = eligible_count + known_unsent == attempted
+        coverage = ((eligible_count + known_unsent) / attempted
+                    if attempted else None)
+        gaps = []
+        if ambiguous_retry_rows:
+            gaps.append(
+                f"{ambiguous_retry_rows} row(s) had multiple or retry-marked "
+                "physical POSTs whose earlier billed usage is not observed")
+        if unknown_attempt_rows:
+            gaps.append(
+                f"{unknown_attempt_rows} row(s) lacked exact physical-attempt "
+                "accounting")
+        missing_usage = exact_single_attempts - eligible_count
+        if missing_usage:
+            gaps.append(
+                f"{missing_usage} single-POST row(s) did not have one clean, "
+                "complete, internally sane usage response")
+        return complete, coverage, gaps
+
+    applicability_warning = (
+        "rates were supplied by the operator and were not fetched or bound to "
+        "a verified provider, model, commercial product, cloud, region, "
+        "service tier, effective date, contract, or DBU-to-USD conversion. "
+        "this is diagnostic rate arithmetic over measured replay rows, not a "
+        "current Databricks price, invoice, or full-harness cost")
 
     if mode == "provisioned":
         dph = pricing.get("dbu_per_hour")
         if dph is None:
             return {"mode": mode, "error": "provisioned needs dbu_per_hour"}
+        complete, coverage, gaps = completeness(len(exact_usage_rows))
+        exact_tok_total = sum(
+            float(r["prompt_tokens"]) + float(r["completion_tokens"])
+            for r in exact_usage_rows)
         dur_hr = (dur / 3600.0) if dur else None
-        tph = (tok_total / dur_hr) if dur_hr and usage_coverage == 1.0 else None
+        tph = (exact_tok_total / dur_hr) if dur_hr and complete else None
         eff = (dph / (tph / 1e6)) if tph else None
         block = {"mode": "provisioned", "dbu_per_hour": dph,
                  "effective_dbu_per_1m_tokens": eff,
-                 "tokens_measured": tok_total,
+                 "tokens_measured": exact_tok_total if complete else None,
+                 "tokens_measured_subset": tok_total,
                  "usage_coverage": usage_coverage,
                  "usage_rows": len(usage_rows),
-                 "successful_rows": len(ok),
+                 "exact_single_usage_rows": len(exact_usage_rows),
+                 "successful_rows": successful,
+                 "attempted_rows": attempted,
+                 "known_unsent_rows": known_unsent,
+                 "ambiguous_retry_rows": ambiguous_retry_rows,
+                 "unknown_attempt_rows": unknown_attempt_rows,
+                 "coverage": coverage,
+                 "complete": complete,
+                 "scope": "measured_replay_interval_only",
+                 "provenance_verified": False,
+                 "applicability_warning": applicability_warning,
                  "coverage_warning": (
-                     None if usage_coverage in (None, 1.0) else
-                     f"token usage was reported for {len(usage_rows)} of "
-                     f"{len(ok)} successful responses, so effective cost per "
-                     "token is unavailable"),
+                     None if complete or not rows else
+                     "; ".join(gaps) + ". effective provisioned cost per "
+                     "token and its token-throughput denominator are "
+                     "unavailable; final-response token usage is retained "
+                     "only as a measured-subset diagnostic"),
                  "note": "provisioned throughput bills by capacity (DBU/hour), "
                          "not per token. effective cost per 1M tokens is the "
                          "hourly rate over tokens served per hour at the "
-                         "measured throughput, so it improves as you fill the "
-                         "endpoint. rates are user-supplied from the pricing "
-                         "page."}
+                         "measured replay throughput. the supplied hourly rate "
+                         "and its applicability are unverified."}
         if usd is not None:
             block["usd_per_hour"] = dph * usd
-            if eff is not None:
-                block["effective_usd_per_1m_tokens"] = eff * usd
+            block["effective_usd_per_1m_tokens"] = (
+                eff * usd if eff is not None else None)
             block["usd_per_dbu"] = usd
         return block
 
@@ -1446,11 +2266,12 @@ def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
     # have the same price. With a cache discount it is a required billing
     # field: treating missing as zero silently prices an unknown row at the
     # expensive rate and invents a total.
-    priced_rows = [
-        r for r in usage_rows
+    indexed_priced_rows = [
+        (i, r) for i, r in indexed_usage_rows
         if ((r.get("cached_tokens") is None and cache == inp)
             or (r.get("cached_tokens") is not None
                 and 0 <= r["cached_tokens"] <= r["prompt_tokens"]))]
+    priced_rows = [r for _i, r in indexed_priced_rows]
     per = []
     measured_cached = 0
     for r in priced_rows:
@@ -1462,35 +2283,43 @@ def _cost_block(ok: list[dict], dur, in_tok: int, out_tok: int,
         measured_cached += ct
     measured_total = sum(per)
     n = len(per)
-    complete = n == len(ok)
-    coverage = (n / len(ok)) if ok else None
+    exact_single_rows = [
+        r for i, r in indexed_priced_rows if attempt_classes[i] == "single"]
+    complete, coverage, gaps = completeness(len(exact_single_rows))
     total = measured_total if complete else None
     block = {
         "mode": "per_token",
         "dbu_per_request": _pct_table(per),
         "priced_rows": n,
-        "successful_rows": len(ok),
+        "successful_rows": successful,
+        "attempted_rows": attempted,
+        "known_unsent_rows": known_unsent,
+        "ambiguous_retry_rows": ambiguous_retry_rows,
+        "unknown_attempt_rows": unknown_attempt_rows,
         "coverage": coverage,
         "complete": complete,
+        "scope": "measured_replay_rows_only",
+        "provenance_verified": False,
+        "applicability_warning": applicability_warning,
         "dbu_total_measured_subset": measured_total,
         "dbu_total": total,
-        "dbu_per_1k_requests": ((total / n * 1000)
-                                 if complete and n else None),
+        "dbu_per_1k_requests": ((total / attempted * 1000)
+                                 if complete and attempted else None),
         "dbu_per_min": ((total / (dur / 60.0))
                          if complete and dur else None),
         "cache_dbu_saved": (measured_cached / 1e6
                             * max(inp - cache, 0.0)) if complete else None,
         "rates_dbu_per_m": {"input": inp, "output": out, "cache_read": cache},
         "coverage_warning": (
-            None if complete or not ok else
-            f"cost-required usage was present for {n} of {len(ok)} successful "
-            "responses and passed token-accounting checks. aggregate cost, "
+            None if complete or not rows else
+            "; ".join(gaps) + ". aggregate replay cost, "
             "cost per 1,000 requests, cost per minute and cache savings are "
             "unavailable; the measured subset is retained only for "
             "diagnosis"),
-        "note": "cost from endpoint-reported tokens times user-supplied DBU "
-                "rates (Databricks pricing page). cached input is billed at "
-                "the cache-read rate.",
+        "note": "arithmetic from clean endpoint-reported tokens times "
+                "unverified user-supplied rates. cached input uses the "
+                "supplied cache-read rate. setup, sizing, calibration and "
+                "probe traffic are outside this replay-only block.",
     }
     if usd is not None:
         block["usd_per_dbu"] = usd
@@ -1516,7 +2345,7 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
       ttft_ms:  {p50: 500, p90: 800, p95: 900, p99: 1600}
       ttfg_ms:  {p50: 700, ...}          evaluated against measured E2E
       hard_timeouts: {ttft_s: 15, ttfg_s: 45}   over-budget requests count
-                                                as SLA failures
+                                                as acceptance-target failures
       success_rate: 0.9999
     """
     stated = acceptance.get("targets_are")
@@ -1588,7 +2417,8 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
     if caller_gaps:
         out["caller_latency_warning"] = (
             "; ".join(caller_gaps)
-            + ". a caller-experienced SLA cannot be proven from that coverage")
+            + ". caller-experienced acceptance targets cannot be proven from "
+              "that coverage")
 
     hard = acceptance.get("hard_timeouts") or {}
     ttft_cap = (hard.get("ttft_s") or 0) * 1000.0
@@ -1678,9 +2508,71 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
 def _top_errors(failed: list[dict], k: int = 5) -> dict:
     counts: dict[str, int] = {}
     for r in failed:
-        key = (r.get("error") or "unknown")[:80]
+        # Error bodies are deliberately represented by digests in request
+        # rows. Those digests vary across otherwise identical 429 responses,
+        # so grouping quota failures only by the error string fragments the
+        # most important operational signal. Preserve the detailed rows while
+        # giving every 429 one stable aggregate key.
+        key = ("http 429 (rate limited)" if _http_status(r) == 429
+               else (r.get("error") or "unknown")[:80])
         counts[key] = counts.get(key, 0) + 1
-    return dict(sorted(counts.items(), key=lambda kv: -kv[1])[:k])
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:k])
+
+
+def _http_status(row: dict) -> int | None:
+    """Return a real HTTP status code, rejecting bools and loose coercion."""
+    value = row.get("status")
+    if isinstance(value, int) and not isinstance(value, bool) \
+            and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _failures_by_http_status(failed: list[dict]) -> dict[str, int]:
+    """Stable failure counts that survive varying redacted body digests."""
+    counts: dict[int, int] = {}
+    for row in failed:
+        status = _http_status(row)
+        if status is not None:
+            counts[status] = counts.get(status, 0) + 1
+    # String keys are stable before and after a JSON serialization round-trip.
+    return {str(status): counts[status] for status in sorted(counts)}
+
+
+def _http_429_evidence(rows: list[dict], *, scope: str) -> dict:
+    """Count 429s over the complete request-row evidence supplied to metrics.
+
+    ``rate_limit_results`` includes setup requests as well as measured replay.
+    When it is available, use it so a throttled preflight or probe cannot be
+    hidden by a later clean replay phase.
+    """
+    request_rows = [row for row in rows if isinstance(row, dict)]
+    limited = [row for row in request_rows if _http_status(row) == 429]
+    phases: dict[str, int] = {}
+    for row in limited:
+        phase = str(row.get("phase") or "unlabeled")
+        phases[phase] = phases.get(phase, 0) + 1
+    total = len(request_rows)
+    observed = sum(_http_status(row) is not None for row in request_rows)
+    count = len(limited)
+    return {
+        "count": count,
+        "rate": count / total if total else None,
+        "rate_denominator": "all supplied logical request rows",
+        "request_rows_examined": total,
+        "http_status_observed_for": observed,
+        "phases": {name: phases[name] for name in sorted(phases)},
+        "scope": scope,
+        "quota_limited": bool(count),
+        "endpoint_capacity_conclusion_allowed": not bool(count),
+        "note": (
+            "HTTP 429 establishes rate limiting, not which quota dimension "
+            "or component enforced it. provider telemetry is required for "
+            "that attribution and for any endpoint-capacity conclusion"
+            if count else
+            "no HTTP 429 was present in the supplied request rows; absence "
+            "does not establish provider quota headroom"),
+    }
 
 
 def _err_cell(w: dict) -> str:
@@ -1706,8 +2598,38 @@ def _lag_p95(arr: dict) -> str:
     return "n/a" if v is None else f"{v:.0f}"
 
 
-def render_markdown(summary: dict, title: str) -> str:
+def _traffic_phase_summary(traffic_scope: dict) -> str:
+    """Describe sealed request coverage without calling missing time 'unsent'."""
+    parts = []
+    for name, details in sorted(
+            (traffic_scope.get("phases") or {}).items()):
+        captured = details.get("rows", 0)
+        timestamped = details.get("sent_rows", 0)
+        unknown = details.get("unknown_outcome_rows", 0)
+        text = (f"{name}: {captured} captured, {timestamped} send-"
+                "timestamped")
+        if unknown:
+            text += f", {unknown} send timing/outcome unknown"
+        attempts = details.get("physical_attempts_estimate", 0)
+        if attempts:
+            exact = details.get("attempt_counts_exact") is True
+            text += (f", {attempts} physical POST attempt"
+                     f"{'s' if attempts != 1 else ''} "
+                     f"{'recorded' if exact else 'estimated'}")
+        parts.append(text)
+    return "; ".join(parts) or "none"
+
+
+def render_markdown(summary: dict, title: str, *,
+                    verification_context: dict | None = None) -> str:
     s = summary
+    from .markdown import markdown_plain_text
+    from .report_decision import build_report_decision
+    verified_view = _external_report_context(s, verification_context)
+
+    def inline(value) -> str:
+        """One Markdown line; customer-controlled metadata cannot add blocks."""
+        return markdown_plain_text(value)
 
     def row(name, t):
         if not t or t.get("n", 0) == 0:
@@ -1733,41 +2655,122 @@ def render_markdown(summary: dict, title: str) -> str:
     cautions: list[str] = []
     _nw = (s.get("network_path") or {}).get("warning")
     if _nw:
-        cautions += [f"CAUTION (network distance): {_nw}", ""]
+        cautions += [f"CAUTION (network distance): {inline(_nw)}", ""]
     _cw = (s.get("throughput") or {}).get("coverage_warning")
     if _cw:
-        cautions += [f"CAUTION (token usage): {_cw}", ""]
+        cautions += [f"CAUTION (token usage): {inline(_cw)}", ""]
     _costw = (s.get("cost") or {}).get("coverage_warning")
     if _costw:
-        cautions += [f"CAUTION (cost coverage): {_costw}", ""]
+        cautions += [f"CAUTION (cost coverage): {inline(_costw)}", ""]
+    _costa = (s.get("cost") or {}).get("applicability_warning")
+    if _costa:
+        cautions += [f"CAUTION (pricing applicability): {inline(_costa)}", ""]
     _cachew = (s.get("cache_fidelity") or {}).get("warning")
     if _cachew:
-        cautions += [f"CAUTION (cache fidelity): {_cachew}", ""]
+        cautions += [f"CAUTION (cache fidelity): {inline(_cachew)}", ""]
     _tokenw = (s.get("token_targeting") or {}).get("warning")
     if _tokenw:
-        cautions += [f"CAUTION (workload token fidelity): {_tokenw}", ""]
+        cautions += [f"CAUTION (workload token fidelity): {inline(_tokenw)}", ""]
     _popw = (s.get("latency_population") or {}).get("warning")
     if _popw:
-        cautions += [f"CAUTION (latency population): {_popw}", ""]
+        cautions += [f"CAUTION (latency population): {inline(_popw)}", ""]
     _sw = (s.get("sample") or {}).get("warning")
     if _sw:
-        cautions += [f"CAUTION (sample size): {_sw}", ""]
+        cautions += [f"CAUTION (sample size): {inline(_sw)}", ""]
     _rw = (s.get("replay") or {}).get("warning")
     if _rw:
-        cautions += [f"CAUTION (prompt replay): {_rw}", ""]
+        cautions += [f"CAUTION (prompt replay): {inline(_rw)}", ""]
     _cw = (s.get("client") or {}).get("warning")
     if _cw:
-        cautions += [f"CAUTION (client saturation): {_cw}", ""]
+        cautions += [f"CAUTION (client saturation): {inline(_cw)}", ""]
     _nw = (s.get("concurrency") or {}).get("warning")
     if _nw:
-        cautions += [f"CAUTION (concurrency not reached): {_nw}", ""]
+        cautions += [f"CAUTION (concurrency not reached): {inline(_nw)}", ""]
+    _ratew = (s.get("rate_limits") or {}).get("warning")
+    if _ratew:
+        cautions += [f"CAUTION (rate-limit evidence): {inline(_ratew)}", ""]
+    _http429 = s.get("http_429") or {}
+    _http429_count = s.get("http_429_count")
+    if isinstance(_http429_count, int) \
+            and not isinstance(_http429_count, bool) \
+            and _http429_count > 0:
+        _http429_total = _http429.get("request_rows_examined")
+        _http429_of = (f" of {_http429_total}"
+                       if isinstance(_http429_total, int)
+                       and _http429_total >= _http429_count else "")
+        cautions += [
+            f"INVALID (quota-limited): {_http429_count}{_http429_of} request "
+            f"{'row returned' if _http429_count == 1 else 'rows returned'} "
+            "HTTP 429. No endpoint-capacity conclusion can be drawn; use "
+            "provider telemetry to identify the enforcing limit and dimension.",
+            "",
+        ]
 
+    decision = (verified_view["decision"] if verified_view
+                else build_report_decision(s))
+    decision_rows = []
+    for heading, key in (
+            ("Evidence integrity", "evidence_integrity"),
+            ("Measurement validity", "measurement_validity"),
+            ("Acceptance checks", "customer_sla"),
+            ("Quota state", "quota_state"),
+            ("Endpoint capacity", "endpoint_capacity")):
+        state = decision[key]
+        decision_rows.append(
+            f"| {heading} | {inline(state['label'])} | "
+            f"{inline(state['reason'])} |")
+
+    verified_intro = []
+    if verified_view:
+        source_repro = verified_view["source_reproducibility"]
+        verifier_repro = verified_view["verifier_reproducibility"]
+        verified_intro = [
+            f"> **{verified_view['view_label']}**",
+            ">",
+            "> Integrity: **VERIFIED** (internal SHA-256 consistency)  ",
+            f"> Source reproducibility: **{source_repro['code']}** - "
+            f"{inline(source_repro['reason'])}"
+            + (" (reason codes: "
+               + ", ".join(inline(code) for code in source_repro[
+                   "reason_codes"]) + ")"
+               if source_repro["reason_codes"] else "") + "  ",
+            f"> Verifier reproducibility: **{verifier_repro['code']}** - "
+            f"{inline(verifier_repro['reason'])}"
+            + (" (reason codes: "
+               + ", ".join(inline(code) for code in verifier_repro[
+                   "reason_codes"]) + ")"
+               if verifier_repro["reason_codes"] else "") + "  ",
+            f"> Source artifact: `{inline(verified_view['source_artifact_id'])}`  ",
+            f"> Source manifest SHA-256: "
+            f"`{verified_view['source_manifest_sha256']}`  ",
+            f"> Verified by llm-traffic-replay "
+            f"`{inline(verified_view['verifier_version'])}` at "
+            f"`{inline(verified_view['verified_at_utc'])}`.  ",
+            f"> Receipt: `{inline(verified_view['receipt_id'])}`  ",
+            f"> {inline(verified_view['assurance'])}",
+            "",
+        ]
     lines = [
-        f"# {title}",
+        f"# {inline(title)}",
         "",
-        f"requests: {s['requests_total']} total, {s['requests_ok']} produced "
-        f"a content delta, {s['requests_failed']} did not "
-        f"(error rate {100 * (s['error_rate'] or 0):.2f}%)",
+        *verified_intro,
+        "## Decision states",
+        "",
+        "These states are independent. A quota-limited run can still retain "
+        "its separately observed acceptance outcome; no single traffic light erases "
+        "another fact.",
+        "",
+        "| decision | state | reason |",
+        "|---|---|---|",
+        *decision_rows,
+        "",
+        "Claim boundary: observed tested-load facts do not establish an "
+        "endpoint ceiling or provider quota headroom.",
+        "",
+        f"measured replay: {s['requests_total']} requests, "
+        f"{s['requests_ok']} harness-successful, "
+        f"{s['requests_failed']} failed "
+        f"(replay error rate {100 * (s['error_rate'] or 0):.2f}%)",
         "",
         *cautions,
         f"latency population: "
@@ -1817,6 +2820,18 @@ def render_markdown(summary: dict, title: str) -> str:
         if sched_src != "synthetic" else "- arrival schedule: synthetic bursts",
         f"- failures: {json.dumps(s['failures_by_error'])}"
         if s["requests_failed"] else "- failures: none",
+        f"- failed requests by HTTP status: "
+        f"{json.dumps(s.get('failures_by_http_status') or {})}"
+        if s["requests_failed"] else
+        "- failed requests by HTTP status: none",
+        (f"- HTTP 429 rate-limit responses: {_http429_count} of "
+         f"{_http429.get('request_rows_examined')} request rows "
+         f"({100 * _http429.get('rate'):.2f}%); scope: "
+         f"{inline(_http429.get('scope'))}. This is quota-limited evidence, "
+         "not an endpoint-capacity result."
+         if isinstance(_http429_count, int) and _http429_count > 0
+         and isinstance(_http429.get("rate"), (int, float)) else
+         "- HTTP 429 rate-limit responses: none observed in supplied evidence"),
         f"- requests that needed a connection retry: {s['requests_retried']} "
         "(retried requests restart their latency clock. a nonzero count "
         "here means the tail has survivorship bias, read with care)"
@@ -1922,15 +2937,115 @@ def render_markdown(summary: dict, title: str) -> str:
 
     tp = s.get("throughput") or {}
     if tp.get("input_tokens_per_min"):
+        usage_coverage = tp.get("usage_coverage")
+        coverage_text = (
+            f"; clean usage coverage {usage_coverage:.1%}"
+            if isinstance(usage_coverage, (int, float))
+            and not isinstance(usage_coverage, bool) else "")
         lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
                       f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
-                      "tokens/min (endpoint-reported counts over wall time)"]
+                      "tokens/min (endpoint-reported counts over wall time"
+                      f"{coverage_text})"]
+    windows = s.get("observed_rate_windows") or {}
+    win_input = windows.get("input_tokens_by_first_send") or {}
+    win_reserved = (
+        windows.get(
+            "offered_output_token_reservation_demand_by_first_send") or {})
+    win_actual = windows.get("actual_output_tokens_by_completion") or {}
+    win_queries = windows.get("physical_queries_by_first_send") or {}
+    if any(window.get("max") is not None
+           for window in (win_input, win_reserved, win_actual, win_queries)):
+        def rolling_value(window: dict) -> str:
+            value = window.get("max")
+            return "NOT REPORTED" if value is None else f"{value:,.0f}"
+
+        traffic_scope = windows.get("traffic_scope") or {}
+        phase_text = _traffic_phase_summary(traffic_scope)
+        lines += ["", "rolling rate-window evidence:",
+                  f"- captured traffic phases: {inline(phase_text)}",
+                  f"- input tokens: {rolling_value(win_input)} maximum in a "
+                  f"trailing 60-second request cohort "
+                  + (f"(usage coverage {win_input['coverage']:.1%})"
+                     if win_input.get("coverage") is not None else
+                     "(usage coverage NOT REPORTED)"),
+                  f"- offered output reservation demand: "
+                  f"{rolling_value(win_reserved)} maximum requested "
+                  "max_tokens in a trailing 60-second send cohort. this is "
+                  "pre-admission demand, not observed provider consumption",
+                  f"- actual output tokens: {rolling_value(win_actual)} "
+                  "maximum when request totals are attributed to completion; "
+                  "per-token generation timing was not available",
+                  f"- offered physical POST demand: "
+                  f"{rolling_value(win_queries)} maximum in a trailing "
+                  "3,600-second cohort; this is not the provider's confirmed "
+                  "processed-query counter"]
+    limit_block = s.get("rate_limits") or {}
+    if limit_block:
+        configured = limit_block.get("configured") or {}
+        binding = limit_block.get("binding") or {}
+        if not binding.get("binding_complete"):
+            binding_label = "NOT VERIFIED"
+        elif binding.get("workspace_tier_verified"):
+            binding_label = (
+                "endpoint/model/deployment metadata and workspace tier "
+                "verified")
+        else:
+            binding_label = (
+                "endpoint/model/deployment metadata bound; workspace tier "
+                "remains operator-asserted")
+        lines += [
+            "- configured rate-limit snapshot: "
+            f"provider {inline(configured.get('provider'))}, model "
+            f"{inline(configured.get('model'))}, deployment "
+            f"{inline(configured.get('deployment_mode'))}, tier "
+            f"{inline(configured.get('workspace_tier'))}; source "
+            f"{inline(configured.get('source'))} as of "
+            f"{inline(configured.get('as_of'))}; operator reverified "
+            f"{inline(configured.get('verified_at') or 'NOT RECORDED')} with "
+            f"max age {inline(configured.get('max_age_days') or 'NOT RECORDED')} "
+            "days",
+            f"- configured scope: {inline(configured.get('scope'))}",
+            f"- endpoint binding: {binding_label}",
+        ]
+        for name, comparison in (limit_block.get("comparisons") or {}).items():
+            observed_ratio = comparison.get(
+                "observed_ratio_to_nominal_limit")
+            observed_rendered = (
+                "n/a" if observed_ratio is None else f"{observed_ratio:.1%}")
+            ratio = comparison.get("ratio_to_nominal_limit")
+            decision_rendered = "n/a" if ratio is None else f"{ratio:.1%}"
+            projected = comparison.get("steady_state_projection")
+            configured_limit = comparison.get("configured_limit")
+            projected_ratio = (
+                float(projected) / float(configured_limit)
+                if isinstance(projected, (int, float))
+                and not isinstance(projected, bool)
+                and isinstance(configured_limit, (int, float))
+                and not isinstance(configured_limit, bool)
+                and configured_limit else None)
+            lines.append(
+                f"  - {inline(name.replace('_', ' '))}: observed "
+                f"{comparison.get('observed_max')} / configured "
+                f"{configured_limit} ({observed_rendered})"
+                + (f", sustained projection {projected:.1f} "
+                   f"({projected_ratio:.1%})"
+                   if projected is not None else "")
+                + f", conservative gate ratio {decision_rendered} "
+                f"({inline(str(comparison.get('status')).replace('_', ' '))})")
+        if limit_block.get("warning"):
+            lines.append(
+                f"- rate-limit warning: {inline(limit_block['warning'])}")
+        lines.append(
+            f"- scope warning: {inline(limit_block['external_usage_warning'])}")
     cost = s.get("cost")
     if cost and cost.get("error"):
-        lines += ["", f"cost: config error, {cost['error']}"]
+        lines += ["", f"cost: config error, {inline(cost['error'])}"]
     elif cost and cost["mode"] == "per_token" and cost.get("coverage_warning"):
-        lines += ["", "cost (per-token): unavailable for the full run. "
-                  + cost["coverage_warning"]]
+        lines += ["", "unverified user-supplied rate arithmetic: aggregate "
+                  "replay total unavailable. "
+                  + inline(cost["coverage_warning"]),
+                  "pricing applicability warning: "
+                  + inline(cost.get("applicability_warning") or "unverified")]
     elif cost and cost["mode"] == "per_token":
         dr = cost.get("dbu_per_request") or {}
         if dr.get("p50") is None:
@@ -1938,28 +3053,44 @@ def render_markdown(summary: dict, title: str) -> str:
         else:
             usd = cost.get("usd_total")
             dollar = f" (${usd:,.4f} total)" if usd is not None else ""
-            lines += ["", f"cost (per-token, user-supplied DBU rates): "
+            lines += ["", f"unverified user-supplied rate arithmetic "
+                      f"(measured replay only): "
                       f"{dr['p50']:.4f} DBU/request p50, "
                       f"{cost['dbu_per_1k_requests']:,.2f} DBU/1k requests, "
                       f"{cost['dbu_per_min']:,.3f} DBU/min, cache saved "
-                      f"{cost['cache_dbu_saved']:,.3f} DBU{dollar}"]
+                      f"{cost['cache_dbu_saved']:,.3f} DBU{dollar}",
+                      "pricing applicability warning: "
+                      + inline(cost.get("applicability_warning") or "unverified")]
+    elif cost and cost["mode"] == "provisioned" \
+            and cost.get("coverage_warning"):
+        lines += ["", "unverified provisioned-rate arithmetic: effective "
+                  "cost per 1M tokens unavailable. "
+                  + inline(cost["coverage_warning"]),
+                  "configured capacity rate: "
+                  f"{cost['dbu_per_hour']} DBU/hour",
+                  "pricing applicability warning: "
+                  + inline(cost.get("applicability_warning") or "unverified")]
     elif cost:
         eff = cost.get("effective_dbu_per_1m_tokens")
-        lines += ["", f"cost (provisioned, {cost['dbu_per_hour']} DBU/hour): "
+        lines += ["", f"unverified provisioned-rate arithmetic "
+                  f"({cost['dbu_per_hour']} DBU/hour): "
                   + (f"effective {eff:,.1f} DBU per 1M tokens at the measured "
                      f"throughput" if eff is not None
-                     else "throughput too low to compute an effective rate")]
+                     else "throughput too low to compute an effective rate"),
+                  "pricing applicability warning: "
+                  + inline(cost.get("applicability_warning") or "unverified")]
     rp = (s.get("run") or {}).get("request_params")
     if rp:
         eb = rp.get("extra_body") or {}
         line = (f"request params: temperature {rp.get('temperature')}, "
-                f"max_tokens cap {rp.get('max_output_tokens_cap')}")
+                "global max_tokens safety cap "
+                f"{rp.get('max_output_tokens_cap')}")
         if eb:
             line += f", extra_body {json.dumps(eb)}"
-        lines += ["", line]
+        lines += ["", inline(line)]
     merge_note = (s.get("run") or {}).get("merge_note")
     if merge_note:
-        lines += ["", merge_note]
+        lines += ["", inline(merge_note)]
 
     # report.md is the file that gets pasted into an email, so it shows the
     # same verdict the html does, from the same function, whether or not
@@ -1973,8 +3104,14 @@ def render_markdown(summary: dict, title: str) -> str:
     if a:
         answer_lines = ["", "## answers",
                   "", f"- attempted: {a['attempted']}",
-                  f"- produced at least one content delta: "
-                  f"{a.get('content_streams', a['transport_ok'])}"]
+                  f"- harness-successful: "
+                  f"{a.get('harness_successful', a['transport_ok'])}",
+                  f"- produced at least one visible or reasoning content "
+                  f"delta: {a.get('content_delta_streams', 'NOT RECORDED')}"]
+        if a.get("unclassified_legacy_successes"):
+            answer_lines.append(
+                f"- legacy successes without content/tool observability: "
+                f"{a['unclassified_legacy_successes']}")
         if a.get("http_status_observed_for"):
             answer_lines.append(
                 f"- returned HTTP 200: {a['http_200']} (status recorded for "
@@ -2000,24 +3137,26 @@ def render_markdown(summary: dict, title: str) -> str:
                   f"{a['truncated']}",
                   f"- cut short by the global token cap: "
                   f"{a['truncated_by_global_cap']}",
-                  "", a["note"]]
+                  "", inline(a["note"])]
         lines += answer_lines
         if a.get("invalid"):
-            lines += ["", f"INVALID: {a['invalid']}"]
+            lines += ["", f"INVALID: {inline(a['invalid'])}"]
 
     sla = s.get("sla")
     if sla:
         _tgt_src = sla.get("targets_source") or "the run configuration"
         _basis = (sla.get("latency_basis") or "unknown").replace("_", " ")
-        lines += ["", f"## SLA scorecard (targets from {_tgt_src}; "
-                  f"latency basis: {_basis})"]
+        lines += ["", f"## Acceptance scorecard (targets from {inline(_tgt_src)}; "
+                  f"latency basis: {inline(_basis)})"]
         if sla.get("targets_warning"):
-            lines += ["", f"CAUTION (targets): {sla['targets_warning']}"]
+            lines += ["", f"CAUTION (targets): "
+                      f"{inline(sla['targets_warning'])}"]
         if sla.get("coverage_warning"):
-            lines += ["", f"CAUTION (coverage): {sla['coverage_warning']}"]
+            lines += ["", f"CAUTION (coverage): "
+                      f"{inline(sla['coverage_warning'])}"]
         if sla.get("caller_latency_warning"):
             lines += ["", f"CAUTION (caller timing): "
-                      f"{sla['caller_latency_warning']}"]
+                      f"{inline(sla['caller_latency_warning'])}"]
         lines += ["", "| metric | quantile | target ms | actual ms | met |",
                   "|---|---|---|---|---|"]
         for name, key in (("TTFT", "ttft_vs_target"),
@@ -2028,9 +3167,15 @@ def render_markdown(summary: dict, title: str) -> str:
                     else "not measured"
                 lines.append(f"| {name} | {r['quantile']} | {r['target_ms']} "
                              f"| {act} | {met} |")
-        lines.append(f"| hard timeout breaches | - | - | "
-                     f"{sla.get('hard_timeout_breaches', 0)} | "
-                     f"{'yes' if not sla.get('hard_timeout_breaches') else 'NO'} |")
+        hard_basis = sla.get("hard_timeout_basis") or {}
+        hard_timeout_configured = any(
+            hard_basis.get(key) is not None
+            for key in ("ttft_cap_ms", "ttfg_cap_ms"))
+        if hard_timeout_configured:
+            hard_breaches = sla.get("hard_timeout_breaches", 0)
+            lines.append(f"| hard timeout breaches | - | - | "
+                         f"{hard_breaches} | "
+                         f"{'yes' if not hard_breaches else 'NO'} |")
         if "interchunk_breaches" in sla:
             ib = sla["interchunk_breaches"]
             lines.append(f"| interchunk breaches | - | - | {ib} | "
@@ -2060,15 +3205,17 @@ def render_markdown(summary: dict, title: str) -> str:
         if tfv is None:
             vis = "no request emitted visible content within max_tokens"
         elif _miss:
-            vis = (f"ttfv (first visible token) p50 {tfv:.0f} ms, but over "
+            vis = (f"ttfv (first visible content) p50 {tfv:.0f} ms, but over "
                    f"only the {_of - _miss} of {_of} requests that produced "
                    "visible content. the rest ran out of output tokens still "
                    "reasoning, so that p50 is the fastest subset, not the run")
         else:
-            vis = f"ttfv (first visible token) p50 {tfv:.0f} ms"
-        lines += ["", "note: reasoning model detected. ttft (first token of "
-                  f"either kind) p50 {tft:.0f} ms. {vis}. agree which "
-                  "definition the SLA scores via ttft_definition in the run "
+            vis = f"ttfv (first visible content) p50 {tfv:.0f} ms"
+        lines += ["", "note: reasoning model detected. ttft (first visible-"
+                  "or-reasoning content delta) "
+                  f"p50 {tft:.0f} ms. {vis}. agree which "
+                  "definition the configured acceptance target scores via "
+                  "ttft_definition in the run "
                   "config."]
 
     drift = s.get("drift") or {}
@@ -2083,8 +3230,8 @@ def render_markdown(summary: dict, title: str) -> str:
         spread = drift.get("ttft_p95_spread_ratio")
         sp = (f" worst window is {spread:.1f}x the best."
               if spread else "")
-        lines += ["", f"stability over time ({flag})."
-                  f"{sp} {drift.get('drift_headline') or drift.get('note', '')}"]
+        lines += ["", f"stability over time ({inline(flag)})."
+                  f"{sp} {inline(drift.get('drift_headline') or drift.get('note', ''))}"]
         if drift.get("windows"):
             lines += ["", f"per-{drift.get('window_seconds', 60)}s windows, p95 in ms:",
                       "",
@@ -2100,25 +3247,41 @@ def render_markdown(summary: dict, title: str) -> str:
         # only when a verdict exists, otherwise the headline already IS the note
         if drift.get("drift_headline"):
             lines.append("")
-            lines.append(f"note: {drift.get('note', '')}")
+            lines.append(f"note: {inline(drift.get('note', ''))}")
     elif drift.get("note"):
-        lines += ["", f"stability over time: {drift['note']}"]
+        lines += ["", f"stability over time: {inline(drift['note'])}"]
 
     em = (s.get("run") or {}).get("endpoint_metadata")
     if em:
         se = em.get("served_entities") or []
-        detail = (", ".join(f"{k}={v}" for k, v in se[0].items() if k != "name")
+        detail = (", ".join(f"{inline(k)}={inline(v)}"
+                            for k, v in se[0].items() if k != "name")
                   if se else "")
-        _task = f"task {em.get('task')}, " if em.get("task") else ""
-        lines += ["", f"endpoint under test: {em.get('name')}, {_task}"
-                  f"route_optimized {em.get('route_optimized')}, "
-                  f"ready {em.get('ready')}" + (f", {detail}" if detail else "")]
+        _task = f"task {inline(em.get('task'))}, " if em.get("task") else ""
+        lines += ["", f"endpoint under test: {inline(em.get('name'))}, "
+                  f"{_task}route_optimized "
+                  f"{inline(em.get('route_optimized'))}, "
+                  f"ready {inline(em.get('ready'))}"
+                  + (f", {detail}" if detail else "")]
 
     run_meta = s.get("run") or {}
     if run_meta.get("label"):
-        lines += ["", f"**Label: {run_meta['label']}**"]
+        lines += ["", f"**Label:** {inline(run_meta['label'])}"]
     if run_meta.get("profile_label"):
-        lines += ["", f"**Profile: {run_meta['profile_label']}**"]
+        lines += ["", f"**Profile:** {inline(run_meta['profile_label'])}"]
+    if verified_view:
+        source_repro = verified_view["source_reproducibility"]
+        verifier_repro = verified_view["verifier_reproducibility"]
+        lines += [
+            "",
+            "---",
+            f"{verified_view['view_label']} derivative · source artifact "
+            f"`{inline(verified_view['source_artifact_id'])}` · full manifest "
+            f"SHA-256 `{verified_view['source_manifest_sha256']}` · "
+            f"source reproducibility {source_repro['code']} · verifier "
+            f"reproducibility {verifier_repro['code']} · "
+            f"{inline(verified_view['assurance'])}",
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -2301,6 +3464,14 @@ def write_outputs(results, summary: dict, out_dir: str | Path,
             raise
     out = artifact_run.path
     safe_summary = _redact_secrets(summary)
+    # Persist the same five independent states that HTML and Markdown render.
+    # A summary cannot authenticate the manifest that contains it, so this
+    # embedded decision intentionally remains VERIFY_REQUIRED until an
+    # external verifier supplies an explicit integrity context.
+    from .report_decision import build_report_decision
+
+    safe_summary["decision"] = build_report_decision(safe_summary)
+    summary["decision"] = safe_summary["decision"]
     try:
         artifact_run.finalize_requests()
         artifact_run.atomic_text(
@@ -2335,51 +3506,261 @@ def write_outputs(results, summary: dict, out_dir: str | Path,
 
 
 _HTML_STYLE = """<style>
-:root{--blue:#1971c2;--green:#2f9e44;--red:#e03131;--amber:#e8590c;--gray:#495057}
+:root{color-scheme:light;--canvas:#f5f7fb;--surface:#fff;--surface-2:#f8fafc;
+ --ink:#172033;--muted:#556176;--quiet:#667085;--line:#d9e0e9;
+ --blue:#075fce;--blue-soft:#eaf2ff;--green:#166534;--green-soft:#e9f7ef;
+ --red:#b42318;--red-soft:#fff0ee;--amber:#8a4b08;--amber-soft:#fff6e8;
+ --gray:#344054;--shadow:0 1px 2px rgba(16,24,40,.05),0 8px 24px rgba(16,24,40,.04)}
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,
- sans-serif;color:#1e1e1e;background:#f4f6f8;margin:0;padding:24px;line-height:1.45}
-.wrap{max-width:960px;margin:0 auto}
-h1{font-size:23px;margin:0 0 4px}
-.sub{color:#6b7280;font-size:13px;margin-bottom:6px}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px 20px;
- margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.card h2{font-size:13px;margin:0 0 4px;color:var(--blue);text-transform:uppercase;
- letter-spacing:.04em}
-.cap{font-size:12px;color:#6b7280;margin:0 0 12px}
-.slanote{background:#eef6fc;border:1px solid #cfe2f5;border-radius:8px;
- padding:10px 14px;font-size:12px;color:#1c4f77;margin-top:12px;line-height:1.5}
-.slanote code{background:#dcecf7;padding:1px 4px;border-radius:3px}
-.stats{display:flex;flex-wrap:wrap;gap:12px;margin:16px 0}
-.stat{flex:1 1 150px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;
- padding:14px 16px}
-.stat .k{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
-.stat .v{font-size:25px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
-.stat .u{font-size:12px;color:#9aa0a6;font-weight:400}
+html{scroll-behavior:smooth;scroll-padding-top:76px}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,
+ sans-serif;color:var(--ink);background:var(--canvas);margin:0;line-height:1.48;
+ -webkit-font-smoothing:antialiased}
+a{color:var(--blue);text-underline-offset:3px}
+a:focus-visible,summary:focus-visible{outline:3px solid #155eef;outline-offset:3px;
+ border-radius:4px}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 28px 56px}
+.external-verified{border:2px solid #6c87a8;border-radius:14px;padding:14px 16px;
+ margin:0 0 12px;background:#f4f7fb;color:var(--ink);box-shadow:var(--shadow)}
+.external-verified.repro-warning{border-color:#d19042;background:var(--amber-soft)}
+.external-verified .verified-badge{display:inline-flex;border-radius:999px;padding:4px 9px;
+ background:var(--gray);color:#fff;font-size:10px;font-weight:900;letter-spacing:.1em;
+ text-transform:uppercase}.external-verified .verified-grid{display:grid;
+ grid-template-columns:minmax(180px,.55fr) minmax(0,1.45fr);gap:5px 16px;margin-top:10px;
+ font-size:12px}.external-verified dt{font-weight:800}.external-verified dd{margin:0;
+ overflow-wrap:anywhere}.external-verified code{font-family:ui-monospace,SFMono-Regular,Menlo,
+ Consolas,monospace;font-size:11px}.external-verified .assurance{grid-column:1/-1;margin:5px 0 0;
+ color:var(--muted);font-size:11px}.verification-states{display:grid;
+ grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px}
+.verification-state{border:1px solid var(--line);border-radius:9px;background:#fff;
+ padding:7px 9px;display:flex;justify-content:space-between;align-items:center;gap:8px;
+ font-size:11px}.verification-state span{font-weight:750;color:var(--muted)}
+.verification-state strong{font-size:10px;border-radius:999px;padding:2px 7px;
+ letter-spacing:.04em}.verification-state .status-pass{color:var(--green);
+ background:var(--green-soft)}.verification-state .status-failed{color:var(--red);
+ background:var(--red-soft)}.repro-codes{color:var(--muted);font-size:10px}
+.report-head{background:#0c1729;color:#fff;border-radius:18px;padding:28px 30px 24px;
+ box-shadow:0 18px 44px rgba(12,23,41,.16)}
+.eyebrow{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+ color:#b9d3ff;margin-bottom:8px}
+h1{font-size:clamp(25px,3vw,38px);line-height:1.14;letter-spacing:-.025em;
+ margin:0 0 10px;max-width:900px;overflow-wrap:anywhere}
+.sub{color:#d3dceb;font-size:14px;margin:0;overflow-wrap:anywhere}
+.meta-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+.meta-chip{display:inline-flex;align-items:center;min-height:28px;padding:5px 10px;
+ border:1px solid #31415a;border-radius:999px;color:#e5edf8;background:#15233a;
+ font-size:12px;font-variant-numeric:tabular-nums;max-width:100%;min-width:0;
+ white-space:normal;overflow-wrap:anywhere}
+.report-nav{position:sticky;top:0;z-index:10;display:flex;gap:4px;overflow-x:auto;
+ margin:14px 0 18px;padding:7px;background:rgba(255,255,255,.96);
+ border:1px solid var(--line);border-radius:12px;box-shadow:0 4px 16px rgba(16,24,40,.06);
+ scrollbar-width:thin;backdrop-filter:blur(10px)}
+.report-nav a{flex:0 0 auto;padding:7px 10px;border-radius:7px;color:#344054;
+ font-size:12px;font-weight:700;text-decoration:none}
+.report-nav a:hover{background:var(--blue-soft);color:#064da8}
+.decision-hero{border:1px solid var(--line);border-top:5px solid var(--gray);
+ border-radius:16px;background:var(--surface);padding:22px 24px;margin:16px 0;
+ box-shadow:var(--shadow)}
+.decision-hero.state-ok{border-top-color:var(--green)}
+.decision-hero.state-bad{border-top-color:var(--red)}
+.decision-hero.state-warn{border-top-color:var(--amber)}
+.decision-lead{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(260px,.8fr);
+ gap:24px;align-items:start}
+.status-kicker{font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+ color:var(--quiet)}
+.decision-hero h2{font-size:clamp(21px,2.4vw,30px);line-height:1.22;margin:7px 0 8px;
+ letter-spacing:-.015em;text-transform:none;color:var(--ink)}
+.decision-copy{color:var(--muted);font-size:14px;margin:0}
+.claim-box{border-left:3px solid var(--line);padding-left:16px;font-size:13px}
+.claim-box p{margin:0 0 9px}.claim-box p:last-child{margin-bottom:0}
+.claim-box b{display:block;color:var(--ink);font-size:11px;letter-spacing:.06em;
+ text-transform:uppercase;margin-bottom:2px}
+.state-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;
+ margin-top:20px}
+.state-card{min-width:0;border:1px solid var(--line);border-radius:11px;padding:12px;
+ background:var(--surface-2)}
+.state-card .k{font-size:10px;color:var(--quiet);font-weight:800;letter-spacing:.07em;
+ text-transform:uppercase}
+.state-card .v{font-size:13px;font-weight:800;margin-top:5px;line-height:1.25;
+ overflow-wrap:anywhere}
+.state-card .why{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.35}
+.state-card .why{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+ overflow:hidden}
+.gate-detail{margin-top:13px;border-top:1px solid var(--line);padding-top:10px}
+.gate-detail summary{cursor:pointer;color:var(--muted);font-size:11px;font-weight:800;
+ text-transform:uppercase;letter-spacing:.045em}.gate-detail .banner{margin-bottom:0}
+.decision-reasons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;
+ margin:10px 0 0}.decision-reasons div{min-width:0}.decision-reasons dt{font-size:10px;
+ color:var(--quiet);font-weight:800;text-transform:uppercase;letter-spacing:.04em}
+.decision-reasons dd{margin:3px 0 0;color:var(--muted);font-size:12px}
+.tone-ok .v{color:var(--green)}.tone-bad .v{color:var(--red)}
+.tone-warn .v{color:var(--amber)}.tone-neutral .v{color:var(--gray)}
+.section-head{display:flex;justify-content:space-between;align-items:end;gap:18px;
+ margin:30px 2px 10px}
+.section-head h2{font-size:18px;line-height:1.25;margin:0;letter-spacing:-.01em}
+.section-head p{font-size:12px;color:var(--muted);margin:0;max-width:650px;text-align:right}
+.fact-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:14px 0}
+.fact{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:12px 13px;
+ min-width:0}
+.fact .k{font-size:10px;color:var(--quiet);font-weight:800;letter-spacing:.06em;
+ text-transform:uppercase}.fact .v{font-size:18px;font-weight:800;margin-top:3px;
+ font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.fact .u{font-size:11px;
+ color:var(--muted);font-weight:500}.fact .note{font-size:10px;color:var(--muted);margin-top:4px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+ padding:18px 20px;margin:12px 0;box-shadow:var(--shadow);break-inside:avoid}
+.card h2{font-size:12px;margin:0 0 5px;color:#0757b5;text-transform:uppercase;
+ letter-spacing:.055em}
+.cap{font-size:12px;color:var(--muted);margin:0 0 12px;max-width:880px}
+.slanote{background:#eef6ff;border:1px solid #c8dcfa;border-radius:9px;
+ padding:11px 14px;font-size:12px;color:#164d7d;margin-top:12px;line-height:1.5}
+.slanote code{background:#daeafd;padding:1px 4px;border-radius:3px}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0}
+.stat{min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:12px;
+ padding:14px 15px;box-shadow:0 1px 2px rgba(16,24,40,.03)}
+.stat .k{font-size:10px;color:var(--quiet);font-weight:800;text-transform:uppercase;
+ letter-spacing:.055em;line-height:1.35}
+.stat .v{font-size:24px;font-weight:800;margin-top:6px;font-variant-numeric:tabular-nums;
+ letter-spacing:-.02em;overflow-wrap:anywhere}
+.stat .u{font-size:11px;color:var(--muted);font-weight:500;letter-spacing:0}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-th,td{padding:8px 10px;text-align:right;border-bottom:1px solid #eef0f2;font-size:13px}
-th{color:#6b7280;font-weight:600;font-size:11px;text-transform:uppercase}
-td.lbl,th.lbl{text-align:left;font-weight:600}
-td.n{color:#9aa0a6}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;
- font-weight:700}
-.ok{background:#ebfbee;color:var(--green)}
-.bad{background:#fff5f5;color:var(--red)}
-.neutral{background:#f1f3f5;color:var(--gray)}
-.banner{border-radius:12px;padding:14px 18px;margin:14px 0;font-weight:600;font-size:15px}
-.banner.ok{background:#ebfbee;color:#1b7a34;border:1px solid #b2f2bb}
-.banner.bad{background:#fff5f5;color:#c92a2a;border:1px solid #ffc9c9}
-.banner.warn{background:#fff4e6;color:#b34700;border:1px solid #ffd8a8}
-.believe{border-left:4px solid var(--amber)}
-.believe ul{margin:0;padding-left:18px}
-.believe li{margin:7px 0;font-size:13px;color:#3b4148}
-.believe b{color:#1e1e1e}
-.label-note{background:#fff9db;border:1px solid #ffe066;border-radius:10px;
- padding:12px 16px;font-size:13px;color:#7a5c00;margin:14px 0}
-.foot{color:#9aa0a6;font-size:12px;margin-top:18px;text-align:center}
-td.yes{color:var(--green);font-weight:700}
-td.no{background:#fff5f5;color:var(--red);font-weight:700}
-td.na{color:#c0c4c9}
+.table-scroll{max-width:100%;overflow-x:auto;overscroll-behavior-inline:contain;
+ scrollbar-gutter:stable}.table-scroll:focus-visible{outline:3px solid var(--blue);
+ outline-offset:3px}.scroll-hint{display:none}
+caption{color:var(--muted);font-size:12px;text-align:left;padding:0 0 8px}
+th,td{padding:9px 10px;text-align:right;border-bottom:1px solid #e9edf3;font-size:13px}
+thead th{color:var(--quiet);font-weight:800;font-size:10px;text-transform:uppercase;
+ letter-spacing:.045em;background:#fbfcfe}
+tbody tr:last-child th,tbody tr:last-child td{border-bottom:0}
+td.lbl,th.lbl{text-align:left;font-weight:650;color:#27364b}
+td.n{color:var(--muted)}
+.pill{display:inline-block;padding:3px 9px;border-radius:999px;font-size:11px;
+ font-weight:800;line-height:1.35;white-space:nowrap}
+.ok{background:var(--green-soft);color:var(--green)}
+.bad{background:var(--red-soft);color:var(--red)}
+.warn{background:var(--amber-soft);color:var(--amber)}
+.neutral{background:#eef1f5;color:var(--gray)}
+.banner{border-radius:10px;padding:12px 14px;margin:10px 0;font-weight:650;font-size:13px}
+.banner.ok{background:var(--green-soft);color:var(--green);border:1px solid #a9dbbc}
+.banner.bad{background:var(--red-soft);color:var(--red);border:1px solid #f1b5ae}
+.banner.warn{background:var(--amber-soft);color:var(--amber);border:1px solid #ebca98}
+.issue-card{border-left:5px solid var(--amber)}
+.issue-card ul{margin:10px 0 0;padding-left:20px}.issue-card li{margin:8px 0;
+ color:#364152;font-size:13px}.issue-card b{color:var(--ink)}
+.believe{border-left:5px solid var(--amber)}
+.believe ul{margin:0;padding-left:20px}
+.believe li{margin:8px 0;font-size:13px;color:#364152}
+.believe b{color:var(--ink)}
+.label-note{background:#fff9e8;border:1px solid #e7c86f;border-radius:10px;
+ padding:12px 15px;font-size:13px;color:#6b4e08;margin:12px 0}
+.run-context-notes{margin:10px 0 14px}
+.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.chart{border:1px solid var(--line);border-radius:11px;padding:14px;background:#fbfcfe}
+.chart h3{font-size:13px;margin:0}.chart .chart-meta{font-size:11px;color:var(--muted);
+ margin:2px 0 10px}.chart svg{display:block;width:100%;height:auto;overflow:visible}
+.chart-axis{stroke:#7b8798;stroke-width:1}.chart-line{fill:none;stroke:var(--blue);
+ stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}.chart-area{fill:#dfeeff;opacity:.7}
+.chart-dot{fill:var(--surface);stroke:var(--blue);stroke-width:2}.chart-label{fill:#475467;
+ font-size:9px;font-family:inherit}.chart-bad{stroke:var(--red)}
+.chart-secondary{stroke:#6b55c5}.chart-dot-secondary{stroke:#6b55c5}
+.quota-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.gauge{border:1px solid var(--line);border-radius:10px;padding:13px;background:#fbfcfe}
+.gauge-head{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:700}
+.gauge-track{height:8px;background:#e5eaf0;border-radius:999px;overflow:hidden;margin:9px 0 6px}
+.gauge-fill{height:100%;background:var(--blue);border-radius:999px}.gauge-fill.warn{background:#c66a08}
+.gauge-fill.bad{background:var(--red)}.gauge-note{font-size:11px;color:var(--muted)}
+details.evidence{background:var(--surface);border:1px solid var(--line);border-radius:12px;
+ margin:12px 0;break-inside:avoid}
+details.evidence summary{cursor:pointer;padding:14px 16px;font-size:13px;font-weight:800;
+ color:#27364b;list-style-position:inside}
+details.evidence[open] summary{border-bottom:1px solid var(--line)}
+details.evidence .detail-body{padding:4px 16px 16px}
+.print-evidence{display:none}
+.foot{color:var(--muted);font-size:11px;margin-top:24px;text-align:center}
+.print-footer{display:none}
+td.yes{color:var(--green);font-weight:800}
+td.no{background:var(--red-soft);color:var(--red);font-weight:800}
+td.na{color:var(--muted);font-weight:650}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;
+ margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;
+ white-space:nowrap!important;border:0!important}
+@media(max-width:900px){.state-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+ .fact-strip,.stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+ .decision-lead{grid-template-columns:1fr}.chart-grid{grid-template-columns:1fr}
+ .quota-grid{grid-template-columns:1fr}.section-head{align-items:start;flex-direction:column;gap:4px}
+ .section-head p{text-align:left}}
+@media(max-width:640px){.wrap{padding:14px 12px 36px}.report-head{border-radius:14px;
+ padding:16px}.external-verified .verified-grid{grid-template-columns:1fr;gap:2px}
+ .verification-states{grid-template-columns:1fr;gap:4px}
+ .external-verified .verified-grid dt{margin-top:5px}.external-verified .assurance{grid-column:auto}
+ .report-head h1{font-size:22px;margin-bottom:7px}.report-head .sub{font-size:11px}
+ .report-head .meta-artifact{display:inline-flex;max-width:100%;overflow-wrap:anywhere}
+ .meta-row{margin-top:10px;gap:6px}.meta-chip{font-size:11px;min-height:26px;padding:4px 8px}
+ .report-nav{margin:10px 0 14px;border-radius:9px}
+ .report-nav a{padding:6px 9px;font-size:11px}.decision-hero{padding:14px 16px;
+ margin-top:12px}.decision-hero h2{font-size:19px;margin:5px 0}.decision-hero .claim-box{display:none}
+ .status-kicker{font-size:10px}.decision-copy{font-size:12px}
+ .decision-copy{display:block;overflow:visible}.state-grid{grid-template-columns:1fr;gap:0;
+ border:1px solid var(--line);border-radius:10px;overflow:hidden}
+ .state-card{display:flex;align-items:center;justify-content:space-between;gap:10px;
+ border:0;border-bottom:1px solid var(--line);border-radius:0;padding:6px 9px}
+ .state-card:last-child{border-bottom:0}.state-card .v{margin:0;text-align:right}
+ .state-card .k{font-size:9px}.state-card .v{font-size:11px}.state-card .why{display:none}
+ .fact-strip{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .section-head{margin:14px 2px 7px}.section-head h2{font-size:16px}.section-head p{display:none}
+ .fact{padding:8px}.fact .k{font-size:8px}.fact .v{font-size:15px}.fact .u{font-size:9px}
+ .fact .note{display:none}
+ .decision-reasons{grid-template-columns:1fr}.decision-reasons dd{font-size:11px}
+ .card{padding:15px 14px;border-radius:11px}.stat .v{font-size:21px}
+ .scroll-hint{display:flex;align-items:center;gap:7px;margin:0 0 7px;padding:7px 9px;
+ border-radius:8px;background:var(--blue-soft);color:#174ea6;font-size:12px;
+ font-weight:750}.table-scroll{box-shadow:inset -12px 0 12px -14px var(--ink);
+ -webkit-overflow-scrolling:touch}.dense-table{display:table;min-width:620px;
+ white-space:nowrap}.dense-table .sticky-col{position:sticky;inset-inline-start:0;
+ z-index:2;box-shadow:5px 0 7px -7px var(--ink);background:var(--surface)}
+ .dense-table thead .sticky-col{z-index:4;background:#fbfcfe}
+ table:not(.dense-table){display:table;width:100%;max-width:100%;table-layout:fixed;
+ white-space:normal}table:not(.dense-table) th,table:not(.dense-table) td{
+ overflow-wrap:anywhere;vertical-align:top}table:not(.dense-table) th.lbl{width:44%}
+ th,td{padding:8px;font-size:12px}.believe li{font-size:12px}.sub{font-size:12px}}
+@media print{@page{size:auto;margin:14mm 12mm 16mm}html{scroll-padding-top:0}
+ body{background:#fff;font-size:10pt}.wrap{max-width:none;padding:0}.report-head{box-shadow:none;
+ border:1px solid #9aa7b8;background:#fff;color:#111;padding:10px 12px}.external-verified{
+ box-shadow:none;border:1.5px solid #6c87a8;background:#fff;color:#111;padding:7px 9px;
+ break-inside:avoid;page-break-inside:avoid}.external-verified .verified-grid{font-size:8pt;
+ margin-top:5px;gap:2px 8px}.external-verified .assurance{font-size:7.5pt}
+ .external-verified .verified-badge{background:#fff;color:#111;
+ border:1px solid #667085}
+ .verification-states{gap:3px;margin-top:5px}.verification-state{padding:3px 5px;
+ font-size:7.5pt}.verification-state strong{font-size:7pt}
+ .external-verified.repro-warning{border-color:#d19042;background:#fff}
+ .report-head h1{font-size:21px}
+ .eyebrow,.sub{color:#344054}.meta-row{margin-top:8px}.meta-chip{background:#fff;color:#111;
+ border-color:#aeb8c6;min-height:22px;padding:2px 7px;font-size:9px}.report-nav{display:none}
+ .decision-hero,.card,.stat,.fact,.state-card,details.evidence{box-shadow:none;break-inside:avoid;
+ page-break-inside:avoid}.decision-hero{margin-top:8px;padding:11px 13px}.decision-hero h2{font-size:18px;
+ margin:4px 0}.decision-copy{font-size:10px}.decision-lead{gap:12px}.claim-box{font-size:9px;
+ padding-left:10px}.claim-box b{font-size:8px}.state-grid{grid-template-columns:repeat(5,minmax(0,1fr));
+ gap:4px;margin-top:9px}.state-card{padding:6px}.state-card .k{font-size:7px}.state-card .v{font-size:9px}
+ .state-card .why,.gate-detail{display:none}.section-head{break-after:avoid;page-break-after:avoid;
+ margin:12px 2px 6px}.section-head h2{font-size:15px}.section-head p{display:none}#workload{break-inside:avoid;
+ page-break-inside:avoid}.fact-strip{grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;margin:6px 0}
+ .fact{padding:6px}.fact .k{font-size:7px}.fact .v{font-size:12px}.fact .u{font-size:8px}
+ .fact .note{display:none}
+ .stats{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:8px 0}
+ .stat{padding:8px}.stat .k{font-size:8px}.stat .v{font-size:17px}
+ table{break-inside:auto}th,td{padding:6px 7px}thead{display:table-header-group}
+ tr{break-inside:avoid;page-break-inside:avoid}.label-note{margin:4px 0;padding:8px 10px}
+ details.evidence{display:none}.print-evidence{display:block;break-inside:auto;
+ page-break-inside:auto}.print-evidence li{break-inside:avoid;page-break-inside:avoid;
+ margin:5px 0}
+ .print-evidence h2{break-after:avoid;page-break-after:avoid}
+ .chart svg{max-height:160px}.foot{display:none}.print-footer{display:block;
+ border:1px solid #98a2b3;padding:2.5mm 3mm;margin:4mm 0 2mm;background:#fff;
+ color:#344054;text-align:center;font-size:8pt;line-height:1.25;break-inside:avoid}
+ .run-context-notes{break-inside:avoid;page-break-inside:avoid;margin:3mm 0}
+ .scroll-hint{display:none}.table-scroll{overflow:visible;box-shadow:none}
+ .dense-table{min-width:0}.dense-table .sticky-col{position:static;box-shadow:none}
+ a{color:#111;text-decoration:none}}
 </style>"""
 
 
@@ -2389,12 +3770,301 @@ def _html_stat(k, v, u=""):
             f"<div class='v'>{v}{unit}</div></div>")
 
 
-def render_html(summary: dict, title: str) -> str:
+def _html_fact(label: str, value: str, unit: str = "", note: str = "") -> str:
+    """One compact, escaped statement of what the run actually exercised."""
+    unit_html = f" <span class='u'>{html.escape(unit)}</span>" if unit else ""
+    note_html = f"<div class='note'>{html.escape(note)}</div>" if note else ""
+    return (f"<div class='fact'><div class='k'>{html.escape(label)}</div>"
+            f"<div class='v'>{html.escape(value)}{unit_html}</div>"
+            f"{note_html}</div>")
+
+
+def _html_stability_chart(drift: dict) -> str:
+    """Accessible inline p95 trend chart; the table remains the exact source.
+
+    A missing window is a gap, never a zero.  This is intentionally SVG-only:
+    completed artifacts remain self-contained and cannot fetch remote code.
+    """
+    windows = drift.get("windows") or []
+    series = []
+    for key, label, css in (
+            ("ttft_p95", "TTFT p95", "chart-line"),
+            ("e2e_p95", "E2E p95", "chart-line chart-secondary")):
+        points = []
+        for position, window in enumerate(windows):
+            value = window.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and math.isfinite(float(value)) and float(value) >= 0:
+                points.append((position, float(value)))
+        if points:
+            series.append((label, css, points))
+    if not series:
+        return ""
+    values = [value for _label, _css, points in series for _x, value in points]
+    ceiling = max(values) or 1.0
+    n_windows = max(len(windows), 2)
+    left, top, width, height = 46.0, 12.0, 566.0, 136.0
+
+    def xy(position: int, value: float) -> tuple[float, float]:
+        x = left + (position / max(n_windows - 1, 1)) * width
+        y = top + height - (value / ceiling) * height
+        return x, y
+
+    paths = []
+    for label, css, points in series:
+        # Split around missing windows so a gap is not joined by a line.
+        segments: list[list[tuple[int, float]]] = []
+        for point in points:
+            if not segments or point[0] != segments[-1][-1][0] + 1:
+                segments.append([point])
+            else:
+                segments[-1].append(point)
+        for segment in segments:
+            coords = " ".join(f"{x:.1f},{y:.1f}"
+                              for x, y in (xy(*point) for point in segment))
+            if len(segment) == 1:
+                x, y = xy(*segment[0])
+                dot_class = (
+                    "chart-dot chart-bad" if "chart-bad" in css else
+                    "chart-dot chart-dot-secondary"
+                    if "chart-secondary" in css else "chart-dot")
+                paths.append(
+                    f"<circle class='{dot_class}' cx='{x:.1f}' cy='{y:.1f}' "
+                    "r='3'/>")
+            else:
+                paths.append(
+                    f"<polyline class='{css}' points='{coords}'/>")
+    middle = ceiling / 2.0
+    window_seconds = drift.get("window_seconds") or 60
+    desc = (f"p95 latency by {window_seconds}-second window; "
+            f"{len(windows)} windows. Missing values are gaps, not zeros.")
+    def legend_color(css: str) -> str:
+        if "chart-bad" in css:
+            return "#b42318"
+        if "chart-secondary" in css:
+            return "#6b55c5"
+        return "#075fce"
+
+    legend = "".join(
+        f"<span><span aria-hidden='true' style='color:{legend_color(css)}'"
+        f">&#8212;</span> {html.escape(label)}</span>"
+        for label, css, _points in series)
+    return (
+        "<div class='chart'><h3>Tail latency over time</h3>"
+        f"<div class='chart-meta'>{html.escape(desc)} &nbsp; {legend}</div>"
+        "<svg viewBox='0 0 640 170' role='img' "
+        "aria-labelledby='stability-chart-title stability-chart-desc'>"
+        "<title id='stability-chart-title'>Tail latency over time</title>"
+        f"<desc id='stability-chart-desc'>{html.escape(desc)}</desc>"
+        f"<line class='chart-axis' x1='{left}' y1='{top}' x2='{left}' "
+        f"y2='{top + height}'/><line class='chart-axis' x1='{left}' "
+        f"y1='{top + height}' x2='{left + width}' y2='{top + height}'/>"
+        f"<line class='chart-axis' x1='{left}' y1='{top + height / 2}' "
+        f"x2='{left + width}' y2='{top + height / 2}'/>"
+        f"<text class='chart-label' x='2' y='{top + 4:.1f}'>"
+        f"{ceiling:,.0f} ms</text>"
+        f"<text class='chart-label' x='2' y='{top + height / 2 + 4:.1f}'>"
+        f"{middle:,.0f}</text>"
+        f"<text class='chart-label' x='29' y='{top + height + 4:.1f}'>0</text>"
+        + "".join(paths)
+        + f"<text class='chart-label' x='{left}' y='166'>0 min</text>"
+        + f"<text class='chart-label' text-anchor='end' x='{left + width}' "
+          f"y='166'>{len(windows) * float(window_seconds) / 60:g} min</text>"
+        + "</svg></div>")
+
+
+def _html_quota_gauges(rate: dict) -> str:
+    """Show captured-window evidence separately from short-run projections.
+
+    On a short run, ``ratio_to_nominal_limit`` is the larger of the observed
+    rolling maximum and a sustained-rate projection.  It must never be
+    rendered as an observed percentage beside ``observed_max``.
+    """
+    labels = {
+        "input_tokens_per_minute": "Input tokens / trailing 60 s",
+        "output_tokens_per_minute": "Offered max_tokens / trailing 60 s",
+        "queries_per_hour": "Physical POSTs / trailing 3,600 s",
+    }
+    gauges = []
+    for key, comparison in (rate.get("comparisons") or {}).items():
+        configured = comparison.get("configured_limit")
+        observed = comparison.get("observed_max")
+        if (isinstance(configured, bool)
+                or not isinstance(configured, (int, float))
+                or not math.isfinite(float(configured))
+                or float(configured) <= 0):
+            continue
+        configured = float(configured)
+        observed_ratio = comparison.get("observed_ratio_to_nominal_limit")
+        if (isinstance(observed_ratio, bool)
+                or not isinstance(observed_ratio, (int, float))
+                or not math.isfinite(float(observed_ratio))
+                or float(observed_ratio) < 0):
+            if (isinstance(observed, bool)
+                    or not isinstance(observed, (int, float))
+                    or not math.isfinite(float(observed))
+                    or float(observed) < 0):
+                continue
+            observed_ratio = float(observed) / configured
+        observed_ratio = float(observed_ratio)
+        warning_at = comparison.get("warning_utilization")
+        if (isinstance(warning_at, bool)
+                or not isinstance(warning_at, (int, float))
+                or not math.isfinite(float(warning_at))
+                or not 0 < float(warning_at) <= 1):
+            # Compatibility for older sealed summaries that predate the
+            # per-comparison threshold field.
+            warning_at = 0.8
+        warning_at = float(warning_at)
+        label = labels.get(key, str(key).replace("_", " ").capitalize())
+
+        def gauge(kind: str, value: object, ratio: float,
+                  qualifier: str) -> str:
+            def amount(item: object) -> str:
+                number = float(item)
+                return (f"{number:,.0f}" if number.is_integer()
+                        else f"{number:,.1f}")
+
+            percent = ratio * 100.0
+            width = min(percent, 100.0)
+            tone = ("bad" if ratio >= 1.0 else
+                    "warn" if ratio >= warning_at else "")
+            return (
+                "<div class='gauge'>"
+                f"<div class='gauge-head'><span>{html.escape(label)} - "
+                f"{html.escape(kind)}</span><span>{percent:.1f}%</span></div>"
+                "<div class='gauge-track' role='img' "
+                f"aria-label='{html.escape(label)}, {html.escape(kind)}: "
+                f"{percent:.1f} percent of the configured nominal limit; "
+                f"warning threshold {warning_at * 100:.1f} percent'>"
+                f"<div class='gauge-fill {tone}' "
+                f"style='width:{width:.3f}%'></div></div>"
+                f"<div class='gauge-note'>{amount(value)} / "
+                f"{amount(configured)} configured; warning at "
+                f"{warning_at * 100:.1f}%. {html.escape(qualifier)} "
+                "Harness-local; provider headroom is not established."
+                "</div></div>")
+
+        gauges.append(gauge(
+            "observed captured window", observed, observed_ratio,
+            "This is captured run evidence."))
+        projected = comparison.get("steady_state_projection")
+        if (not isinstance(projected, bool)
+                and isinstance(projected, (int, float))
+                and math.isfinite(float(projected))
+                and float(projected) >= 0):
+            projected = float(projected)
+            gauges.append(gauge(
+                "sustained-rate projection", projected,
+                projected / configured,
+                "This is a projection from a short observation, not an "
+                "observed rolling-window maximum."))
+    if not gauges:
+        return ""
+    return "<div class='quota-grid'>" + "".join(gauges) + "</div>"
+
+
+def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
+    """Render independent decision states before any performance number."""
+    ordered = (
+        ("Evidence integrity", "evidence_integrity"),
+        ("Measurement validity", "measurement_validity"),
+        ("Acceptance checks", "customer_sla"),
+        ("Quota state", "quota_state"),
+        ("Endpoint capacity", "endpoint_capacity"),
+    )
+    tone_by_severity = {
+        "pass": "ok", "fail": "bad", "warning": "warn",
+        "neutral": "neutral",
+    }
+    cards = []
+    reason_rows = []
+    severities = []
+    for heading, key in ordered:
+        state = decision[key]
+        severity = str(state.get("severity") or "neutral")
+        severities.append(severity)
+        tone = tone_by_severity.get(severity, "neutral")
+        state_label = str(state.get("label") or state.get("code") or "UNKNOWN")
+        cards.append(
+            f"<div class='state-card tone-{tone}'>"
+            f"<div class='k'>{html.escape(heading)}</div>"
+            f"<div class='v'>{html.escape(state_label)}</div>"
+            f"<div class='why'>{html.escape(str(state.get('reason') or ''))}</div>"
+            "</div>")
+        reason_rows.append(
+            f"<div><dt>{html.escape(heading)}</dt>"
+            f"<dd>{html.escape(str(state.get('reason') or ''))}</dd></div>")
+    quota = decision["quota_state"]
+    measurement = decision["measurement_validity"]
+    sla = decision["customer_sla"]
+    capacity = decision["endpoint_capacity"]
+    integrity = decision["evidence_integrity"]
+    if integrity.get("code") == "TAMPERED":
+        headline = "Do not use this report: artifact integrity failed."
+        lead = integrity["reason"]
+    elif quota.get("code") == "EXCEEDED":
+        headline = "No endpoint-capacity conclusion: quota rejection observed."
+        lead = quota["reason"]
+    elif measurement.get("code") == "INVALID":
+        headline = "No performance conclusion: the measurement is invalid."
+        lead = measurement["reason"]
+    elif sla.get("code") == "MISS":
+        headline = "Configured acceptance checks missed at this tested load."
+        lead = sla["reason"]
+    elif measurement.get("code") == "CAUTION":
+        headline = "Diagnostic result: validity gates require review."
+        lead = measurement["reason"]
+    elif sla.get("code") == "PASS":
+        headline = "Configured acceptance checks passed at this tested load."
+        lead = sla["reason"]
+    else:
+        headline = "Run observed; no acceptance-check pass is claimed."
+        lead = sla["reason"]
+    if "fail" in severities:
+        hero_tone = "bad"
+    elif "warning" in severities:
+        hero_tone = "warn"
+    else:
+        hero_tone = "ok"
+    established = (
+        "The report records the tested workload, captured outcomes, and "
+        "independent acceptance-check and rate-limit states for this run."
+    )
+    not_established = (
+        "It does not establish an endpoint ceiling, behavior for a different "
+        "workload, or provider quota headroom."
+    )
+    return (
+        f"<section class='decision-hero state-{hero_tone}' id='overview' "
+        "aria-labelledby='decision-heading'>"
+        "<div class='decision-lead'><div>"
+        "<div class='status-kicker'>Decision summary</div>"
+        f"<h2 id='decision-heading'>{html.escape(headline)}</h2>"
+        f"<p class='decision-copy'>{html.escape(str(lead))}</p>"
+        "</div>"
+        "<div class='claim-box'>"
+        f"<p><b>What this establishes</b>{html.escape(established)}</p>"
+        f"<p><b>What this does not establish</b>"
+        f"{html.escape(not_established)}</p>"
+        f"<p><b>Capacity state</b>{html.escape(str(capacity['label']))}</p>"
+        "</div></div>"
+        f"<div class='state-grid'>{''.join(cards)}</div>"
+        "<details class='gate-detail' id='decision-reasons'>"
+        "<summary>Why these states · combined CLI exit-code gate</summary>"
+        f"<dl class='decision-reasons'>{''.join(reason_rows)}</dl>"
+        + combined_gate_html + "</details></section>")
+
+
+def render_html(summary: dict, title: str, *,
+                verification_context: dict | None = None) -> str:
     """A self-contained, styled HTML report built from the same summary the
     markdown uses. Stdlib only, no external assets, safe to open in a browser
     or attach to a deck."""
     s = summary
-    esc = html.escape
+    verified_view = _external_report_context(s, verification_context)
+    def esc(value: object) -> str:
+        return html.escape(sanitize_display_text(value), quote=True)
     run = s.get("run") or {}
     mode = run.get("input_mode", "profile")
 
@@ -2404,29 +4074,249 @@ def render_html(summary: dict, title: str) -> str:
     def has(t):
         return bool(t) and t.get("n", 0) > 0
 
+    def display_text(value, limit):
+        clean = sanitize_title(value)
+        return clean if len(clean) <= limit else clean[:limit - 1].rstrip() + "…"
+
     # ---- header ----
-    ep = esc(run.get("endpoint_path") or "")
+    display_title = display_text(title, 160)
+    ep = esc(display_text(run.get("endpoint_path") or "", 180))
     src = ("real prompts" if mode == "prompts" else "synthetic shape")
-    total = s.get("requests_total") or 0
-    okc = s.get("requests_ok") or 0
-    failed = s.get("requests_failed") or 0
-    err = (s.get("error_rate") or 0) * 100
-    sub = (f"{ep} &middot; {src} &middot; {total} requests, {okc} produced a "
-           f"content delta, {failed} did not")
+    def count_or_none(key: str) -> int | None:
+        value = s.get(key)
+        return (value if isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0 else None)
+
+    total = count_or_none("requests_total")
+    okc = count_or_none("requests_ok")
+    failed = count_or_none("requests_failed")
+    error_rate = s.get("error_rate")
+    if (isinstance(error_rate, bool)
+            or not isinstance(error_rate, (int, float))
+            or not math.isfinite(float(error_rate))
+            or float(error_rate) < 0):
+        error_rate = None
+    else:
+        error_rate = float(error_rate)
+    total_text = f"{total:,}" if total is not None else "NOT REPORTED"
+    ok_text = f"{okc:,}" if okc is not None else "NOT REPORTED"
+    failed_text = f"{failed:,}" if failed is not None else "NOT REPORTED"
+    sub = (f"Measured replay &middot; {ep} &middot; {src} &middot; "
+           f"{total_text} requests, {ok_text} harness-successful, "
+           f"{failed_text} failed")
+
+    endpoint_meta = run.get("endpoint_metadata") or {}
+    entity_names = [str(entity.get("name"))
+                    for entity in (endpoint_meta.get("served_entities") or [])
+                    if isinstance(entity, dict) and entity.get("name")]
+    tested_entity = display_text(
+        run.get("endpoint_model") or
+        (entity_names[0] if entity_names else None) or
+        endpoint_meta.get("name") or "not recorded", 120)
+    header_chips = []
+    if tested_entity != "not recorded":
+        header_chips.append(("entity", f"entity: {tested_entity}"))
+    header_chips.extend([
+        ("mode", f"input: {src}"),
+        ("version", f"harness: {s.get('harness_version') or 'not recorded'}"),
+    ])
+    if run.get("artifact_id"):
+        header_chips.append((
+            "artifact", f"artifact: {display_text(run['artifact_id'], 100)}"))
+    verified_banner_html = ""
+    if verified_view:
+        source_repro = verified_view["source_reproducibility"]
+        verifier_repro = verified_view["verifier_reproducibility"]
+        repro_warning = (
+            source_repro["code"] == "FAILED"
+            or verifier_repro["code"] == "FAILED")
+
+        def verification_state(label: str, code: str) -> str:
+            css = "status-pass" if code in {"PASS", "VERIFIED"} \
+                else "status-failed"
+            return (
+                "<div class='verification-state'>"
+                f"<span>{esc(label)}</span>"
+                f"<strong class='{css}'>{esc(code)}</strong></div>")
+
+        def reproducibility_detail(state: dict) -> str:
+            reason_codes = state["reason_codes"]
+            codes = (
+                "<br><span class='repro-codes'>Reason codes: "
+                + ", ".join(f"<code>{esc(code)}</code>"
+                            for code in reason_codes)
+                + "</span>" if reason_codes else "")
+            return esc(state["reason"]) + codes
+
+        verified_banner_html = (
+            f"<aside class='external-verified"
+            f"{' repro-warning' if repro_warning else ''}' role='status' "
+            "aria-label='External verification context'>"
+            f"<span class='verified-badge'>{esc(verified_view['view_label'])}"
+            "</span><div class='verification-states' "
+            "aria-label='Independent verification states'>"
+            + verification_state("Integrity", "VERIFIED")
+            + verification_state("Source reproducibility", source_repro["code"])
+            + verification_state(
+                "Verifier reproducibility", verifier_repro["code"])
+            + "</div><dl class='verified-grid'>"
+            f"<dt>Source reproducibility</dt><dd>"
+            f"{reproducibility_detail(source_repro)}</dd>"
+            f"<dt>Verifier reproducibility</dt><dd>"
+            f"{reproducibility_detail(verifier_repro)}</dd>"
+            f"<dt>Source artifact</dt><dd><code>"
+            f"{esc(verified_view['source_artifact_id'])}</code></dd>"
+            f"<dt>Full manifest SHA-256</dt><dd><code>"
+            f"{esc(verified_view['source_manifest_sha256'])}</code></dd>"
+            f"<dt>Verifier</dt><dd>llm-traffic-replay "
+            f"<code>{esc(verified_view['verifier_version'])}</code> at "
+            f"<code>{esc(verified_view['verified_at_utc'])}</code></dd>"
+            f"<dt>Receipt</dt><dd><code>{esc(verified_view['receipt_id'])}"
+            "</code></dd>"
+            f"<dd class='assurance'>{esc(verified_view['assurance'])}</dd>"
+            "</dl></aside>")
+    eyebrow = ("Benchmark evidence · external verification receipt"
+               if verified_view else "Benchmark evidence · verify the manifest")
+    header_html = (
+        "<header class='report-head'>"
+        f"<div class='eyebrow'>{esc(eyebrow)}</div>"
+        f"<h1 title='{esc(sanitize_title(title))}'>{esc(display_title)}</h1>"
+        f"<p class='sub'>{sub}</p>"
+        "<div class='meta-row'>"
+        + "".join(f"<span class='meta-chip meta-{kind}'>"
+                  f"{esc(str(chip))}</span>" for kind, chip in header_chips)
+        + "</div></header>")
+    nav_links = [
+        ("overview", "Decision"), ("workload", "Workload"),
+        ("validity", "Validity"),
+    ]
+    if s.get("sla"):
+        nav_links.append(("sla", "Acceptance"))
+    nav_links.append(("performance", "Performance"))
+    if s.get("drift"):
+        nav_links.append(("stability", "Stability"))
+    if s.get("observed_rate_windows") or s.get("rate_limits"):
+        nav_links.append(("quota", "Quota"))
+    nav_links.append(("evidence", "Evidence"))
+    nav_html = (
+        "<nav class='report-nav' aria-label='Report sections'>"
+        + "".join(f"<a href='#{target}'>{esc(label)}</a>"
+                  for target, label in nav_links)
+        + "</nav>")
+
+    schedule = s.get("schedule") or {}
+    scheduled_requests = schedule.get("requests")
+    load_seconds = schedule.get("seconds")
+    scheduled_avg = None
+    if isinstance(scheduled_requests, int) and not isinstance(
+            scheduled_requests, bool) \
+            and isinstance(load_seconds, (int, float)) \
+            and not isinstance(load_seconds, bool) \
+            and math.isfinite(float(load_seconds)) and float(load_seconds) > 0:
+        scheduled_avg = scheduled_requests / float(load_seconds)
+    achieved_qps = (s.get("arrivals") or {}).get("achieved_qps_overall")
+    conc = s.get("concurrency") or {}
+    throughput = s.get("throughput") or {}
+    throughput_coverage = throughput.get("usage_coverage")
+    throughput_note = "endpoint-reported usage"
+    if isinstance(throughput_coverage, (int, float)) \
+            and not isinstance(throughput_coverage, bool) \
+            and throughput_coverage < 1.0:
+        throughput_note = (
+            f"clean usage subset; {throughput_coverage:.1%} row coverage")
+    fact_items = [
+        _html_fact("Scheduled average",
+                   f"{scheduled_avg:,.2f}" if scheduled_avg is not None
+                   else "NOT RECORDED", "RPS",
+                   "open-loop load window"),
+        _html_fact("Achieved arrival rate",
+                   f"{achieved_qps:,.2f}" if isinstance(
+                       achieved_qps, (int, float)) and not isinstance(
+                           achieved_qps, bool) else "NOT MEASURED", "RPS",
+                   "first sends over observed span"),
+        _html_fact("Load window",
+                   f"{float(load_seconds):,.0f}" if isinstance(
+                       load_seconds, (int, float)) and not isinstance(
+                           load_seconds, bool) else "NOT RECORDED", "s",
+                   f"{scheduled_requests} scheduled requests"
+                   if scheduled_requests is not None else "schedule unavailable"),
+        _html_fact("Replay requests", total_text, "requests",
+                   f"{ok_text} harness-successful; {failed_text} failed"),
+        _html_fact("In-flight p95",
+                   f"{conc['in_flight_p95']:,.0f}" if isinstance(
+                       conc.get("in_flight_p95"), (int, float))
+                   and not isinstance(conc.get("in_flight_p95"), bool)
+                   else "NOT MEASURED", "requests",
+                   f"peak {conc.get('in_flight_max', 'unknown')}"),
+        _html_fact("Input throughput",
+                   f"{throughput['input_tokens_per_min']:,.0f}"
+                   if isinstance(throughput.get("input_tokens_per_min"),
+                                 (int, float))
+                   and not isinstance(throughput.get("input_tokens_per_min"),
+                                      bool) else "NOT REPORTED", "tok/min",
+                   throughput_note),
+    ]
+    facts_html = (
+        "<section id='workload' aria-labelledby='workload-heading'>"
+        "<div class='section-head'><h2 id='workload-heading'>What was tested"
+        "</h2><p>Load and workload facts come before latency so a light or "
+        "malformed run cannot look impressive out of context.</p></div>"
+        f"<div class='fact-strip'>{''.join(fact_items)}</div></section>")
 
     # ---- stat cards ----
     cards = []
-    ttft = s.get("ttft_ms") or {}
+    provenance = s.get("latency_correction_provenance") or {}
+
+    def exact_caller_table(corrected_key: str, service_key: str) -> dict | None:
+        corrected = s.get(corrected_key)
+        service = s.get(service_key)
+        corrected = corrected if isinstance(corrected, dict) else {}
+        service = service if isinstance(service, dict) else {}
+        corrected_n = corrected.get("n")
+        service_n = service.get("n")
+        legacy_n = provenance.get("legacy_reconstructed_values")
+        if (isinstance(corrected_n, int) and corrected_n > 0
+                and isinstance(service_n, int) and service_n > 0
+                and corrected_n == service_n
+                and legacy_n == 0):
+            return corrected
+        return None
+
+    ttft_service = s.get("ttft_ms") or {}
+    ttft_caller = exact_caller_table("ttft_corrected_ms", "ttft_ms")
+    ttft = ttft_caller or ttft_service
+    ttft_label = "Caller TTFT" if ttft_caller else "Service-path TTFT"
     if has(ttft):
-        cards.append(_html_stat("TTFT p50", num(ttft["p50"]), "ms"))
-        cards.append(_html_stat("TTFT p95", num(ttft["p95"]), "ms"))
-    e2e = s.get("e2e_ms") or {}
+        cards.append(_html_stat(f"{ttft_label} p50", num(ttft["p50"]), "ms"))
+        cards.append(_html_stat(f"{ttft_label} p95", num(ttft["p95"]), "ms"))
+    e2e_service = s.get("e2e_ms") or {}
+    e2e_caller = exact_caller_table("e2e_corrected_ms", "e2e_ms")
+    e2e = e2e_caller or e2e_service
+    e2e_label = "Caller end to end" if e2e_caller else \
+        "Service-path end to end"
     if has(e2e):
-        cards.append(_html_stat("End to end p95", num(e2e["p95"]), "ms"))
-    err_cls = "ok" if failed == 0 else "bad"
-    cards.append(f"<div class='stat'><div class='k'>error rate</div>"
+        cards.append(_html_stat(f"{e2e_label} p95", num(e2e["p95"]), "ms"))
+    err_cls = (
+        "neutral" if failed is None or error_rate is None else
+        "ok" if failed == 0 and error_rate == 0 else "bad")
+    err_text = "NOT REPORTED" if error_rate is None else \
+        f"{error_rate * 100:.2f}%"
+    cards.append(f"<div class='stat'><div class='k'>Replay error rate</div>"
                  f"<div class='v'><span class='pill {err_cls}'>"
-                 f"{err:.2f}%</span></div></div>")
+                 f"{err_text}</span></div></div>")
+    http_429_count = s.get("http_429_count")
+    http_429 = s.get("http_429") or {}
+    if isinstance(http_429_count, int) \
+            and not isinstance(http_429_count, bool) \
+            and http_429_count > 0:
+        http_429_rate = http_429.get("rate")
+        rendered_rate = (f"{100 * http_429_rate:.2f}%"
+                         if isinstance(http_429_rate, (int, float))
+                         and not isinstance(http_429_rate, bool) else "n/a")
+        cards.append(
+            "<div class='stat'><div class='k'>HTTP 429 rate</div>"
+            "<div class='v'><span class='pill bad'>"
+            f"{rendered_rate}</span></div></div>")
     ach = s.get("achieved_cache_fraction") or {}
     if has(ach):
         cards.append(_html_stat("cached prompt-token fraction p50",
@@ -2437,7 +4327,8 @@ def render_html(summary: dict, title: str) -> str:
                      "<div class='v'><span class='pill neutral' "
                      "style='font-size:12px'>not reported</span></div></div>")
     tp = s.get("throughput") or {}
-    if tp.get("output_tokens_per_min"):
+    if isinstance(tp.get("output_tokens_per_min"), (int, float)) \
+            and not isinstance(tp.get("output_tokens_per_min"), bool):
         cards.append(_html_stat("output throughput",
                                 num(tp["output_tokens_per_min"]), "tok/min"))
     stats = f"<div class='stats'>{''.join(cards)}</div>"
@@ -2460,14 +4351,21 @@ def render_html(summary: dict, title: str) -> str:
                 cls = "yes" if met else ("no" if met is False else "na")
                 cell = {True: "PASS", False: "NO", None: "-"}[met]
                 rows.append(
-                    f"<tr><td class='lbl'>{name} {esc(r['quantile'])} (ms)</td>"
+                    f"<tr><th scope='row' class='lbl sticky-col'>{name} "
+                    f"{esc(r['quantile'])} (ms)</th>"
                     f"<td>{num(r['target_ms'])}</td>"
                     f"<td>{num(r['actual_ms']) if r['actual_ms'] is not None else '-'}</td>"
                     f"<td class='{cls}'>{cell}</td></tr>")
+        hard_basis = sla.get("hard_timeout_basis") or {}
+        hard_timeout_configured = any(
+            hard_basis.get(key) is not None
+            for key in ("ttft_cap_ms", "ttfg_cap_ms"))
         ht = sla.get("hard_timeout_breaches")
-        if ht is not None:
+        if hard_timeout_configured and ht is not None:
             cls = "yes" if ht == 0 else "no"
-            rows.append(f"<tr><td class='lbl'>hard timeout breaches (count)</td>"
+            rows.append(f"<tr><th scope='row' class='lbl sticky-col'>"
+                        f"hard timeout "
+                        f"breaches (count)</th>"
                         f"<td>-</td><td>{ht}</td>"
                         f"<td class='{cls}'>{'PASS' if ht == 0 else ht}</td></tr>")
             if ht:
@@ -2475,7 +4373,9 @@ def render_html(summary: dict, title: str) -> str:
         ib = sla.get("interchunk_breaches")
         if ib is not None:
             cls = "yes" if ib == 0 else "no"
-            rows.append(f"<tr><td class='lbl'>interchunk breaches (count)</td>"
+            rows.append(f"<tr><th scope='row' class='lbl sticky-col'>"
+                        f"interchunk "
+                        f"breaches (count)</th>"
                         f"<td>-</td><td>{ib}</td>"
                         f"<td class='{cls}'>{'PASS' if ib == 0 else ib}</td></tr>")
             if ib:
@@ -2487,7 +4387,8 @@ def render_html(summary: dict, title: str) -> str:
             if met is False:
                 misses += 1
             rows.append(
-                f"<tr><td class='lbl'>success rate (fraction 0-1)</td>"
+                f"<tr><th scope='row' class='lbl sticky-col'>success rate "
+                f"(fraction 0-1)</th>"
                 f"<td>{num(sr['target'], 4)}</td><td>{num(sr['actual'], 4)}</td>"
                 f"<td class='{cls}'>{'PASS' if met else 'NO'}</td></tr>")
             lower = sr.get("one_sided_95pct_wilson_lower")
@@ -2495,8 +4396,9 @@ def render_html(summary: dict, title: str) -> str:
             if lower is not None:
                 confidence_cls = "yes" if demonstrated else "no"
                 rows.append(
-                    "<tr><td class='lbl'>success-rate one-sided 95% Wilson "
-                    "lower bound</td>"
+                    "<tr><th scope='row' class='lbl sticky-col'>"
+                    "success-rate one-sided "
+                    "95% Wilson lower bound</th>"
                     f"<td>{num(sr['target'], 4)}</td><td>{num(lower, 4)}</td>"
                     f"<td class='{confidence_cls}'>"
                     f"{'PASS' if demonstrated else 'NOT PROVEN'}</td></tr>")
@@ -2519,25 +4421,27 @@ def render_html(summary: dict, title: str) -> str:
             fix = (f" Raise {_knob}, or set <code>ttft_definition</code> to "
                    "<code>first_content</code>, to get a number."
                    if defn != "first_content" else
-                   f" Raise {_knob} so requests reach that token."
+                   f" Raise {_knob} so requests reach that content."
                    " On a reasoning-only model no budget may be enough, and"
                    " the mode is the decision rather than the budget.")
             note_bits.append(
                 f"TTFT actual is <b>-</b> because it is scored on "
-                f"<b>{defn}</b> and no request emitted that token within "
+                f"<b>{defn}</b> and no request emitted that content within "
                 f"max_tokens (a reasoning model can spend the whole token "
                 f"budget thinking).{fix} The latency table below still shows "
-                f"TTFT for the first token of any kind.")
+                f"TTFT for the first visible-or-reasoning content delta.")
         if s.get("ttfr_ms"):
             tft = (s.get("ttft_ms") or {}).get("p50")
             note_bits.append(
-                f"Reasoning model detected: TTFT (first token of any kind) "
-                f"p50 {num(tft)} ms arrives before the first visible token.")
+                "Reasoning model detected: TTFT (first visible-or-reasoning "
+                f"content delta) p50 {num(tft)} ms arrives before the first "
+                "visible content.")
         slanote = (f"<div class='slanote'>{' '.join(note_bits)}</div>"
                    if note_bits else "")
         basis = esc((sla.get("latency_basis") or "unknown").replace("_", " "))
         sla_html = (
-            f"<div class='card'><h2>SLA scorecard "
+            f"<div class='card' id='sla'><h2 id='sla-heading'>"
+            f"Acceptance scorecard "
             f"(TTFT definition: {defn}; latency basis: {basis})</h2>"
             f"<div class='cap'>targets from {esc(sla.get('targets_source') or 'the run configuration')}. "
             f"target and actual share each row's unit, shown in the metric "
@@ -2549,9 +4453,19 @@ def render_html(summary: dict, title: str) -> str:
             + (f"<div class='banner warn'>"
                f"{esc(sla['caller_latency_warning'])}</div>"
                if sla.get("caller_latency_warning") else "")
-            + "<table>"
-            f"<tr><th class='lbl'>metric</th><th>target</th><th>actual</th>"
-            f"<th>result</th></tr>{''.join(rows)}</table>{slanote}</div>")
+            + "<div class='scroll-hint' id='sla-scroll-hint' role='note'>"
+              "<span aria-hidden='true'>↔</span> Scroll horizontally; the "
+              "Metric column stays visible.</div>"
+              "<div class='table-scroll' tabindex='0' role='region' "
+              "aria-labelledby='sla-heading' "
+              "aria-describedby='sla-scroll-hint'>"
+              "<table class='dense-table'><caption class='sr-only'>"
+              "Configured acceptance target, actual "
+              "measurement, and result</caption><thead>"
+            f"<tr><th scope='col' class='lbl sticky-col'>metric</th>"
+            f"<th scope='col'>target</th><th scope='col'>actual</th>"
+            f"<th scope='col'>result</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>{slanote}</div>")
 
     # one shared verdict, so report.md and this page cannot disagree, and it
     # renders whether or not acceptance targets were given. a run with no
@@ -2566,9 +4480,9 @@ def render_html(summary: dict, title: str) -> str:
 
     # ---- latency table ----
     lat = []
-    for label, key in (("TTFT (first token)", "ttft_ms"),
+    for label, key in (("TTFT (first content delta)", "ttft_ms"),
                        ("TTF valid tool call", "ttf_tool_call_ms"),
-                       ("TTFB (first byte)", "ttfb_ms"),
+                       ("TTFB (first response-body line)", "ttfb_ms"),
                        ("TTFG (end to end)", "e2e_ms"),
                        ("interchunk max", "interchunk_max_ms"),
                        ("TTFR (first reasoning)", "ttfr_ms"),
@@ -2576,18 +4490,32 @@ def render_html(summary: dict, title: str) -> str:
         t = s.get(key)
         if has(t):
             lat.append(
-                f"<tr><td class='lbl'>{label}</td><td>{num(t['p50'])}</td>"
+                f"<tr><th scope='row' class='lbl sticky-col'>{label}</th>"
+                f"<td>{num(t['p50'])}</td>"
                 f"<td>{num(t['p90'])}</td><td>{num(t['p95'])}</td>"
                 f"<td>{num(t['p99'])}</td><td class='n'>{t['n']}</td></tr>")
     pop_note = esc((s.get("latency_population") or {}).get("note")
                    or "latency population was not recorded")
     lat_html = (
-        "<div class='card'><h2>Endpoint service latency (milliseconds, from send)</h2>"
+        "<div class='card' id='performance'><h2 id='performance-heading'>"
+        "Endpoint service latency "
+        "(milliseconds, from send)</h2>"
         f"<div class='cap'>{pop_note}. p50 to p99 are percentiles across that "
         "population, lower is better. n is the measured count; all values are "
-        "in ms.</div><table>"
-        "<tr><th class='lbl'>metric</th><th>p50</th><th>p90</th><th>p95</th>"
-        f"<th>p99</th><th>n</th></tr>{''.join(lat)}</table></div>")
+        "in ms.</div><div class='scroll-hint' id='performance-scroll-hint' "
+        "role='note'><span aria-hidden='true'>↔</span> Scroll horizontally; "
+        "the Metric column stays visible.</div>"
+        "<div class='table-scroll' tabindex='0' role='region' "
+        "aria-labelledby='performance-heading' "
+        "aria-describedby='performance-scroll-hint'>"
+        "<table class='dense-table'><caption class='sr-only'>"
+        "Endpoint-service latency "
+        "percentiles in milliseconds</caption><thead>"
+        "<tr><th scope='col' class='lbl sticky-col'>metric</th>"
+        "<th scope='col'>p50</th>"
+        "<th scope='col'>p90</th><th scope='col'>p95</th>"
+        f"<th scope='col'>p99</th><th scope='col'>n</th></tr></thead>"
+        f"<tbody>{''.join(lat)}</tbody></table></div></div>")
 
     # ---- believability panel ----
     bel = []
@@ -2686,14 +4614,33 @@ def render_html(summary: dict, title: str) -> str:
     if failed:
         bel.append(f"<li><b>Failures</b>: "
                    f"{esc(json.dumps(s.get('failures_by_error')))}</li>")
+        bel.append(f"<li><b>Failed requests by HTTP status</b>: "
+                   f"{esc(json.dumps(s.get('failures_by_http_status') or {}))}"
+                   "</li>")
     else:
         bel.append("<li><b>Failures</b>: none</li>")
+        bel.append("<li><b>Failed requests by HTTP status</b>: none</li>")
+    if isinstance(http_429_count, int) \
+            and not isinstance(http_429_count, bool) \
+            and http_429_count > 0:
+        total_429 = http_429.get("request_rows_examined")
+        rate_429 = http_429.get("rate")
+        rendered_429_rate = (f"{100 * rate_429:.2f}%"
+                             if isinstance(rate_429, (int, float))
+                             and not isinstance(rate_429, bool) else "n/a")
+        bel.append(
+            f"<li><b>HTTP 429 rate-limit responses</b>: {http_429_count} of "
+            f"{esc(str(total_429))} request rows ({rendered_429_rate}); "
+            f"scope: {esc(str(http_429.get('scope') or 'not recorded'))}. "
+            "This is quota-limited evidence, not an endpoint-capacity "
+            "result.</li>")
     rp = run.get("request_params")
     if rp:
         eb = rp.get("extra_body") or {}
         extra = f", extra_body {esc(json.dumps(eb))}" if eb else ""
         bel.append(f"<li><b>Request params</b>: temperature "
-                   f"{esc(str(rp.get('temperature')))}, max_tokens cap "
+                   f"{esc(str(rp.get('temperature')))}, global max_tokens "
+                   "safety cap "
                    f"{esc(str(rp.get('max_output_tokens_cap')))}{extra}</li>")
     cc = s.get("concurrency") or {}
     if cc.get("in_flight_p50") is not None:
@@ -2708,21 +4655,141 @@ def render_html(summary: dict, title: str) -> str:
     if lb:
         bel.append(f"<li><b>Latency basis</b>: {esc(lb)}</li>")
 
+    believe_items = "".join(bel)
     believe = (
-        "<div class='card believe'><h2>Believability "
+        "<details class='evidence believe' id='evidence'>"
+        "<summary>Measurement evidence: read before quoting a number</summary>"
+        "<div class='detail-body'><h2 class='sr-only'>Believability "
         "(read before quoting a number)</h2>"
-        f"<ul>{''.join(bel)}</ul></div>")
+        f"<ul>{believe_items}</ul></div></details>"
+        "<section class='card believe print-evidence' "
+        "aria-labelledby='print-evidence-heading'>"
+        "<h2 id='print-evidence-heading'>Measurement evidence: read before "
+        "quoting a number</h2>"
+        f"<ul>{believe_items}</ul></section>")
 
     # ---- throughput + merge note ----
     extra_cards = ""
     if tp.get("input_tokens_per_min"):
+        usage_coverage = tp.get("usage_coverage")
+        incomplete_usage = (
+            isinstance(usage_coverage, (int, float))
+            and not isinstance(usage_coverage, bool)
+            and usage_coverage < 1.0)
+        throughput_heading = (
+            "Throughput: clean usage subset"
+            if incomplete_usage else "Throughput")
+        throughput_warning = (
+            f"<div class='banner warn'>{esc(tp['coverage_warning'])}</div>"
+            if incomplete_usage and tp.get("coverage_warning") else "")
         extra_cards = (
-            f"<div class='card'><h2>Throughput</h2><table>"
-            f"<tr><td class='lbl'>input tokens per minute</td>"
+            f"<div class='card'><h2>{throughput_heading}</h2>"
+            f"{throughput_warning}<table>"
+            "<caption class='sr-only'>Endpoint-reported token throughput"
+            "</caption><tbody>"
+            f"<tr><th scope='row' class='lbl'>input tokens per minute</th>"
             f"<td>{num(tp['input_tokens_per_min'])} tok/min</td></tr>"
-            f"<tr><td class='lbl'>output tokens per minute</td>"
+            f"<tr><th scope='row' class='lbl'>output tokens per minute</th>"
             f"<td>{num(tp['output_tokens_per_min'])} tok/min</td></tr>"
-            f"</table></div>")
+            f"</tbody></table></div>")
+    windows = s.get("observed_rate_windows") or {}
+    win_input = windows.get("input_tokens_by_first_send") or {}
+    win_reserved = (
+        windows.get(
+            "offered_output_token_reservation_demand_by_first_send") or {})
+    win_actual = windows.get("actual_output_tokens_by_completion") or {}
+    win_queries = windows.get("physical_queries_by_first_send") or {}
+    if any(window.get("max") is not None
+           for window in (win_input, win_reserved, win_actual, win_queries)) \
+            or s.get("rate_limits"):
+        traffic_scope = windows.get("traffic_scope") or {}
+        phase_text = _traffic_phase_summary(traffic_scope)
+        coverage = win_input.get("coverage")
+        rows = [
+            ("captured traffic phases", phase_text),
+            ("input tokens / trailing 60 s",
+             f"{num(win_input.get('max'))} tok "
+             + (f"({num(coverage * 100, 1)}% coverage)"
+                if coverage is not None else "(coverage n/a)")),
+            ("offered max_tokens demand / trailing 60 s",
+             f"{num(win_reserved.get('max'))} tok; pre-admission demand, "
+             "not observed consumption"),
+            ("actual output attributed to completion / trailing 60 s",
+             f"{num(win_actual.get('max'))} tok (approximate timing)"),
+            ("offered physical POST demand / trailing 3,600 s",
+             f"{num(win_queries.get('max'))}; not confirmed processed QPH"),
+        ]
+        rate = s.get("rate_limits") or {}
+        for name, comparison in (rate.get("comparisons") or {}).items():
+            observed_ratio = comparison.get(
+                "observed_ratio_to_nominal_limit")
+            ratio = comparison.get("ratio_to_nominal_limit")
+            projected = comparison.get("steady_state_projection")
+            configured_limit = comparison.get("configured_limit")
+            projected_ratio = (
+                float(projected) / float(configured_limit)
+                if isinstance(projected, (int, float))
+                and not isinstance(projected, bool)
+                and isinstance(configured_limit, (int, float))
+                and not isinstance(configured_limit, bool)
+                and configured_limit else None)
+            rows.append((
+                name.replace("_", " "),
+                f"observed {comparison.get('observed_max')} / configured "
+                f"{configured_limit}"
+                + ("; observed ratio n/a" if observed_ratio is None else
+                   f"; observed ratio {observed_ratio:.1%}")
+                + (f"; sustained projection {projected:.1f} "
+                   f"({projected_ratio:.1%})"
+                   if projected is not None else "")
+                + ("; conservative gate ratio n/a" if ratio is None else
+                   f"; conservative gate ratio {ratio:.1%}")
+                + f" ({str(comparison.get('status')).replace('_', ' ')})"))
+        warning = ""
+        if rate:
+            cfg = rate.get("configured") or {}
+            binding = rate.get("binding") or {}
+            if not binding.get("binding_complete"):
+                binding_label = "NOT VERIFIED"
+            elif binding.get("workspace_tier_verified"):
+                binding_label = (
+                    "endpoint/model/deployment metadata and workspace tier "
+                    "verified")
+            else:
+                binding_label = (
+                    "endpoint/model/deployment metadata bound; workspace "
+                    "tier remains operator-asserted")
+            warning = (
+                f"<p><b>Configured snapshot:</b> provider "
+                f"{esc(str(cfg.get('provider')))}, model "
+                f"{esc(str(cfg.get('model')))}, deployment "
+                f"{esc(str(cfg.get('deployment_mode')))}, tier "
+                f"{esc(str(cfg.get('workspace_tier')))}; "
+                f"{esc(str(cfg.get('source')))} as of "
+                f"{esc(str(cfg.get('as_of')))}; operator reverified "
+                f"{esc(str(cfg.get('verified_at') or 'NOT RECORDED'))} with "
+                f"max age "
+                f"{esc(str(cfg.get('max_age_days') or 'NOT RECORDED'))} "
+                "days.</p>"
+                f"<p><b>Scope:</b> {esc(str(cfg.get('scope')))}. "
+                f"<b>Endpoint binding:</b> {esc(binding_label)}.</p>"
+                + (f"<p class='warn'>{esc(str(rate['warning']))}</p>"
+                   if rate.get("warning") else "")
+                + f"<p>{esc(str(rate['external_usage_warning']))}</p>")
+        rate_metric_keys = " ".join(
+            str(name) for name in (rate.get("comparisons") or {}))
+        extra_cards += (
+            "<div class='card' id='quota' data-rate-metrics='"
+            + esc(rate_metric_keys)
+            + "'><h2>Rolling rate windows</h2>"
+            + _html_quota_gauges(rate)
+            + "<table><caption class='sr-only'>Exact rolling rate-window "
+              "evidence and configured-limit comparisons</caption><tbody>"
+            + "".join(
+                f"<tr><th scope='row' class='lbl'>{esc(label)}</th>"
+                f"<td>{esc(value)}</td></tr>"
+                for label, value in rows)
+            + f"</tbody></table>{warning}</div>")
     merge_note = run.get("merge_note")
     note_html = (f"<div class='label-note'>{esc(merge_note)}</div>"
                  if merge_note else "")
@@ -2739,6 +4806,10 @@ def render_html(summary: dict, title: str) -> str:
         parts.append(f"<div class='label-note'><b>Profile:</b> "
                      f"{esc(run['profile_label'])}</div>")
     label_html = "".join(parts)
+    provenance_html = (
+        "<div class='run-context-notes' aria-label='Run context notes'>"
+        f"{note_html}{label_html}</div>"
+        if note_html or label_html else "")
 
     cost = s.get("cost")
     cost_html = ""
@@ -2748,13 +4819,15 @@ def render_html(summary: dict, title: str) -> str:
                      f"</div>")
     elif cost and cost["mode"] == "per_token" and cost.get("coverage_warning"):
         cost_html = (
-            "<div class='card'><h2>Cost (Databricks DBUs)</h2>"
-            "<div class='banner warn'>Full-run cost is unavailable. "
+            "<div class='card'><h2>Unverified user-supplied rate arithmetic</h2>"
+            "<div class='banner warn'>Aggregate replay total is unavailable. "
             + esc(cost["coverage_warning"])
+            + "</div><div class='cap'>"
+            + esc(cost.get("applicability_warning") or "")
             + "</div></div>")
     elif cost and cost["mode"] == "per_token" \
             and (cost.get("dbu_per_request") or {}).get("p50") is None:
-        cost_html = ("<div class='card'><h2>Cost (Databricks DBUs)</h2>"
+        cost_html = ("<div class='card'><h2>Unverified user-supplied rate arithmetic</h2>"
                      "<div class='cap'>no successful requests to price</div>"
                      "</div>")
     elif cost and cost["mode"] == "per_token":
@@ -2767,24 +4840,38 @@ def render_html(summary: dict, title: str) -> str:
                 base += f" (${num(dbu * usd, nd)})"
             return base
         rows = [
-            f"<tr><td class='lbl'>DBU per request (p50)</td>"
+            f"<tr><th scope='row' class='lbl'>DBU per request (p50)</th>"
             f"<td>{_money(cost['dbu_per_request']['p50'])}</td></tr>",
-            f"<tr><td class='lbl'>DBU per request (p95)</td>"
+            f"<tr><th scope='row' class='lbl'>DBU per request (p95)</th>"
             f"<td>{_money(cost['dbu_per_request']['p95'])}</td></tr>",
-            f"<tr><td class='lbl'>DBU per 1,000 requests</td>"
+            f"<tr><th scope='row' class='lbl'>DBU per 1,000 requests</th>"
             f"<td>{_money(cost['dbu_per_1k_requests'], 2)}</td></tr>",
-            f"<tr><td class='lbl'>DBU per minute</td>"
+            f"<tr><th scope='row' class='lbl'>DBU per minute</th>"
             f"<td>{_money(cost['dbu_per_min'], 3)}</td></tr>",
-            f"<tr><td class='lbl'>cache DBUs saved</td>"
+            f"<tr><th scope='row' class='lbl'>cache DBUs saved</th>"
             f"<td>{_money(cost['cache_dbu_saved'], 3)}</td></tr>",
         ]
-        cap = (f"per-token rates you supplied (DBU/M): input {num(r.get('input'), 3)}, "
+        cap = (f"Measured replay rows only. Per-token rates you supplied "
+               f"(DBU/M): input {num(r.get('input'), 3)}, "
                f"output {num(r.get('output'), 3)}, cache-read {num(r.get('cache_read'), 3)}"
                + (f", at ${usd}/DBU" if usd else "")
-               + ". cached input is billed at the cache-read rate.")
-        cost_html = (f"<div class='card'><h2>Cost (Databricks DBUs)</h2>"
-                     f"<div class='cap'>{cap}</div><table>{''.join(rows)}"
-                     f"</table></div>")
+               + ". Cached input uses the supplied cache-read rate.")
+        cost_html = ("<div class='card'><h2>Unverified user-supplied rate arithmetic</h2>"
+                     f"<div class='banner warn'>{esc(cost.get('applicability_warning') or '')}</div>"
+                     f"<div class='cap'>{cap}</div><table>"
+                     "<caption class='sr-only'>Estimated per-token cost"
+                     "</caption><tbody>"
+                     f"{''.join(rows)}</tbody></table></div>")
+    elif cost and cost["mode"] == "provisioned" \
+            and cost.get("coverage_warning"):
+        cost_html = (
+            "<div class='card'><h2>Unverified provisioned-rate arithmetic</h2>"
+            "<div class='banner warn'>Effective cost per 1M tokens is "
+            "unavailable. " + esc(cost["coverage_warning"]) + "</div>"
+            "<div class='cap'>Configured capacity rate: "
+            f"{num(cost['dbu_per_hour'], 3)} DBU/hour. "
+            + esc(cost.get("applicability_warning") or "")
+            + "</div></div>")
     elif cost:
         usd = cost.get("usd_per_dbu")
         eff = cost.get("effective_dbu_per_1m_tokens")
@@ -2792,50 +4879,73 @@ def render_html(summary: dict, title: str) -> str:
                 + (f" (${num(eff * usd, 2)})" if usd and eff is not None else "")
                 if eff is not None else "throughput too low to compute")
         rows = [
-            f"<tr><td class='lbl'>capacity rate</td>"
+            f"<tr><th scope='row' class='lbl'>capacity rate</th>"
             f"<td>{num(cost['dbu_per_hour'], 3)} DBU/hour"
             + (f" (${num(cost['dbu_per_hour'] * usd, 3)})" if usd else "")
             + "</td></tr>",
-            f"<tr><td class='lbl'>effective cost per 1M tokens</td>"
+            f"<tr><th scope='row' class='lbl'>effective cost per 1M tokens</th>"
             f"<td>{effv}</td></tr>",
         ]
-        cost_html = (f"<div class='card'><h2>Cost (Databricks DBUs, "
-                     f"provisioned)</h2><div class='cap'>provisioned throughput "
+        cost_html = ("<div class='card'><h2>Unverified provisioned-rate arithmetic</h2>"
+                     f"<div class='banner warn'>{esc(cost.get('applicability_warning') or '')}</div>"
+                     "<div class='cap'>provisioned throughput "
                      f"bills by capacity, so effective cost per 1M tokens is the "
                      f"hourly rate over tokens served per hour at the measured "
                      f"throughput. it improves as you fill the endpoint.</div>"
-                     f"<table>{''.join(rows)}</table></div>")
+                     "<table><caption class='sr-only'>Estimated provisioned "
+                     "capacity cost</caption><tbody>"
+                     f"{''.join(rows)}</tbody></table></div>")
 
-    sw = (s.get("sample") or {}).get("warning")
-    sample_banner = (f"<div class='banner warn'>{esc(sw)}</div>" if sw else "")
-    rw = (s.get("replay") or {}).get("warning")
-    if rw:
-        sample_banner += f"<div class='banner warn'>{esc(rw)}</div>"
-    cw = (s.get("client") or {}).get("warning")
-    if cw:
-        sample_banner += f"<div class='banner warn'>{esc(cw)}</div>"
-    nw = (s.get("concurrency") or {}).get("warning")
-    if nw:
-        sample_banner += f"<div class='banner warn'>{esc(nw)}</div>"
+    issues = []
 
-    _netw = (s.get("network_path") or {}).get("warning")
-    if _netw:
-        sample_banner += f"<div class='banner warn'>{esc(_netw)}</div>"
-    for warning in (
-            (s.get("throughput") or {}).get("coverage_warning"),
-            (s.get("cost") or {}).get("coverage_warning"),
-            (s.get("cache_fidelity") or {}).get("warning"),
-            (s.get("token_targeting") or {}).get("warning"),
-            (s.get("latency_population") or {}).get("warning")):
-        if warning:
-            sample_banner += f"<div class='banner warn'>{esc(warning)}</div>"
+    def add_issue(label, value):
+        if value:
+            issues.append((label, str(value)))
+
+    add_issue("Sample size", (s.get("sample") or {}).get("warning"))
+    add_issue("Prompt replay", (s.get("replay") or {}).get("warning"))
+    add_issue("Load delivery", (s.get("client") or {}).get("warning"))
+    add_issue("Concurrency", (s.get("concurrency") or {}).get("warning"))
+    add_issue("Network path", (s.get("network_path") or {}).get("warning"))
+    add_issue("Token-usage coverage",
+              (s.get("throughput") or {}).get("coverage_warning"))
+    add_issue("Cost coverage", (s.get("cost") or {}).get("coverage_warning"))
+    add_issue("Pricing applicability",
+              (s.get("cost") or {}).get("applicability_warning"))
+    add_issue("Cache fidelity", (s.get("cache_fidelity") or {}).get("warning"))
+    add_issue("Token-shape fidelity",
+              (s.get("token_targeting") or {}).get("warning"))
+    add_issue("Latency population",
+              (s.get("latency_population") or {}).get("warning"))
+    sample_banner = ""
+    if issues:
+        sample_banner = (
+            "<section class='card issue-card' id='validity' "
+            "aria-labelledby='validity-heading'>"
+            "<h2 id='validity-heading'>Validity and workload-fidelity gates</h2>"
+            f"<div class='banner warn'>{len(issues)} issue"
+            f"{'s' if len(issues) != 1 else ''} must be read before using "
+            "the latency or cost figures.</div><ul>"
+            + "".join(
+                f"<li><b>{esc(label)}:</b> {esc(value)}</li>"
+                for label, value in issues)
+            + "</ul></section>")
+    else:
+        sample_banner = (
+            "<section class='card issue-card' id='validity' "
+            "aria-labelledby='validity-heading'>"
+            "<h2 id='validity-heading'>Validity and workload-fidelity gates"
+            "</h2><span class='pill neutral'>No additional warning blocks</span>"
+            "<p class='cap' style='margin-top:8px'>Use the independent "
+            "Measurement validity, Quota, and Evidence integrity states above "
+            "as the decision gates.</p></section>")
 
     drift = s.get("drift") or {}
     if drift.get("windows") or drift.get("drift_kind"):
         wr = "".join(
-            f"<tr><td class='lbl'>window {w['window']} "
+            f"<tr><th scope='row' class='lbl sticky-col'>window {w['window']} "
             f"({w['n']} content-bearing streams)"
-            f"{'' if w.get('counted', True) else ', not counted'}</td>"
+            f"{'' if w.get('counted', True) else ', not counted'}</th>"
             f"<td>{_err_cell(w)}</td>"
             f"<td>{num(w['ttft_p95'])}</td><td>{num(w['e2e_p95'])}</td></tr>"
             for w in (drift.get("windows") or []))
@@ -2849,19 +4959,34 @@ def render_html(summary: dict, title: str) -> str:
         spread = drift.get("ttft_p95_spread_ratio")
         sp = (f"worst window is {spread:.1f}x the best. " if spread else "")
         drift_html = (
-            f"<div class='card'><h2>Stability over time &nbsp;{flag}</h2>"
+            f"<div class='card' id='stability'><h2 id='stability-heading'>"
+            f"Stability over time "
+            f"&nbsp;{flag}</h2>"
             f"<div class='cap'>"
             f"{'per-' + str(drift.get('window_seconds', 60)) + 's windows, counts and p95 in ms. ' if drift.get('windows') else ''}"
             f"{sp}"
             f"{esc(drift.get('drift_headline') or drift.get('note', ''))}"
             f"{('<br>' + esc(drift.get('note', ''))) if drift.get('drift_headline') else ''}"
             f"</div>"
-            + (f"<table><tr><th class='lbl'>window</th><th>errors</th>"
-               f"<th>TTFT p95</th><th>E2E p95</th></tr>{wr}</table>"
+            + _html_stability_chart(drift)
+            + (f"<div class='scroll-hint' id='stability-scroll-hint' "
+               f"role='note'><span aria-hidden='true'>↔</span> Scroll "
+               f"horizontally; the Window column stays visible.</div>"
+               f"<div class='table-scroll' tabindex='0' role='region' "
+               f"aria-labelledby='stability-heading' "
+               f"aria-describedby='stability-scroll-hint'>"
+               f"<table class='dense-table'><caption class='sr-only'>"
+               f"Exact per-window stability "
+               f"values in milliseconds</caption><thead><tr>"
+               f"<th scope='col' class='lbl sticky-col'>window</th>"
+               f"<th scope='col'>errors</th><th scope='col'>TTFT p95</th>"
+               f"<th scope='col'>E2E p95</th></tr></thead><tbody>{wr}</tbody>"
+               f"</table></div>"
                if drift.get("windows") else "")
             + "</div>")
     else:
-        drift_html = (f"<div class='card'><h2>Stability over time</h2>"
+        drift_html = (f"<div class='card' id='stability'>"
+                      f"<h2>Stability over time</h2>"
                       f"<div class='cap'>{esc(drift.get('note', ''))}</div></div>"
                       if drift.get("note") else "")
 
@@ -2877,16 +5002,18 @@ def render_html(summary: dict, title: str) -> str:
             f"<div class='card'><h2>Endpoint under test</h2>"
             f"<div class='cap'>read from the serving-endpoints API at run time, "
             f"so the report states what was tested</div><table>"
-            f"<tr><td class='lbl'>name</td><td>{esc(str(em.get('name')))}</td></tr>"
-            + (f"<tr><td class='lbl'>task</td>"
+            "<caption class='sr-only'>Endpoint metadata recorded at run "
+            "time</caption><tbody>"
+            f"<tr><th scope='row' class='lbl'>name</th><td>{esc(str(em.get('name')))}</td></tr>"
+            + (f"<tr><th scope='row' class='lbl'>task</th>"
                f"<td>{esc(str(em.get('task')))}</td></tr>"
                if em.get("task") else "")
-            + f"<tr><td class='lbl'>route optimized</td>"
+            + f"<tr><th scope='row' class='lbl'>route optimized</th>"
             f"<td>{esc(str(em.get('route_optimized')))}</td></tr>"
-            f"<tr><td class='lbl'>ready</td><td>{esc(str(em.get('ready')))}</td></tr>"
-            + (f"<tr><td class='lbl'>served entity</td><td>{detail}</td></tr>"
+            f"<tr><th scope='row' class='lbl'>ready</th><td>{esc(str(em.get('ready')))}</td></tr>"
+            + (f"<tr><th scope='row' class='lbl'>served entity</th><td>{detail}</td></tr>"
                if detail else "")
-            + "</table></div>")
+            + "</tbody></table></div>")
 
     # the html is the artifact the README sends people to, so it must carry
     # the same facts the markdown does. answer counts, caller-experienced
@@ -2898,8 +5025,10 @@ def render_html(summary: dict, title: str) -> str:
         rate = (f"{a['answer_rate']:.1%}" if a.get("answer_rate") is not None
                 else "n/a")
         rows_a = [("attempted", a.get("attempted")),
-                  ("produced at least one content delta",
-                   a.get("content_streams", a.get("transport_ok"))),
+                  ("harness-successful",
+                   a.get("harness_successful", a.get("transport_ok"))),
+                  ("produced at least one visible or reasoning content delta",
+                   a.get("content_delta_streams", "NOT RECORDED")),
                   ("produced a readable answer or valid tool call",
                    f"{a.get('answered')} ({rate} of "
                    f"{a.get('judged')} judged)"),
@@ -2917,6 +5046,10 @@ def render_html(summary: dict, title: str) -> str:
                    a.get("truncated")),
                   ("cut short by the global token cap",
                    a.get("truncated_by_global_cap"))]
+        if a.get("unclassified_legacy_successes"):
+            rows_a.insert(3, (
+                "legacy successes without content/tool observability",
+                a["unclassified_legacy_successes"]))
         if a.get("http_status_observed_for"):
             rows_a.insert(2, (
                 "returned HTTP 200",
@@ -2924,9 +5057,11 @@ def render_html(summary: dict, title: str) -> str:
                 f"{a.get('http_status_observed_for')} requests)"))
         ans_html = (
             "<div class='card'><h2>Answers</h2><table>"
-            + "".join(f"<tr><td class='lbl'>{esc(k)}</td>"
+            "<caption class='sr-only'>Answer and stream outcome counts"
+            "</caption><tbody>"
+            + "".join(f"<tr><th scope='row' class='lbl'>{esc(k)}</th>"
                       f"<td>{esc(str(v))}</td></tr>" for k, v in rows_a)
-            + f"</table><div class='cap'>{esc(a.get('note') or '')}</div>"
+            + f"</tbody></table><div class='cap'>{esc(a.get('note') or '')}</div>"
             + (f"<div class='banner bad'>{esc(a['invalid'])}</div>"
                if a.get("invalid") else "")
             + "</div>")
@@ -2946,23 +5081,70 @@ def render_html(summary: dict, title: str) -> str:
             r_.append(("TTF valid tool call corrected (ms)", ct))
         r_.append(("end-to-end corrected (ms)", c2))
         corr_html = (
-            "<div class='card'><h2>Latency as the caller experienced it</h2>"
+            "<div class='card'><h2 id='caller-latency-heading'>"
+            "Latency as the caller experienced it</h2>"
             "<div class='cap'>Includes time the request waited on the "
-            "client.</div><table><tr><th class='lbl'>metric</th><th>p50</th>"
-            "<th>p95</th><th>p99</th></tr>"
-            + "".join(f"<tr><td class='lbl'>{esc(n)}</td>"
+            "client.</div><div class='scroll-hint' "
+            "id='caller-latency-scroll-hint' role='note'>"
+            "<span aria-hidden='true'>↔</span> Scroll horizontally; the "
+            "Metric column stays visible.</div>"
+            "<div class='table-scroll' tabindex='0' role='region' "
+            "aria-labelledby='caller-latency-heading' "
+            "aria-describedby='caller-latency-scroll-hint'>"
+            "<table class='dense-table'><caption class='sr-only'>"
+            "Client-corrected "
+            "latency percentiles in milliseconds</caption><thead><tr>"
+            "<th scope='col' class='lbl sticky-col'>metric</th>"
+            "<th scope='col'>p50</th>"
+            "<th scope='col'>p95</th><th scope='col'>p99</th></tr></thead><tbody>"
+            + "".join(
+                f"<tr><th scope='row' class='lbl sticky-col'>{esc(n)}</th>"
                       f"<td>{num(t['p50'])}</td><td>{num(t['p95'])}</td>"
                       f"<td>{num(t['p99'])}</td></tr>" for n, t in r_)
-            + "</table><div class='cap'>"
+            + "</tbody></table></div><div class='cap'>"
             + esc(s.get("latency_correction_note") or "") + "</div></div>")
 
+    from .report_decision import build_report_decision
+
+    decision = (verified_view["decision"] if verified_view
+                else build_report_decision(s))
+    decision_html = _html_decision_hero(decision, banner)
+    artifact_label = display_text(
+        (s.get("run") or {}).get("artifact_id") or "NOT RECORDED", 120)
+    if verified_view:
+        print_stamp = (
+            "<div class='print-footer' role='note'>EXTERNAL VERIFIED VIEW · "
+            "PRINT/PDF DERIVATIVE: source artifact "
+            f"{esc(verified_view['source_artifact_id'])} · full manifest "
+            f"SHA-256 {esc(verified_view['source_manifest_sha256'])} · "
+            f"verified by llm-traffic-replay "
+            f"{esc(verified_view['verifier_version'])} at "
+            f"{esc(verified_view['verified_at_utc'])} · "
+            f"source reproducibility "
+            f"{esc(verified_view['source_reproducibility']['code'])} · "
+            f"verifier reproducibility "
+            f"{esc(verified_view['verifier_reproducibility']['code'])} · "
+            f"{esc(verified_view['assurance'])}</div>")
+        foot_html = (
+            "<div class='foot'>EXTERNAL VERIFIED VIEW · source run remains "
+            "immutable · internal hash consistency is not a digital "
+            "signature</div>")
+    else:
+        print_stamp = (
+            "<div class='print-footer' role='note'>UNSEALED PRINT/PDF "
+            "DERIVATIVE: verify the source manifest · artifact "
+            f"{esc(artifact_label)} · internal hashes are not a digital "
+            "signature</div>")
+        foot_html = (
+            "<div class='foot'>llm-traffic-replay report · artifact integrity "
+            "requires manifest verification</div>")
     body = (
-        f"<div class='wrap'><h1>{esc(title)}</h1>"
-        f"<div class='sub'>{sub}</div>{sample_banner}{banner}{stats}"
-        f"{em_html}{ans_html}{sla_html}{lat_html}{corr_html}"
-        f"{drift_html}{believe}{cost_html}"
-        f"{extra_cards}{note_html}{label_html}"
-        f"<div class='foot'>llm-traffic-replay report</div></div>")
+        f"<main class='wrap'>{verified_banner_html}{header_html}{print_stamp}"
+        f"{nav_html}{decision_html}{provenance_html}"
+        f"{facts_html}{sample_banner}{stats}{believe}"
+        f"{em_html}{ans_html}{sla_html}{corr_html}{lat_html}"
+        f"{drift_html}{extra_cards}{cost_html}"
+        f"{foot_html}</main>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,"
             f"initial-scale=1'><title>{esc(title)}</title>{_HTML_STYLE}"

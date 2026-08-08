@@ -85,6 +85,15 @@ def test_extra_body_allows_an_explicit_single_choice():
     assert cfg.extra_body == {"n": 1}
 
 
+@pytest.mark.parametrize("alias", [
+    "max_completion_tokens", "max_output_tokens", "max_new_tokens",
+])
+def test_extra_body_rejects_output_budget_aliases(alias):
+    with pytest.raises(ValueError, match="output-token budget aliases"):
+        EndpointConfig(
+            base_url="http://x", path="/p", extra_body={alias: 999})
+
+
 @pytest.mark.parametrize("key", ["token", "api_token", "service_token"])
 def test_endpoint_path_rejects_secret_query_parameters(key):
     path = f"/serving-endpoints/e/invocations?{key}=opaque-value-123456789"
@@ -160,7 +169,10 @@ def test_reasoning_tokens_reported_end_to_end():
     assert all(row["completion_tokens"] <= 16 for row in truth_rows)
     report = Path(out["out_dir"], "report.md").read_text()
     assert "reasoning tokens:" in report
-    assert "reasoning_effort" in report  # provenance line echoes extra_body
+    # Customer-controlled request keys are plain-text escaped at the Markdown
+    # trust boundary; the provenance value remains visible without creating
+    # emphasis or other Markdown structure.
+    assert r"reasoning\_effort" in report
 
 
 def test_compare_table_has_reasoning_tokens_row():

@@ -7,8 +7,10 @@ would have been wrong.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -19,6 +21,29 @@ from traffic_replay.cli import _pair, main
 
 def _tmp() -> Path:
     return Path(tempfile.mkdtemp(prefix="bench-"))
+
+
+def _run_generated_benchmark(monkeypatch, out_dir: Path, *,
+                             input_tokens: str, output_tokens: str,
+                             title: str) -> int:
+    def fake_run(rc, quiet=False):
+        return {"out_dir": rc.out_dir, "summary": {}}
+
+    monkeypatch.setattr("traffic_replay.runner.run", fake_run)
+    monkeypatch.setattr("traffic_replay.cli._finish",
+                        lambda out, fail_on="miss", fmt="text": 0)
+    return main([
+        "benchmark", "--host", "https://example.invalid",
+        "--endpoint", "my-ep", "--input-tokens", input_tokens,
+        "--output-tokens", output_tokens, "--duration", "1",
+        "--sizing-concurrency", "1", "--title", title,
+        "--out-dir", str(out_dir), "--skip-preflight",
+    ])
+
+
+def _immutable_files(out_dir: Path, section: str, filename: str) -> list[Path]:
+    root = out_dir.parent / ".traffic-replay-configs" / section
+    return sorted(root.glob(f"*/{filename}"))
 
 
 def test_a_single_number_becomes_a_p50_and_a_p95():
@@ -42,7 +67,11 @@ def test_a_backwards_pair_is_refused():
         raise AssertionError("should have refused")
 
 
-def test_it_writes_a_profile_so_the_user_does_not_have_to():
+@pytest.mark.parametrize("cache_flag", [
+    "--cache-fraction",
+    "--cache-hit-rate",
+])
+def test_it_writes_a_profile_so_the_user_does_not_have_to(cache_flag):
     """The step this removes: hand-authoring a profile JSON before you can
     measure anything."""
     d = _tmp()
@@ -51,7 +80,7 @@ def test_it_writes_a_profile_so_the_user_does_not_have_to():
         main(["benchmark", "--host", "https://example.invalid",
               "--endpoint", "my-ep", "--token-env", "TR_BENCH_TOKEN",
               "--input-tokens", "8000,20000", "--output-tokens", "50,120",
-              "--cache-hit-rate", "0.4,0.8",
+              cache_flag, "0.4,0.8",
               "--duration", "1", "--concurrency", "1",
               "--out-dir", str(d), "--skip-preflight"])
     except SystemExit:
@@ -94,6 +123,131 @@ def test_the_saved_config_reruns_the_same_experiment():
     assert "_input_tokens" not in cfg
 
 
+def test_sequential_benchmarks_never_mutate_an_earlier_profile_or_config(
+        tmp_path, monkeypatch):
+    out_dir = tmp_path / "results"
+    assert _run_generated_benchmark(
+        monkeypatch, out_dir, input_tokens="100,200", output_tokens="10,20",
+        title="first experiment") == 0
+    first_profile = _immutable_files(out_dir, "profiles", "profile.json")[0]
+    first_config = _immutable_files(out_dir, "runs", "run-config.json")[0]
+    first_profile_raw = first_profile.read_bytes()
+    first_config_raw = first_config.read_bytes()
+    legacy_profile_raw = (out_dir / "profile.json").read_bytes()
+    legacy_config_raw = (out_dir / "run-config.json").read_bytes()
+
+    assert _run_generated_benchmark(
+        monkeypatch, out_dir, input_tokens="300,600", output_tokens="30,60",
+        title="second experiment") == 0
+    profiles = _immutable_files(out_dir, "profiles", "profile.json")
+    configs = _immutable_files(out_dir, "runs", "run-config.json")
+    assert len(profiles) == 2
+    assert len(configs) == 2
+    assert first_profile.read_bytes() == first_profile_raw
+    assert first_config.read_bytes() == first_config_raw
+    assert (out_dir / "profile.json").read_bytes() == legacy_profile_raw
+    assert (out_dir / "run-config.json").read_bytes() == legacy_config_raw
+
+    first = json.loads(first_config_raw)
+    second_path = next(path for path in configs if path != first_config)
+    second = json.loads(second_path.read_bytes())
+    assert first["title"] == "first experiment"
+    assert second["title"] == "second experiment"
+    assert Path(first["profile_path"]) == first_profile
+    assert Path(second["profile_path"]) != first_profile
+    assert json.loads(Path(second["profile_path"]).read_text())[
+        "input_tokens"] == {"p50": 300, "p95": 600}
+    for path in profiles + configs:
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode)
+        assert not path.is_symlink()
+        assert info.st_mode & 0o222 == 0
+        assert path.parent.name == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_concurrent_benchmarks_get_distinct_immutable_config_bundles(
+        tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    out_dir = tmp_path / "shared-results"
+    start = threading.Barrier(2)
+
+    def invoke(input_tokens, output_tokens, title):
+        start.wait(timeout=10)
+        return _run_generated_benchmark(
+            monkeypatch, out_dir, input_tokens=input_tokens,
+            output_tokens=output_tokens, title=title)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(invoke, "100,200", "10,20", "concurrent one"),
+            pool.submit(invoke, "300,600", "30,60", "concurrent two"),
+        ]
+        assert [future.result(timeout=20) for future in futures] == [0, 0]
+
+    profiles = _immutable_files(out_dir, "profiles", "profile.json")
+    configs = _immutable_files(out_dir, "runs", "run-config.json")
+    assert len(profiles) == 2
+    assert len(configs) == 2
+    by_title = {json.loads(path.read_text())["title"]: path for path in configs}
+    assert set(by_title) == {"concurrent one", "concurrent two"}
+    for title, config_path in by_title.items():
+        cfg = json.loads(config_path.read_text())
+        profile_path = Path(cfg["profile_path"])
+        assert profile_path in profiles
+        p50 = json.loads(profile_path.read_text())["input_tokens"]["p50"]
+        assert p50 == (100 if title == "concurrent one" else 300)
+    legacy = (out_dir / "run-config.json").read_bytes()
+    assert legacy in {path.read_bytes() for path in configs}
+    assert not list((out_dir.parent / ".traffic-replay-configs").rglob("*.tmp"))
+
+
+def test_same_content_concurrent_publish_is_one_complete_file(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from traffic_replay.immutable_config import write_immutable_json
+
+    out_dir = tmp_path / "results"
+    start = threading.Barrier(8)
+
+    def publish():
+        start.wait(timeout=10)
+        return write_immutable_json(
+            out_dir, "profile", {"name": "one immutable value"})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = [future.result(timeout=20)
+                 for future in [pool.submit(publish) for _ in range(8)]]
+    assert len(set(paths)) == 1
+    assert json.loads(paths[0].read_text()) == {"name": "one immutable value"}
+    assert not list((out_dir.parent / ".traffic-replay-configs").rglob("*.tmp"))
+
+
+def test_generated_config_paths_fail_closed_on_links_or_mutation(
+        tmp_path, monkeypatch):
+    from traffic_replay.immutable_config import (
+        ImmutableConfigError, write_immutable_json)
+
+    linked_out = tmp_path / "linked-results"
+    linked_out.mkdir()
+    target = tmp_path / "link-target"
+    target.write_text("do not touch\n")
+    (linked_out / "profile.json").symlink_to(target)
+    with pytest.raises(ImmutableConfigError, match="cannot read generated config safely"):
+        _run_generated_benchmark(
+            monkeypatch, linked_out, input_tokens="10,20",
+            output_tokens="2,4", title="must fail")
+    assert target.read_text() == "do not touch\n"
+
+    out_dir = tmp_path / "mutated-results"
+    path = write_immutable_json(out_dir, "profile", {"name": "original"})
+    path.chmod(0o600)
+    path.write_text('{"name":"mutated"}\n')
+    with pytest.raises(ImmutableConfigError, match="immutable generated config is writable"):
+        write_immutable_json(out_dir, "profile", {"name": "original"})
+
+
 def test_prompts_mode_honors_output_tokens_without_a_512_floor():
     d = _tmp()
     prompts = d / "prompts.jsonl"
@@ -108,6 +262,12 @@ def test_prompts_mode_honors_output_tokens_without_a_512_floor():
         pass
     cfg = json.loads((d / "run-config.json").read_text())
     assert cfg["prompts_file"] == str(prompts)
+    raw = prompts.read_bytes()
+    assert cfg["input_expectations"] == {
+        "prompts": {
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw),
+        }}
     assert cfg["max_output_tokens_cap"] == 135
     assert cfg["max_output_tokens_cap"] != 512
 
@@ -434,7 +594,7 @@ def test_persisted_provenance_is_full_length_and_secret_redacted():
     base = _tmp()
     profile = base / "profile.json"
     profile.write_text('{"name":"shape"}\n')
-    secret = "dapi0123456789supersecret"
+    secret = "dapi" + "0123456789" + "supersecret"
     rows = [{"ok": True, "ttft_ms": 10.0, "e2e_ms": 20.0,
              "t_send_unix": 1.0, "prompt_tokens": 10,
              "completion_tokens": 2}]
@@ -477,7 +637,7 @@ def test_the_terminal_prints_the_report_not_sliced_json():
     with contextlib.redirect_stdout(buf):
         _finish(_summary_dir("miss"))
     out = buf.getvalue()
-    assert "requests:" in out          # the report, not a JSON blob
+    assert "measured replay:" in out   # the report, not a JSON blob
     assert "MISS:" in out
     assert not out.lstrip().startswith("{")
 

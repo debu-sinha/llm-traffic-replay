@@ -7,8 +7,10 @@ mode deduplicates complete numeric triples and stores only integer frequency
 weights; it preserves observed combinations without copying arbitrary source
 fields.
 
-Only the distribution is extracted. No prompt text is read or stored, so a
-log export with token counts is enough and no customer content moves.
+The parser necessarily reads each complete source record. Only the selected
+numeric fields and aggregate extraction counts are emitted; prompt text and
+all other arbitrary source fields are neither copied nor stored in the output.
+A token-count-only export is still the safest input.
 
 Usage:
   python3 scripts/profile_from_logs.py --input logs.jsonl --name agent_real
@@ -35,23 +37,21 @@ from pathlib import Path
 
 import numpy as np
 
-
-class _DuplicateKeyError(ValueError):
-    pass
-
-
-def _object_without_duplicates(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise _DuplicateKeyError(f"duplicate key {key!r}")
-        result[key] = value
-    return result
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+from traffic_replay.json_input import json_error_detail, loads_strict  # noqa: E402
 
 
-def _load_records(path: Path) -> list[dict]:
-    text = path.read_text(encoding="utf-8-sig")
+def _parse_records(path: Path, raw: bytes) -> list[dict]:
+    """Parse the exact byte sequence whose provenance will be reported."""
     if path.suffix.lower() == ".csv":
+        try:
+            text = raw.decode("utf-8-sig", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"{path}: CSV is not UTF-8 at byte offset {exc.start}") \
+                from exc
         reader = csv.DictReader(text.splitlines())
         headers = reader.fieldnames
         if headers is None:
@@ -67,23 +67,25 @@ def _load_records(path: Path) -> list[dict]:
             raise ValueError(f"{path}: CSV rows must be objects")
         return records
     records = []
-    for line_number, line in enumerate(text.splitlines(), 1):
+    for line_number, line in enumerate(raw.splitlines(), 1):
         line = line.strip()
         if line:
             try:
-                value = json.loads(
-                    line, object_pairs_hook=_object_without_duplicates)
-            except json.JSONDecodeError as exc:
+                value = loads_strict(line)
+            except ValueError as exc:
                 raise ValueError(
-                    f"{path}:{line_number}: invalid JSON ({exc})") from exc
-            except _DuplicateKeyError as exc:
-                raise ValueError(
-                    f"{path}:{line_number}: invalid JSON ({exc})") from exc
+                    f"{path}:{line_number}: invalid JSON "
+                    f"({json_error_detail(exc)})") from exc
             if not isinstance(value, dict):
                 raise ValueError(
                     f"{path}:{line_number}: each record must be an object")
             records.append(value)
     return records
+
+
+def _load_records(path: Path) -> list[dict]:
+    """Load records from one immutable-in-memory snapshot of ``path``."""
+    return _parse_records(path, path.read_bytes())
 
 
 def _numeric(value, field: str, record_number: int, *, integer=False,
@@ -170,6 +172,19 @@ def _validate_source_sha256(source_sha256: str | None) -> str | None:
             or any(char not in "0123456789abcdef" for char in source_sha256):
         raise ValueError("source_sha256 must be 64 lowercase hexadecimal digits")
     return source_sha256
+
+
+def _validate_source_byte_count(source_sha256: str | None,
+                                source_byte_count: int | None) -> int | None:
+    if source_byte_count is None:
+        return None
+    if source_sha256 is None:
+        raise ValueError("source_byte_count requires source_sha256")
+    if not isinstance(source_byte_count, int) \
+            or isinstance(source_byte_count, bool) \
+            or source_byte_count < 0:
+        raise ValueError("source_byte_count must be a non-negative integer")
+    return source_byte_count
 
 
 def _extraction_counts(records: list[dict], input_field: str,
@@ -278,18 +293,31 @@ def _empirical_rows(records: list[dict], input_field: str,
     return rows, extraction
 
 
-def _source_fields(source_sha256: str | None) -> dict:
+def _source_fields(source_sha256: str | None,
+                   source_byte_count: int | None) -> dict:
     if source_sha256 is None:
         return {}
-    return {"source": {"digest_algorithm": "sha256",
-                       "sha256": source_sha256}}
+    source = {"digest_algorithm": "sha256", "sha256": source_sha256}
+    if source_byte_count is not None:
+        source["bytes"] = source_byte_count
+    return {"source": source}
+
+
+def _source_provenance(source_sha256: str | None,
+                       source_byte_count: int | None) -> str:
+    if source_sha256 is None:
+        return ""
+    byte_text = (f"; bytes: {source_byte_count}"
+                 if source_byte_count is not None else "")
+    return f" Source SHA-256: {source_sha256}{byte_text}."
 
 
 def _build_empirical_profile(records: list[dict], name: str,
                              input_field: str, output_field: str,
                              cached_field: str,
                              cache_fraction_field: str | None,
-                             source_sha256: str | None) -> dict:
+                             source_sha256: str | None,
+                             source_byte_count: int | None) -> dict:
     rows, extraction = _empirical_rows(
         records, input_field, output_field, cached_field,
         cache_fraction_field)
@@ -305,8 +333,7 @@ def _build_empirical_profile(records: list[dict], name: str,
             p50, p95 = int(p50), int(p95)
         return {"p50": p50, "p95": p95}
 
-    digest_text = (f" Source SHA-256: {source_sha256}."
-                   if source_sha256 else "")
+    digest_text = _source_provenance(source_sha256, source_byte_count)
     result = {
         "schema_version": 2,
         "name": name,
@@ -325,13 +352,14 @@ def _build_empirical_profile(records: list[dict], name: str,
             "weighted cycles preserve their combinations and frequencies."),
         "extraction": extraction,
     }
-    result.update(_source_fields(source_sha256))
+    result.update(_source_fields(source_sha256, source_byte_count))
     return result
 
 
 def build_profile(records, name, input_field, output_field,
                   cached_field, cache_fraction_field, *,
-                  mode="quantiles", source_sha256=None):
+                  mode="quantiles", source_sha256=None,
+                  source_byte_count=None):
     if not isinstance(records, list) or any(
             not isinstance(record, dict) for record in records):
         raise ValueError("records must be a list of objects")
@@ -351,10 +379,12 @@ def build_profile(records, name, input_field, output_field,
     if mode not in {"quantiles", "empirical-joint"}:
         raise ValueError("mode must be 'quantiles' or 'empirical-joint'")
     source_sha256 = _validate_source_sha256(source_sha256)
+    source_byte_count = _validate_source_byte_count(
+        source_sha256, source_byte_count)
     if mode == "empirical-joint":
         return _build_empirical_profile(
             records, name, input_field, output_field, cached_field,
-            cache_fraction_field, source_sha256)
+            cache_fraction_field, source_sha256, source_byte_count)
 
     inp = _column(records, input_field, positive=True)
     out = _column(records, output_field)
@@ -391,8 +421,7 @@ def build_profile(records, name, input_field, output_field,
         records, input_field, output_field, cached_field,
         cache_fraction_field, usable_input=len(inp), usable_output=len(out),
         usable_cache=len(cf))
-    digest_text = (f" Source SHA-256: {source_sha256}."
-                   if source_sha256 else "")
+    digest_text = _source_provenance(source_sha256, source_byte_count)
     result = {
         "name": name,
         "input_tokens": inp_q,
@@ -406,7 +435,7 @@ def build_profile(records, name, input_field, output_field,
                  "with 'python3 -m traffic_replay sample --profile <this file>'.",
         "extraction": extraction,
     }
-    result.update(_source_fields(source_sha256))
+    result.update(_source_fields(source_sha256, source_byte_count))
     return result
 
 
@@ -431,14 +460,17 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     input_path = Path(args.input)
-    source_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
-    records = _load_records(input_path)
+    frozen_source = input_path.read_bytes()
+    source_sha256 = hashlib.sha256(frozen_source).hexdigest()
+    source_byte_count = len(frozen_source)
+    records = _parse_records(input_path, frozen_source)
     if not records:
         raise SystemExit(f"no records in {args.input}")
     profile = build_profile(
         records, args.name, args.input_field, args.output_field,
         args.cached_field, args.cache_fraction_field,
-        mode=args.mode, source_sha256=source_sha256)
+        mode=args.mode, source_sha256=source_sha256,
+        source_byte_count=source_byte_count)
     text = json.dumps(profile, indent=2, allow_nan=False)
     if args.out:
         Path(args.out).write_text(text + "\n")

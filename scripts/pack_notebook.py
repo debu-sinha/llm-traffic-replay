@@ -33,11 +33,23 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK = ROOT / "notebooks" / "smoke_test_e2e_demo.ipynb"
 
+# This script is also run by absolute path from outside the repository. Make
+# its checked-in package parser available without depending on an editable
+# install or the caller's current working directory.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from traffic_replay.json_input import (  # noqa: E402
+    json_error_detail,
+    loads_strict,
+)
+
 PUBLIC_CONFIGS = (
     "configs/profile_agent_stated.json",
     "configs/profile_agent_blended.json",
+    "configs/profile_glm52_canary_illustrative.json",
     "configs/profile_validation_small.json",
     "configs/prompts_example.jsonl",
+    "configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json",
     "configs/run_smoke.json",
     "configs/run_pt_full.json",
     "configs/run_prompts.json",
@@ -313,6 +325,18 @@ def _assert_clean_notebook(notebook: dict) -> None:
                 f"notebook cell {index} has an execution count; clear it first")
 
 
+def _read_notebook() -> dict:
+    """Read the checked-in notebook as strict UTF-8 JSON."""
+    try:
+        notebook = loads_strict(NOTEBOOK.read_bytes())
+    except ValueError as exc:
+        raise SystemExit(
+            f"notebook is invalid JSON ({json_error_detail(exc)})") from exc
+    if not isinstance(notebook, dict):
+        raise SystemExit("notebook JSON root must be an object")
+    return notebook
+
+
 def _claims(source: str) -> tuple[tuple[str, int, int], int]:
     headers = re.findall(
         r"Self-contained runnable payload \(v([^,]+), (\d+) tracked files, "
@@ -343,7 +367,7 @@ def _claims(source: str) -> tuple[tuple[str, int, int], int]:
 def check() -> None:
     files = collect()
     expected_raw = payload_bytes(files)
-    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    notebook = _read_notebook()
     _assert_clean_notebook(notebook)
     source = _notebook_source(notebook)
 
@@ -388,7 +412,7 @@ def pack() -> None:
     digest = hashlib.sha256(raw).hexdigest()
     version, file_count, expected_tests = metadata(files, test_count)
 
-    notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+    notebook = _read_notebook()
     _assert_clean_notebook(notebook)
     hits = {
         "payload": 0,

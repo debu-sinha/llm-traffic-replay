@@ -1,0 +1,17 @@
+{
+  "name": "glm52_p2t_canary_illustrative",
+  "input_tokens": {
+    "p50": 1000,
+    "p95": 2000
+  },
+  "output_tokens": {
+    "p50": 1024,
+    "p95": 1536
+  },
+  "cache_fraction": {
+    "p50": 0.0,
+    "p95": 0.0
+  },
+  "provenance": "Illustrative instrument-conformance shape created on 2026-08-08. The output values are request budgets selected for preflight completeness testing; they are not measured customer output demand, a natural-answer-length estimate, or a Databricks performance recommendation.",
+  "label": "ILLUSTRATIVE CANARY ONLY: use a quota-planned, low-rate preflight to test transport, answer completeness, usage, and timing; expect workload-fidelity caution and never quote this profile as customer demand, performance, or capacity."
+}

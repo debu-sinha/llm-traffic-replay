@@ -29,6 +29,40 @@ def _row(i, ttft, e2e):
             "error": None, "doc_id": 1, "chars_sent": 4000, "retries": 0}
 
 
+def _rate_limits(**overrides):
+    limits = {
+        "input_tokens_per_minute": 10_000,
+        "output_tokens_per_minute": 2_000,
+        "queries_per_hour": 7_200,
+        "warning_utilization": 0.8,
+        "source": ("https://docs.databricks.com/aws/en/machine-learning/"
+                   "foundation-model-apis/limits"),
+        "as_of": "2026-08-03",
+        "scope": "Enterprise workspace pay-per-token traffic",
+        "provider": "databricks",
+        "deployment_mode": "pay_per_token",
+        "workspace_tier": "Enterprise",
+        "model": "model",
+        "accounting_model": "databricks_fmapi_pay_per_token",
+    }
+    limits.update(overrides)
+    return limits
+
+
+def _endpoint_metadata(name="model"):
+    return {
+        "name": name,
+        "task": "llm/v1/chat",
+        "route_optimized": False,
+        "ready": "READY",
+        "served_entities": [{
+            "name": name,
+            "foundation_model": {"name": f"system.ai.{name}"},
+        }],
+        "note": "captured test metadata",
+    }
+
+
 def _source_manifest(ep: str, *, input_mode="profile", profile_sha="b" * 64,
                      shard_index=0, shard_total=2, local_requests=5,
                      global_requests=None):
@@ -162,6 +196,45 @@ def _mkrun(d: Path, ep: str, ttfts, title="run", profile_sha="b" * 64,
     _seal_completion(d)
 
 
+def _set_quota_evidence(d: Path, *, limits=None, endpoint_metadata=None,
+                        binding_complete=True):
+    limits = _rate_limits() if limits is None else limits
+    endpoint_metadata = (_endpoint_metadata() if endpoint_metadata is None
+                         else endpoint_metadata)
+    summary = json.loads((d / "summary.json").read_text())
+    summary["run"]["endpoint_metadata"] = endpoint_metadata
+    summary["rate_limits"] = {
+        "configured": limits,
+        "binding": {"binding_complete": binding_complete},
+        "comparisons": {},
+        "warning": None,
+    }
+    (d / "summary.json").write_text(json.dumps(summary))
+    manifest = json.loads((d / "manifest.json").read_text())
+    manifest["endpoint_metadata"] = endpoint_metadata
+    manifest["effective_config"] = {"rate_limits": limits}
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    _refresh_artifacts(d)
+
+
+def _set_quota_row_evidence(d: Path, prompt_tokens):
+    path = d / "requests.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == len(prompt_tokens)
+    for offset, (row, tokens) in enumerate(zip(rows, prompt_tokens)):
+        stamp = 2_000.0 + offset / 10.0
+        row.update({
+            "first_send_unix": stamp,
+            "finished_unix": stamp + 0.05,
+            "prompt_tokens": tokens,
+            "completion_tokens": 10,
+            "max_tokens_requested": 20,
+            "request_attempts": 1,
+        })
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    _refresh_artifacts(d)
+
+
 def test_merge_pools_and_percentiles_from_union():
     base = _tmp()
     _mkrun(base / "a", "/serving-endpoints/pt/invocations", [100] * 5)
@@ -171,7 +244,11 @@ def test_merge_pools_and_percentiles_from_union():
     assert summ["requests_total"] == 10           # calibration rows excluded
     assert summ["ttft_ms"]["n"] == 10
     assert 100 <= summ["ttft_ms"]["p50"] <= 300    # from the union
-    assert len((out / "requests.jsonl").read_text().splitlines()) == 10
+    sealed_rows = [json.loads(line) for line in
+                   (out / "requests.jsonl").read_text().splitlines()]
+    assert len(sealed_rows) == 12
+    assert sum(row["phase"] == "replay" for row in sealed_rows) == 10
+    assert sum(row["phase"] == "calibration" for row in sealed_rows) == 2
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["manifest_schema_version"] == 3
     assert all(manifest[field] for field in (
@@ -186,6 +263,154 @@ def test_merge_pools_and_percentiles_from_union():
         manifest["artifacts"])
     assert (out / ".traffic-replay-complete").is_file()
     assert not (out / ".traffic-replay-writing").exists()
+
+
+def test_merge_pools_every_sealed_traffic_phase_for_quota_only():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [300] * 2)
+    # Each source contains calibration + two replay rows. All six sends overlap
+    # in one rolling minute, so the union must be 700+100+100+500+100+100.
+    _set_quota_row_evidence(base / "a", [700, 100, 100])
+    _set_quota_row_evidence(base / "b", [500, 100, 100])
+    _set_quota_evidence(base / "a")
+    _set_quota_evidence(base / "b")
+
+    out = merge_runs(base / "out", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+
+    assert summary["requests_total"] == 4
+    assert summary["ttft_ms"]["n"] == 4
+    windows = summary["observed_rate_windows"]
+    assert windows["input_tokens_by_first_send"]["max"] == 1_600
+    assert windows["traffic_scope"]["rows"] == 6
+    assert windows["traffic_scope"]["phases"]["calibration"]["rows"] == 2
+    assert windows["traffic_scope"]["phases"]["replay"]["rows"] == 4
+    assert summary["rate_limits"]["configured"] == _rate_limits()
+    assert summary["rate_limits"]["binding"]["binding_complete"] is True
+    assert summary["run"]["quota_merge"]["sla_population"] == "replay_only"
+    assert summary["run"]["quota_merge"]["sealed_rows"] == 6
+    assert summary["run"]["quota_merge"]["observed_phase_rows"] == {
+        "calibration": 2, "replay": 4}
+    sealed = [json.loads(line) for line in
+              (out / "requests.jsonl").read_text().splitlines()]
+    assert len(sealed) == 6
+    assert {row["phase"] for row in sealed} == {"calibration", "replay"}
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["effective_config"]["rate_limits"] == _rate_limits()
+    assert manifest["endpoint_metadata"] == _endpoint_metadata()
+
+
+def test_merge_preserves_unknown_setup_outcome_as_incomplete_quota_evidence():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    for directory in (base / "a", base / "b"):
+        _set_quota_row_evidence(directory, [100, 100, 100])
+        _set_quota_evidence(directory)
+    path = base / "b" / "requests.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["first_send_unix"] = None
+    rows[0]["request_attempts"] = None
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    _refresh_artifacts(base / "b")
+
+    out = merge_runs(base / "out", [base / "a", base / "b"])
+    summary = json.loads((out / "summary.json").read_text())
+
+    scope = summary["observed_rate_windows"]["traffic_scope"]
+    assert scope["unknown_outcome_rows"] == 1
+    assert scope["phases"]["calibration"]["unknown_outcome_rows"] == 1
+    assert all(comparison["status"] == "incomplete_run_evidence"
+               for comparison in
+               summary["rate_limits"]["comparisons"].values())
+    assert "cannot establish headroom" in summary["rate_limits"]["warning"]
+
+
+def test_merge_refuses_different_quota_snapshots_and_force_withholds_claim():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    _set_quota_evidence(base / "a")
+    _set_quota_evidence(
+        base / "b", limits=_rate_limits(input_tokens_per_minute=9_000))
+
+    with pytest.raises(ValueError, match="different rate-limit snapshots"):
+        merge_runs(base / "refused", [base / "a", base / "b"])
+    out = merge_runs(
+        base / "diagnostic", [base / "a", base / "b"], force=True)
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["run"]["aggregation_valid"] is False
+    assert "rate_limits" not in summary
+    assert summary["observed_rate_windows"]["withheld"] is True
+    assert summary["run"]["quota_merge"][
+        "configured_snapshot_status"] == "withheld_invalid_inputs"
+
+
+def test_merge_refuses_partial_quota_snapshot_coverage():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    _set_quota_evidence(base / "a")
+
+    with pytest.raises(
+            ValueError, match="not complete for every merge source"):
+        merge_runs(base / "refused", [base / "a", base / "b"])
+
+
+def test_merge_refuses_snapshot_disagreement_inside_one_source():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    _set_quota_evidence(base / "a")
+    _set_quota_evidence(base / "b")
+    summary = json.loads((base / "b" / "summary.json").read_text())
+    summary["rate_limits"]["configured"]["queries_per_hour"] = 7_199
+    (base / "b" / "summary.json").write_text(json.dumps(summary))
+    _refresh_artifacts(base / "b")
+
+    with pytest.raises(ValueError, match="manifest and summary"):
+        merge_runs(base / "refused", [base / "a", base / "b"])
+
+
+def test_merge_refuses_unknown_phase_in_configured_quota_evidence():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    _set_quota_evidence(base / "a")
+    _set_quota_evidence(base / "b")
+    path = base / "b" / "requests.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["phase"] = "warmup"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    _refresh_artifacts(base / "b")
+
+    with pytest.raises(ValueError, match="unsupported request phases: warmup"):
+        merge_runs(base / "refused", [base / "a", base / "b"])
+
+
+def test_merge_refuses_incomplete_or_different_quota_endpoint_binding():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    _set_quota_evidence(base / "a")
+    _set_quota_evidence(base / "b", binding_complete=False)
+
+    with pytest.raises(ValueError, match="incomplete rate-limit endpoint binding"):
+        merge_runs(base / "binding", [base / "a", base / "b"])
+
+    changed_metadata = _endpoint_metadata()
+    changed_metadata["ready"] = "NOT_READY"
+    _set_quota_evidence(base / "b", endpoint_metadata=changed_metadata)
+    with pytest.raises(ValueError, match="different rate-limit endpoint metadata"):
+        merge_runs(base / "metadata", [base / "a", base / "b"])
 
 
 def test_merge_refuses_mismatched_endpoints_without_force():
@@ -446,6 +671,54 @@ def test_merge_rejects_tampered_hashed_artifact():
     _write_manifest(base / "b", manifest)
     with pytest.raises(ValueError, match="blank JSONL record"):
         merge_runs(base / "blank-row", [base / "a", base / "b"])
+
+
+def test_merge_rejects_duplicate_keys_in_authenticated_request_jsonl():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 3)
+    _mkrun(base / "b", ep, [100] * 3)
+    path = base / "b" / "requests.jsonl"
+    lines = path.read_text().splitlines()
+    lines[0] = lines[0][:-1] + ',"ok":false}'
+    path.write_text("\n".join(lines) + "\n")
+    changed = path.read_bytes()
+    manifest = json.loads((base / "b" / "manifest.json").read_text())
+    manifest["artifacts"]["requests.jsonl"] = {
+        "sha256": hashlib.sha256(changed).hexdigest(),
+        "bytes": len(changed),
+        "row_count": len(lines),
+    }
+    _write_manifest(base / "b", manifest)
+
+    with pytest.raises(
+            ValueError,
+            match=r"invalid JSON .*requests\.jsonl line 1: .*duplicate key 'ok'"):
+        merge_runs(base / "out", [base / "a", base / "b"])
+
+
+def test_merge_rejects_nonfinite_authenticated_request_jsonl():
+    base = _tmp()
+    ep = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", ep, [100] * 3)
+    _mkrun(base / "b", ep, [100] * 3)
+    path = base / "b" / "requests.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["ttft_ms"] = float("inf")
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    changed = path.read_bytes()
+    manifest = json.loads((base / "b" / "manifest.json").read_text())
+    manifest["artifacts"]["requests.jsonl"] = {
+        "sha256": hashlib.sha256(changed).hexdigest(),
+        "bytes": len(changed),
+        "row_count": len(rows),
+    }
+    _write_manifest(base / "b", manifest)
+
+    with pytest.raises(
+            ValueError,
+            match=r"invalid JSON .*requests\.jsonl line 1: .*non-finite"):
+        merge_runs(base / "out", [base / "a", base / "b"])
 
 
 def test_merge_requires_requests_hash_and_row_count_metadata():

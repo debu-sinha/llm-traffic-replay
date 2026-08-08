@@ -30,6 +30,8 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .json_input import loads_strict
+
 MOCK_CPT = 4.0
 BLOCK_CHARS = 256  # ~64 tokens per cache block, realistic page granularity
 
@@ -107,17 +109,32 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
             t_recv = time.monotonic()
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length))
-            except Exception:
+                if not 0 < length <= 4 * 1024 * 1024:
+                    raise ValueError("invalid content length")
+                payload = loads_strict(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("request body must be an object")
+                msgs = payload.get("messages")
+                if not isinstance(msgs, list) or not msgs \
+                        or any(not isinstance(message, dict)
+                               for message in msgs):
+                    raise ValueError("messages must be a non-empty array")
+                if any(not isinstance(message.get("role"), str)
+                       or not isinstance(message.get("content"), str)
+                       for message in msgs):
+                    raise ValueError("mock messages need string role/content")
+                max_tokens = payload.get("max_tokens", 32)
+                if not isinstance(max_tokens, int) \
+                        or isinstance(max_tokens, bool) or max_tokens <= 0:
+                    raise ValueError("max_tokens must be a positive integer")
+            except (OSError, TypeError, ValueError):
                 self.send_error(400, "bad json")
                 return
 
             rid = self.headers.get("X-Request-Id", "unknown")
-            msgs = payload.get("messages") or []
             system_text = "".join(m.get("content", "") for m in msgs
                                   if m.get("role") == "system")
             all_text = "".join(m.get("content", "") for m in msgs)
-            max_tokens = int(payload.get("max_tokens", 32))
 
             matched_chars = cache.match_and_insert(system_text) \
                 if system_text else 0

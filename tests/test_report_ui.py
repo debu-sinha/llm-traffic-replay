@@ -1,0 +1,430 @@
+"""Decision-first, responsive, safe report UI contract tests."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from traffic_replay.json_input import loads_strict
+from traffic_replay.metrics import (
+    _html_quota_gauges,
+    render_html,
+    render_markdown,
+    summarize,
+    write_outputs,
+)
+
+
+def _rows(n: int = 240) -> list[dict]:
+    rows = []
+    for index in range(n):
+        sent = float(index)
+        rows.append({
+            "ok": True,
+            "phase": "replay",
+            "status": 200,
+            "t_send_unix": sent,
+            "first_send_unix": sent,
+            "t_completed_unix": sent + 0.2,
+            "scheduled_s": sent,
+            "queue_wait_ms": 0.0,
+            "ttfb_ms": 80.0,
+            "ttft_ms": 100.0,
+            "e2e_ms": 200.0,
+            "interchunk_max_ms": 25.0,
+            "visible_content_seen": True,
+            "stream_complete": True,
+            "parse_errors": 0,
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "finish_reason": "stop",
+        })
+    return rows
+
+
+def _summary(*, quota_limited: bool = False) -> dict:
+    replay = _rows()
+    all_phases = list(replay)
+    if quota_limited:
+        all_phases.append({
+            "ok": False,
+            "phase": "preflight",
+            "status": 429,
+            "error": "redacted response body sha256=abc",
+        })
+    return summarize(
+        replay,
+        schedule_meta={
+            "seconds": 240,
+            "requests": 240,
+            "rate_min": 1.0,
+            "rate_p50": 1.0,
+            "rate_p95": 1.0,
+            "rate_max": 1.0,
+            "spiky": False,
+            "source": "test schedule",
+        },
+        run_meta={
+            "input_mode": "profile",
+            "endpoint_path": "/serving-endpoints/test/invocations",
+            "endpoint_metadata": {
+                "name": "test-endpoint",
+                "served_entities": [{"name": "test-model"}],
+            },
+            "artifact_id": "artifact-ui-contract",
+            "label": "customer load shape",
+        },
+        acceptance={
+            "targets_are": "customer requirements",
+            "ttft_ms": {"p95": 50},
+            "success_rate": 0.99,
+        },
+        rate_limit_results=all_phases,
+    )
+
+
+def test_first_screen_model_keeps_quota_sla_and_capacity_independent():
+    body = render_html(_summary(quota_limited=True), "quota-limited run")
+
+    assert "Measurement invalid" in body
+    assert "Acceptance checks missed" in body
+    assert "HTTP 429 / rate-limit rejection observed" in body
+    assert "Endpoint capacity inconclusive" in body
+    assert "1/241" in body
+    assert "preflight: 1 captured, 0 send-timestamped, 1 send " \
+           "timing/outcome unknown" in body
+    assert "Tested load held" not in body
+    assert body.index("Decision summary") < body.index("What was tested")
+    assert body.index("What was tested") < body.index(
+        "Endpoint service latency")
+
+
+def test_report_shell_is_self_contained_responsive_semantic_and_printable():
+    body = render_html(_summary(), "responsive report")
+
+    assert "<main class='wrap'>" in body
+    assert "<nav class='report-nav' aria-label='Report sections'>" in body
+    assert "@media(max-width:640px)" in body
+    assert "@media print" in body
+    assert "page-break-inside:avoid" in body
+    assert "UNSEALED PRINT/PDF DERIVATIVE" in body
+    assert "artifact artifact-ui-contract" in body
+    assert "internal hashes are not a digital signature" in body
+    assert ".print-footer{display:block;" in body
+    assert "position:fixed" not in body
+    assert "artifact: artifact-ui-contract" in body
+    assert "counter(page)" not in body
+    assert "<script" not in body
+    assert "<link" not in body
+    assert "http://" not in body and "https://" not in body
+    assert ".report-head .meta-artifact{display:inline-flex" in body
+    assert ".decision-copy{display:block;overflow:visible}" in body
+    assert ".report-head .meta-mode,.report-head .meta-version{display:none}" \
+        not in body
+    assert ".meta-chip{font-size:11px;min-height:26px" in body
+    assert "Scroll horizontally; the Metric column stays visible." in body
+    assert "class='table-scroll' tabindex='0' role='region'" in body
+    assert ".dense-table .sticky-col{position:sticky" in body
+    assert ".table-scroll:focus-visible{outline:3px solid var(--blue)" in body
+    assert "table:not(.dense-table){display:table;width:100%" in body
+    assert "table:not(.dense-table) th.lbl{width:44%}" in body
+    for heading in (
+            "Evidence integrity", "Measurement validity", "Acceptance checks",
+            "Quota state", "Endpoint capacity"):
+        assert heading in body
+
+
+def test_unsealed_report_never_calls_captured_quota_rows_sealed():
+    body = render_html(_summary(), "unsealed quota wording")
+    markdown = render_markdown(_summary(), "unsealed quota wording")
+    gauge = _html_quota_gauges({
+        "comparisons": {
+            "queries_per_hour": {
+                "configured_limit": 100,
+                "observed_max": 10,
+                "observed_ratio_to_nominal_limit": 0.1,
+                "warning_utilization": 0.8,
+            },
+        },
+    })
+
+    assert "This is captured run evidence." in gauge
+    assert "captured traffic phases" in body
+    assert "captured traffic phases" in markdown
+    assert "sealed run evidence" not in body.lower()
+    assert "sealed traffic phases" not in body.lower()
+    assert "sealed traffic phases" not in markdown.lower()
+
+
+def test_hard_timeout_row_exists_only_when_a_timeout_target_was_configured():
+    no_timeout = _summary()
+    assert no_timeout["sla"]["hard_timeout_breaches"] == 0
+    assert "hard timeout breaches" not in render_html(
+        no_timeout, "no timeout target")
+    assert "hard timeout breaches" not in render_markdown(
+        no_timeout, "no timeout target")
+
+    with_timeout = summarize(
+        _rows(),
+        acceptance={
+            "targets_are": "customer requirements",
+            "hard_timeouts": {"ttft_s": 1.0},
+        },
+    )
+    assert "hard timeout breaches" in render_html(
+        with_timeout, "timeout target")
+    assert "hard timeout breaches" in render_markdown(
+        with_timeout, "timeout target")
+
+
+def test_near_complete_usage_is_still_labeled_as_subset_throughput():
+    rows = _rows()
+    rows[-1]["parse_errors"] = 1
+    summary = summarize(rows)
+    html = render_html(summary, "subset throughput")
+
+    assert summary["throughput"]["usage_coverage"] == 239 / 240
+    assert summary["throughput"]["coverage_warning"]
+    assert "Throughput: clean usage subset" in html
+    assert "clean usage subset; 99.6% row coverage" in html
+
+
+def test_run_provenance_is_near_decision_not_an_orphanable_final_block():
+    summary = _summary()
+    summary["run"].update({
+        "profile_label": "Customer production traffic profile",
+        "merge_note": "Merged from two manifest-bound shards.",
+    })
+
+    body = render_html(summary, "provenance placement")
+
+    provenance = body.index(
+        "<div class='run-context-notes' aria-label='Run context notes'>")
+    assert body.index("Decision summary") < provenance
+    assert provenance < body.index("What was tested")
+    assert body.index("Label:</b> customer load shape") < body.index(
+        "What was tested")
+    assert body.index("Profile:</b> Customer production traffic profile") \
+        < body.index("What was tested")
+    assert body.count("aria-label='Run context notes'") == 1
+    assert ".run-context-notes{break-inside:avoid;page-break-inside:avoid" \
+        in body
+
+
+def test_missing_run_counts_never_render_as_a_green_zero():
+    summary = _summary()
+    for key in ("requests_total", "requests_ok", "requests_failed",
+                "error_rate"):
+        summary.pop(key, None)
+
+    body = render_html(summary, "legacy incomplete summary")
+
+    assert "NOT REPORTED requests, NOT REPORTED harness-successful, " \
+           "NOT REPORTED failed" in body
+    error_card = body[body.index("Replay error rate"):]
+    error_card = error_card[:error_card.index("</div></div>") + 12]
+    assert "pill neutral" in error_card
+    assert "NOT REPORTED" in error_card
+    assert "0.00%" not in error_card
+
+
+def test_exact_caller_latency_is_primary_and_zero_throughput_is_visible():
+    rows = _rows()
+    for row in rows:
+        row["caller_ttft_ms"] = 500.0
+        row["caller_e2e_ms"] = 700.0
+    summary = summarize(rows)
+    summary["throughput"]["output_tokens_per_min"] = 0.0
+
+    body = render_html(summary, "caller-first report")
+
+    assert "Caller TTFT p50" in body and ">500 <span class='u'>ms" in body
+    assert "Caller end to end p95" in body and ">700 <span class='u'>ms" in body
+    assert body.index("Caller TTFT p50") < body.index(
+        "Endpoint service latency")
+    assert "output throughput" in body
+    assert ">0 <span class='u'>tok/min</span>" in body
+
+
+def test_stability_chart_has_units_alt_text_and_preserves_missing_gaps():
+    summary = _summary()
+    summary["drift"] = {
+        "window_seconds": 60,
+        "drift_kind": "variable",
+        "drift_flag": True,
+        "drift_headline": "middle window has no answer latency",
+        "windows": [
+            {"window": 0, "n": 40, "attempts": 40, "errors": 0,
+             "error_rate": 0.0, "ttft_p95": 100.0, "e2e_p95": 200.0,
+             "counted": True},
+            {"window": 1, "n": 0, "attempts": 40, "errors": 40,
+             "error_rate": 1.0, "ttft_p95": None, "e2e_p95": None,
+             "counted": False},
+            {"window": 2, "n": 40, "attempts": 40, "errors": 0,
+             "error_rate": 0.0, "ttft_p95": 300.0, "e2e_p95": 500.0,
+             "counted": True},
+        ],
+    }
+    body = render_html(summary, "gapped chart")
+
+    assert "role='img'" in body
+    assert "Tail latency over time" in body
+    assert "Missing values are gaps, not zeros" in body
+    assert "Exact per-window stability values in milliseconds" in body
+    assert "nan" not in body.lower()
+    assert "chart-dot chart-dot-secondary" in body
+    assert "style='color:#6b55c5'" in body
+    assert "E2E p95</span>" in body
+
+
+def test_quota_gauge_never_labels_projection_as_observed():
+    body = _html_quota_gauges({
+        "comparisons": {
+            "input_tokens_per_minute": {
+                "configured_limit": 1_000,
+                "observed_max": 200,
+                "observed_ratio_to_nominal_limit": 0.20,
+                "steady_state_projection": 1_200,
+                "ratio_to_nominal_limit": 1.20,
+                "warning_utilization": 0.60,
+            },
+        },
+    })
+
+    assert "observed captured window</span><span>20.0%" in body
+    assert "200 / 1,000 configured; warning at 60.0%" in body
+    assert "sustained-rate projection</span><span>120.0%" in body
+    assert "1,200 / 1,000 configured; warning at 60.0%" in body
+    assert "projection from a short observation" in body
+    assert "observed captured window</span><span>120.0%" not in body
+    # The configured 60% warning threshold, not a hard-coded 80%, controls
+    # tone.  The observed 20% bar remains neutral and projection is red.
+    assert body.count("gauge-fill bad") == 1
+    assert "gauge-fill warn" not in body
+
+
+def test_written_json_and_both_human_reports_share_decision_states(tmp_path):
+    summary = _summary(quota_limited=True)
+    sealed_rows = _rows() + [{
+        "ok": False, "phase": "preflight", "status": 429,
+        "error": "redacted response body sha256=abc",
+    }]
+    out = write_outputs(sealed_rows, summary, tmp_path, "parity")
+    stored = loads_strict((Path(out) / "summary.json").read_bytes())
+    html = (Path(out) / "report.html").read_text()
+    markdown = (Path(out) / "report.md").read_text()
+
+    expected = {
+        "measurement_validity": "INVALID",
+        "customer_sla": "MISS",
+        "quota_state": "EXCEEDED",
+        "endpoint_capacity": "INCONCLUSIVE",
+    }
+    for key, code in expected.items():
+        assert stored["decision"][key]["code"] == code
+        label = stored["decision"][key]["label"]
+        assert label in html
+        assert label in markdown
+
+
+def test_single_run_markdown_neutralizes_customer_structure():
+    summary = _summary()
+    hostile = "title | split\n<script>x</script> ![fetch](https://evil.invalid/x)"
+    summary["run"]["label"] = hostile
+    summary["run"]["profile_label"] = hostile
+    markdown = render_markdown(summary, hostile)
+
+    assert "<script>" not in markdown
+    assert "![fetch](https://evil.invalid/x)" not in markdown
+    assert "title | split" not in markdown
+    assert "title &#124; split" in markdown
+    assert markdown.count("| decision | state | reason |") == 1
+
+
+def test_tool_call_only_success_is_never_called_a_content_delta():
+    row = {
+        "ok": True,
+        "phase": "replay",
+        "status": 200,
+        "visible_content_seen": False,
+        "reasoning_seen": False,
+        "valid_tool_calls": 1,
+        "stream_complete": True,
+        "parse_errors": 0,
+        "ttf_tool_call_ms": 42.0,
+        "e2e_ms": 60.0,
+        "t_send_unix": 100.0,
+        "first_send_unix": 100.0,
+    }
+    summary = summarize([row])
+    answers = summary["answers"]
+    html = render_html(summary, "tool-only")
+    markdown = render_markdown(summary, "tool-only")
+
+    assert answers["harness_successful"] == 1
+    assert answers["content_delta_streams"] == 0
+    assert answers["tool_call_only_outcomes"] == 1
+    assert "1 produced a content delta" not in html
+    assert "1 produced a content delta" not in markdown
+    assert "visible or reasoning content delta</th><td>0" in html
+    assert "visible or reasoning content delta: 0" in markdown
+    assert "1 harness-successful" in html
+
+
+def test_success_rate_confidence_gate_matches_json_html_and_markdown(tmp_path):
+    rows = _rows(1_200)
+    summary = summarize(
+        rows,
+        schedule_meta={
+            "seconds": 1_200,
+            "requests": 1_200,
+            "rate_min": 1.0,
+            "rate_p50": 1.0,
+            "rate_p95": 1.0,
+            "rate_max": 1.0,
+            "spiky": False,
+            "source": "test schedule",
+        },
+        acceptance={"success_rate": 0.9999},
+    )
+
+    assert summary["sla"]["success_rate"]["actual"] == 1.0
+    assert summary["sla"]["success_rate"]["met"] is True
+    assert summary["sla"]["success_rate"][
+        "statistically_demonstrated"] is False
+
+    out = write_outputs(rows, summary, tmp_path, "confidence")
+    stored = loads_strict((Path(out) / "summary.json").read_bytes())
+    html = (Path(out) / "report.html").read_text()
+    markdown = (Path(out) / "report.md").read_text()
+
+    sla = stored["decision"]["customer_sla"]
+    assert sla["code"] == "INCONCLUSIVE"
+    assert sla["reason_codes"] == [
+        "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED"]
+    assert "Acceptance checks inconclusive" in html
+    assert "Acceptance checks inconclusive" in markdown
+    assert "Configured acceptance checks passed" not in html
+    assert "Configured acceptance checks passed" not in markdown
+    assert "NOT PROVEN" in html
+
+
+def test_html_and_markdown_strip_bidi_controls_from_untrusted_metadata():
+    summary = _summary(quota_limited=True)
+    hostile = "Trusted\u202eLIAF\u2066"
+    summary["run"].update({
+        "label": hostile,
+        "profile_label": hostile,
+        "merge_note": hostile,
+        "endpoint_path": f"/serving-endpoints/{hostile}/invocations",
+    })
+    summary["run"]["endpoint_metadata"]["served_entities"] = [
+        {"name": hostile}]
+    summary["http_429"]["scope"] = hostile
+
+    html = render_html(summary, hostile)
+    markdown = render_markdown(summary, hostile)
+
+    for control in ("\u202e", "\u2066"):
+        assert control not in html
+        assert control not in markdown
+    assert "TrustedLIAF" in html
+    assert "TrustedLIAF" in markdown

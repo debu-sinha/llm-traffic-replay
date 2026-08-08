@@ -10,6 +10,7 @@ from __future__ import annotations
 import errno
 from datetime import datetime, timezone
 import hashlib
+import html
 import hmac
 import json
 import math
@@ -19,10 +20,18 @@ import re
 import stat
 import struct
 import time
+from urllib.parse import quote
 import uuid
 
 from . import __version__
-from .artifacts import snapshot_source_state, strict_json_dumps
+from .artifacts import (
+    sanitize_display_text,
+    snapshot_source_state,
+    strict_json_dumps,
+)
+from .config_validation import validate_rate_limits
+from .json_input import json_error_detail, loads_strict
+from .markdown import markdown_plain_text
 from .metrics import _pct_table, summarize, write_outputs
 
 
@@ -31,8 +40,9 @@ _COMPLETE_MARKER = ".traffic-replay-complete"
 _SUPPORTED_MANIFEST_SCHEMAS = {3}
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
 _SHARD_RE = re.compile(r"([1-9][0-9]*)/([1-9][0-9]*)")
-
-
+_QUOTA_REQUEST_PHASES = frozenset({
+    "preflight", "probe", "sizing", "calibration", "replay",
+})
 def _read_regular_bytes(path: Path) -> bytes:
     """Read one artifact without following a final-component symlink."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -82,9 +92,10 @@ def _measure_regular(path: Path) -> tuple[str, int, int]:
 
 def _load_json_object(path: Path, label: str) -> dict:
     try:
-        value = json.loads(_read_regular_bytes(path))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ValueError(f"invalid {label} in {path}: {exc}") from exc
+        value = loads_strict(_read_regular_bytes(path))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"invalid {label} in {path}: {json_error_detail(exc)}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} must contain a JSON object: {path}")
     return value
@@ -228,7 +239,9 @@ def _compatibility_issues(dirs: list[Path], summaries: list[dict],
 
 
 def _run_title(d: Path, summ: dict) -> str:
-    return (summ.get("run") or {}).get("title") or d.name
+    run = summ.get("run")
+    title = run.get("title") if isinstance(run, dict) else None
+    return str(title) if title not in (None, "") else d.name
 
 
 def _has_path(path: Path) -> bool:
@@ -502,7 +515,7 @@ def _verify_run_completion_marker(d: Path, manifest: dict) -> None:
     if isinstance(declared_rows, bool) or not isinstance(declared_rows, int) \
             or declared_rows != request_metadata["row_count"]:
         raise ValueError(
-            f"completion marker request_rows disagrees with authenticated "
+            f"completion marker request_rows disagrees with manifest-bound "
             f"requests.jsonl for {d}")
 
 
@@ -573,7 +586,14 @@ def _validated_input_dirs(input_dirs, need: str, operation: str) \
     return dirs, manifests
 
 
-def _replay_rows(d: Path) -> list[dict]:
+def _request_rows(d: Path) -> list[dict]:
+    """Read every manifest-bound row from a sealed request journal.
+
+    Merge latency/SLA integrity is checked against the replay subset, but
+    setup traffic is still real workspace demand.  Keeping the full journal
+    here lets rolling token/query windows union preflight, probe, sizing,
+    calibration, and replay requests by their recorded epoch timestamps.
+    """
     rows = []
     path = d / "requests.jsonl"
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -592,24 +612,168 @@ def _replay_rows(d: Path) -> list[dict]:
                         raise ValueError(
                             f"blank JSONL record in {path} line {line_no}")
                     try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError as exc:
+                        r = loads_strict(line)
+                    except ValueError as exc:
                         raise ValueError(
                             f"invalid JSON in {path} line {line_no}: "
-                            f"{exc}") from exc
+                            f"{json_error_detail(exc)}") from exc
                     if not isinstance(r, dict):
                         raise ValueError(
                             f"requests.jsonl line {line_no} is not an object "
                             f"in {d}")
-                    if r.get("phase") == "replay":
-                        rows.append(r)
+                    rows.append(r)
             except UnicodeDecodeError as exc:
                 raise ValueError(
-                    f"requests.jsonl is not UTF-8 in {d}: {exc}") from exc
+                    f"requests.jsonl is not UTF-8 in {d}: "
+                    f"{json_error_detail(exc)}") from exc
     finally:
         if fd >= 0:
             os.close(fd)
     return rows
+
+
+def _rate_limit_merge_context(
+        dirs: list[Path], summaries: list[dict], manifests: list[dict],
+) -> tuple[dict | None, dict | None, list[str]]:
+    """Return a quota snapshot and endpoint binding safe to pool.
+
+    A provider limit is workspace/model/deployment policy, not a shard-local
+    measurement setting.  A merged report may compare the epoch-unioned
+    traffic with that policy only when every sealed source carries the same
+    valid snapshot in both its effective configuration and its summary, and
+    every source captured the same endpoint metadata with a complete binding.
+    Missing or conflicting evidence becomes an ordinary merge compatibility
+    issue so ``--force`` can still emit an explicitly INVALID diagnostic, but
+    the diagnostic receives no configured quota comparison.
+    """
+    snapshots: list[tuple[str, dict]] = []
+    metadata: list[tuple[str, dict]] = []
+    issues: list[str] = []
+    quota_seen = False
+
+    for d, summary, manifest in zip(dirs, summaries, manifests):
+        title = _run_title(d, summary)
+        effective = manifest.get("effective_config")
+        effective_has = isinstance(effective, dict) \
+            and "rate_limits" in effective \
+            and effective.get("rate_limits") is not None
+        effective_limits = effective.get("rate_limits") \
+            if effective_has else None
+
+        summary_block = summary.get("rate_limits")
+        summary_has = isinstance(summary_block, dict) \
+            and "configured" in summary_block \
+            and summary_block.get("configured") is not None
+        summary_limits = summary_block.get("configured") \
+            if summary_has else None
+        malformed_summary_block = summary_block is not None \
+            and not isinstance(summary_block, dict)
+        quota_seen = quota_seen or effective_has or summary_block is not None
+
+        if malformed_summary_block:
+            issues.append(f"invalid rate-limit evidence for {title}: "
+                          "summary.rate_limits must be an object")
+            continue
+        if isinstance(summary_block, dict) and not summary_has:
+            issues.append(f"invalid rate-limit evidence for {title}: "
+                          "summary.rate_limits.configured is missing")
+            continue
+        if effective_has != summary_has:
+            missing = ("summary configured snapshot" if effective_has else
+                       "manifest effective-config snapshot")
+            issues.append(
+                f"incomplete rate-limit evidence for {title}: missing {missing}")
+            continue
+        if not effective_has:
+            continue
+
+        valid = True
+        for label, value in (
+                ("manifest effective-config", effective_limits),
+                ("summary configured", summary_limits)):
+            try:
+                validate_rate_limits(
+                    value, f"{title} {label} rate_limits")
+            except ValueError as exc:
+                issues.append(f"invalid rate-limit evidence for {title}: {exc}")
+                valid = False
+        if not valid:
+            continue
+        if _stable(effective_limits) != _stable(summary_limits):
+            issues.append(
+                f"rate-limit snapshot disagrees between the manifest and "
+                f"summary for {title}")
+            continue
+
+        manifest_meta = manifest.get("endpoint_metadata")
+        summary_meta = (summary.get("run") or {}).get("endpoint_metadata")
+        if not isinstance(manifest_meta, dict) \
+                or not isinstance(summary_meta, dict):
+            issues.append(
+                f"incomplete rate-limit endpoint binding for {title}: "
+                "captured endpoint metadata is missing")
+            continue
+        if _stable(manifest_meta) != _stable(summary_meta):
+            issues.append(
+                f"rate-limit endpoint metadata disagrees between the manifest "
+                f"and summary for {title}")
+            continue
+        provisioned_fields = {
+            "workload_type", "workload_size", "provisioned_model_units",
+            "min_provisioned_throughput", "max_provisioned_throughput",
+        }
+        entities = manifest_meta.get("served_entities")
+        independently_bound = bool(
+            manifest_meta.get("name") == effective_limits.get("model")
+            and isinstance(entities, list) and entities
+            and all(isinstance(entity, dict)
+                    and entity.get("name") == effective_limits.get("model")
+                    and not any(field in entity for field in provisioned_fields)
+                    for entity in entities))
+        if not independently_bound:
+            issues.append(
+                f"incomplete rate-limit endpoint binding for {title}: "
+                "captured metadata does not independently bind the configured "
+                "pay-per-token model/deployment")
+            continue
+        binding = summary_block.get("binding") or {}
+        if not isinstance(binding, dict) \
+                or binding.get("binding_complete") is not True:
+            issues.append(
+                f"incomplete rate-limit endpoint binding for {title}: the "
+                "source run did not verify its configured model/deployment")
+            continue
+        snapshots.append((title, effective_limits))
+        metadata.append((title, manifest_meta))
+
+    if not quota_seen:
+        return None, None, issues
+    if len(snapshots) != len(dirs):
+        issues.append(
+            "rate-limit snapshot and endpoint binding are not complete for "
+            "every merge source")
+
+    snapshot_groups: dict[str, list[str]] = {}
+    for title, value in snapshots:
+        snapshot_groups.setdefault(_stable(value), []).append(title)
+    if len(snapshot_groups) > 1:
+        detail = "; ".join(
+            f"{', '.join(titles)}={value}"
+            for value, titles in snapshot_groups.items())
+        issues.append("different rate-limit snapshots: " + detail)
+
+    metadata_groups: dict[str, list[str]] = {}
+    for title, value in metadata:
+        metadata_groups.setdefault(_stable(value), []).append(title)
+    if len(metadata_groups) > 1:
+        detail = "; ".join(
+            f"{', '.join(titles)}={value}"
+            for value, titles in metadata_groups.items())
+        issues.append("different rate-limit endpoint metadata: " + detail)
+
+    if issues or len(snapshots) != len(dirs) or len(metadata) != len(dirs):
+        return None, None, issues
+    return snapshots[0][1], metadata[0][1], issues
 
 
 def _parse_shard(manifest: dict, d: Path) -> tuple[int, int]:
@@ -964,15 +1128,45 @@ def _coverage_gaps(actual: list[int], expected_total: int,
 
 def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
                force=False) -> Path:
-    """Concatenate replay rows from each run dir and re-summarize the union."""
+    """Pool concurrent shard evidence and re-summarize the epoch union.
+
+    Replay rows alone feed latency and SLA metrics. Every sealed request row
+    feeds rolling quota windows so setup traffic cannot disappear at merge.
+    """
     dirs, manifests = _validated_input_dirs(
         input_dirs, "requests.jsonl", "merge")
     summaries = [_load_summary(d) for d in dirs]
-    rows_by_dir = [_replay_rows(d) for d in dirs]
+    request_rows_by_dir = [_request_rows(d) for d in dirs]
+    rows_by_dir = [
+        [row for row in source_rows if row.get("phase") == "replay"]
+        for source_rows in request_rows_by_dir
+    ]
     coverage_issues = _merge_integrity(dirs, manifests, rows_by_dir)
     compatibility_issues = _compatibility_issues(
         dirs, summaries, manifests, merging=True)
     compatibility_issues.extend(coverage_issues)
+    rate_limits, quota_endpoint_meta, quota_issues = \
+        _rate_limit_merge_context(dirs, summaries, manifests)
+    compatibility_issues.extend(quota_issues)
+    quota_rows = [
+        row for source_rows in request_rows_by_dir for row in source_rows
+    ]
+    observed_quota_phases = {
+        phase: sum(str(row.get("phase") or "unlabeled") == phase
+                   for row in quota_rows)
+        for phase in sorted({
+            str(row.get("phase") or "unlabeled") for row in quota_rows
+        })
+    }
+    if rate_limits is not None:
+        unsupported_phases = sorted({
+            str(row.get("phase")) for row in quota_rows
+            if row.get("phase") not in _QUOTA_REQUEST_PHASES
+        })
+        if unsupported_phases:
+            compatibility_issues.append(
+                "configured rate-limit evidence contains unsupported request "
+                "phases: " + ", ".join(unsupported_phases))
     if compatibility_issues and not force:
         raise ValueError(
             "refusing to merge inputs that are not proven compatible: "
@@ -1092,6 +1286,23 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "merge_note": (f"pooled from {len(dirs)} run dirs. throughput is over "
                        "the union wall-clock window, so it is the aggregate "
                        "rate only when the shards ran concurrently."),
+        **({"endpoint_metadata": quota_endpoint_meta}
+           if rate_limits is not None and not compatibility_issues else {}),
+        "quota_merge": {
+            "traffic_population": "all_sealed_request_phases",
+            "sla_population": "replay_only",
+            "eligible_phase_kinds": sorted(_QUOTA_REQUEST_PHASES),
+            "observed_phase_rows": observed_quota_phases,
+            "sealed_rows": len(quota_rows),
+            "configured_snapshot_status": (
+                "compatible" if rate_limits is not None
+                and not compatibility_issues else
+                "withheld_invalid_inputs" if compatibility_issues else
+                "not_configured"),
+            "note": (
+                "rolling quota windows pool manifest-bound shard rows by epoch; "
+                "latency and acceptance-target metrics remain replay-only"),
+        },
     }
     # cost is a per-run figure (rates can differ across pooled runs), so
     # it is not recomputed here; read each run report for its own cost.
@@ -1101,7 +1312,21 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     # only exact monotonic caller clocks already recorded on each row.
     for row in rows:
         row["queue_wait_ms"] = None
-    summary = summarize(rows, run_meta=meta, acceptance=acceptance)
+    summary = summarize(
+        rows, run_meta=meta, acceptance=acceptance,
+        rate_limits=(rate_limits if not compatibility_issues else None),
+        rate_limit_results=quota_rows)
+    if compatibility_issues:
+        # ``--force`` is diagnostic only.  In particular, do not display a
+        # workspace rolling-rate union when the inputs may cover different
+        # policies, endpoints, workloads, or an incomplete shard set.
+        summary.pop("rate_limits", None)
+        summary["observed_rate_windows"] = {
+            "withheld": True,
+            "note": (
+                "workspace rolling-rate evidence is withheld because the "
+                "forced merge inputs were not proven compatible"),
+        }
     # drift buckets on absolute send time from the pooled minimum. shards that
     # ran at different times produce windows spanning the gap between them, so
     # a trend across pooled rows would describe the schedule, not the endpoint.
@@ -1169,6 +1394,8 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
             "operation": "merge",
             "forced": bool(force),
             "sources": source_provenance,
+            **({"rate_limits": rate_limits}
+               if rate_limits is not None and not compatibility_issues else {}),
         },
         "inputs": ({input_key: {"sha256": input_hash}}
                    if input_hash else {}),
@@ -1176,7 +1403,7 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "index_identity": index_identity,
     }
     return write_outputs(
-        rows, summary, out_dir, title or f"merged: {len(dirs)} runs",
+        quota_rows, summary, out_dir, title or f"merged: {len(dirs)} runs",
         start_provenance=start_provenance)
 
 
@@ -1192,7 +1419,21 @@ def _fsync_directory(path: Path) -> None:
     except OSError as exc:
         if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
             return
-        raise
+        # macOS exposes /tmp as a symlink to /private/tmp. Resolve a directory
+        # alias only for this read-only fsync, then keep O_NOFOLLOW on the
+        # resolved final component and prove it is the same directory inode.
+        if exc.errno not in {errno.ELOOP, errno.ENOTDIR}:
+            raise
+        expected = path.stat()
+        resolved = path.resolve(strict=True)
+        fd = os.open(resolved, flags)
+        actual = os.fstat(fd)
+        if not stat.S_ISDIR(expected.st_mode) \
+                or (actual.st_dev, actual.st_ino) != (
+                    expected.st_dev, expected.st_ino):
+            os.close(fd)
+            raise OSError(errno.ESTALE, "directory alias changed during fsync",
+                          str(path))
     try:
         _fsync_fd(fd)
     finally:
@@ -1283,7 +1524,7 @@ def _atomic_compare_text(dir_fd: int, name: str, value: str) -> dict:
 
 
 def _verified_comparison_summary(d: Path, manifest: dict) -> dict:
-    """Read exactly the summary bytes authenticated by the input manifest."""
+    """Read exactly the summary bytes bound by the input manifest."""
     expected = _artifact_declarations(manifest, d)["summary.json"]
     raw = _read_regular_bytes(d / "summary.json")
     actual = hashlib.sha256(raw).hexdigest()
@@ -1296,22 +1537,266 @@ def _verified_comparison_summary(d: Path, manifest: dict) -> dict:
             f"artifact byte count mismatch for {d / 'summary.json'}: expected "
             f"{expected['bytes']}, got {len(raw)}")
     try:
-        value = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ValueError(f"invalid summary.json in {d}: {exc}") from exc
+        value = loads_strict(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"invalid summary.json in {d}: {json_error_detail(exc)}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"summary.json must contain a JSON object: {d}")
     return value
 
 
+def _verified_comparison_request_evidence(d: Path, manifest: dict) -> dict:
+    """Scan the exact manifest-bound journal bytes for HTTP 429 evidence.
+
+    Comparison must include setup traffic, not only replay rows. Reading and
+    hashing through one descriptor also closes the verify-then-read race: the
+    429 verdict is derived from the same bytes bound by the source manifest.
+    """
+    expected = _artifact_declarations(manifest, d)["requests.jsonl"]
+    path = d / "requests.jsonl"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"cannot read regular artifact {path}: {exc}") from exc
+    digest = hashlib.sha256()
+    size = 0
+    total = 0
+    count = 0
+    phases: dict[str, int] = {}
+    phase_totals: dict[str, int] = {}
+    http_status_observed_for = 0
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"artifact is not a regular file: {path}")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            for line_no, raw in enumerate(handle, 1):
+                digest.update(raw)
+                size += len(raw)
+                if not raw.strip():
+                    raise ValueError(
+                        f"blank JSONL record in {path} line {line_no}")
+                try:
+                    row = loads_strict(raw)
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid JSON in {path} line {line_no}: "
+                        f"{json_error_detail(exc)}") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"requests.jsonl line {line_no} is not an object in {d}")
+                total += 1
+                phase = str(row.get("phase") or "unlabeled")
+                phase_totals[phase] = phase_totals.get(phase, 0) + 1
+                status = row.get("status")
+                if isinstance(status, int) and not isinstance(status, bool):
+                    http_status_observed_for += 1
+                    if status == 429:
+                        count += 1
+                        phases[phase] = phases.get(phase, 0) + 1
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    actual = digest.hexdigest()
+    if not hmac.compare_digest(actual, expected["sha256"]):
+        raise ValueError(
+            f"artifact SHA-256 mismatch for {path}: expected "
+            f"{expected['sha256']}, got {actual}")
+    if size != expected["bytes"]:
+        raise ValueError(
+            f"artifact byte count mismatch for {path}: expected "
+            f"{expected['bytes']}, got {size}")
+    if total != expected["row_count"]:
+        raise ValueError(
+            f"artifact row count mismatch for {path}: expected "
+            f"{expected['row_count']}, got {total}")
+    return {
+        "count": count,
+        "total": total,
+        "phases": phases,
+        "phase_totals": phase_totals,
+        "http_status_observed_for": http_status_observed_for,
+    }
+
+
+def _nonnegative_int(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _comparison_http_429_issues(
+        title: str, summary: dict, journal: dict) -> list[str]:
+    """Fail closed on direct or summarized, manifest-bound 429 evidence."""
+    issues: list[str] = []
+    block = summary.get("http_429")
+    block = block if isinstance(block, dict) else {}
+    failure_counts = summary.get("failures_by_http_status")
+    failure_counts = failure_counts if isinstance(failure_counts, dict) else {}
+    reported = {
+        "summary.http_429_count": _nonnegative_int(
+            summary.get("http_429_count")),
+        "summary.http_429.count": _nonnegative_int(block.get("count")),
+        "summary.failures_by_http_status[429]": _nonnegative_int(
+            failure_counts.get("429")),
+    }
+    positive = {name: value for name, value in reported.items()
+                if value is not None and value > 0}
+    journal_count = journal["count"]
+
+    if journal_count > 0:
+        phases = ", ".join(
+            f"{name or 'unlabeled'}={value}"
+            for name, value in sorted(journal["phases"].items()))
+        issues.append(
+            f"{title}: quota-limited; {journal_count}/{journal['total']} "
+            "manifest-bound request rows returned HTTP 429; phases: "
+            f"{phases}. This source supports no endpoint-capacity conclusion")
+        disagreements = [
+            f"{name}={value}" for name, value in reported.items()
+            if value is not None and value != journal_count
+        ]
+        if summary.get("quota_limited") is False:
+            disagreements.append("summary.quota_limited=false")
+        if disagreements:
+            issues.append(
+                f"{title}: manifest-bound 429 summary evidence disagrees with "
+                "the sealed request journal (" + ", ".join(disagreements) + ")")
+        return issues
+
+    if positive:
+        counts = sorted(set(positive.values()))
+        count = counts[-1]
+        denominator = _nonnegative_int(block.get("request_rows_examined"))
+        if denominator is None or denominator < count:
+            denominator = _nonnegative_int(summary.get("requests_total"))
+        shown_denominator = str(denominator) if denominator is not None \
+            and denominator >= count else "?"
+        reported_phases = block.get("phases")
+        if isinstance(reported_phases, dict):
+            phase_items = [
+                (str(name), value)
+                for name, raw_value in reported_phases.items()
+                if (value := _nonnegative_int(raw_value)) is not None
+                and value > 0
+            ]
+        else:
+            phase_items = []
+        phases = ", ".join(
+            f"{name or 'unlabeled'}={value}"
+            for name, value in sorted(phase_items)) or "not recorded"
+        issues.append(
+            f"{title}: quota-limited; the manifest-bound summary reports "
+            f"{count}/{shown_denominator} request rows returned HTTP 429; "
+            f"phases: {phases}. The sealed journal contains no matching 429, "
+            "so the source evidence is inconsistent and supports no "
+            "endpoint-capacity conclusion")
+        if len(counts) > 1:
+            detail = ", ".join(
+                f"{name}={value}" for name, value in positive.items())
+            issues.append(
+                f"{title}: manifest-bound 429 summary counts disagree "
+                f"internally ({detail})")
+    elif summary.get("quota_limited") is True:
+        issues.append(
+            f"{title}: the manifest-bound summary marks this run "
+            "quota-limited, but exact HTTP 429 count, denominator, and phases "
+            "are unavailable; this source is invalid as comparison evidence")
+    return issues
+
+
+def _explicit_measurement_issues(title: str, summary: dict) -> list[str]:
+    """Recognize manifest-bound source invalidity before showing deltas."""
+    issues: list[str] = []
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    answers = summary.get("answers")
+    answers = answers if isinstance(answers, dict) else {}
+    validity = summary.get("validity")
+    validity = validity if isinstance(validity, dict) else {}
+    decision = summary.get("decision")
+    decision = decision if isinstance(decision, dict) else {}
+    measurement = decision.get("measurement_validity")
+    measurement = measurement if isinstance(measurement, dict) else {}
+
+    decision_code = measurement.get("code")
+    if decision_code == "INVALID":
+        issues.append(
+            f"{title}: canonical measurement state is INVALID: "
+            f"{measurement.get('reason') or 'no reason recorded'}")
+    elif decision_code is not None and decision_code not in {"VALID", "CAUTION"}:
+        issues.append(
+            f"{title}: canonical measurement state is unrecognized "
+            f"({decision_code!r})")
+
+    invalid_reason = answers.get("invalid")
+    if invalid_reason:
+        issues.append(
+            f"{title}: source measurement is explicitly INVALID: "
+            f"{invalid_reason}")
+    flags = []
+    if summary.get("measurement_valid") is False:
+        flags.append("summary.measurement_valid=false")
+    if run.get("measurement_valid") is False:
+        flags.append("summary.run.measurement_valid=false")
+    if validity.get("valid") is False:
+        flags.append("summary.validity.valid=false")
+    status = validity.get("status")
+    if isinstance(status, str) and status.strip().lower() in {
+            "invalid", "inconclusive"}:
+        flags.append(f"summary.validity.status={status}")
+    if flags:
+        issues.append(
+            f"{title}: source measurement carries explicit invalidity "
+            "evidence (" + ", ".join(flags) + ")")
+    return issues
+
+
+def _explicit_measurement_warnings(title: str, summary: dict) -> list[str]:
+    """Authenticated cautions that make relative judgment diagnostic-only."""
+    warnings: list[str] = []
+    decision = summary.get("decision")
+    decision = decision if isinstance(decision, dict) else {}
+    measurement = decision.get("measurement_validity")
+    measurement = measurement if isinstance(measurement, dict) else {}
+    if measurement.get("code") == "CAUTION":
+        warnings.append(
+            f"{title}: canonical measurement state is CAUTION: "
+            f"{measurement.get('reason') or 'no reason recorded'}")
+
+    direct_paths = (
+        ("cache fidelity", ("cache_fidelity", "warning")),
+        ("token-shape fidelity", ("token_targeting", "warning")),
+        ("token-usage coverage", ("throughput", "coverage_warning")),
+        ("latency population", ("latency_population", "warning")),
+        ("load delivery", ("client", "warning")),
+        ("concurrency fidelity", ("concurrency", "warning")),
+        ("rate-limit evidence", ("rate_limits", "warning")),
+        ("Acceptance-target coverage", ("sla", "coverage_warning")),
+        ("caller-latency coverage", ("sla", "caller_latency_warning")),
+    )
+    for label, path in direct_paths:
+        value: object = summary
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        if isinstance(value, str) and value.strip():
+            rendered = f"{title}: {label}: {value.strip()}"
+            if not any(value.strip() in existing for existing in warnings):
+                warnings.append(rendered)
+    return warnings
+
+
 def _comparison_source_reference(position: int, d: Path,
                                  manifest: dict) -> dict:
-    """Bind the exact source manifest plus its authenticated summary."""
+    """Bind the exact source manifest plus its manifest-bound summary."""
     raw = _read_regular_bytes(d / "manifest.json")
     try:
-        current = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ValueError(f"invalid manifest.json in {d}: {exc}") from exc
+        current = loads_strict(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            f"invalid manifest.json in {d}: {json_error_detail(exc)}") from exc
     if current != manifest:
         raise ValueError(
             f"input manifest changed while constructing comparison: {d}")
@@ -1354,6 +1839,572 @@ def _verify_comparison_source(source: object, position: int, d: Path) -> None:
                 f"invalid source {field} byte count in comparison manifest for {d}")
 
 
+def _html_text(value: object) -> str:
+    """Escape untrusted text and remove controls that can spoof report UI."""
+    return html.escape(sanitize_display_text(value), quote=True)
+
+
+def _html_code(value: object) -> str:
+    return f"<code>{_html_text(value)}</code>"
+
+
+def _html_number(value: object, *, scale: float = 1.0,
+                 decimals: int = 1, unit: str = "") -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(float(value)):
+        return "<span class='na'>not reported</span>"
+    number = float(value) * scale
+    shown = f"{number:,.{decimals}f}"
+    suffix = f" {_html_text(unit)}" if unit else ""
+    return f"{shown}{suffix}"
+
+
+def _comparison_endpoint_value(summary: dict, manifest: dict) -> str:
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    metadata = manifest.get("endpoint_metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    base = manifest.get("endpoint_base_url") or run.get("endpoint_base_url")
+    path = manifest.get("endpoint_path") or run.get("endpoint_path")
+    model = (manifest.get("endpoint_model") or run.get("endpoint_model")
+             or metadata.get("name"))
+    parts = []
+    if base or path:
+        parts.append(f"route={base or ''}{path or ''}")
+    if model:
+        parts.append(f"model={model}")
+    return "; ".join(parts) or "not recorded"
+
+
+def _comparison_utc_instant(
+        manifest: dict, iso_field: str, unix_field: str) -> str | None:
+    raw_iso = manifest.get(iso_field)
+    if isinstance(raw_iso, str) and raw_iso.strip():
+        try:
+            parsed = datetime.fromisoformat(
+                raw_iso.strip().replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).isoformat().replace(
+                "+00:00", "Z")
+    raw_unix = manifest.get(unix_field)
+    if isinstance(raw_unix, (int, float)) \
+            and not isinstance(raw_unix, bool) \
+            and math.isfinite(float(raw_unix)):
+        try:
+            return datetime.fromtimestamp(
+                float(raw_unix), timezone.utc).isoformat().replace(
+                    "+00:00", "Z")
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _comparison_utc_window(manifest: dict) -> str:
+    start = _comparison_utc_instant(
+        manifest, "run_started_at_utc", "run_started_at_unix")
+    end = _comparison_utc_instant(
+        manifest, "run_ended_at_utc", "run_ended_at_unix")
+    if start and end:
+        return f"{start} → {end}"
+    if start:
+        return f"{start} → end not recorded"
+    if end:
+        return f"start not recorded → {end}"
+    return "not recorded"
+
+
+def _comparison_endpoint_metadata(summary: dict, manifest: dict) -> dict:
+    metadata = manifest.get("endpoint_metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    metadata = run.get("endpoint_metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _comparison_deployment_value(summary: dict, manifest: dict) -> str:
+    """Render only deployment facts actually recorded by the source run."""
+    metadata = _comparison_endpoint_metadata(summary, manifest)
+    parts = []
+    for field, label in (
+            ("name", "endpoint"), ("task", "task"),
+            ("route_optimized", "route optimized"), ("ready", "ready")):
+        value = metadata.get(field)
+        if value is not None:
+            parts.append(f"{label}={value}")
+    entities = metadata.get("served_entities")
+    if isinstance(entities, list):
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            facts = []
+            for field, label in (
+                    ("name", "name"), ("entity_version", "version"),
+                    ("workload_type", "workload"),
+                    ("workload_size", "size"),
+                    ("provisioned_model_units", "PMUs"),
+                    ("min_provisioned_throughput", "min throughput"),
+                    ("max_provisioned_throughput", "max throughput"),
+                    ("scale_to_zero_enabled", "scale to zero")):
+                value = entity.get(field)
+                if value is not None:
+                    facts.append(f"{label}={value}")
+            if facts:
+                parts.append("served entity: " + ", ".join(facts))
+    rate_limits = summary.get("rate_limits")
+    configured = (rate_limits.get("configured")
+                  if isinstance(rate_limits, dict) else None)
+    if isinstance(configured, dict) and configured.get("deployment_mode"):
+        parts.append(
+            "configured deployment mode="
+            + str(configured["deployment_mode"]))
+    return "; ".join(parts) or "not recorded"
+
+
+def _comparison_workload_digest(manifest: dict) -> str:
+    digest = manifest.get("profile_sha256") \
+        or manifest.get("profile_sha256_16")
+    if isinstance(digest, str) and digest:
+        return digest
+    inputs = manifest.get("inputs")
+    if isinstance(inputs, dict):
+        for name in ("profile", "prompts"):
+            entry = inputs.get(name)
+            value = entry.get("sha256") if isinstance(entry, dict) else None
+            if isinstance(value, str) and value:
+                return value
+    return "not recorded"
+
+
+def _comparison_sample_count(summary: dict) -> str:
+    sample = summary.get("sample")
+    value = sample.get("n") if isinstance(sample, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return f"{value:,}"
+    return "not recorded"
+
+
+def _comparison_summary_429_count(summary: dict) -> int:
+    block = summary.get("http_429")
+    block = block if isinstance(block, dict) else {}
+    statuses = summary.get("failures_by_http_status")
+    statuses = statuses if isinstance(statuses, dict) else {}
+    values = [
+        _nonnegative_int(summary.get("http_429_count")),
+        _nonnegative_int(block.get("count")),
+        _nonnegative_int(statuses.get("429")),
+    ]
+    return max((value for value in values if value is not None), default=0)
+
+
+def _comparison_relative_report_link(
+        source_dir: Path, out_dir: Path, manifest: dict) -> str:
+    declarations = manifest.get("artifacts")
+    if not isinstance(declarations, dict) or "report.html" not in declarations:
+        return "<span class='muted'>No sealed source report</span>"
+    relative = os.path.relpath(source_dir / "report.html", start=out_dir)
+    relative = relative.replace(os.sep, "/")
+    href = quote(relative, safe="/._~-")
+    return (
+        f"<a href='{_html_text(href)}'>Open sealed source report</a>"
+        f"<span class='link-path'>{_html_text(relative)}</span>"
+    )
+
+
+def _comparison_metric_value(summary: dict, path: tuple[str, ...]):
+    value: object = summary
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _comparison_metric_table(
+        summaries: list[dict], titles: list[str], valid: bool) -> str:
+    """Render arithmetic deltas without claiming statistical improvement."""
+    # label, path, direction, value unit, scale, decimals, delta unit
+    metrics = (
+        ("Caller TTFT p50", ("ttft_corrected_ms", "p50"),
+         "lower", "ms", 1.0, 1, "ms"),
+        ("Caller TTFT p95", ("ttft_corrected_ms", "p95"),
+         "lower", "ms", 1.0, 1, "ms"),
+        ("Caller E2E p95", ("e2e_corrected_ms", "p95"),
+         "lower", "ms", 1.0, 1, "ms"),
+        ("TTFT p50", ("ttft_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
+        ("TTFT p95", ("ttft_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
+        ("TTFT p99", ("ttft_ms", "p99"), "lower", "ms", 1.0, 1, "ms"),
+        ("TTFB p50", ("ttfb_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
+        ("TTFB p95", ("ttfb_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
+        ("TTFB p99", ("ttfb_ms", "p99"), "lower", "ms", 1.0, 1, "ms"),
+        ("E2E p50", ("e2e_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
+        ("E2E p95", ("e2e_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
+        ("E2E p99", ("e2e_ms", "p99"), "lower", "ms", 1.0, 1, "ms"),
+        ("Interchunk max p95", ("interchunk_max_ms", "p95"),
+         "lower", "ms", 1.0, 1, "ms"),
+        ("Interchunk max p99", ("interchunk_max_ms", "p99"),
+         "lower", "ms", 1.0, 1, "ms"),
+        ("Error rate", ("error_rate",), "lower", "%", 100.0, 2, "pp"),
+        ("Input tokens / min", ("throughput", "input_tokens_per_min"),
+         "context", "", 1.0, 0, ""),
+        ("Output tokens / min", ("throughput", "output_tokens_per_min"),
+         "context", "", 1.0, 0, ""),
+        ("Dispatch lag p95", ("arrivals", "dispatch_lag_ms", "p95"),
+         "lower", "ms", 1.0, 1, "ms"),
+        ("Wire lateness p95", ("arrivals", "wire_lateness_ms", "p95"),
+         "lower", "ms", 1.0, 1, "ms"),
+    )
+    candidate_count = len(summaries) - 1
+    head = [
+        "<thead>",
+        "<tr><th scope='col' rowspan='2' class='sticky-col'>Metric</th>",
+        "<th scope='col' rowspan='2'>Direction</th>",
+        "<th scope='col' rowspan='2'>Baseline absolute</th>",
+    ]
+    for title in titles[1:]:
+        head.append(
+            f"<th scope='colgroup' colspan='3'>{_html_text(title)}</th>")
+    head.extend(["</tr><tr>"])
+    for _ in range(candidate_count):
+        head.extend([
+            "<th scope='col'>Candidate absolute</th>",
+            "<th scope='col'>Absolute delta</th>",
+            "<th scope='col'>Percent delta</th>",
+        ])
+    head.extend(["</tr></thead>"])
+
+    body = ["<tbody>"]
+    for label, path, direction, unit, scale, decimals, delta_unit in metrics:
+        baseline = _comparison_metric_value(summaries[0], path)
+        baseline_number = (float(baseline) if isinstance(
+            baseline, (int, float)) and not isinstance(baseline, bool) else None)
+        direction_text = (
+            {
+                "lower": "lower preferred; untested",
+                "higher": "higher preferred; untested",
+                "context": "context only",
+            }[direction]
+            if valid else
+            ("context only" if direction == "context" else
+             "direction withheld"))
+        body.extend([
+            "<tr>",
+            f"<th scope='row' class='sticky-col'>{_html_text(label)}</th>",
+            f"<td class='direction'>{direction_text}</td>",
+            f"<td>{_html_number(baseline, scale=scale, decimals=decimals, unit=unit)}</td>",
+        ])
+        for candidate in summaries[1:]:
+            value = _comparison_metric_value(candidate, path)
+            candidate_number = (float(value) if isinstance(
+                value, (int, float)) and not isinstance(value, bool) else None)
+            body.append(
+                f"<td>{_html_number(value, scale=scale, decimals=decimals, unit=unit)}</td>")
+            if baseline_number is None or candidate_number is None:
+                body.extend([
+                    "<td class='delta'>not available</td>",
+                    "<td class='delta'>not available</td>",
+                ])
+                continue
+            delta = (candidate_number - baseline_number) * scale
+            sign = "+" if delta > 0 else ""
+            delta_suffix = f" {_html_text(delta_unit)}" if delta_unit else ""
+            assessment = ""
+            signal_class = ""
+            if valid and direction in {"lower", "higher"} and delta != 0:
+                preferred_direction = (
+                    (direction == "lower" and delta < 0)
+                    or (direction == "higher" and delta > 0))
+                assessment = (
+                    "numerically preferred" if preferred_direction else
+                    "numerically adverse")
+                signal_class = " signal-change"
+            assessment_html = (
+                f"<span class='assessment'>{assessment}</span>"
+                if assessment else "")
+            body.append(
+                f"<td class='delta{signal_class}'>{sign}{delta:,.{decimals}f}"
+                f"{delta_suffix}{assessment_html}</td>")
+            if baseline_number == 0:
+                body.append(
+                    "<td class='delta'>not defined (baseline is zero)</td>")
+            else:
+                percent = (candidate_number - baseline_number) \
+                    / abs(baseline_number) * 100.0
+                pct_sign = "+" if percent > 0 else ""
+                body.append(
+                    f"<td class='delta{signal_class}'>{pct_sign}{percent:,.1f}%"
+                    f"{assessment_html}</td>")
+        body.append("</tr>")
+    body.append("</tbody>")
+    return "".join(head + body)
+
+
+def _render_comparison_html(
+        out_dir: Path, dirs: list[Path], summaries: list[dict],
+        manifests: list[dict], request_evidence: list[dict],
+        titles: list[str], compatibility_issues: list[str],
+        warnings: list[str], artifact_id: str) -> str:
+    """Create a sealed, dependency-free decision and diagnostic surface."""
+    comparison_state = (
+        "invalid" if compatibility_issues else
+        "qualified" if warnings else "valid")
+    arithmetic_labels_allowed = comparison_state == "valid"
+    status = {
+        "valid": "VALID COMPARISON",
+        "qualified": "QUALIFIED COMPARISON",
+        "invalid": "INVALID COMPARISON",
+    }[comparison_state]
+    status_class = comparison_state
+    disposition = {
+        "valid": (
+            "Compatibility and measurement-quality checks passed. Deltas are "
+            "arithmetic observations relative to the first input, not "
+            "statistically demonstrated improvements or regressions."),
+        "qualified": (
+            "Diagnostic-only while measurement warnings remain. Do not quote "
+            "relative performance, rank candidates, or use directional delta "
+            "judgments until every warning is resolved and the runs repeat."),
+        "invalid": (
+            "Diagnostic-only. Do not quote relative results, rank candidates, "
+            "or draw endpoint-capacity conclusions until every issue is "
+            "resolved and the runs are repeated."),
+    }[comparison_state]
+
+    source_cards = []
+    for position, (title, source_dir, summary, manifest) in enumerate(
+            zip(titles, dirs, summaries, manifests)):
+        role = "Baseline · first input" if position == 0 else \
+            f"Candidate {position}"
+        endpoint = _comparison_endpoint_value(summary, manifest)
+        deployment = _comparison_deployment_value(summary, manifest)
+        workload_digest = _comparison_workload_digest(manifest)
+        source_cards.append(
+            "<article class='source-card'>"
+            f"<div class='eyebrow'>{_html_text(role)}</div>"
+            f"<h3>{_html_text(title)}</h3>"
+            "<dl class='source-meta'>"
+            f"<dt>Artifact ID</dt><dd>{_html_code(manifest['artifact_id'])}</dd>"
+            f"<dt>UTC window</dt><dd>"
+            f"{_html_text(_comparison_utc_window(manifest))}</dd>"
+            f"<dt>Endpoint identity</dt><dd>{_html_code(endpoint)}</dd>"
+            f"<dt>Deployment context</dt><dd>{_html_text(deployment)}</dd>"
+            f"<dt>Workload ID</dt><dd>"
+            f"{_html_code(manifest.get('workload_id') or 'not recorded')}</dd>"
+            f"<dt>Workload digest</dt><dd>"
+            f"{_html_code(workload_digest)}</dd>"
+            f"<dt>Sample count</dt><dd>"
+            f"{_html_text(_comparison_sample_count(summary))}</dd>"
+            "</dl>"
+            f"<div class='source-link'>{_comparison_relative_report_link(source_dir, out_dir, manifest)}</div>"
+            "</article>"
+        )
+
+    issue_blocks = []
+    if compatibility_issues:
+        items = "".join(
+            f"<li>{_html_text(issue)}</li>" for issue in compatibility_issues)
+        issue_blocks.append(
+            "<section class='callout invalid-callout' aria-labelledby='issues-heading'>"
+            "<h2 id='issues-heading'>Why this comparison is invalid</h2>"
+            f"<ol>{items}</ol></section>"
+        )
+    if warnings:
+        items = "".join(
+            f"<li>{_html_text(warning)}</li>" for warning in warnings)
+        issue_blocks.append(
+            "<section id='warnings' class='callout warning-callout' "
+            "aria-labelledby='first-warning-heading'>"
+            "<h2 id='first-warning-heading'>Why this comparison is "
+            "diagnostic-only</h2>"
+            f"<p>{len(warnings)} measurement warning(s) block arithmetic "
+            "preference labels and relative performance claims:</p>"
+            f"<ol>{items}</ol>"
+            "</section>"
+        )
+    issue_block = "".join(issue_blocks)
+
+    def same(values: list[object]) -> bool:
+        return bool(values) and all(value is not None for value in values) \
+            and len({_stable(value) for value in values}) == 1
+
+    harness_values = [
+        (manifest.get("harness_version") or summary.get("harness_version"),
+         manifest.get("latency_basis") or summary.get("latency_basis"))
+        for summary, manifest in zip(summaries, manifests)
+    ]
+    workload_values = [
+        (manifest.get("workload_id"), manifest.get("profile_sha256")
+         or manifest.get("profile_sha256_16"))
+        for manifest in manifests
+    ]
+    parameter_values = [manifest.get("request_params") for manifest in manifests]
+    sample_ready = all(
+        not (summary.get("sample") or {}).get("warning")
+        and (summary.get("drift") or {}).get("drift_kind") == "stable"
+        for summary in summaries
+    )
+    any_quota_issue = any(
+        journal["count"] > 0 or summary.get("quota_limited") is True
+        or _comparison_summary_429_count(summary) > 0
+        for summary, journal in zip(summaries, request_evidence)
+    )
+    any_request_rows = any(journal["total"] > 0 for journal in request_evidence)
+
+    matrix_rows: list[tuple[str, str, list[str]]] = []
+    identity_cells = []
+    for manifest in manifests:
+        clean = "clean" if manifest.get("git_dirty") is False else \
+            "dirty or unknown"
+        identity_cells.append(
+            f"Artifact {_html_code(manifest.get('artifact_id'))}<br>"
+            f"source {_html_code(manifest.get('git_commit'))} · {_html_text(clean)}")
+    matrix_rows.append(("Artifact / source identity", "Bound", identity_cells))
+    matrix_rows.append((
+        "Harness / latency basis",
+        "Match" if same(harness_values) else "Invalid",
+        [f"harness {_html_code(value[0])}<br>{_html_text(value[1] or 'not recorded')}"
+         for value in harness_values],
+    ))
+    matrix_rows.append((
+        "Workload / profile hash",
+        "Match" if same(workload_values) else "Invalid",
+        [f"workload {_html_code(value[0])}<br>profile {_html_code(value[1])}"
+         for value in workload_values],
+    ))
+    matrix_rows.append((
+        "Request parameters",
+        "Match" if same(parameter_values) else "Invalid",
+        [_html_code(_stable(value)) if value is not None
+         else "<span class='na'>not recorded</span>"
+         for value in parameter_values],
+    ))
+    matrix_rows.append((
+        "Endpoint",
+        "Context",
+        [_html_code(_comparison_endpoint_value(summary, manifest))
+         for summary, manifest in zip(summaries, manifests)],
+    ))
+    sample_cells = []
+    for summary in summaries:
+        sample = summary.get("sample")
+        sample = sample if isinstance(sample, dict) else {}
+        drift = summary.get("drift")
+        drift = drift if isinstance(drift, dict) else {}
+        sample_cells.append(
+            f"n={_html_text(sample.get('n', 'not recorded'))}<br>"
+            f"stability={_html_text(drift.get('drift_kind') or 'not established')}"
+            + (f"<br>{_html_text(sample['warning'])}"
+               if sample.get("warning") else "")
+        )
+    matrix_rows.append((
+        "Sample / stability", "Ready" if sample_ready else "Review",
+        sample_cells,
+    ))
+    quota_cells = []
+    for summary, journal in zip(summaries, request_evidence):
+        phases = ", ".join(
+            f"{name or 'unlabeled'}={count}"
+            for name, count in sorted(journal["phases"].items())) or "none"
+        quota_flag = summary.get("quota_limited")
+        quota_label = "yes" if quota_flag is True else \
+            "no" if quota_flag is False else "not recorded"
+        quota_cells.append(
+            f"HTTP 429: <strong>{journal['count']}/{journal['total']}</strong>"
+            f"<br>phases: {_html_text(phases)}"
+            f"<br>summary quota-limited: {_html_text(quota_label)}"
+        )
+    quota_status = "Invalid" if any_quota_issue else \
+        "Clear" if any_request_rows else "No request rows"
+    matrix_rows.append(("HTTP 429 / quota state", quota_status, quota_cells))
+
+    matrix_head = "".join(
+        f"<th scope='col'>{_html_text(title)}</th>" for title in titles)
+    matrix_body = []
+    for dimension, state, cells in matrix_rows:
+        state_class = (
+            "state-pass" if state in {"Bound", "Match", "Ready", "Clear"}
+            else "state-invalid" if state == "Invalid" else "state-review"
+        )
+        matrix_body.append(
+            f"<tr><th scope='row' class='sticky-col'>"
+            f"{_html_text(dimension)}</th>"
+            f"<td><span class='matrix-state {state_class}'>{_html_text(state)}</span></td>"
+            + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+
+    metric_table = _comparison_metric_table(
+        summaries, titles, arithmetic_labels_allowed)
+    color_note = (
+        "Numeric direction labels are shown because the comparison is valid, "
+        "but no repeat-run uncertainty or practical-effect threshold was "
+        "configured. They are not improvement/regression verdicts. Positive "
+        "deltas mean the candidate value is numerically higher."
+        if arithmetic_labels_allowed else
+        "All deltas are neutral diagnostic values. Arithmetic preference "
+        "labels and performance judgments are intentionally suppressed for this "
+        f"{comparison_state} comparison."
+    )
+    baseline_title = titles[0]
+    return f"""<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<meta name='referrer' content='no-referrer'>
+<meta http-equiv='Content-Security-Policy' content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
+<title>{_html_text(status)} · endpoint comparison</title>
+<style>
+:root{{--ink:#122033;--muted:#5d6b7c;--line:#dce3ec;--soft:#f4f7fb;--navy:#172f52;--blue:#2f67d8;--green:#117a55;--green-soft:#e8f7f0;--red:#b42318;--red-soft:#fff0ef;--amber:#8a5700;--amber-soft:#fff7df;--white:#fff}}
+*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:#edf2f7;color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}
+a{{color:#174ea6;text-underline-offset:3px}}code{{font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}.shell{{max-width:1500px;margin:auto;background:var(--white);min-height:100vh;box-shadow:0 0 45px #10233a1a}}
+header{{padding:32px 42px 0}}.eyebrow{{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.09em;text-transform:uppercase}}h1{{font-size:clamp(30px,4vw,50px);line-height:1.05;letter-spacing:-.035em;margin:8px 0 20px}}h2{{font-size:24px;line-height:1.2;margin:3px 0 0}}h3{{font-size:17px;margin:4px 0 9px}}
+.hero{{border:1px solid var(--line);border-left:8px solid var(--green);border-radius:14px;padding:22px 24px;background:linear-gradient(135deg,#fff,#f3fbf7);display:grid;grid-template-columns:minmax(230px,.75fr) 2fr;gap:26px;align-items:center}}.hero.invalid{{border-left-color:var(--red);background:linear-gradient(135deg,#fff,#fff4f3)}}.hero.qualified{{border-left-color:var(--amber);background:linear-gradient(135deg,#fff,#fffaf0)}}.status{{font-size:22px;font-weight:850;color:var(--green)}}.invalid .status{{color:var(--red)}}.qualified .status{{color:var(--amber)}}.disposition{{font-size:17px;margin:4px 0 10px;max-width:860px}}.hero-facts{{display:flex;flex-wrap:wrap;gap:8px 22px;color:var(--muted)}}
+.callout{{margin-top:16px;border-radius:12px;padding:16px 20px}}.callout h2{{font-size:18px}}.callout ol{{margin:8px 0 0;padding-left:22px}}.invalid-callout{{border:1px solid #fac5c1;background:var(--red-soft)}}.warning-callout{{border:1px solid #f1d58a;background:var(--amber-soft)}}
+nav{{margin-top:18px;border-block:1px solid var(--line);display:flex;gap:22px;padding:12px 42px;overflow:auto;background:#fff;position:sticky;top:0;z-index:2}}nav a{{white-space:nowrap;font-weight:700;text-decoration:none}}main{{padding:0 42px 48px}}section{{padding:31px 0;border-bottom:1px solid var(--line)}}.source-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px;margin-top:16px}}.source-card{{border:1px solid var(--line);border-radius:12px;padding:16px;background:var(--soft)}}.source-meta{{display:grid;grid-template-columns:minmax(112px,.38fr) minmax(0,1fr);gap:6px 10px;margin:10px 0 0;font-size:12px}}.source-meta dt{{font-weight:800;color:#435168}}.source-meta dd{{margin:0;min-width:0;overflow-wrap:anywhere}}.source-link{{margin-top:12px}}.link-path{{display:block;color:var(--muted);font-size:11px;overflow-wrap:anywhere}}.muted,.na{{color:var(--muted)}}
+.section-head{{display:flex;align-items:end;justify-content:space-between;gap:16px;margin-bottom:14px}}.count{{display:inline-grid;place-items:center;min-width:35px;height:35px;padding:0 9px;border-radius:20px;background:var(--soft);font-weight:800}}.scroll-hint{{display:none}}.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;overscroll-behavior-inline:contain;scrollbar-gutter:stable}}table{{border-collapse:separate;border-spacing:0;width:100%;min-width:900px}}caption{{text-align:left;padding:12px 14px;background:var(--soft);font-weight:700;color:var(--muted)}}th,td{{padding:11px 13px;border-bottom:1px solid var(--line);border-right:1px solid var(--line);text-align:right;vertical-align:top}}th:last-child,td:last-child{{border-right:0}}thead th{{background:var(--navy);color:#fff;font-size:12px;letter-spacing:.02em}}tbody th{{text-align:left;background:#f8fafc;min-width:160px}}.compat td{{text-align:left;min-width:210px}}.compat td:nth-child(2){{min-width:115px}}.matrix-state{{display:inline-block;border-radius:20px;padding:3px 9px;font-size:12px;font-weight:800}}.state-pass{{color:var(--green);background:var(--green-soft)}}.state-invalid{{color:var(--red);background:var(--red-soft)}}.state-review{{color:var(--amber);background:var(--amber-soft)}}.direction{{color:var(--muted);font-size:12px;white-space:nowrap}}.delta{{white-space:nowrap}}.signal-change{{color:#174ea6;background:#eef4ff;font-weight:750}}.assessment{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em}}.warning-list{{padding-left:22px}}.warning-list li+li{{margin-top:10px}}.method-note{{color:var(--muted);max-width:1000px}}.method-card{{border:1px solid var(--line);border-left:5px solid var(--blue);border-radius:11px;background:var(--soft);padding:14px 16px;margin:14px 0}}.method-card h3{{margin:0 0 5px}}.method-card p{{margin:0}}
+footer{{padding:22px 42px;background:var(--navy);color:#dce7f8}}footer code{{color:#fff}}
+.print-stamp{{display:none}}
+@media(max-width:720px){{header,main{{padding-left:18px;padding-right:18px}}header{{padding-top:22px}}nav{{padding-left:18px;padding-right:18px}}.hero{{grid-template-columns:1fr;padding:18px}}h1{{font-size:34px}}section{{padding:24px 0}}.source-grid{{grid-template-columns:1fr}}.source-meta{{grid-template-columns:1fr;gap:2px;font-size:13px}}.source-meta dt{{margin-top:7px}}.source-meta dd,.source-meta code{{font-size:12px}}.scroll-hint{{display:flex;align-items:center;gap:7px;margin:0 0 7px;padding:7px 9px;border-radius:8px;background:#eef4ff;color:#174ea6;font-size:12px;font-weight:750}}.table-wrap{{box-shadow:inset -12px 0 12px -14px #122033;-webkit-overflow-scrolling:touch}}.table-wrap:focus-visible{{outline:3px solid #155eef;outline-offset:3px}}.table-wrap .sticky-col{{position:sticky;inset-inline-start:0;z-index:2;box-shadow:5px 0 7px -7px #122033}}.table-wrap thead .sticky-col{{z-index:4;background:var(--navy)}}.table-wrap tbody .sticky-col{{background:#f8fafc}}th,td{{padding:9px 10px}}footer{{padding:20px 18px}}}}
+@media print{{@page{{size:landscape;margin:10mm}}body{{background:#fff;font-size:10px}}.shell{{box-shadow:none;max-width:none}}nav{{display:none}}header,main{{padding-left:0;padding-right:0}}section{{break-inside:auto;padding:14px 0}}.hero,.source-card,.callout,.method-card{{break-inside:avoid;print-color-adjust:exact;-webkit-print-color-adjust:exact}}#method{{break-inside:avoid-page;break-after:avoid-page;margin-bottom:6px}}.source-meta{{font-size:9px;gap:3px 7px}}.source-link{{margin-top:6px}}.print-stamp{{display:block;border:1px solid #98a2b3;padding:2.5mm 3mm;margin:4mm 0 2mm;background:#fff;color:#344054;text-align:center;font-size:8pt;line-height:1.25;break-inside:avoid}}.scroll-hint{{display:none}}.table-wrap{{overflow:visible;box-shadow:none}}.table-wrap .sticky-col{{position:static;box-shadow:none}}table{{min-width:0}}th,td{{padding:5px 6px}}thead{{display:table-header-group}}tr{{break-inside:avoid}}a::after{{content:" (" attr(href) ")";font-size:9px}}footer{{display:none}}}}
+</style>
+</head>
+<body><div class='shell'>
+<header>
+<div class='eyebrow'>Sealed endpoint comparison</div>
+<h1>Benchmark comparison</h1>
+<div class='hero {status_class}' role='status' aria-live='off'>
+<div><div class='status'>{status}</div><div>{len(summaries)} internally hash-verified inputs</div></div>
+<div><p class='disposition'>{_html_text(disposition)}</p><div class='hero-facts'>
+<span><strong>Baseline:</strong> {_html_text(baseline_title)} (first input)</span>
+<span><strong>Compatibility issues:</strong> {len(compatibility_issues)}</span>
+<span><strong>Warnings:</strong> {len(warnings)}</span>
+</div></div></div>
+{issue_block}
+<div class='print-stamp' role='note'>UNSEALED PRINT/PDF DERIVATIVE: verify the comparison manifest · artifact {_html_text(artifact_id)} · internal hashes are not a digital signature</div>
+<div class='source-grid'>{''.join(source_cards)}</div>
+</header>
+<nav aria-label='Report sections'><a href='#compatibility'>Compatibility</a><a href='#metrics'>Metrics and deltas</a>{"<a href='#warnings'>Warnings</a>" if warnings else ""}<a href='#method'>How to read</a></nav>
+<main>
+<section id='compatibility' aria-labelledby='compatibility-heading'>
+<div class='section-head'><div><div class='eyebrow'>Evidence gate</div><h2 id='compatibility-heading'>Compatibility matrix</h2></div></div>
+<div class='scroll-hint' id='compatibility-scroll-hint' role='note'><span aria-hidden='true'>↔</span> Scroll horizontally; the Dimension column stays visible.</div>
+<div class='table-wrap' tabindex='0' role='region' aria-labelledby='compatibility-heading' aria-describedby='compatibility-scroll-hint'><table class='compat'><caption>Each cell comes from a manifest-bound source manifest, summary, or request journal. Internal hashes are not a digital signature.</caption><thead><tr><th scope='col' class='sticky-col'>Dimension</th><th scope='col'>State</th>{matrix_head}</tr></thead><tbody>{''.join(matrix_body)}</tbody></table></div>
+</section>
+<section id='method' class='method-card' aria-labelledby='method-heading'><div class='eyebrow'>Interpretation contract</div><h2 id='method-heading'>How to read this report</h2><p class='method-note'>Latency percentiles describe successful requests and can be biased when errors occur. Throughput and token counts are context, not an automatic quality ranking. HTTP 429 evidence includes setup and replay phases from each sealed journal. This file contains no scripts, remote assets, remote fonts, or network requests.</p></section>
+<section id='metrics' aria-labelledby='metrics-heading'>
+<div class='section-head'><div><div class='eyebrow'>First-input baseline</div><h2 id='metrics-heading'>Absolute values and deltas</h2></div></div>
+<p class='method-note'>Baseline is explicitly the first input: <strong>{_html_text(baseline_title)}</strong>. Absolute delta is candidate minus baseline. {_html_text(color_note)}</p>
+<div class='scroll-hint' id='metrics-scroll-hint' role='note'><span aria-hidden='true'>↔</span> Scroll horizontally; the Metric column stays visible.</div>
+<div class='table-wrap' tabindex='0' role='region' aria-labelledby='metrics-heading' aria-describedby='metrics-scroll-hint'><table><caption>Candidate values and deltas relative to the first input baseline.</caption>{metric_table}</table></div>
+</section>
+</main>
+<footer>Generated by traffic-replay {_html_code(__version__)} · comparison artifact is complete only when this file and <code>comparison.md</code> match <code>manifest.json</code>.</footer>
+</div></body></html>
+"""
+
+
 def verify_comparison_output(out_dir: str | Path) -> dict:
     """Verify the completion chain and rendered artifact of a comparison."""
     d = Path(out_dir)
@@ -1368,6 +2419,7 @@ def verify_comparison_output(out_dir: str | Path) -> dict:
     _require_regular(d / _COMPLETE_MARKER, "completion marker")
     _require_regular(d / "manifest.json", "manifest.json")
     _require_regular(d / "comparison.md", "comparison.md")
+    _require_regular(d / "comparison.html", "comparison.html")
     completion = _load_json_object(d / _COMPLETE_MARKER, "completion marker")
     manifest = _load_json_object(d / "manifest.json", "manifest.json")
     if manifest.get("manifest_schema_version") != 3 \
@@ -1396,7 +2448,7 @@ def verify_comparison_output(out_dir: str | Path) -> dict:
         raise ValueError(f"invalid sources in comparison manifest for {d}")
     for position, source in enumerate(sources):
         _verify_comparison_source(source, position, d)
-    _verify_artifacts(d, manifest, ("comparison.md",))
+    _verify_artifacts(d, manifest, ("comparison.md", "comparison.html"))
     return manifest
 
 
@@ -1408,6 +2460,10 @@ def compare_runs(out_dir, input_dirs) -> Path:
         input_dirs, "summary.json", "compare")
     summ = [_verified_comparison_summary(d, manifest)
             for d, manifest in zip(dirs, manifests)]
+    request_evidence = [
+        _verified_comparison_request_evidence(d, manifest)
+        for d, manifest in zip(dirs, manifests)
+    ]
     source_state = snapshot_source_state(Path(__file__).parent)
     source_commit = source_state.get("git_commit")
     source_tree = source_state.get("source_tree_sha256")
@@ -1416,16 +2472,51 @@ def compare_runs(out_dir, input_dirs) -> Path:
         and isinstance(source_commit, str) and bool(source_commit.strip())
         and isinstance(source_tree, str) and bool(_SHA256_RE.fullmatch(source_tree))
     )
-    titles = [_run_title(d, s) for d, s in zip(dirs, summ)]
+    raw_titles = [_run_title(d, s) for d, s in zip(dirs, summ)]
+    titles = [markdown_plain_text(title) or f"run {position + 1}"
+              for position, title in enumerate(raw_titles)]
     n = len(titles)
     hdr = "| metric / quantile | " + " | ".join(titles) + " |"
     sep = "|---" * (n + 1) + "|"
     L = ["# endpoint comparison", "",
          "Runs measured on the same instrument. Read the warnings and the "
          "believability section before trusting the latency tables.", ""]
+    L += ["## source runs", ""]
+    for position, (title, summary, manifest) in enumerate(
+            zip(titles, summ, manifests)):
+        role = "Baseline (first input)" if position == 0 else \
+            f"Candidate {position}"
+        L += [
+            f"### {role}: {title}",
+            "",
+            "- Artifact ID: "
+            + markdown_plain_text(manifest.get("artifact_id")
+                                  or "not recorded"),
+            "- UTC window: "
+            + markdown_plain_text(_comparison_utc_window(manifest)),
+            "- Endpoint identity: "
+            + markdown_plain_text(
+                _comparison_endpoint_value(summary, manifest)),
+            "- Deployment context: "
+            + markdown_plain_text(
+                _comparison_deployment_value(summary, manifest)),
+            "- Workload ID: "
+            + markdown_plain_text(manifest.get("workload_id")
+                                  or "not recorded"),
+            "- Workload digest: "
+            + markdown_plain_text(_comparison_workload_digest(manifest)),
+            "- Sample count: "
+            + markdown_plain_text(_comparison_sample_count(summary)),
+            "",
+        ]
 
     compatibility_issues = _compatibility_issues(
         dirs, summ, manifests, merging=False)
+    for title, summary, journal in zip(raw_titles, summ, request_evidence):
+        compatibility_issues.extend(
+            _comparison_http_429_issues(title, summary, journal))
+        compatibility_issues.extend(
+            _explicit_measurement_issues(title, summary))
     if not generator_source_reconstructible:
         if source_state.get("git_dirty") is not False:
             reason = "dirty or unknown Git state"
@@ -1437,16 +2528,72 @@ def compare_runs(out_dir, input_dirs) -> Path:
             f"the comparison generator has {reason}; the code that rendered "
             "this table is not reconstructible")
     if compatibility_issues:
-        L += ["## INVALID COMPARISON - inputs are not proven like-for-like", "",
+        L += ["## INVALID COMPARISON / INCONCLUSIVE: diagnostic-only", "",
               "The tables below are retained for diagnosis only. Do not quote "
               "a winner or a relative latency until every incompatibility is "
               "resolved and the runs are repeated.", ""]
         for issue in compatibility_issues:
-            L += [f"> INVALID: {issue}", ""]
+            L += [f"> INVALID: {markdown_plain_text(issue)}", ""]
 
     # Everything that can make a side-by-side dishonest goes ABOVE the tables.
     # A reader who stops after the first screen still sees the disqualifiers.
     warns: list[str] = []
+    for title, summary in zip(raw_titles, summ):
+        warns.extend(_explicit_measurement_warnings(title, summary))
+
+    # Arithmetic can still be rendered when provenance is incomplete, but it
+    # must not receive a green comparison state. Unknown endpoint identity or
+    # an absent/partial request journal cannot establish which system was
+    # exercised or that HTTP 429 was absent.
+    missing_endpoint_identity = [
+        title for title, summary, manifest in zip(titles, summ, manifests)
+        if _comparison_endpoint_value(summary, manifest) == "not recorded"
+    ]
+    if missing_endpoint_identity:
+        warns.append(
+            "endpoint identity is not recorded for "
+            f"{', '.join(missing_endpoint_identity)}; endpoint-under-test "
+            "provenance is incomplete, so the columns cannot support a "
+            "relative performance claim")
+
+    no_request_rows = [
+        title for title, journal in zip(titles, request_evidence)
+        if journal["total"] == 0
+    ]
+    if no_request_rows:
+        warns.append(
+            "no manifest-bound request rows are available for "
+            f"{', '.join(no_request_rows)}; absence of HTTP 429 and request "
+            "outcome evidence is not established")
+
+    incomplete_status_evidence = [
+        (title, journal["http_status_observed_for"], journal["total"])
+        for title, journal in zip(titles, request_evidence)
+        if journal["total"] > 0
+        and journal["http_status_observed_for"] != journal["total"]
+    ]
+    if incomplete_status_evidence:
+        detail = ", ".join(
+            f"{title} ({observed}/{total} rows)"
+            for title, observed, total in incomplete_status_evidence)
+        warns.append(
+            "HTTP status is not recorded for every manifest-bound request "
+            f"row: {detail}. Absence of HTTP 429 is not established")
+
+    incomplete_replay_evidence = []
+    for title, summary, journal in zip(titles, summ, request_evidence):
+        expected = _nonnegative_int(summary.get("requests_total"))
+        observed = journal["phase_totals"].get("replay", 0)
+        if expected is not None and observed != expected:
+            incomplete_replay_evidence.append((title, observed, expected))
+    if incomplete_replay_evidence:
+        detail = ", ".join(
+            f"{title} ({observed}/{expected} replay rows)"
+            for title, observed, expected in incomplete_replay_evidence)
+        warns.append(
+            "the manifest-bound request journal does not cover the complete "
+            f"reported replay population: {detail}. Outcome and HTTP 429 "
+            "evidence is incomplete")
 
     # cache parity. one endpoint reporting no cache at all is the common case
     # when putting Databricks next to a provider that does not report cached
@@ -1484,6 +2631,69 @@ def compare_runs(out_dir, input_dirs) -> Path:
             f"{max(have):.3f}, a gap over 0.10. Comparing latency at different "
             "cached-token fractions is not fair. Match them before quoting "
             "numbers.")
+    cache_p95 = [
+        (s.get("achieved_cache_fraction") or {}).get("p95") for s in summ]
+    cache_p95_have = [value for value in cache_p95
+                      if isinstance(value, (int, float))
+                      and not isinstance(value, bool)]
+    if len(cache_p95_have) >= 2 \
+            and max(cache_p95_have) - min(cache_p95_have) > 0.10:
+        warns.append(
+            "cached prompt-token fraction p95 spans "
+            f"{min(cache_p95_have):.3f} to {max(cache_p95_have):.3f}, a gap "
+            "over 0.10. Tail latency is not like-for-like until that cache "
+            "shape is matched.")
+
+    # Identical intended profiles do not guarantee that different endpoint
+    # tokenizers or early-stop behavior produced identical work. Compare the
+    # endpoint-reported achieved/input and output ratios, not only the profile
+    # hash. Missing achieved evidence is itself a qualification.
+    for side, label in (("input", "input-token"), ("output", "output-token")):
+        for quantile in ("p50", "p95"):
+            field = f"{side}_reported_over_intended"
+            values = [
+                ((summary.get("token_targeting") or {}).get(field) or {}).get(
+                    quantile)
+                for summary in summ
+            ]
+            missing_titles = [
+                title for title, value in zip(titles, values)
+                if isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ]
+            have_values = [float(value) for value in values
+                           if isinstance(value, (int, float))
+                           and not isinstance(value, bool)
+                           and math.isfinite(float(value))]
+            if missing_titles:
+                warns.append(
+                    f"achieved {label} shape {quantile} is not reported for "
+                    f"{', '.join(missing_titles)}. Matching intended workload "
+                    "identity alone does not prove equal realized token work.")
+            elif len(have_values) >= 2 \
+                    and max(have_values) - min(have_values) > 0.10:
+                warns.append(
+                    f"achieved {label} reported/intended {quantile} spans "
+                    f"{min(have_values):.3f} to {max(have_values):.3f}, a gap "
+                    "over 0.10. Match realized token shape before quoting "
+                    "relative latency.")
+
+    weak_answer_coverage = []
+    for title, summary in zip(titles, summ):
+        answers = summary.get("answers")
+        answers = answers if isinstance(answers, dict) else {}
+        rate = answers.get("answer_rate")
+        if isinstance(rate, (int, float)) and not isinstance(rate, bool) \
+                and math.isfinite(float(rate)) and float(rate) < 0.99:
+            weak_answer_coverage.append((title, float(rate)))
+    if weak_answer_coverage:
+        detail = ", ".join(
+            f"{title} at {rate:.1%}" for title, rate in weak_answer_coverage)
+        warns.append(
+            f"acceptable-answer coverage is below 99%: {detail}. Latency "
+            "percentiles exclude unacceptable outcomes and are subject to "
+            "survivorship bias.")
 
     # error rates. percentiles over a run that dropped requests carry
     # survivorship bias, and the failures are often the slow ones.
@@ -1502,7 +2712,8 @@ def compare_runs(out_dir, input_dirs) -> Path:
             for t, s in zip(titles, summ)
             if (s.get("sample") or {}).get("warning")]
     if thin:
-        detail = ", ".join(f"{t} ({n} requests)" for t, n in thin)
+        detail = ", ".join(
+            f"{t} ({markdown_plain_text(n)} requests)" for t, n in thin)
         warns.append(
             f"small samples: {detail}. p99 is indicative below 1000 "
             "requests. Run longer before quoting a tail.")
@@ -1512,7 +2723,8 @@ def compare_runs(out_dir, input_dirs) -> Path:
               for t, s in zip(titles, summ)
               if (s.get("drift") or {}).get("drift_flag")]
     if moving:
-        detail = ", ".join(f"{t} ({k})" for t, k in moving)
+        detail = ", ".join(
+            f"{t} ({markdown_plain_text(k)})" for t, k in moving)
         broke = [t for t, k in moving if k == "failing"]
         one = len(broke) == 1
         extra = (f" {', '.join(broke)} {'was' if one else 'were'} shedding "
@@ -1531,16 +2743,32 @@ def compare_runs(out_dir, input_dirs) -> Path:
     unjudged = [t for t, s in zip(titles, summ)
                 if (s.get("drift") or {}).get("drift_kind") is None]
     if unjudged:
-        why = {t: ((s.get("drift") or {}).get("note") or "no stability data")
-               for t, s in zip(titles, summ)
-               if (s.get("drift") or {}).get("drift_kind") is None}
-        detail = " ".join(f"{t}: {w}" for t, w in why.items())
+        why = [
+            (t, markdown_plain_text(
+                (s.get("drift") or {}).get("note") or "no stability data"))
+            for t, s in zip(titles, summ)
+            if (s.get("drift") or {}).get("drift_kind") is None
+        ]
+        detail = " ".join(f"{t}: {w}" for t, w in why)
         warns.append(
             f"stability was never established for {', '.join(unjudged)}, so "
             "these columns were not checked for warmup or degradation. "
             f"Reported reason per run. {detail}")
 
+    comparison_state = (
+        "invalid" if compatibility_issues else
+        "qualified" if warns else "valid")
     if warns:
+        if comparison_state == "qualified":
+            L.extend([
+                "## QUALIFIED COMPARISON: diagnostic-only",
+                "",
+                "Compatibility checks passed, but the measurement warnings "
+                "below block relative performance claims, candidate ranking, "
+                "and directional judgment. Resolve every warning and repeat "
+                "the runs before quoting a winner or latency delta.",
+                "",
+            ])
         L.append("## Read this before the tables")
         L.append("")
         for w in warns:
@@ -1623,6 +2851,11 @@ def compare_runs(out_dir, input_dirs) -> Path:
     try:
         comparison_metadata = _atomic_compare_text(
             dir_fd, "comparison.md", comparison_text)
+        comparison_html = _render_comparison_html(
+            out, dirs, summ, manifests, request_evidence, raw_titles,
+            compatibility_issues, warns, artifact_id)
+        comparison_html_metadata = _atomic_compare_text(
+            dir_fd, "comparison.html", comparison_html)
         manifest = {
             "manifest_schema_version": 3,
             "artifact_type": "comparison",
@@ -1640,10 +2873,17 @@ def compare_runs(out_dir, input_dirs) -> Path:
                 generator_source_reconstructible,
             "input_count": len(sources),
             "sources": sources,
-            "comparison_valid": not compatibility_issues,
+            "comparison_state": comparison_state,
+            "comparison_valid": comparison_state == "valid",
+            "numeric_direction_labels_allowed": comparison_state == "valid",
+            "directional_judgment_allowed": False,
+            "performance_judgment_basis": "not configured; no repeat-run uncertainty or practical-effect threshold",
             "compatibility_issue_count": len(compatibility_issues),
             "warning_count": len(warns),
-            "artifacts": {"comparison.md": comparison_metadata},
+            "artifacts": {
+                "comparison.md": comparison_metadata,
+                "comparison.html": comparison_html_metadata,
+            },
         }
         manifest_text = strict_json_dumps(manifest, indent=2) + "\n"
         manifest_metadata = _atomic_compare_text(

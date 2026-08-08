@@ -8,7 +8,9 @@ and deliberately rejects unknown keys.
 from __future__ import annotations
 
 import math
+from datetime import date
 from typing import Any
+from urllib.parse import urlsplit
 
 
 _QUANTILES = {"p50", "p90", "p95", "p99"}
@@ -18,7 +20,10 @@ def _number(value: Any, where: str, *, positive: bool = False,
             maximum: float | None = None) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{where} must be a number")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{where} must be a finite number") from exc
     if not math.isfinite(number):
         raise ValueError(f"{where} must be finite")
     if positive and number <= 0:
@@ -112,3 +117,94 @@ def validate_pricing(value: Any, where: str = "pricing") -> None:
         if name != "mode":
             _number(amount, f"{where}.{name}",
                     positive=(name == "dbu_per_hour"))
+
+
+def validate_rate_limits(value: Any, where: str = "rate_limits") -> None:
+    """Validate an as-of provider quota snapshot used for run safety.
+
+    Rate limits change independently of the harness.  Requiring both a source
+    and an observation date keeps a sealed run from presenting an unattributed
+    number as a timeless provider fact.
+    """
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} must be an object")
+    allowed = {
+        "input_tokens_per_minute", "output_tokens_per_minute",
+        "queries_per_hour", "warning_utilization", "source", "as_of",
+        "scope", "note", "provider", "deployment_mode", "workspace_tier",
+        "model", "accounting_model", "verified_at", "max_age_days",
+    }
+    _keys(value, allowed, where)
+    limits = {
+        name: value[name]
+        for name in ("input_tokens_per_minute", "output_tokens_per_minute",
+                     "queries_per_hour")
+        if name in value
+    }
+    if not limits:
+        raise ValueError(
+            f"{where} needs input_tokens_per_minute, "
+            "output_tokens_per_minute, or queries_per_hour")
+    for name, limit in limits.items():
+        _number(limit, f"{where}.{name}", positive=True)
+    if "warning_utilization" not in value:
+        raise ValueError(f"{where}.warning_utilization is required")
+    _number(value["warning_utilization"],
+            f"{where}.warning_utilization", positive=True, maximum=1.0)
+    for name in (
+            "source", "as_of", "scope", "provider", "deployment_mode",
+            "workspace_tier", "model", "accounting_model"):
+        if not isinstance(value.get(name), str) or not value[name].strip():
+            raise ValueError(f"{where}.{name} must be a non-empty string")
+    if value["provider"] != "databricks":
+        raise ValueError(
+            f"{where}.provider must be 'databricks'; other accounting "
+            "models are not implemented")
+    if value["deployment_mode"] != "pay_per_token":
+        raise ValueError(
+            f"{where}.deployment_mode must be 'pay_per_token' for token/QPH "
+            "accounting; provisioned endpoints do not use these TPM limits")
+    if value["accounting_model"] != "databricks_fmapi_pay_per_token":
+        raise ValueError(
+            f"{where}.accounting_model must be "
+            "'databricks_fmapi_pay_per_token'")
+    source_url = urlsplit(value["source"])
+    if source_url.scheme != "https" or not source_url.netloc:
+        raise ValueError(f"{where}.source must be an https URL")
+    try:
+        parsed = date.fromisoformat(value["as_of"])
+    except ValueError as exc:
+        raise ValueError(f"{where}.as_of must be YYYY-MM-DD") from exc
+    if parsed.isoformat() != value["as_of"]:
+        raise ValueError(f"{where}.as_of must be YYYY-MM-DD")
+    if parsed > date.today():
+        raise ValueError(f"{where}.as_of cannot be in the future")
+    freshness_fields = {"verified_at", "max_age_days"}.intersection(value)
+    if freshness_fields and freshness_fields != {"verified_at", "max_age_days"}:
+        missing = ({"verified_at", "max_age_days"} - freshness_fields).pop()
+        raise ValueError(
+            f"{where}.{missing} is required when snapshot freshness is set")
+    if freshness_fields:
+        verified_at = value["verified_at"]
+        if not isinstance(verified_at, str):
+            raise ValueError(f"{where}.verified_at must be YYYY-MM-DD")
+        try:
+            verified_date = date.fromisoformat(verified_at)
+        except ValueError as exc:
+            raise ValueError(
+                f"{where}.verified_at must be YYYY-MM-DD") from exc
+        if verified_date.isoformat() != verified_at:
+            raise ValueError(f"{where}.verified_at must be YYYY-MM-DD")
+        if verified_date > date.today():
+            raise ValueError(f"{where}.verified_at cannot be in the future")
+        max_age = value["max_age_days"]
+        if isinstance(max_age, bool) or not isinstance(max_age, int) \
+                or max_age <= 0:
+            raise ValueError(
+                f"{where}.max_age_days must be a positive integer")
+    for name in ("note",):
+        if name in value and (
+                not isinstance(value[name], str) or not value[name].strip()):
+            raise ValueError(f"{where}.{name} must be a non-empty string")

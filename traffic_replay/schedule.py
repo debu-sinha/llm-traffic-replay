@@ -138,10 +138,15 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
                 value = loads_strict(line)
                 if not isinstance(value, dict) or "t" not in value:
                     raise ValueError("JSON row must be an object with a t field")
-                timestamp = float(value["t"])
+                raw_timestamp = value["t"]
+                if isinstance(raw_timestamp, bool) or not isinstance(
+                        raw_timestamp, (int, float)):
+                    raise ValueError("JSON t field must be a number")
+                timestamp = float(raw_timestamp)
             else:
                 timestamp = float(line)
-        except (KeyError, TypeError, ValueError, _json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError,
+                _json.JSONDecodeError) as exc:
             raise ValueError(
                 f"invalid arrival timestamp at {path}:{line_number}: {exc}") \
                 from exc
@@ -159,7 +164,12 @@ def load_trace(path, duration_cap_s: float | None = None) -> dict:
     arr = arr - arr[0]
     if duration_cap_s is not None:
         arr = arr[arr <= duration_cap_s]
-    dur = int(np.ceil(arr[-1])) + 1 if len(arr) else 0
+    # One bucket covers each interval [second, second + 1).  ``ceil(max) + 1``
+    # creates a phantom trailing bucket whenever the last timestamp is not an
+    # integer (for example, a trace ending at 1.2 seconds needs buckets 0 and
+    # 1, not an empty bucket 2).  The integer part plus one is the exact bucket
+    # count for non-negative, zero-based timestamps.
+    dur = int(math.floor(arr[-1])) + 1 if len(arr) else 0
     counts = np.bincount(arr.astype(int), minlength=dur)
     return {"rates": counts.astype(float), "counts": counts,
             "timestamps": arr, "source": str(path)}

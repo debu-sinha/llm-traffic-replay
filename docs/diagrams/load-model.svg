@@ -28,10 +28,11 @@
 
   <rect class="amber" x="725" y="85" width="235" height="145" rx="12"/>
   <text class="t" x="842" y="113" text-anchor="middle">Request construction</text>
-  <text class="s" x="745" y="141">sampled input and output budgets</text>
-  <text class="s" x="745" y="165">shared prefix + unique suffix</text>
-  <text class="s" x="745" y="189">intended cache fraction is token share</text>
-  <text class="s" x="745" y="213">it is not request hit probability</text>
+  <text class="s" x="745" y="137">sampled input/output budgets</text>
+  <text class="s" x="745" y="156">shared prefix + unique suffix</text>
+  <text class="s" x="745" y="175">intended cache fraction</text>
+  <text class="s" x="745" y="194">= prefix / target input tokens</text>
+  <text class="s" x="745" y="213">never a request hit probability</text>
 
   <rect class="gray" x="1015" y="85" width="220" height="145" rx="12"/>
   <text class="t" x="1125" y="113" text-anchor="middle">Request body plan</text>

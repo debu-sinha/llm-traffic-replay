@@ -269,8 +269,8 @@ rows, one calibration row, and one measured replay row, with no probes. The
 default fallback envelope permits at most 12 physical `POST` attempts. The
 illustrative output-budget p50/p95 is 320/480 tokens, which derives a 720-token
 request cap. The command explicitly selects the managed no-reasoning path with
-`{"reasoning_effort":"none"}`. The offline plan reserves a peak 89,202 input
-tokens/minute and 4,464 output tokens/minute. These are conservative planned
+`{"reasoning_effort":"none"}`. The offline plan reserves a peak 89,142 input
+tokens/minute and 4,320 output tokens/minute. These are conservative planned
 admission values, not observed usage, customer demand, performance, or capacity.
 
 ## 5. Handle reasoning controls explicitly

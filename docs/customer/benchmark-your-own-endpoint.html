@@ -348,7 +348,7 @@
 
     <p class="kicker">Stage one, continued</p>
     <h2>Exercise the endpoint contract without making a timing claim.</h2>
-    <p class="lede">This command deterministically plans <strong>two preflight rows + one calibration row + one measured replay row</strong>, with no probes. Its illustrative output-budget p50/p95 is <strong>320/480 tokens</strong>, deriving a <strong>720-token request cap</strong>. The default fallback envelope permits at most <strong>12 physical POST attempts</strong>. With the explicit managed thinking-off control, its offline peak plan is <strong>89,202 input and 4,464 output tokens/minute</strong>. Those are conservative admission reservations, not observed usage. It qualifies mechanics only: <strong>no report-latency, throughput, SLA, or capacity claim.</strong></p>
+    <p class="lede">This command deterministically plans <strong>two preflight rows + one calibration row + one measured replay row</strong>, with no probes. Its illustrative output-budget p50/p95 is <strong>320/480 tokens</strong>, deriving a <strong>720-token request cap</strong>. The default fallback envelope permits at most <strong>12 physical POST attempts</strong>. With the explicit managed thinking-off control, its offline peak plan is <strong>89,142 input and 4,320 output tokens/minute</strong>. Those are conservative admission reservations, not observed usage. It qualifies mechanics only: <strong>no report-latency, throughput, SLA, or capacity claim.</strong></p>
 
     <div class="code-title"><span>GLM 5.2 instrument canary</span><span>Real, billable requests</span></div>
     <pre><span class="cmd">python3</span> -m traffic_replay benchmark \

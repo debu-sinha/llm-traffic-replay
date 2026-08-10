@@ -346,7 +346,7 @@ With the default compatibility/fallback envelope that is at most 12 physical
 `POST` attempts. The illustrative output-budget p50/p95 is 320/480 tokens,
 which derives a 720-token safety cap. It explicitly selects the managed
 thinking-off path with `{"reasoning_effort":"none"}`. Its offline quota plan
-reserves a peak 89,202 input tokens/minute and 4,464 output tokens/minute. Those are
+reserves a peak 89,142 input tokens/minute and 4,320 output tokens/minute. Those are
 conservative planned admission quantities, not observed usage, customer
 demand, performance, or capacity.
 

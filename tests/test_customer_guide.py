@@ -35,8 +35,8 @@ def test_customer_guide_publishes_the_current_safety_contract():
             "sweep.html", "one-sided 95% Wilson lower",
             "two preflight rows + one calibration row + one measured replay row",
             "320/480 tokens", "720-token request cap",
-            "12 physical POST attempts", "89,202 input",
-            "4,464 output tokens/minute", "Read five decisions",
+            "12 physical POST attempts", "89,142 input",
+            "4,320 output tokens/minute", "Read five decisions",
             "exactly five independent decision dimensions",
             "first nonempty bounded response-body chunk",
             "YOUR-FRACTION-STRICTLY-BETWEEN-0-AND-1",
@@ -174,13 +174,13 @@ def test_published_glm_canary_numbers_are_recomputed_from_its_exact_command(
     assert plan["status"] == "within_configured_harness_warning_budget"
     assert plan["planned_physical_attempts_worst_case"] == 12
     assert plan["windows"]["input_tokens_per_minute"][
-        "planned_peak"] == 89_202
+        "planned_peak"] == 89_142
     assert plan["windows"]["input_tokens_per_minute"][
-        "ratio_to_configured_limit"] == pytest.approx(0.44601)
+        "ratio_to_configured_limit"] == pytest.approx(0.44571)
     assert plan["windows"]["output_tokens_per_minute"][
-        "planned_peak"] == 4_464
+        "planned_peak"] == 4_320
     assert plan["windows"]["output_tokens_per_minute"][
-        "ratio_to_configured_limit"] == pytest.approx(0.2232)
+        "ratio_to_configured_limit"] == pytest.approx(0.216)
 
 
 def _fake_git(source: Path, *, dirty: bool):

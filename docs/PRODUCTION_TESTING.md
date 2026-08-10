@@ -368,7 +368,7 @@ configured. The default fallback envelope allows at most 12 physical `POST`
 attempts. Its illustrative output-budget p50/p95 is 320/480 tokens, which
 derives a 720-token request cap. It explicitly selects the managed no-reasoning
 path with `{"reasoning_effort":"none"}`. The offline gate reserves a peak
-89,202 input tokens/minute and 4,464 output tokens/minute. These are
+89,142 input tokens/minute and 4,320 output tokens/minute. These are
 conservative planned admission values, not observed usage, customer demand, or
 a performance/capacity result.
 

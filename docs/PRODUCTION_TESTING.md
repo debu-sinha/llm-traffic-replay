@@ -36,6 +36,7 @@ creating a provisioned endpoint or making a provisioned-capacity claim.
 ```bash
 python3 -m pytest
 python3 -m traffic_replay validate --port 0 --format json
+python3 -m traffic_replay adapters --format json
 ```
 
 The test suite is the implementation regression gate. `validate` checks this
@@ -52,10 +53,12 @@ Keep the sizing hint small and retain the default preflight:
 python3 -m traffic_replay benchmark \
   --host https://YOUR-WORKSPACE-HOST \
   --endpoint YOUR-ENDPOINT-NAME \
+  --endpoint-adapter openai.chat_completions.sse/v1 \
   --auth-profile YOUR-DATABRICKS-PROFILE \
   --profile configs/profile_validation_small.json \
   --sizing-concurrency 2 \
   --duration 60 \
+  --calibrate-requests 0 \
   --ttft-definition first_visible \
   --out-dir results/protocol-smoke \
   --fail-on none
@@ -73,13 +76,21 @@ This sends real inference traffic. Review:
 - response-model identity is consistent and bound where reported;
 - the recorded fresh-HTTP/1.1-per-attempt transport is either the real
   application's exact connection behavior or explicitly treated as a
-  diagnostic mismatch; do not use a transport-qualified run for capacity;
+  diagnostic mismatch; do not use a transport-mismatched or unqualified run
+  for capacity;
 - endpoint metadata was captured both before runner-owned sizing, calibration,
   and replay traffic and after response drain, or its incomplete coverage is
   explained;
 - no secret or response body content appears in artifacts.
 
 This stage validates mechanics only. Its latency is not a capacity result.
+`--calibrate-requests 0` keeps this protocol smoke from adding the high-level
+command's default pre-replay calibration population. It does not clear or
+prove cold endpoint, cache, worker, or autoscaling state. For a later synthetic
+workload-fidelity run, choose an authorized count explicitly; clean usage can
+recalibrate characters/token, and every positive count is real, potentially
+billable warm-up traffic. Prompt replay is never retokenized but would still
+send those configured calibration rows.
 
 The harness does not pool connections and does not use HTTP/2. Production
 capacity therefore remains inconclusive by default even when protocol and SLA
@@ -150,8 +161,11 @@ basis.
 All final-attempt latency clocks begin immediately before `conn.request` on an
 already-established connection and therefore include request upload. TTFB is
 the first nonempty bounded response-body chunk returned by the client read,
-not the first socket byte or first parsed SSE line. Tool-call fragments do not
-trigger TTFT; first-visible and first-tool-call timings remain separate.
+not the first socket byte or first parsed SSE line. `ttse_ms` is the later
+first complete framed event emitted by the selected adapter parser. It can be
+usage-only, terminal, or a content-free parse diagnostic and must not be
+called a token or content latency. Tool-call fragments do not trigger TTFT;
+first-visible and first-tool-call timings remain separate.
 
 `interchunk_max_ms` is the widest elapsed gap between successive SSE events
 with a nonempty visible, reasoning, or refusal delta. It is not token-level
@@ -171,16 +185,18 @@ request per supplied candidate after an unreadable answer. Use it only for
 model-documented candidates in an authorized probe. Metadata-only result rows
 for those calls are first fsynced and sealed in the setup-traffic artifact and,
 after a pass, are also included once in the measured run's quota evidence
-without request or response content. Retain stdout and stderr too for the
-human-readable decision. A candidate is not copied into the measured config;
-rerun with the selected object as `--extra-body`.
+without request or response content. The sealed gate and report retain
+credential-free canonical candidate JSON and digest, disposition/evidence
+method, explicitly limited effective-behavior status, request ID, logical
+request-body hash, and physical-attempt hashes linked to `requests.jsonl`.
+Retain stdout and stderr as supplemental operator context. A candidate is not
+copied into the measured config; rerun with the selected object as
+`--extra-body`. Acceptance never proves that the provider applied a control.
 
-The measured `extra_body` is persisted as reproducibility evidence, while
-probe candidates and outcomes are reported in preflight text with displayed
-values and errors credential-redacted. Secret-like keys and credential-shaped
-values are rejected recursively before config output or traffic. Command
-arguments can still be visible locally. Keep authentication in the endpoint
-profile or token environment variable.
+The measured `extra_body` is persisted as reproducibility evidence.
+Secret-like keys and credential-shaped values are rejected recursively before
+config output or traffic. Command arguments can still be visible locally.
+Keep authentication in the endpoint profile or token environment variable.
 
 A larger output budget can reveal whether the model eventually produces a
 visible answer, but it changes work and cost. It is diagnosis, not a neutral
@@ -257,6 +273,7 @@ enforce the applicable limits outside this tool:
 python3 -m traffic_replay sweep \
   --host https://YOUR-WORKSPACE-HOST \
   --endpoint YOUR-ENDPOINT-NAME \
+  --endpoint-adapter openai.chat_completions.sse/v1 \
   --auth-profile YOUR-DATABRICKS-PROFILE \
   --profile configs/profile_measured.json \
   --rate 1,2,4,8 \
@@ -351,11 +368,11 @@ configured. The default fallback envelope allows at most 12 physical `POST`
 attempts. Its illustrative output-budget p50/p95 is 320/480 tokens, which
 derives a 720-token request cap. It explicitly selects the managed no-reasoning
 path with `{"reasoning_effort":"none"}`. The offline gate reserves a peak
-89,202 input tokens/minute and 4,464 output tokens/minute. These are
+89,142 input tokens/minute and 4,320 output tokens/minute. These are
 conservative planned admission values, not observed usage, customer demand, or
 a performance/capacity result.
 
-For managed Databricks GLM 5.2, direct service-owner confirmation establishes
+For managed Databricks GLM 5.2, serving-engineering-confirmed evidence establishes
 that top-level `{"reasoning_effort":"none"}` disables reasoning and omission
 selects maximum reasoning. That behavior is confirmed for both Unity AI
 Gateway model service `system.ai.glm-5-2` and the direct managed endpoint. The
@@ -363,18 +380,23 @@ current public Databricks
 [reasoning-model guide](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models)
 still classifies `databricks-glm-5-2` as reasoning-only and names
 `reasoning_effort` without enumerating accepted GLM-specific values. Treat the
-off value as owner-confirmed managed behavior, not as a value independently
+off value as serving-engineering-confirmed managed behavior, not as a value independently
 enumerated by that guide. Preserve it in `extra_body`, inspect reasoning and
 visible-answer evidence, and repeat preflight; HTTP acceptance alone does not
 prove that a behavioral control was applied.
+
+The high-level CLI sends numeric `temperature: 0.0` by default. A route that
+requires absence must use `--omit-temperature`; omission and zero are distinct
+request contracts and must not be pooled or compared as identical.
 
 Databricks documents the Unity AI Gateway
 [model-service query API](https://docs.databricks.com/aws/en/ai-gateway/query-model-services)
 and its
 [destination routing and fallback model](https://docs.databricks.com/aws/en/ai-gateway/model-services).
-The harness can POST the Gateway protocol, but this release production-
-qualifies only the exact direct `/serving-endpoints/.../invocations` route.
-Gateway is protocol-diagnostic only: requested FQN-to-destination identity,
+The harness can serialize the same Chat/SSE protocol to the Gateway route, but
+the retained live conformance evidence covers only an exact direct
+`/serving-endpoints/.../invocations` route. Gateway is protocol-diagnostic
+only: requested FQN-to-destination identity,
 routing/fallback pre/post state, and the intersection of Gateway plus
 downstream quotas are not bound. Such a run supports no tool quota or capacity
 conclusion, and the shipped GLM quota snapshot refuses that route.
@@ -552,13 +574,16 @@ run-local baseline/final snapshots, and physical-attempt counts. Inconsistent
 guard evidence makes quota unknown and measurement invalid.
 
 Review response and control-plane identity before latency. Multiple response
-models, or a response model that disagrees with an explicit request-body model,
-invalidates a single-model benchmark. The endpoint name is not an expected
-OpenAI response-model value for a custom/PT route. Bind each Databricks
-`served-model-name` response header to an active served entity captured from
-the control plane; an unexpected entity invalidates the result and incomplete
-binding is a caution. Response IDs are hashed; response objects and system
-fingerprints are bounded context. With endpoint capture enabled, compare
+models invalidate a single-model benchmark. One stable response-model name
+that differs from an explicit request-body model produces an
+unverified-identity caution; alias or revision naming can differ, so the
+string mismatch alone is not proof that another model served the request. The
+endpoint name is not an expected OpenAI response-model value for a custom/PT
+route. Bind each Databricks `served-model-name` response header to an active
+served entity captured from the control plane; an unexpected entity or route
+contradiction invalidates the result and incomplete binding is a caution.
+Response IDs are hashed; response objects and system fingerprints are bounded
+context. With endpoint capture enabled, compare
 the normalized metadata summary captured before runner-owned sizing,
 calibration, and replay traffic to the summary captured only after every
 response drains. A change invalidates the single-configuration result; missing

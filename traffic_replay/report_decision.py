@@ -376,13 +376,21 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
     run = summary.get("run")
     run = run if isinstance(run, Mapping) else {}
     preflight_gate = run.get("preflight_gate")
-    if isinstance(preflight_gate, Mapping) \
-            and preflight_gate.get("outcome") == \
-            "preflight_forced_unreadable":
+    preflight_outcome = (
+        preflight_gate.get("outcome")
+        if isinstance(preflight_gate, Mapping) else None)
+    if preflight_outcome == "preflight_forced_unreadable":
         invalid_codes.append("FORCED_UNREADABLE_PREFLIGHT")
         invalid_reasons.append(
             "measured load was explicitly forced after the representative "
             "preflight produced an incomplete answer")
+    elif preflight_gate is not None and (
+            not isinstance(preflight_gate, Mapping)
+            or preflight_outcome not in {"preflight_passed", "skipped"}):
+        invalid_codes.append("PREFLIGHT_GATE_NOT_SATISFIED")
+        invalid_reasons.append(
+            "the recorded representative preflight state did not establish "
+            "a valid load gate")
     if run.get("endpoint_metadata_stability") == "changed":
         invalid_codes.append("ENDPOINT_METADATA_CHANGED_DURING_RUN")
         invalid_reasons.append(
@@ -426,6 +434,16 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
             reason_details=list(zip(invalid_codes, invalid_reasons)))
 
     cautions: list[tuple[str, str]] = []
+    if preflight_gate is None:
+        cautions.append((
+            "PREFLIGHT_NOT_ESTABLISHED",
+            "no representative capability preflight is bound to this run; "
+            "treat the measurements as exploratory"))
+    elif preflight_outcome == "skipped":
+        cautions.append((
+            "PREFLIGHT_SKIPPED",
+            "the representative capability preflight was explicitly "
+            "skipped; treat the measurements as exploratory"))
     quota_rows = quota_facts["request_rows_examined"]
     quota_observed = quota_facts["http_status_observed_for"]
     if quota_rows is None:
@@ -454,6 +472,7 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
         ("PRICING_APPLICABILITY_UNVERIFIED",
          ("cost", "applicability_warning")),
         ("CACHE_FIDELITY_UNVERIFIED", ("cache_fidelity", "warning")),
+        ("CALIBRATION_WARM_STATE", ("calibration_warmth", "warning")),
         ("TOKEN_FIDELITY_UNVERIFIED", ("token_targeting", "warning")),
         ("LOAD_DELIVERY_UNVERIFIED", ("client", "warning")),
         ("CONCURRENCY_FIDELITY_UNVERIFIED", ("concurrency", "warning")),

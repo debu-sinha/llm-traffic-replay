@@ -42,6 +42,16 @@ def _summary(*, with_sla: bool = True) -> dict:
         },
         "run": {
             "aggregation_valid": True,
+            "preflight_gate": {
+                "skipped": False,
+                "attempted": 2,
+                "reachable": 2,
+                "readable": 2,
+                "reasoning_probe_requests": 0,
+                "outcome": "preflight_passed",
+                "force_requested": False,
+                "gate_satisfied": True,
+            },
             "transport": {
                 "connection_policy_id":
                     "fresh_http1_per_physical_attempt",
@@ -122,6 +132,40 @@ def test_clean_verified_run_keeps_all_five_decisions_separate():
         decision["quota_state"]["reason"]
     assert "not an endpoint ceiling" in \
         decision["endpoint_capacity"]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("gate", "reason_code"),
+    [
+        (None, "PREFLIGHT_NOT_ESTABLISHED"),
+        ({
+            "skipped": True,
+            "attempted": 0,
+            "reachable": 0,
+            "readable": 0,
+            "reasoning_probe_requests": 0,
+            "outcome": "skipped",
+            "force_requested": False,
+            "gate_satisfied": False,
+        }, "PREFLIGHT_SKIPPED"),
+    ],
+)
+def test_missing_or_skipped_preflight_is_exploratory_and_blocks_capacity(
+        gate, reason_code):
+    summary = _summary()
+    if gate is None:
+        summary["run"].pop("preflight_gate")
+    else:
+        summary["run"]["preflight_gate"] = gate
+
+    decision = build_report_decision(summary, VERIFIED)
+
+    assert decision["measurement_validity"]["code"] == "CAUTION"
+    assert reason_code in decision["measurement_validity"]["reason_codes"]
+    assert "exploratory" in decision["measurement_validity"]["reason"]
+    assert decision["endpoint_capacity"]["code"] == "INCONCLUSIVE"
+    assert "MEASUREMENT_NOT_VALID" in \
+        decision["endpoint_capacity"]["reason_codes"]
 
 
 @pytest.mark.parametrize("transport,reason_code", [
@@ -233,6 +277,7 @@ def test_cli_exit_and_sweep_rung_follow_canonical_measurement_invalidity(
 
 @pytest.mark.parametrize("caution,reason_code", [
     ("response_identity", "RESPONSE_MODEL_IDENTITY_UNVERIFIED"),
+    ("calibration", "CALIBRATION_WARM_STATE"),
     ("endpoint_stability", "ENDPOINT_METADATA_STABILITY_UNVERIFIED"),
 ])
 def test_cli_and_sweep_never_promote_canonical_measurement_caution_to_pass(
@@ -247,6 +292,14 @@ def test_cli_and_sweep_never_promote_canonical_measurement_caution_to_pass(
         summary["response_identity"] = {
             "status": "caution",
             "warning": "response model identity was not reported",
+        }
+    elif caution == "calibration":
+        summary["calibration_warmth"] = {
+            "status": "caution",
+            "calibration_requests": 2,
+            "warning": (
+                "calibration traffic ran before replay, so cold-cache "
+                "performance is not established"),
         }
     else:
         summary["run"]["endpoint_metadata_stability"] = "unverified"

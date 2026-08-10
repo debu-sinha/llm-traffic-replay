@@ -17,6 +17,17 @@ def _svg_text(name: str) -> str:
     path = DIAGRAMS / name
     root = ET.fromstring(path.read_text(encoding="utf-8"))
     assert root.tag.endswith("svg")
+    assert root.attrib.get("role") == "img"
+    labelled_by = root.attrib.get("aria-labelledby", "").split()
+    assert labelled_by == ["title", "desc"]
+    labelled = {
+        child.attrib.get("id"): " ".join(
+            value.strip() for value in child.itertext() if value.strip())
+        for child in root
+        if child.attrib.get("id") in labelled_by
+    }
+    assert set(labelled) == set(labelled_by)
+    assert all(labelled.values())
     return " ".join(value.strip() for value in root.itertext()
                     if value.strip())
 
@@ -25,11 +36,11 @@ def test_architecture_diagram_has_the_complete_evidence_lifecycle():
     text = _svg_text("architecture.svg")
     for required in (
             "Setup evidence claimed first", "Billable preflight",
-            "Runtime-admitted POST attempts",
-            "reserve immediately before conn.request",
-            "local denial sends no physical POST",
-            "fresh HTTP/1.1 connection each attempt",
-            "model/entity identity kept", "Post-drain endpoint snapshot",
+            "Versioned endpoint adapter", "exact request serialization",
+            "declared media + framing", "canonical event fold",
+            "outcome + normalized usage", "Fresh HTTP/1.1",
+            "transport boundary", "after connect; before POST",
+            "denial sends no POST", "Post-drain endpoint snapshot",
             "normalized-subset change invalidates claim",
             "five decisions + evidence gates",
             ".traffic-replay-complete promoted last"):
@@ -40,12 +51,17 @@ def test_architecture_diagram_has_the_complete_evidence_lifecycle():
 def test_load_model_separates_offered_load_from_runtime_admission():
     text = _svg_text("load-model.svg")
     for required in (
-            "Open-loop dispatch", "fresh HTTP/1.1 POST admission",
-            "one no-wait guard spans the command",
-            "reserve QPS/QPH, TPM, exact bytes",
-            "local denial sends no POST",
+            "Versioned endpoint adapter boundary",
+            "serialize the exact request bytes",
+            "declare request media, accepted response media",
+            "fold provider events into canonical content-free state",
+            "normalize usage and classify terminal/output outcome",
+            "Open-loop dispatch", "Fresh HTTP/1.1",
+            "transport boundary", "connect before admission",
+            "Runtime admission", "immediately before POST",
+            "denial sends no POST",
             "response identity", "runtime admission",
-            "identity / stability / admission evidence gates"):
+            "runtime-admission evidence gates"):
         assert required in text
     assert "quota or errors can shed work" not in text
 
@@ -57,14 +73,31 @@ def test_request_sequence_puts_admission_before_every_request_call():
     assert admission < request_call
     for required in (
             "denial → terminal row, no conn.request",
-            "Fresh HTTP/1.1", "new connection per physical attempt",
-            "every repeated POST requires a new reservation",
-            "reasoning/visible/refusal/tool/usage events",
+            "Versioned endpoint adapter",
+            "exact request bytes + declared media/framing contract",
+            "Fresh HTTP/1.1 transport",
+            "new connection per physical attempt",
+            "every repeated POST needs a new reservation",
+            "folds provider events → canonical content-free state",
+            "normalize usage", "classify outcome",
             "response identity", "settle admission event",
             "first_content = reasoning/visible/refusal onset",
-            "TTFB = first nonempty bounded body chunk"):
+            "TTFB = first bounded body chunk",
+            "TTSE = first adapter-framed event",
+            "neither is a token"):
         assert required in text
     assert "network distance" not in text.lower()
+
+
+def test_diagrams_keep_failures_in_reliability_and_occupancy_only():
+    for name in (
+            "architecture.svg", "load-model.svg", "request-sequence.svg"):
+        text = _svg_text(name).casefold()
+        assert "reliability" in text, name
+        assert "occupancy" in text, name
+        assert "latency needs acceptable outcomes" in text, name
+        assert "tokens need trustworthy usage" in text, name
+        assert "failed streams excluded from metrics" not in text, name
 
 
 def test_excalidraw_source_matches_the_current_runtime_contract():
@@ -79,11 +112,16 @@ def test_excalidraw_source_matches_the_current_runtime_contract():
     text = "\n".join(element["text"] for element in text_elements)
     for required in (
             "claim sibling setup artifact before default two-request preflight",
+            "versioned endpoint adapter: exact request serialization",
+            "declared media/framing",
+            "canonical event fold + normalized usage/outcome",
+            "separate built-in transport opens a fresh HTTP/1.1 connection",
             "immediately before every physical POST",
-            "local no-wait guard reserves QPS/QPH",
-            "fresh HTTP/1.1 connection per physical attempt",
+            "command-local guard reserves QPS/QPH",
             "response model/fingerprint",
             "first_content includes reasoning, visible, or refusal onset",
+            "failed/partial attempts remain in reliability and occupancy",
+            "latency needs acceptable outcomes; tokens need trustworthy usage",
             "capture the normalized endpoint-metadata subset again",
             "exactly five decisions",
             "identity/stability/runtime-admission are evidence gates"):
@@ -151,7 +189,7 @@ def test_glm_reasoning_controls_keep_managed_and_sglang_contracts_separate():
     ]
     for path in documents:
         body = path.read_text(encoding="utf-8")
-        assert "owner-confirmed" in body.casefold(), path
+        assert "serving-engineering-confirmed" in body.casefold(), path
         assert '{"reasoning_effort":"none"}' in body, path
         assert '"chat_template_kwargs":{"enable_thinking":false}' in body, path
         assert "maximum reasoning" in body, path
@@ -173,5 +211,6 @@ def test_glm_reasoning_controls_keep_managed_and_sglang_contracts_separate():
 
     for command in ("benchmark", "sweep"):
         help_text = " ".join(_command_help(command).split())
-        assert '{"reasoning_effort":"none"}' in help_text
-        assert '"chat_template_kwargs":{"enable_thinking":false}' in help_text
+        assert "--endpoint-adapter" in help_text
+        assert "versioned request/response wire contract" in help_text
+        assert "model behavior is never inferred from its name" in help_text

@@ -47,7 +47,7 @@ from .schedule import MAX_EXACT_ANALYSIS_REQUEST_ROWS
 
 _WRITING_MARKER = ".traffic-replay-writing"
 _COMPLETE_MARKER = ".traffic-replay-complete"
-_SWEEP_DECISION_SCHEMA_VERSION = 6
+_SWEEP_DECISION_SCHEMA_VERSION = 7
 _SWEEP_RENDERER_SCHEMA_VERSION = 6
 
 
@@ -550,6 +550,9 @@ def sweep_outcome(rungs: list[dict], preflight: dict | None = None) -> dict:
     quota_limited = [r for r in rungs
                      if _rung_state(r) == "QUOTA_LIMITED"]
     invalid_reasons = []
+    exploratory_reasons = []
+    preflight_outcome = None
+    preflight_established = False
     if preflight is not None:
         if not isinstance(preflight, dict):
             raise ValueError("invalid sweep preflight outcome evidence")
@@ -559,16 +562,45 @@ def sweep_outcome(rungs: list[dict], preflight: dict | None = None) -> dict:
                 "preflight_forced_unreadable", "preflight_forced_failed",
                 "preflight_state_unknown"}:
             raise ValueError("invalid sweep preflight outcome")
+        attempted = preflight.get("attempted")
+        reachable = preflight.get("reachable")
+        readable = preflight.get("readable")
+        counts_are_ints = all(
+            isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0
+            for value in (attempted, reachable, readable))
         if preflight_outcome == "preflight_forced_unreadable":
             invalid_reasons.append(
                 "measured load was explicitly forced after an unreadable "
                 "representative preflight")
+        elif preflight_outcome == "preflight_passed":
+            if not counts_are_ints or attempted <= 0 \
+                    or reachable != attempted or readable != attempted \
+                    or preflight.get("skipped") is not False \
+                    or preflight.get("gate_satisfied") is not True:
+                raise ValueError(
+                    "passed sweep preflight outcome disagrees with counts")
+            preflight_established = True
+        elif preflight_outcome == "skipped":
+            if not counts_are_ints or any(
+                    value != 0 for value in
+                    (attempted, reachable, readable)) \
+                    or preflight.get("skipped") is not True \
+                    or preflight.get("gate_satisfied") is not False:
+                raise ValueError(
+                    "skipped sweep preflight outcome disagrees with counts")
+            exploratory_reasons.append(
+                "the representative capability preflight was explicitly "
+                "skipped")
         elif preflight_outcome in {
                 "preflight_forced_failed", "preflight_refused",
                 "preflight_state_unknown"}:
             invalid_reasons.append(
                 "the representative preflight did not establish a valid "
                 f"load gate ({preflight_outcome})")
+    else:
+        exploratory_reasons.append(
+            "no representative capability preflight was supplied")
     if unverified:
         invalid_reasons.append("one or more rung attempts produced no verified report")
     invalid_reports = [
@@ -613,7 +645,8 @@ def sweep_outcome(rungs: list[dict], preflight: dict | None = None) -> dict:
             f"{'s have' if unknown_attempt_rows != 1 else ' has'} unknown "
             "provider-attempt timing or count")
     invalid = bool(invalid_reasons)
-    highest_sla_passing = (None if invalid or non_monotonic or not good
+    highest_sla_passing = (None if invalid or not preflight_established
+                           or non_monotonic or not good
                            else good[-1]["rate"])
     def achieved_rate(rung):
         value = rung.get("achieved_rps")
@@ -640,6 +673,8 @@ def sweep_outcome(rungs: list[dict], preflight: dict | None = None) -> dict:
         capacity_conclusion = "NO_CRITERION_DIAGNOSTIC_ONLY"
     elif non_monotonic:
         capacity_conclusion = "NON_MONOTONIC_NO_BOUNDARY"
+    elif not preflight_established:
+        capacity_conclusion = "PREFLIGHT_NOT_ESTABLISHED_EXPLORATORY"
     elif not good:
         capacity_conclusion = (
             "INSUFFICIENT_EVIDENCE" if insufficient else
@@ -653,11 +688,16 @@ def sweep_outcome(rungs: list[dict], preflight: dict | None = None) -> dict:
     return {
         "invalid": invalid,
         "invalid_reasons": invalid_reasons,
+        "exploratory_reasons": exploratory_reasons,
+        "preflight_outcome": preflight_outcome,
+        "preflight_established": preflight_established,
         "unverified": unverified,
         "invalid_reports": invalid_reports,
         "non_monotonic": non_monotonic,
-        "boundary_status": ("NON_MONOTONIC" if non_monotonic else
-                            "MONOTONIC"),
+        "boundary_status": (
+            "NON_MONOTONIC" if non_monotonic else
+            "PREFLIGHT_NOT_ESTABLISHED" if not preflight_established else
+            "MONOTONIC"),
         "calibration_rows": calibration_rows,
         "sizing_rows": sizing_rows,
         "other_rows": other_rows,
@@ -673,12 +713,12 @@ def sweep_outcome(rungs: list[dict], preflight: dict | None = None) -> dict:
             highest_achieved,
         "requested_rate_at_highest_achieved_sla_passing_rung":
             requested_at_highest_achieved,
-        # Backward-compatible field name with corrected schema-v5 semantics:
-        # a held/delivered claim is the achieved average, never the requested
-        # open-loop rung label.
+        # Backward-compatible field name: a held/delivered claim is the
+        # achieved average, never the requested open-loop rung label.
         "highest_held_rate": highest_achieved,
         "capacity_conclusion": capacity_conclusion,
         "exit_code": 2 if invalid else 1 if quota_limited or non_monotonic \
+            or not preflight_established \
             else 0 if good or no_criterion else 1,
     }
 
@@ -1048,6 +1088,12 @@ def render_sweep_report(rungs: list[dict], report_context: dict) -> str:
             "NON-MONOTONIC SLA OUTCOME: a higher rung passed after a lower "
             "rung failed. The artifact is valid, but no capacity boundary "
             "can be inferred; repeat the ladder.")
+    elif not outcome["preflight_established"]:
+        detail = "; ".join(outcome["exploratory_reasons"])
+        head = (
+            f"EXPLORATORY SWEEP: {detail}. Rung measurements remain "
+            "diagnostic observations; no highest-held rate or endpoint-"
+            "capacity conclusion is allowed.")
     elif good:
         best = max(
             (rung for rung in good
@@ -1262,6 +1308,8 @@ def render_sweep_html(rungs: list[dict], report_context: dict,
         status_label, status_class = "DIAGNOSTIC ONLY", "review"
     elif outcome["non_monotonic"]:
         status_label, status_class = "NON-MONOTONIC", "review"
+    elif not outcome["preflight_established"]:
+        status_label, status_class = "EXPLORATORY - NO PREFLIGHT", "review"
     elif outcome["good"]:
         status_label, status_class = "TESTED RATE HELD", "pass"
     elif outcome["insufficient"] and transport_unmatched:

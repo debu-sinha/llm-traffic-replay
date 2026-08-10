@@ -673,9 +673,9 @@ def test_reasoning_probe_quota_uses_deep_merged_candidate_body(tmp_path):
     probe = {
         "thinking": {
             "type": "disabled",
-            "evidence": "probe-control-" + "x" * 20_000,
+            "evidence": "probe-control-" + "x" * 3_000,
         },
-        "tools": [{"description": "tool-schema-" + "y" * 20_000}],
+        "tools": [{"description": "tool-schema-" + "y" * 3_000}],
     }
     setup = _quota_setup_plans(
         dict(rc.__dict__),

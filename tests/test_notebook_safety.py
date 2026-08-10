@@ -180,18 +180,17 @@ def test_exact_notebook_canary_has_one_replay_and_passes_offline_quota_plan(
     assert plan["logical_replay_requests"] == 1
     assert plan["planned_physical_attempts_worst_case"] == 12
     assert rc.endpoint["extra_body"] == {"reasoning_effort": "none"}
-    assert plan["windows"]["input_tokens_per_minute"]["planned_peak"] == 89202
+    assert plan["windows"]["input_tokens_per_minute"]["planned_peak"] == 89142
     assert plan["windows"]["input_tokens_per_minute"][
-        "ratio_to_configured_limit"] == pytest.approx(0.44601)
-    assert plan["windows"]["output_tokens_per_minute"]["planned_peak"] == 4464
+        "ratio_to_configured_limit"] == pytest.approx(0.44571)
+    assert plan["windows"]["output_tokens_per_minute"]["planned_peak"] == 4320
     assert plan["windows"]["output_tokens_per_minute"][
-        "ratio_to_configured_limit"] == pytest.approx(0.2232)
+        "ratio_to_configured_limit"] == pytest.approx(0.216)
     assert profile.input_tokens == {"p50": 1000.0, "p95": 2000.0}
     assert profile.output_tokens == {"p50": 320.0, "p95": 480.0}
     assert "workload shape only" in profile.provenance
-    assert "reasoning_effort=none" in profile.provenance
-    assert "same field is confirmed for AI Gateway" in profile.provenance
-    assert "does not establish Gateway control-plane" in profile.provenance
+    assert "reasoning controls" in profile.provenance
+    assert "belong to the run configuration" in profile.provenance
     assert rc.max_output_tokens_cap == 720
     for disclosed in (
             "input p50/p95 of 1,000/2,000 tokens",
@@ -201,9 +200,9 @@ def test_exact_notebook_canary_has_one_replay_and_passes_offline_quota_plan(
             'default direct-endpoint `extra_body_json` of '
             '`{"reasoning_effort":"none"}`',
             "changing that control is replanned",
-            "89,202 input tokens/minute",
-            "4,464 output tokens/minute",
-            "44.601% and 22.32%",
+            "89,142 input tokens/minute",
+            "4,320 output tokens/minute",
+            "44.571% and 21.6%",
             "same field is confirmed for AI Gateway",
             "intentionally targets the direct "
             "`/serving-endpoints/.../invocations` path",

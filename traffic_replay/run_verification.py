@@ -142,6 +142,8 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
     preflight_rows_judged = 0
     preflight_acceptable_outcomes = 0
     preflight_http_200 = 0
+    reasoning_control_probes: list[dict | None] = []
+    setup_request_links: list[dict] = []
     replay_identity_rows: list[tuple[int, float, str]] = []
     replay_request_ids: set[str] = set()
     try:
@@ -189,6 +191,45 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
                         f"requests.jsonl line {line_number} has no valid "
                         f"phase in {d}")
                 phases[phase] = phases.get(phase, 0) + 1
+                if phase in {"preflight", "probe"}:
+                    from .runner import _prepare_prior_request_rows
+                    try:
+                        prepared_setup = _prepare_prior_request_rows([row])[0]
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise ValueError(
+                            f"requests.jsonl line {line_number} has invalid "
+                            f"setup request binding in {d}: {exc}") from exc
+                    if prepared_setup != row:
+                        raise ValueError(
+                            f"requests.jsonl line {line_number} setup "
+                            f"request evidence is not canonical in {d}")
+                    setup_request_links.append({
+                        "phase": phase,
+                        "trace_request_id": row.get("request_id"),
+                        "setup_request_binding_sha256": row.get(
+                            "setup_request_binding_sha256"),
+                        "logical_request_body_sha256": row.get(
+                            "request_body_sha256"),
+                        "physical_request_body_sha256s": list(
+                            row.get("physical_request_body_sha256s") or []),
+                    })
+                envelope_present = "reasoning_control_probe" in row
+                if phase == "probe":
+                    envelope = row.get("reasoning_control_probe")
+                    if envelope_present:
+                        # Validate the versioned schema and request/logical/
+                        # physical body links before trusting the gate copy.
+                        from .runner import \
+                            _validated_reasoning_control_probe_evidence
+                        envelope = _validated_reasoning_control_probe_evidence(
+                            envelope, row=row,
+                            label=("requests.jsonl line "
+                                   f"{line_number}.reasoning_control_probe"))
+                    reasoning_control_probes.append(envelope)
+                elif envelope_present:
+                    raise ValueError(
+                        f"requests.jsonl line {line_number} carries probe "
+                        f"evidence outside a probe row in {d}")
                 status = row.get("status")
                 if status is not None and (
                         isinstance(status, bool)
@@ -202,6 +243,72 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
                 if status == 429:
                     http_429 += 1
                     http_429_phases[phase] = http_429_phases.get(phase, 0) + 1
+                # v0.7 timing schema: TTSE is the first complete framed event
+                # emitted by the selected adapter parser.  It must not precede
+                # the raw response-body clock, and content milestones must not
+                # precede it.  Older sealed artifacts omit TTSE and remain
+                # verifiable under their legacy schema.
+                for timing_field in ("ttse_ms", "caller_ttse_ms"):
+                    timing_value = row.get(timing_field)
+                    if timing_value is not None and (
+                            isinstance(timing_value, bool)
+                            or not isinstance(timing_value, (int, float))
+                            or not math.isfinite(float(timing_value))
+                            or float(timing_value) < 0):
+                        raise ValueError(
+                            f"requests.jsonl line {line_number} has invalid "
+                            f"{timing_field} in {d}")
+                if row.get("ttse_ms") is not None:
+                    ttse_value = float(row["ttse_ms"])
+                    ttfb = row.get("ttfb_ms")
+                    if ttfb is None or isinstance(ttfb, bool) \
+                            or not isinstance(ttfb, (int, float)) \
+                            or not math.isfinite(float(ttfb)) \
+                            or float(ttfb) < 0 \
+                            or ttse_value < float(ttfb):
+                        raise ValueError(
+                            f"requests.jsonl line {line_number} has TTSE "
+                            f"before or without a valid TTFB in {d}")
+                    for milestone_field in (
+                            "ttft_ms", "ttfr_ms", "ttfv_ms",
+                            "ttf_tool_call_ms"):
+                        milestone = row.get(milestone_field)
+                        if milestone is not None and (
+                                isinstance(milestone, bool)
+                                or not isinstance(milestone, (int, float))
+                                or not math.isfinite(float(milestone))
+                                or float(milestone) < ttse_value):
+                            raise ValueError(
+                                f"requests.jsonl line {line_number} has "
+                                f"{milestone_field} before TTSE in {d}")
+                if row.get("caller_ttse_ms") is not None:
+                    caller_ttse_value = float(row["caller_ttse_ms"])
+                    caller_ttfb = row.get("caller_ttfb_ms")
+                    if caller_ttfb is None \
+                            or isinstance(caller_ttfb, bool) \
+                            or not isinstance(caller_ttfb, (int, float)) \
+                            or not math.isfinite(float(caller_ttfb)) \
+                            or float(caller_ttfb) < 0 \
+                            or caller_ttse_value < float(caller_ttfb):
+                        raise ValueError(
+                            f"requests.jsonl line {line_number} has caller "
+                            f"TTSE before or without a valid caller TTFB in "
+                            f"{d}")
+                    for caller_milestone_field in (
+                            "caller_ttft_ms", "caller_ttfr_ms",
+                            "caller_ttfv_ms", "caller_ttf_tool_call_ms"):
+                        caller_milestone = row.get(caller_milestone_field)
+                        if caller_milestone is not None and (
+                                isinstance(caller_milestone, bool)
+                                or not isinstance(
+                                    caller_milestone, (int, float))
+                                or not math.isfinite(float(caller_milestone))
+                                or float(caller_milestone)
+                                < caller_ttse_value):
+                            raise ValueError(
+                                f"requests.jsonl line {line_number} has "
+                                f"{caller_milestone_field} before caller "
+                                f"TTSE in {d}")
                 if phase == "preflight":
                     if status == 200:
                         preflight_http_200 += 1
@@ -398,6 +505,8 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
         "preflight_rows_judged": preflight_rows_judged,
         "preflight_acceptable_outcomes": preflight_acceptable_outcomes,
         "preflight_http_200": preflight_http_200,
+        "reasoning_control_probes": reasoning_control_probes,
+        "setup_request_links": setup_request_links,
         "replay_global_indices_sha256": index_digest,
         "replay_schedule_sha256": schedule_digest,
     }
@@ -486,18 +595,36 @@ def _validate_preflight_gate_consistency(
         if start_gate is not None or setup_kind:
             raise ValueError(f"missing preflight gate evidence in {d}")
         return
-    expected = {
+    required = {
         "skipped", "attempted", "reachable", "readable",
         "reasoning_probe_requests", "outcome", "force_requested",
-        "gate_satisfied",
+        "gate_satisfied", "evidence_mode", "binding", "binding_sha256",
     }
-    if not isinstance(gate, dict) or set(gate) != expected \
+    optional = {"reasoning_control_probes"}
+    if not isinstance(gate, dict) \
+            or not required.issubset(gate) \
+            or set(gate) - required - optional \
             or start_gate != gate:
         raise ValueError(f"invalid or inconsistent preflight gate in {d}")
     if gate.get("skipped") is not False \
             or not isinstance(gate.get("force_requested"), bool) \
             or not isinstance(gate.get("gate_satisfied"), bool):
         raise ValueError(f"invalid preflight gate flags in {d}")
+    mode = gate.get("evidence_mode")
+    if mode not in {"carried_setup_rows", "inherited_setup_artifact"}:
+        raise ValueError(f"invalid preflight evidence mode in {d}")
+    from .runner import (
+        _PREFLIGHT_BINDING_SCHEMA, _binding_sha256, _is_sha256,
+        _validated_setup_artifact_reference,
+    )
+    binding = gate.get("binding")
+    if not isinstance(binding, dict) \
+            or binding.get("schema_version") != _PREFLIGHT_BINDING_SCHEMA \
+            or not _is_sha256(gate.get("binding_sha256")) \
+            or _binding_sha256(binding) != gate.get("binding_sha256") \
+            or not isinstance(binding.get("execution"), dict) \
+            or not isinstance(binding.get("setup_requests"), list):
+        raise ValueError(f"invalid cryptographic preflight binding in {d}")
     counts = {}
     for field in ("attempted", "reachable", "readable",
                   "reasoning_probe_requests"):
@@ -509,15 +636,57 @@ def _validate_preflight_gate_consistency(
             or counts["reachable"] > counts["attempted"] \
             or counts["readable"] > counts["reachable"]:
         raise ValueError(f"preflight gate counts disagree in {d}")
-    if evidence["phases"].get("preflight", 0) != counts["attempted"] \
-            or evidence["phases"].get("probe", 0) != \
-            counts["reasoning_probe_requests"] \
-            or evidence["preflight_rows_judged"] != counts["attempted"] \
-            or evidence["preflight_http_200"] != counts["reachable"] \
-            or evidence["preflight_acceptable_outcomes"] != \
-            counts["readable"]:
+    carried = mode == "carried_setup_rows"
+    if carried:
+        if evidence["phases"].get("preflight", 0) != counts["attempted"] \
+                or evidence["phases"].get("probe", 0) != \
+                counts["reasoning_probe_requests"] \
+                or evidence["preflight_rows_judged"] != counts["attempted"] \
+                or evidence["preflight_http_200"] != counts["reachable"] \
+                or evidence["preflight_acceptable_outcomes"] != \
+                counts["readable"]:
+            raise ValueError(
+                f"preflight gate counts disagree with requests.jsonl in {d}")
+        if binding["setup_requests"] != evidence.get(
+                "setup_request_links"):
+            raise ValueError(
+                f"preflight binding setup links disagree with the journal "
+                f"in {d}")
+    elif evidence["phases"].get("preflight", 0) \
+            or evidence["phases"].get("probe", 0) \
+            or evidence.get("setup_request_links"):
         raise ValueError(
-            f"preflight gate counts disagree with requests.jsonl in {d}")
+            f"inherited preflight evidence duplicates setup rows in {d}")
+    row_probe_evidence = evidence.get("reasoning_control_probes")
+    if not isinstance(row_probe_evidence, list) \
+            or (carried and len(row_probe_evidence) !=
+                counts["reasoning_probe_requests"]) \
+            or (not carried and row_probe_evidence):
+        raise ValueError(
+            f"reasoning-control probe row count disagrees in {d}")
+    if "reasoning_control_probes" in gate:
+        supplied = gate.get("reasoning_control_probes")
+        if not isinstance(supplied, list) \
+                or len(supplied) != counts["reasoning_probe_requests"] \
+                or (carried and supplied != row_probe_evidence) \
+                or any(item is None for item in supplied):
+            raise ValueError(
+                f"reasoning-control probe gate evidence disagrees in {d}")
+        from .runner import _validated_reasoning_control_probe_evidence
+        validated = [
+            _validated_reasoning_control_probe_evidence(
+                item,
+                label=f"preflight_gate.reasoning_control_probes[{index}]")
+            for index, item in enumerate(supplied)
+        ]
+        if validated != supplied \
+                or [item["candidate_index"] for item in validated] != \
+                list(range(1, len(validated) + 1)):
+            raise ValueError(
+                f"reasoning-control probe gate ordering is invalid in {d}")
+    elif carried and any(item is not None for item in row_probe_evidence):
+        raise ValueError(
+            f"preflight gate omits manifest-bound probe evidence in {d}")
     complete = (
         counts["reachable"] == counts["attempted"]
         and counts["readable"] == counts["attempted"])
@@ -566,6 +735,13 @@ def _validate_preflight_gate_consistency(
             "preflight_passed", "preflight_forced_unreadable"}:
         raise ValueError(
             f"measured run carries a non-executable preflight state in {d}")
+    if not setup_kind:
+        reference = run.get("setup_artifact_reference")
+        if start.get("setup_artifact_reference") != reference:
+            raise ValueError(
+                f"setup artifact reference disagrees between start and "
+                f"summary in {d}")
+        _validated_setup_artifact_reference(reference, gate)
 
 
 def _remeasure_nonstructured_artifacts(d: Path, manifest: dict) -> None:

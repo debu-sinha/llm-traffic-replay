@@ -145,6 +145,23 @@ def test_trace_json_rejects_duplicate_timestamp_keys(tmp_path):
         load_trace(path)
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"t":1,"prompt":"silently-lost"}\n',
+        '{"t":1,"request_id":"silently-reordered"}\n',
+    ],
+)
+def test_arrival_trace_rejects_payload_fields_that_sorting_would_detach(
+        content, tmp_path):
+    from traffic_replay.schedule import load_trace
+
+    path = tmp_path / "not-arrival-only.jsonl"
+    path.write_text(content)
+    with pytest.raises(ValueError, match="exactly the t field"):
+        load_trace(path)
+
+
 @pytest.mark.parametrize("cap", [-1, math.nan, math.inf, True])
 def test_invalid_trace_duration_cap_is_rejected(cap, tmp_path):
     from traffic_replay.schedule import load_trace

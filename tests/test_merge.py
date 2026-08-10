@@ -609,7 +609,9 @@ def _mkprompts_run(d: Path, ep: str, n_rows: int, prompts_count: int):
     with (d / "requests.jsonl").open("w") as f:
         for local_index in range(n_rows):
             global_index = shard_index + local_index * 2
-            f.write(json.dumps(_row(global_index, 100.0, 300.0)) + "\n")
+            row = _row(global_index, 100.0, 300.0)
+            row["prompt_index"] = global_index % prompts_count
+            f.write(json.dumps(row) + "\n")
     _refresh_artifacts(d)
     _seal_completion(d)
 

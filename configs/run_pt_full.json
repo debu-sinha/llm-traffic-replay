@@ -3,7 +3,9 @@
   "endpoint": {
     "base_url": "https://YOUR-WORKSPACE-HOST",
     "path": "/serving-endpoints/YOUR-PT-ENDPOINT/invocations",
-    "auth_token_env": "DATABRICKS_TOKEN"
+    "auth_token_env": "DATABRICKS_TOKEN",
+    "adapter": "openai.chat_completions.sse/v1",
+    "temperature": 0.0
   },
   "duration_s": 300,
   "qps_base": 25.0,

@@ -1081,6 +1081,7 @@ def test_failure_before_http_send_is_not_claimed_as_a_wire_send():
 
 def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     seen = []
+    seen_bytes = []
 
     events = (
         b'data: {"choices":[{"delta":{"content":"ok"},'
@@ -1098,6 +1099,7 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
             pass
 
         def request(self, method, path, body, headers):
+            seen_bytes.append(body)
             seen.append(json.loads(body))
 
         def getresponse(self):
@@ -1130,6 +1132,10 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     assert result.request_attempts == 2
     assert result.retries == 1
     assert result.retry_reasons == ["stream_options_rejected"]
+    assert result.physical_request_body_sha256s == [
+        hashlib.sha256(body).hexdigest() for body in seen_bytes]
+    assert result.physical_request_body_sha256s[0] != \
+        result.physical_request_body_sha256s[1]
 
 
 def test_runtime_quota_denial_occurs_before_the_physical_post():

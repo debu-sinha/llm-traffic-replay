@@ -161,6 +161,24 @@ def write_immutable_json(out_dir: str | Path, kind: str, value) -> Path:
     return (leaf / name).resolve(strict=True)
 
 
+def write_immutable_text(out_dir: str | Path, kind: str, text: str) -> Path:
+    """Write a content-addressed text input used by a generated run config."""
+    if kind != "timestamps":
+        raise ValueError(f"unsupported generated text kind: {kind!r}")
+    if not isinstance(text, str) or not text:
+        raise ValueError("generated timestamps text must be non-empty")
+    raw = text.encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    root = _store_root(out_dir)
+    section = root / "timestamps"
+    leaf = section / digest
+    for directory in (root, section, leaf):
+        _ensure_safe_dir(directory)
+    name = "timestamps.txt"
+    _publish_once(leaf, name, raw, immutable=True)
+    return (leaf / name).resolve(strict=True)
+
+
 def publish_legacy_copy(source: str | Path, destination: str | Path) -> bool:
     """Create an old well-known filename once, without ever replacing it.
 

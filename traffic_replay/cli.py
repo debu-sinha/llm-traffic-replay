@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 
@@ -31,6 +33,27 @@ def cmd_schedule(args) -> int:
     from .schedule import make_schedule, schedule_report
     s = make_schedule(duration_s=args.duration, rate_scale=args.rate_scale)
     print(json.dumps(schedule_report(s), indent=2))
+    return 0
+
+
+def cmd_adapters(args) -> int:
+    """List the versioned wire contracts available in this installation."""
+    from .adapters import list_endpoint_adapters
+
+    adapters = list_endpoint_adapters()
+    if args.format == "json":
+        print(json.dumps(
+            {"schema_version": "endpoint-adapter-catalog/v1",
+             "adapters": adapters},
+            indent=2,
+            allow_nan=False,
+        ))
+        return 0
+    for adapter in adapters:
+        media = ", ".join(adapter["accepted_response_media_types"])
+        print(
+            f"{adapter['adapter_id']}: {adapter['response_mode']}; "
+            f"response {media}; usage {adapter['usage_request_mode']}")
     return 0
 
 
@@ -327,10 +350,12 @@ def _preflight(cfg: dict, *, representative_plans=None,
     from .artifacts import redact_secrets
     from .runner import (
         RunConfig,
+        _attach_setup_request_binding,
         _annotate_result,
+        _client_payload_hash,
         _exception_result,
-        _payload_hash,
         _representative_plans,
+        _rescope_representative_plans,
         _token,
     )
 
@@ -342,8 +367,9 @@ def _preflight(cfg: dict, *, representative_plans=None,
     if runtime_quota_guard is not None:
         client_kwargs["runtime_quota_guard"] = runtime_quota_guard
     client = EndpointClient(ecfg, tok, **client_kwargs)
-    plans = (_representative_plans(rc) if representative_plans is None
-             else list(representative_plans))
+    plans = (_rescope_representative_plans(
+        _representative_plans(rc), f"direct-preflight-{uuid.uuid4().hex}")
+        if representative_plans is None else list(representative_plans))
     if not plans:
         raise ValueError("preflight needs at least one representative plan")
     out: dict = {"auth": bool(tok),
@@ -351,9 +377,9 @@ def _preflight(cfg: dict, *, representative_plans=None,
                  "representatives": [p["representative"] for p in plans]}
     rows = []
     request_rows = []
-    for plan in plans:
-        body_hash = _payload_hash(
-            ecfg, plan["messages"], plan["max_output"])
+    for position, plan in enumerate(plans, start=1):
+        body_hash = _client_payload_hash(
+            client, ecfg, plan["messages"], plan["max_output"])
         try:
             res = client.send(
                 plan["messages"], plan["max_output"], plan["request_id"],
@@ -367,12 +393,17 @@ def _preflight(cfg: dict, *, representative_plans=None,
             request_row = _exception_result(
                 plan["request_id"], "preflight", plan, body_hash,
                 "preflight request outcome unknown: "
-                f"{type(exc).__name__}: {redact_secrets(str(exc))}")
+                f"{type(exc).__name__}: {redact_secrets(str(exc))}",
+                endpoint_adapter=ecfg.adapter)
             # The exception boundary cannot prove whether a POST reached the
             # provider.  Unknown is materially different from zero for quota
             # accounting.
             request_row["request_attempts"] = None
             request_row["connection_attempts"] = None
+        _attach_setup_request_binding(
+            request_row, endpoint=rc.endpoint,
+            max_output_tokens_cap=rc.max_output_tokens_cap,
+            plan=plan, phase="preflight", position=position)
         request_rows.append(request_row)
         if callable(row_sink):
             row_sink(request_row)
@@ -431,7 +462,18 @@ def _benchmark_config(args) -> dict:
     path = args.endpoint
     if not path.startswith("/"):
         path = f"/serving-endpoints/{path}/invocations"
-    ep: dict = {"base_url": args.host.rstrip("/"), "path": path}
+    ep: dict = {
+        "base_url": args.host.rstrip("/"),
+        "path": path,
+        # Keep the historic 0.0 wire behavior when older programmatic callers
+        # construct a Namespace without the new flag.  ``None`` is persisted
+        # explicitly so reruns preserve omission rather than falling back to
+        # EndpointConfig's numeric default.
+        "temperature": getattr(args, "temperature", 0.0),
+    }
+    endpoint_adapter = getattr(args, "endpoint_adapter", None)
+    if endpoint_adapter:
+        ep["adapter"] = endpoint_adapter
     if args.auth_profile:
         ep["auth_profile"] = args.auth_profile
     else:
@@ -457,6 +499,17 @@ def _benchmark_config(args) -> dict:
             raise SystemExit(f"invalid --extra-body: {exc}") from exc
 
     fixed_rate = getattr(args, "fixed_rate", None)
+    exact_requests = getattr(args, "requests", None)
+    if exact_requests is not None and (
+            isinstance(exact_requests, bool) or not isinstance(exact_requests, int)
+            or exact_requests <= 0):
+        raise SystemExit("--requests must be a positive integer")
+    if exact_requests is not None:
+        from .schedule import MAX_EXACT_ANALYSIS_REQUEST_ROWS
+        if exact_requests > MAX_EXACT_ANALYSIS_REQUEST_ROWS:
+            raise SystemExit(
+                f"--requests cannot exceed the exact-analysis limit of "
+                f"{MAX_EXACT_ANALYSIS_REQUEST_ROWS:,}")
     if fixed_rate is not None:
         import math
         if isinstance(fixed_rate, bool) or not math.isfinite(fixed_rate) \
@@ -476,7 +529,11 @@ def _benchmark_config(args) -> dict:
               "one fixed open-loop rate; it does not hold concurrency.",
               file=sys.stderr)
         sizing = legacy
-    if sizing is None and fixed_rate is None \
+    if exact_requests is not None and (
+            fixed_rate is not None or sizing is not None or legacy is not None):
+        raise SystemExit(
+            "use --requests or --fixed-rate/--sizing-concurrency, not both")
+    if sizing is None and fixed_rate is None and exact_requests is None \
             and getattr(args, "cmd", "benchmark") == "benchmark":
         sizing = 10
 
@@ -493,6 +550,9 @@ def _benchmark_config(args) -> dict:
             "Describe the capacity this ran on. Shared pay-per-token is not "
             "a performance claim for a dedicated endpoint."),
     }
+    calibration_requests = getattr(args, "calibrate_requests", None)
+    if calibration_requests is not None:
+        cfg["calibrate_n"] = calibration_requests
     ttft_definition = getattr(args, "ttft_definition", None)
     if ttft_definition is not None:
         cfg["ttft_definition"] = ttft_definition
@@ -500,6 +560,18 @@ def _benchmark_config(args) -> dict:
         cfg.update(
             qps_base=fixed_rate, qps_burst=fixed_rate,
             qps_min=fixed_rate, qps_max=fixed_rate, rate_scale=1.0)
+    if exact_requests is not None:
+        # Midpoint spacing avoids an arrival exactly at the duration boundary
+        # and gives the high-level benchmark an exact, deterministic count.
+        timestamps = "".join(
+            f"{(index + 0.5) * args.duration / exact_requests:.12f}\n"
+            for index in range(exact_requests))
+        from .immutable_config import write_immutable_text
+        cfg["timestamps_file"] = str(write_immutable_text(
+            args.out_dir, "timestamps", timestamps))
+        cfg["title"] = args.title or (
+            f"exact {exact_requests}-request open-loop workload, "
+            f"{args.endpoint}")
     if getattr(args, "max_concurrency", None) is not None:
         cfg["max_concurrency"] = args.max_concurrency
     if getattr(args, "max_pending_requests", None) is not None:
@@ -614,7 +686,9 @@ def _quota_setup_plans(cfg: dict, args, *, representative_plans=None) \
     if not representatives:
         raise ValueError("quota setup needs representative workload plans")
     plans = list(representatives)
-    probes = list(getattr(args, "probe_extra_body", None) or [])
+    probes = _validated_probe_candidates_for_endpoint(
+        cfg, getattr(args, "probe_extra_body", None) or [])
+    args.probe_extra_body = probes
     if probes:
         # Which representative fails is observable only after traffic. Use
         # the largest offered envelope for each explicitly requested probe,
@@ -771,19 +845,234 @@ def _quota_gate(cfg: dict, args, *, rates: list[float] | None = None,
 
 
 def _json_object_arg(value: str) -> dict:
-    """Parse one finite JSON object before any endpoint traffic is sent."""
+    """Parse one bounded, persistence-safe probe object before traffic."""
     try:
         from .json_input import loads_strict
         parsed = loads_strict(value)
-        if not isinstance(parsed, dict):
-            raise ValueError("value is not an object")
-        json.dumps(parsed, allow_nan=False)
-        from .client import validate_extra_body_safety
-        validate_extra_body_safety(parsed)
+        parsed = _validated_probe_candidate(parsed, position=1)
     except (json.JSONDecodeError, TypeError, ValueError, OverflowError) as exc:
+        # The candidate may itself be a credential. Never echo the raw CLI
+        # token in an argparse diagnostic, even though no artifact exists yet.
+        try:
+            input_bytes = len(str(value).encode("utf-8", errors="replace"))
+        except Exception:
+            input_bytes = -1
         raise argparse.ArgumentTypeError(
-            f"expected a finite JSON object, got {value!r}: {exc}") from exc
+            "expected a bounded, credential-free JSON object "
+            f"(input bytes={input_bytes}): {_safe_probe_detail(exc)}") \
+            from exc
     return parsed
+
+
+_PROBE_EVIDENCE_SCHEMA = "reasoning-control-probe-evidence/v1"
+_PROBE_MAX_CANDIDATES = 16
+_PROBE_MAX_CANONICAL_BYTES = 16 * 1024
+_PROBE_MAX_DEPTH = 8
+_PROBE_MAX_NODES = 256
+_PROBE_MAX_OBJECT_KEYS = 64
+_PROBE_MAX_ARRAY_ITEMS = 64
+_PROBE_MAX_KEY_BYTES = 128
+_PROBE_MAX_STRING_BYTES = 4096
+_PROBE_REQUEST_ID_MAX_BYTES = 256
+_PROBE_MAX_PHYSICAL_BODY_HASHES = 5
+_PROBE_DISPOSITIONS = {"accepted", "rejected", "unknown"}
+_PROBE_EVIDENCE_METHODS = {
+    "single_request_behavior_observation",
+    "request_validation_response",
+    "candidate_rejection_unverified_http_failure",
+    "non_validation_http_failure",
+    "transport_outcome_unknown",
+}
+
+
+def _probe_candidate_canonical_json(value: dict) -> str:
+    """Canonical UTF-8 JSON used by the v1 candidate digest."""
+    return json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"))
+
+
+def _probe_candidate_sha256(value: dict) -> str:
+    import hashlib
+    return hashlib.sha256(
+        _probe_candidate_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _validate_probe_json_shape(value: object) -> None:
+    """Bound a control object independently of provider payload limits."""
+    import math
+
+    nodes = 0
+
+    def walk(item: object, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _PROBE_MAX_NODES:
+            raise ValueError(
+                f"probe candidate exceeds {_PROBE_MAX_NODES} JSON nodes")
+        if depth > _PROBE_MAX_DEPTH:
+            raise ValueError(
+                f"probe candidate exceeds depth {_PROBE_MAX_DEPTH}")
+        if item is None or isinstance(item, bool):
+            return
+        if isinstance(item, int):
+            if not -(2 ** 63) <= item <= 2 ** 63 - 1:
+                raise ValueError("probe candidate integer exceeds int64")
+            return
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError("probe candidate numbers must be finite")
+            return
+        if isinstance(item, str):
+            if len(item.encode("utf-8")) > _PROBE_MAX_STRING_BYTES:
+                raise ValueError(
+                    "probe candidate string exceeds "
+                    f"{_PROBE_MAX_STRING_BYTES} UTF-8 bytes")
+            if any(ord(char) < 0x20 or ord(char) == 0x7f for char in item):
+                raise ValueError(
+                    "probe candidate strings must not contain controls")
+            return
+        if isinstance(item, list):
+            if len(item) > _PROBE_MAX_ARRAY_ITEMS:
+                raise ValueError(
+                    "probe candidate array exceeds "
+                    f"{_PROBE_MAX_ARRAY_ITEMS} items")
+            for child in item:
+                walk(child, depth + 1)
+            return
+        if isinstance(item, dict):
+            if len(item) > _PROBE_MAX_OBJECT_KEYS:
+                raise ValueError(
+                    "probe candidate object exceeds "
+                    f"{_PROBE_MAX_OBJECT_KEYS} keys")
+            for key, child in item.items():
+                if not isinstance(key, str) or not key:
+                    raise ValueError(
+                        "probe candidate keys must be non-empty strings")
+                if len(key.encode("utf-8")) > _PROBE_MAX_KEY_BYTES:
+                    raise ValueError(
+                        "probe candidate key exceeds "
+                        f"{_PROBE_MAX_KEY_BYTES} UTF-8 bytes")
+                if any(ord(char) < 0x20 or ord(char) == 0x7f
+                       for char in key):
+                    raise ValueError(
+                        "probe candidate keys must not contain controls")
+                walk(child, depth + 1)
+            return
+        raise ValueError("probe candidate contains a non-JSON value")
+
+    walk(value, 0)
+
+
+def _validated_probe_candidate(value: object, *, position: int) -> dict:
+    """Return an exact safe copy; never redact-and-send a changed control."""
+    import copy
+    from .artifacts import redact_secrets
+    from .client import validate_extra_body_safety
+
+    if not isinstance(value, dict) or not value:
+        raise ValueError(
+            f"probe candidate {position} must be a non-empty JSON object")
+    # Credential rejection precedes diagnostics that might otherwise reveal a
+    # secret-looking key or value. A redacted mutation is never sent.
+    validate_extra_body_safety(value)
+    safe = redact_secrets(value)
+    if safe != value:
+        raise ValueError(
+            f"probe candidate {position} contains secret-like material")
+    _validate_probe_json_shape(value)
+    raw = _probe_candidate_canonical_json(value).encode("utf-8")
+    if len(raw) > _PROBE_MAX_CANONICAL_BYTES:
+        raise ValueError(
+            f"probe candidate {position} exceeds "
+            f"{_PROBE_MAX_CANONICAL_BYTES} canonical UTF-8 bytes")
+    return copy.deepcopy(value)
+
+
+def _validated_probe_candidates(value: object) -> list[dict]:
+    import copy
+
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("reasoning-control probe candidates must be a list")
+    if len(value) > _PROBE_MAX_CANDIDATES:
+        raise ValueError(
+            f"at most {_PROBE_MAX_CANDIDATES} probe candidates are allowed")
+    out = [
+        _validated_probe_candidate(candidate, position=position)
+        for position, candidate in enumerate(value, start=1)
+    ]
+    seen: set[str] = set()
+    for candidate in out:
+        digest = _probe_candidate_sha256(candidate)
+        if digest in seen:
+            raise ValueError("duplicate reasoning-control probe candidate")
+        seen.add(digest)
+    return copy.deepcopy(out)
+
+
+def _validated_probe_candidates_for_endpoint(
+        cfg: dict, candidates: object) -> list[dict]:
+    """Validate every merged wire body before any candidate is submitted."""
+    import copy
+    from .client import EndpointConfig
+
+    out = _validated_probe_candidates(candidates)
+    endpoint = cfg.get("endpoint") if isinstance(cfg, dict) else None
+    if out and not isinstance(endpoint, dict):
+        raise ValueError("probe candidates require an endpoint configuration")
+    for candidate in out:
+        merged = copy.deepcopy(endpoint)
+        merged["extra_body"] = _deep_merge(
+            merged.get("extra_body") or {}, copy.deepcopy(candidate))
+        EndpointConfig(**merged)
+    return out
+
+
+def _finite_temperature_arg(value: str) -> float:
+    """Parse an explicit numeric temperature without accepting JSON NaN/Inf."""
+    import math
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"temperature must be a finite number, got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError(
+            f"temperature must be a finite number, got {value!r}")
+    return parsed
+
+
+def _calibration_request_count_arg(value: str) -> int:
+    """Parse the bounded number of unloaded calibration requests."""
+    from .runner import _MAX_CALIBRATION_REQUESTS
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(
+            "calibration requests must be a non-negative integer") from exc
+    if parsed < 0 or parsed > _MAX_CALIBRATION_REQUESTS:
+        raise argparse.ArgumentTypeError(
+            "calibration requests must be between 0 and "
+            f"{_MAX_CALIBRATION_REQUESTS}")
+    return parsed
+
+
+def _add_temperature_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the same sampling-field contract to every high-level command."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--temperature", type=_finite_temperature_arg, default=0.0,
+        metavar="FINITE_FLOAT",
+        help="send this numeric sampling temperature (default: 0.0)")
+    group.add_argument(
+        "--omit-temperature", dest="temperature", action="store_const",
+        const=None, default=argparse.SUPPRESS,
+        help="omit temperature from every request; this is distinct from "
+             "sending numeric 0.0")
 
 
 def _probe_label(extra: dict, position: int) -> str:
@@ -805,6 +1094,114 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+def _validate_probe_evidence_envelope(value: object, *, row: dict | None = None) \
+        -> dict:
+    """Validate the exact metadata-only v1 envelope and optional row links."""
+    import copy
+    import re
+
+    required = {
+        "schema_version", "candidate_index", "candidate_redacted",
+        "candidate_canonical_sha256", "disposition", "evidence_method",
+        "effective_status", "effective_value", "request_id",
+        "logical_request_body_sha256", "physical_request_body_sha256s",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError(
+            "reasoning-control probe evidence has unknown or missing fields")
+    if value.get("schema_version") != _PROBE_EVIDENCE_SCHEMA:
+        raise ValueError("unsupported reasoning-control probe evidence schema")
+    index = value.get("candidate_index")
+    if isinstance(index, bool) or not isinstance(index, int) \
+            or not 1 <= index <= _PROBE_MAX_CANDIDATES:
+        raise ValueError("probe evidence candidate_index is invalid")
+    candidate = _validated_probe_candidate(
+        value.get("candidate_redacted"), position=index)
+    expected_digest = _probe_candidate_sha256(candidate)
+    digest = value.get("candidate_canonical_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) \
+            or digest != expected_digest:
+        raise ValueError("probe evidence candidate SHA-256 is invalid")
+    disposition = value.get("disposition")
+    method = value.get("evidence_method")
+    if disposition not in _PROBE_DISPOSITIONS \
+            or method not in _PROBE_EVIDENCE_METHODS:
+        raise ValueError("probe evidence disposition or method is invalid")
+    allowed_methods = {
+        "accepted": {"single_request_behavior_observation"},
+        "rejected": {"request_validation_response"},
+        "unknown": {
+            "candidate_rejection_unverified_http_failure",
+            "non_validation_http_failure", "transport_outcome_unknown"},
+    }
+    if method not in allowed_methods[disposition]:
+        raise ValueError(
+            "probe evidence method disagrees with its disposition")
+    expected_effective = (
+        "not_applied_request_rejected"
+        if disposition == "rejected" else "unknown")
+    if value.get("effective_status") != expected_effective \
+            or value.get("effective_value") is not None:
+        raise ValueError(
+            "probe evidence must not infer an effective control value")
+    request_id = value.get("request_id")
+    if not isinstance(request_id, str) or not request_id \
+            or len(request_id.encode("utf-8")) > _PROBE_REQUEST_ID_MAX_BYTES \
+            or any(ord(char) < 0x21 or ord(char) > 0x7e
+                   for char in request_id):
+        raise ValueError("probe evidence request_id is invalid")
+    logical = value.get("logical_request_body_sha256")
+    if not isinstance(logical, str) \
+            or not re.fullmatch(r"[0-9a-f]{64}", logical):
+        raise ValueError("probe evidence logical body SHA-256 is invalid")
+    physical = value.get("physical_request_body_sha256s")
+    if not isinstance(physical, list) \
+            or len(physical) > _PROBE_MAX_PHYSICAL_BODY_HASHES \
+            or any(not isinstance(item, str)
+                   or not re.fullmatch(r"[0-9a-f]{64}", item)
+                   for item in physical):
+        raise ValueError("probe evidence physical body SHA-256 list is invalid")
+    if row is not None:
+        if not isinstance(row, dict) or row.get("phase") != "probe" \
+                or row.get("request_id") != request_id \
+                or row.get("request_body_sha256") != logical \
+                or row.get("physical_request_body_sha256s", []) != physical:
+            raise ValueError(
+                "probe evidence request/body links disagree with its row")
+        attempts = row.get("request_attempts")
+        if attempts is not None and (
+                isinstance(attempts, bool) or not isinstance(attempts, int)
+                or attempts < 0 or len(physical) != attempts):
+            raise ValueError(
+                "probe evidence physical hashes disagree with attempts")
+    return copy.deepcopy(value)
+
+
+def _probe_evidence_envelope(*, candidate: dict, position: int,
+                             disposition: str, evidence_method: str,
+                             row: dict) -> dict:
+    """Create a content-free envelope; HTTP acceptance never proves effect."""
+    safe_candidate = _validated_probe_candidate(candidate, position=position)
+    effective_status = (
+        "not_applied_request_rejected"
+        if disposition == "rejected" else "unknown")
+    envelope = {
+        "schema_version": _PROBE_EVIDENCE_SCHEMA,
+        "candidate_index": position,
+        "candidate_redacted": safe_candidate,
+        "candidate_canonical_sha256": _probe_candidate_sha256(safe_candidate),
+        "disposition": disposition,
+        "evidence_method": evidence_method,
+        "effective_status": effective_status,
+        "effective_value": None,
+        "request_id": row.get("request_id"),
+        "logical_request_body_sha256": row.get("request_body_sha256"),
+        "physical_request_body_sha256s": list(
+            row.get("physical_request_body_sha256s") or []),
+    }
+    return _validate_probe_evidence_envelope(envelope, row=row)
 
 
 def _answer_is_complete(result) -> bool:
@@ -836,13 +1233,19 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
     from .client import EndpointClient, EndpointConfig
     from .runner import (
         RunConfig,
+        _attach_setup_request_binding,
         _annotate_result,
+        _client_payload_hash,
         _exception_result,
-        _payload_hash,
         _representative_plans,
+        _stable_request_id,
         _token,
     )
 
+    # Validate the whole candidate population, including each merged endpoint
+    # body, before constructing the first client. One unsafe later candidate
+    # must not allow earlier candidates to emit paid traffic.
+    candidates = _validated_probe_candidates_for_endpoint(cfg, candidates)
     clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
     rc = RunConfig(**clean)
     plans = (_representative_plans(rc) if representative_plans is None
@@ -853,7 +1256,40 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
     # The caller passes the exact failed budget. Keep it explicit so a future
     # refactor cannot reintroduce a probe-only 512-token floor.
     budget = int(budget)
+    if budget <= 0:
+        raise ValueError("reasoning probe budget must be positive")
     out = []
+    execution_scope = plan.get("execution_scope_id") \
+        or f"direct-probe-{uuid.uuid4().hex}"
+    bound_plan = copy.deepcopy(plan)
+    bound_plan["max_output"] = budget
+
+    def record(*, row: dict, candidate: dict, position: int,
+               name: str, verdict: str, disposition: str,
+               evidence_method: str, confidence: str, detail: str) -> None:
+        envelope = _probe_evidence_envelope(
+            candidate=candidate, position=position,
+            disposition=disposition, evidence_method=evidence_method,
+            row=row)
+        row["reasoning_control_probe"] = envelope
+        # The durable sink sees the complete envelope, never an intermediate
+        # row whose HTTP status has not yet been classified.
+        if callable(row_sink):
+            row_sink(row)
+        out.append({
+            "name": name,
+            "extra": candidate,
+            "verdict": verdict,
+            "disposition": disposition,
+            "effective_status": envelope["effective_status"],
+            "effective_value": envelope["effective_value"],
+            "evidence_method": evidence_method,
+            "confidence": confidence,
+            "detail": detail,
+            "evidence": envelope,
+            "_request_row": row,
+        })
+
     for position, extra in enumerate(candidates, start=1):
         name = _probe_label(extra, position)
         ec = copy.deepcopy(cfg["endpoint"])
@@ -863,48 +1299,74 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
         if runtime_quota_guard is not None:
             client_kwargs["runtime_quota_guard"] = runtime_quota_guard
         client = EndpointClient(ecfg, _token(ecfg), **client_kwargs)
-        request_id = f"lever-{name}"
-        body_hash = _payload_hash(ecfg, plan["messages"], budget)
+        request_id = _stable_request_id(
+            execution_scope, position, "probe")
+        body_hash = _client_payload_hash(
+            client, ecfg, plan["messages"], budget)
         try:
             r = client.send(
                 plan["messages"], budget, request_id, scheduled_s=0.0,
                 dispatch_lag_ms=0.0, intended=plan["intended"],
-                chars_sent=plan["chars"])
+                chars_sent=plan["chars"], probe_candidate=extra)
         except Exception as e:  # never let a probe break the run
             row = _exception_result(
                 request_id, "probe", plan, body_hash,
                 "reasoning-control probe outcome unknown: "
-                f"{type(e).__name__}: {_safe_probe_detail(e)}")
+                f"{type(e).__name__}: {_safe_probe_detail(e)}",
+                endpoint_adapter=ecfg.adapter)
             row["request_attempts"] = None
             row["connection_attempts"] = None
-            if callable(row_sink):
-                row_sink(row)
-            out.append({"name": name, "extra": extra, "verdict": "error",
-                        "detail": _safe_probe_detail(e)[:160],
-                        "_request_row": row})
+            _attach_setup_request_binding(
+                row, endpoint=ec,
+                max_output_tokens_cap=rc.max_output_tokens_cap,
+                plan=bound_plan, phase="probe", position=position)
+            record(
+                row=row, candidate=extra, position=position, name=name,
+                verdict="error", disposition="unknown",
+                evidence_method="transport_outcome_unknown",
+                confidence="none", detail=_safe_probe_detail(e)[:160])
             continue
         row = _annotate_result(r, "probe", plan, body_hash)
-        if callable(row_sink):
-            row_sink(row)
+        _attach_setup_request_binding(
+            row, endpoint=ec,
+            max_output_tokens_cap=rc.max_output_tokens_cap,
+            plan=bound_plan, phase="probe", position=position)
         if r.status != 200:
-            # a refusal is the most useful answer of all: it usually names
-            # the reason, and it rules the flag out for good.
-            out.append({"name": name, "extra": extra, "verdict": "rejected",
-                        "detail": _safe_probe_detail(r.error or "")[:220],
-                        "_request_row": row})
+            # Status alone cannot identify which request field failed.  The
+            # adapter saw the bounded response body in memory and may mark a
+            # rejection only when provider wording names this exact candidate
+            # field/path.  No response text is retained in the result row.
+            rejected = getattr(r, "probe_candidate_rejected", None) is True
+            validation_status = r.status in {400, 422}
+            record(
+                row=row, candidate=extra, position=position, name=name,
+                verdict="rejected" if rejected else "error",
+                disposition="rejected" if rejected else "unknown",
+                evidence_method=(
+                    "request_validation_response" if rejected
+                    else "candidate_rejection_unverified_http_failure"
+                    if validation_status else "non_validation_http_failure"),
+                confidence="high" if rejected else "none",
+                detail=_safe_probe_detail(r.error or "")[:220])
         elif _answer_is_complete(r):
             reasoning = ("reasoning observed" if
                          (r.reasoning_seen or r.reasoning_chunks)
                          else "no reasoning observed")
-            out.append({"name": name, "extra": extra, "verdict": "works",
-                        "detail": f"answered, finish {r.finish_reason}, "
-                                  f"{r.completion_tokens} tokens, {reasoning}",
-                        "_request_row": row})
+            record(
+                row=row, candidate=extra, position=position, name=name,
+                verdict="works", disposition="accepted",
+                evidence_method="single_request_behavior_observation",
+                confidence="unknown_effect",
+                detail=f"answered, finish {r.finish_reason}, "
+                       f"{r.completion_tokens} tokens, {reasoning}")
         else:
-            out.append({"name": name, "extra": extra, "verdict": "ignored",
-                        "detail": f"accepted, still no visible answer within "
-                                  f"{budget} tokens",
-                        "_request_row": row})
+            record(
+                row=row, candidate=extra, position=position, name=name,
+                verdict="unknown", disposition="accepted",
+                evidence_method="single_request_behavior_observation",
+                confidence="unknown_effect",
+                detail=f"accepted, still no visible answer within "
+                       f"{budget} tokens; effect not demonstrated")
     return out
 
 
@@ -914,7 +1376,7 @@ def _print_lever_report(levers: list[dict], budget: int) -> None:
           "one request each:")
     for x in levers:
         mark = {"works": "ANSWERED", "rejected": "rejected",
-                "ignored": "ignored", "error": "error"}[x["verdict"]]
+                "unknown": "unknown", "error": "error"}[x["verdict"]]
         print(f"[preflight]   {x['name']:24s} {mark:9s} {x['detail'][:96]}")
     if works:
         best = works[0]
@@ -983,11 +1445,12 @@ def _claim_setup_traffic_evidence(cfg: dict, args, *, command: str):
     from datetime import datetime, timezone
 
     from .artifacts import (
-        RunArtifacts, redact_secrets, snapshot_source_state,
+        RunArtifacts, snapshot_source_state,
         strict_json_dumps,
     )
     from .runner import (
-        RunConfig, _effective_config, _resolved_workload_id,
+        RunConfig, _effective_config, _prepare_prior_request_rows,
+        _resolved_workload_id,
     )
 
     clean = {key: value for key, value in cfg.items()
@@ -1050,7 +1513,16 @@ def _claim_setup_traffic_evidence(cfg: dict, args, *, command: str):
             raise ValueError(
                 "setup request evidence needs preflight/probe phase and a "
                 "request_id")
-        safe = redact_secrets(row)
+        envelope = row.get("reasoning_control_probe")
+        if phase == "probe":
+            validated = _validate_probe_evidence_envelope(
+                envelope, row=row)
+            if envelope != validated:
+                raise ValueError("probe row evidence is not canonical")
+        elif envelope is not None:
+            raise ValueError(
+                "preflight row cannot carry reasoning-control probe evidence")
+        safe = _prepare_prior_request_rows([row])[0]
         encoded = strict_json_dumps(safe)
         import hashlib
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -1070,6 +1542,7 @@ def _claim_setup_traffic_evidence(cfg: dict, args, *, command: str):
     args._setup_traffic_state = state
     args._setup_request_sink = sink
     args._setup_traffic_artifact_path = str(artifact.path)
+    args._setup_traffic_execution_id = execution_id
     return state
 
 
@@ -1201,6 +1674,32 @@ def _seal_setup_traffic_evidence(cfg: dict, args, *, outcome: str,
     return out
 
 
+def _setup_artifact_reference(path: str | Path, preflight_gate: dict) -> dict:
+    """Return the portable ID/digest link retained by measured artifacts."""
+    import hashlib
+    from .json_input import loads_strict
+    from .runner import (
+        _SETUP_ARTIFACT_REFERENCE_SCHEMA,
+        _validated_setup_artifact_reference,
+    )
+
+    manifest_path = Path(path) / "manifest.json"
+    raw = manifest_path.read_bytes()
+    manifest = loads_strict(raw)
+    if not isinstance(manifest, dict):
+        raise ValueError("setup manifest must contain an object")
+    reference = {
+        "schema_version": _SETUP_ARTIFACT_REFERENCE_SCHEMA,
+        "artifact_id": manifest.get("artifact_id"),
+        "execution_id": manifest.get("execution_id"),
+        "workload_id": manifest.get("workload_id"),
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "manifest_bytes": len(raw),
+        "preflight_binding_sha256": preflight_gate.get("binding_sha256"),
+    }
+    return _validated_setup_artifact_reference(reference, preflight_gate)
+
+
 def _abort_setup_traffic_evidence(args, error: BaseException) -> None:
     state = getattr(args, "_setup_traffic_state", None)
     if not isinstance(state, dict) or state.get("sealed"):
@@ -1212,6 +1711,17 @@ def _abort_setup_traffic_evidence(args, error: BaseException) -> None:
 def _check_preflight(cfg: dict, args, *, representative_plans=None) \
         -> int | None:
     """Run the shared benchmark/sweep gate; return an exit code on refusal."""
+    from .runner import _rescope_representative_plans
+
+    candidates = _validated_probe_candidates_for_endpoint(
+        cfg, getattr(args, "probe_extra_body", None) or [])
+    args.probe_extra_body = candidates
+    scope = getattr(args, "_setup_traffic_execution_id", None) \
+        or f"direct-preflight-{uuid.uuid4().hex}"
+    if representative_plans is not None:
+        representative_plans = _rescope_representative_plans(
+            list(representative_plans), scope)
+        args._preflight_representative_plans = representative_plans
     print("[preflight] sending 2 representative workload requests")
     guard = getattr(args, "_runtime_quota_guard", None)
     preflight_kwargs = {}
@@ -1259,7 +1769,10 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
               "field, so achieved cache coverage may be incomplete")
     if pf_res.get("reasoning"):
         print("[preflight] this endpoint emitted reasoning-channel content; "
-              "those tokens count against max_tokens.")
+              "whether reasoning consumes the offered output budget is "
+              "provider-, route-, and revision-specific. Inspect reported "
+              "usage, finish_reason, and visible-answer completion instead "
+              "of assuming a universal accounting rule.")
         if "ttft_definition" not in cfg:
             cfg["ttft_definition"] = "first_visible"
             print("[preflight] scoring TTFT on the first VISIBLE content "
@@ -1272,7 +1785,6 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
               "structurally valid non-refusal tool call, plus clean stream "
               "completion.")
         levers: list[dict] = []
-        candidates = list(getattr(args, "probe_extra_body", None) or [])
         if candidates:
             print()
             probe_kwargs = {
@@ -1288,12 +1800,24 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
                 probe_kwargs["row_sink"] = setup_sink
             levers = _probe_reasoning_levers(cfg, **probe_kwargs)
             probe_rows = []
+            probe_evidence = []
             for lever in levers:
                 row = lever.pop("_request_row", None)
-                if row is not None:
-                    probe_rows.append(row)
+                evidence = lever.get("evidence")
+                if not isinstance(row, dict) or not isinstance(evidence, dict):
+                    raise ValueError(
+                        "reasoning probe did not return its request evidence")
+                validated = _validate_probe_evidence_envelope(
+                    evidence, row=row)
+                if row.get("reasoning_control_probe") != validated:
+                    raise ValueError(
+                        "reasoning probe row disagrees with its evidence")
+                probe_rows.append(row)
+                probe_evidence.append(validated)
             args._preflight_request_rows.extend(probe_rows)
             args._preflight_evidence["reasoning_probe_requests"] = len(levers)
+            args._preflight_evidence[
+                "reasoning_control_probes"] = probe_evidence
             _print_lever_report(levers, pf_res["budget"])
             print()
         else:
@@ -1305,7 +1829,9 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
     return None
 
 
-def _finalize_preflight_evidence(args, refused: int | None) -> dict:
+def _finalize_preflight_evidence(args, refused: int | None, *,
+                                 cfg: dict | None = None,
+                                 representative_plans=None) -> dict:
     """Freeze the truthful command-level preflight gate state.
 
     ``--force`` authorizes a diagnostic run after an unreadable HTTP-200
@@ -1325,6 +1851,22 @@ def _finalize_preflight_evidence(args, refused: int | None) -> dict:
             int(value) if isinstance(value, int) and not isinstance(value, bool)
             and value >= 0 else 0)
     skipped = bool(raw.get("skipped", False))
+    probe_evidence = raw.get("reasoning_control_probes")
+    if probe_evidence is not None:
+        if not isinstance(probe_evidence, list) \
+                or len(probe_evidence) != counts["reasoning_probe_requests"]:
+            raise ValueError(
+                "reasoning-control probe evidence count disagrees with gate")
+        probe_evidence = [
+            _validate_probe_evidence_envelope(item)
+            for item in probe_evidence
+        ]
+        indices = [item["candidate_index"] for item in probe_evidence]
+        if indices != list(range(1, len(probe_evidence) + 1)):
+            raise ValueError(
+                "reasoning-control probe evidence order is invalid")
+    elif counts["reasoning_probe_requests"]:
+        raise ValueError("reasoning-control probe evidence is missing")
     force_requested = bool(getattr(args, "force", False))
     complete = bool(
         counts["attempted"] > 0
@@ -1351,6 +1893,31 @@ def _finalize_preflight_evidence(args, refused: int | None) -> dict:
         "force_requested": force_requested,
         "gate_satisfied": outcome == "preflight_passed",
     }
+    if probe_evidence is not None:
+        evidence["reasoning_control_probes"] = probe_evidence
+    if not skipped:
+        import copy
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                "preflight evidence needs the exact execution config")
+        plans = (list(representative_plans)
+                 if representative_plans is not None
+                 else list(getattr(
+                     args, "_preflight_representative_plans", []) or []))
+        if not plans:
+            raise ValueError(
+                "preflight evidence needs exact representative plans")
+        from .runner import RunConfig, _preflight_binding_for_rows
+        clean = {key: value for key, value in cfg.items()
+                 if not key.startswith("_")}
+        binding, binding_digest = _preflight_binding_for_rows(
+            RunConfig(**copy.deepcopy(clean)), plans,
+            list(getattr(args, "_preflight_request_rows", []) or []))
+        evidence.update(
+            evidence_mode="carried_setup_rows",
+            binding=binding,
+            binding_sha256=binding_digest,
+        )
     args._preflight_evidence = evidence
     return evidence
 
@@ -1427,9 +1994,14 @@ def cmd_benchmark(args) -> int:
     from .runner import RunConfig, enforce_exact_analysis_envelope, run
     import tempfile
 
+    json_mode = getattr(args, "format", "text") == "json"
+    try:
+        args.probe_extra_body = _validated_probe_candidates(
+            getattr(args, "probe_extra_body", None) or [])
+    except (TypeError, ValueError, OverflowError) as exc:
+        return _input_validation_refusal(exc, json_mode=json_mode)
     cfg = _benchmark_config(args)
     args._preflight_request_rows = []
-    json_mode = getattr(args, "format", "text") == "json"
     with tempfile.TemporaryDirectory(
             prefix="traffic-replay-cli-inputs-") as frozen_dir:
         if json_mode:
@@ -1458,6 +2030,24 @@ def cmd_benchmark(args) -> int:
             enforce_exact_analysis_envelope(
                 prevalidated, setup_rows=setup_rows,
                 context="benchmark including possible setup traffic")
+            schedule = (prevalidated.full_schedule
+                        or prevalidated.sizing_schedule_ceiling)
+            measured_rows = len(schedule["timestamps"])
+            measured_label = (
+                "measured replay" if prevalidated.full_schedule is not None
+                else "measured replay ceiling before sizing")
+            calibration_rows = int(work_cfg.get("calibrate_n") or 0)
+            count_stream = sys.stderr if json_mode else sys.stdout
+            print(
+                f"[plan] {measured_label}={measured_rows:,}; "
+                f"setup/preflight up to={setup_rows:,}; "
+                f"calibration={calibration_rows:,}; logical total up to="
+                f"{measured_rows + setup_rows + calibration_rows:,}",
+                file=count_stream)
+            print(
+                "[plan] retries can add physical POST attempts; the runtime "
+                "quota guard admits each attempt separately.",
+                file=count_stream)
         except (TypeError, ValueError, RuntimeError, OverflowError) as exc:
             return _input_validation_refusal(exc, json_mode=json_mode)
 
@@ -1492,11 +2082,16 @@ def cmd_benchmark(args) -> int:
                     refused = _check_preflight(
                         work_cfg, args,
                         representative_plans=representatives)
-                preflight_gate = _finalize_preflight_evidence(args, refused)
+                preflight_gate = _finalize_preflight_evidence(
+                    args, refused, cfg=work_cfg,
+                    representative_plans=getattr(
+                        args, "_preflight_representative_plans", None))
                 setup_path = _seal_setup_traffic_evidence(
                     work_cfg, args,
                     outcome=preflight_gate["outcome"],
                     exit_code=refused)
+                args._setup_artifact_reference = _setup_artifact_reference(
+                    setup_path, preflight_gate)
             except BaseException as exc:
                 _abort_setup_traffic_evidence(args, exc)
                 raise
@@ -1533,6 +2128,8 @@ def cmd_benchmark(args) -> int:
         if not args.skip_preflight:
             run_options["preflight_gate"] = copy.deepcopy(
                 args._preflight_evidence)
+            run_options["setup_artifact_reference"] = copy.deepcopy(
+                args._setup_artifact_reference)
         if getattr(args, "_runtime_quota_guard", None) is not None:
             run_options["runtime_quota_guard"] = args._runtime_quota_guard
         out = run(rc, quiet=json_mode, **run_options)
@@ -1546,6 +2143,49 @@ def cmd_benchmark(args) -> int:
         print(f"config saved to {saved}. reruns refuse if any external input "
               "bytes changed:", file=stream)
         print(f"  python3 -m traffic_replay run --config {saved}", file=stream)
+        if getattr(args, "verify_after_run", False):
+            from .run_verification import (
+                create_run_verification_receipt,
+                verify_run_receipt,
+            )
+            source_dir = Path(out["out_dir"])
+            receipt_dir = create_run_verification_receipt(
+                source_dir, str(source_dir) + "-verification")
+            receipt = verify_run_receipt(receipt_dir, verify_source=False)
+            decision = receipt["decision"]
+            codes = {
+                "integrity": decision["evidence_integrity"]["code"],
+                "measurement": decision["measurement_validity"]["code"],
+                "sla": decision["customer_sla"]["code"],
+                "quota": decision["quota_state"]["code"],
+                "capacity": decision["endpoint_capacity"]["code"],
+            }
+            completion = {
+                "measured_replay_requests": decision["tested_load"][
+                    "measured_replay_requests"],
+                "captured_setup_and_calibration_requests": (
+                    decision["tested_load"]["captured_quota_request_rows"]
+                    - decision["tested_load"]["measured_replay_requests"]),
+                "source_run_dir": str(source_dir),
+                "verification_receipt_dir": str(receipt_dir),
+                "authoritative_html": str(
+                    Path(receipt_dir) / "verified-report.html"),
+                "authoritative_markdown": str(
+                    Path(receipt_dir) / "verified-report.md"),
+                "decision_codes": codes,
+            }
+            if json_mode:
+                print(json.dumps({"post_run_verification": completion},
+                                 allow_nan=False), file=sys.stderr)
+            else:
+                print("\nAUTHORITATIVE VERIFIED RESULT", file=stream)
+                for key, value in completion.items():
+                    if key == "decision_codes":
+                        print("decisions: " + ", ".join(
+                            f"{name}={state}"
+                            for name, state in value.items()), file=stream)
+                    else:
+                        print(f"{key}: {value}", file=stream)
         return code
 
 
@@ -1620,6 +2260,11 @@ def cmd_sweep(args) -> int:
         raise SystemExit("--duration must be a positive number of seconds")
     if args.cooldown < 0:
         raise SystemExit("--cooldown cannot be negative")
+    try:
+        args.probe_extra_body = _validated_probe_candidates(
+            getattr(args, "probe_extra_body", None) or [])
+    except (TypeError, ValueError, OverflowError) as exc:
+        return _input_validation_refusal(exc)
     rates = _rungs(args.rate)
     sweep_started = _time.monotonic()
     base = _benchmark_config(args)
@@ -1719,11 +2364,16 @@ def cmd_sweep(args) -> int:
                     work_base, args,
                     representative_plans=(
                         first_prevalidated.representative_plans))
-                preflight_gate = _finalize_preflight_evidence(args, refused)
+                preflight_gate = _finalize_preflight_evidence(
+                    args, refused, cfg=work_base,
+                    representative_plans=getattr(
+                        args, "_preflight_representative_plans", None))
                 setup_path = _seal_setup_traffic_evidence(
                     work_base, args,
                     outcome=preflight_gate["outcome"],
                     exit_code=refused)
+                args._setup_artifact_reference = _setup_artifact_reference(
+                    setup_path, preflight_gate)
             except BaseException as exc:
                 _abort_setup_traffic_evidence(args, exc)
                 raise
@@ -1823,9 +2473,14 @@ def cmd_sweep(args) -> int:
                 if i == 0 and args._preflight_request_rows:
                     run_options["prior_request_rows"] = \
                         args._preflight_request_rows
-                if i == 0 and not args.skip_preflight:
-                    run_options["preflight_gate"] = copy.deepcopy(
-                        args._preflight_evidence)
+                if not args.skip_preflight:
+                    inherited_gate = copy.deepcopy(args._preflight_evidence)
+                    if i > 0:
+                        inherited_gate["evidence_mode"] = \
+                            "inherited_setup_artifact"
+                    run_options["preflight_gate"] = inherited_gate
+                    run_options["setup_artifact_reference"] = copy.deepcopy(
+                        args._setup_artifact_reference)
                 if getattr(args, "_runtime_quota_guard", None) is not None:
                     run_options["runtime_quota_guard"] = \
                         args._runtime_quota_guard
@@ -1942,6 +2597,25 @@ def _sweep_report(rungs: list[dict], sweep_artifact, args) -> int:
             "invariant_errors": [],
         },
     })
+    complete_preflight = getattr(args, "_preflight_evidence", {
+        "skipped": True,
+        "attempted": 0,
+        "reachable": 0,
+        "readable": 0,
+        "reasoning_probe_requests": 0,
+        "outcome": "skipped",
+        "force_requested": False,
+        "gate_satisfied": False,
+    })
+    # The sweep's decision schema consumes the compact gate state. Every rung
+    # retains the full cryptographic binding and setup-artifact reference in
+    # its own sealed run; do not duplicate that large evidence in this report.
+    preflight_decision = {
+        key: complete_preflight[key] for key in (
+            "skipped", "attempted", "reachable", "readable",
+            "reasoning_probe_requests", "outcome", "force_requested",
+            "gate_satisfied")
+    }
     context = {
         "endpoint": getattr(args, "_sweep_endpoint_path", args.endpoint),
         "sweep_wall_s": getattr(args, "_sweep_wall_s", 0.0),
@@ -1959,16 +2633,7 @@ def _sweep_report(rungs: list[dict], sweep_artifact, args) -> int:
         },
         "termination_reason": termination_reason,
         "sweep_quota_evidence": sweep_quota,
-        "preflight": getattr(args, "_preflight_evidence", {
-            "skipped": True,
-            "attempted": 0,
-            "reachable": 0,
-            "readable": 0,
-            "reasoning_probe_requests": 0,
-            "outcome": "skipped",
-            "force_requested": False,
-            "gate_satisfied": False,
-        }),
+        "preflight": preflight_decision,
     }
     outcome = sweep_outcome(rungs, context["preflight"])
     body = render_sweep_report(rungs, context)
@@ -2118,7 +2783,14 @@ def cmd_quickstart(args) -> int:
     path = args.endpoint
     if not path.startswith("/"):
         path = f"/serving-endpoints/{path}/invocations"
-    ep: dict = {"base_url": args.host.rstrip("/"), "path": path}
+    ep: dict = {
+        "base_url": args.host.rstrip("/"),
+        "path": path,
+        "temperature": getattr(args, "temperature", 0.0),
+    }
+    endpoint_adapter = getattr(args, "endpoint_adapter", None)
+    if endpoint_adapter:
+        ep["adapter"] = endpoint_adapter
     if args.auth_profile:
         ep["auth_profile"] = args.auth_profile
     else:
@@ -2149,6 +2821,9 @@ def cmd_quickstart(args) -> int:
             "Describe the capacity this ran on. Shared pay-per-token is not a "
             "performance claim for a dedicated endpoint."),
     }
+    calibration_requests = getattr(args, "calibrate_requests", None)
+    if calibration_requests is not None:
+        cfg["calibrate_n"] = calibration_requests
     if args.max_output_tokens is not None:
         cfg["max_output_tokens_cap"] = args.max_output_tokens
     if getattr(args, "ttft_definition", None) is not None:
@@ -2215,6 +2890,167 @@ def cmd_quickstart(args) -> int:
     return 0
 
 
+def _databricks_profile_host(name: str) -> str:
+    """Read only the normalized host from one named Databricks CLI profile."""
+    import configparser
+    from .client import validate_bearer_transport
+
+    cfg_path = Path(os.environ.get(
+        "DATABRICKS_CONFIG_FILE", Path.home() / ".databrickscfg"))
+    parser = configparser.ConfigParser(
+        interpolation=None, default_section="__TRAFFIC_REPLAY_DEFAULTS_DISABLED__")
+    try:
+        read = parser.read(cfg_path)
+    except (OSError, configparser.Error) as exc:
+        raise ValueError(
+            f"could not read Databricks config {cfg_path}: "
+            f"{type(exc).__name__}") from None
+    if not read or parser.defaults() or not parser.has_section(name):
+        raise ValueError(
+            f"Databricks auth profile {name!r} was not found in {cfg_path}")
+    host = (parser[name].get("host") or "").strip()
+    try:
+        scheme, hostname, port = validate_bearer_transport(host)
+    except ValueError as exc:
+        raise ValueError(
+            f"Databricks auth profile {name!r} has an invalid workspace host") \
+            from exc
+    default = 443 if scheme == "https" else 80
+    return f"{scheme}://{hostname}" + (f":{port}" if port != default else "")
+
+
+def _ready_chat_endpoints(profile: str) -> list[dict]:
+    """Discover endpoint metadata without reading or printing credentials."""
+    import subprocess
+    from .json_input import loads_strict
+
+    try:
+        completed = subprocess.run(
+            ["databricks", "serving-endpoints", "list", "--profile", profile,
+             "--output", "json"],
+            check=True, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        raise ValueError(
+            "Databricks CLI was not found; install it before init-databricks") \
+            from None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        detail = (getattr(exc, "stderr", "") or "").strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise ValueError("Databricks endpoint discovery failed" + suffix) \
+            from None
+    try:
+        payload = loads_strict(completed.stdout)
+    except ValueError:
+        raise ValueError("Databricks endpoint discovery returned invalid JSON") \
+            from None
+    if isinstance(payload, dict):
+        payload = payload.get("endpoints", payload.get("serving_endpoints", []))
+    if not isinstance(payload, list):
+        raise ValueError("Databricks endpoint discovery returned no endpoint list")
+    ready = []
+    for item in payload:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        state = item.get("state") if isinstance(item.get("state"), dict) else {}
+        ready_state = state.get("ready", item.get("ready"))
+        task = str(item.get("task") or item.get("task_type") or "").lower()
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        entities = config.get("served_entities") or config.get("served_models") or []
+        entity_tasks = " ".join(
+            str(entity.get("task") or entity.get("task_type") or "").lower()
+            for entity in entities if isinstance(entity, dict))
+        chat_known = "chat" in task or "chat" in entity_tasks
+        foundation = any(
+            isinstance(entity, dict) and (
+                entity.get("foundation_model") or entity.get("entity_name"))
+            for entity in entities)
+        if str(ready_state).upper() == "READY" and (chat_known or foundation):
+            ready.append({
+                "name": item["name"],
+                "task": task or entity_tasks or "foundation-model",
+                "route_optimized": bool(item.get("route_optimized", False)),
+            })
+    return sorted(ready, key=lambda item: item["name"])
+
+
+def cmd_init_databricks(args) -> int:
+    """Discover a named workspace and emit a bounded editable starter run."""
+    try:
+        host = _databricks_profile_host(args.auth_profile)
+        endpoints = _ready_chat_endpoints(args.auth_profile)
+    except ValueError as exc:
+        raise SystemExit(f"init-databricks refused: {exc}") from exc
+    if not endpoints:
+        raise SystemExit("init-databricks found no READY chat/foundation endpoints")
+    names = [item["name"] for item in endpoints]
+    endpoint = args.endpoint
+    if endpoint is None:
+        if len(names) == 1:
+            endpoint = names[0]
+        elif sys.stdin.isatty():
+            print("READY chat/foundation endpoints:")
+            for index, item in enumerate(endpoints, start=1):
+                print(f"  {index}. {item['name']} ({item['task']})")
+            try:
+                selected = int(input("Select endpoint number: "))
+                endpoint = names[selected - 1]
+            except (ValueError, IndexError, EOFError):
+                raise SystemExit("init-databricks requires a valid selection") \
+                    from None
+        else:
+            raise SystemExit(
+                "multiple READY endpoints found; rerun with --endpoint NAME. "
+                "Candidates: " + ", ".join(names))
+    if endpoint not in names:
+        raise SystemExit(
+            f"endpoint {endpoint!r} is not a discovered READY chat/foundation "
+            "endpoint; candidates: " + ", ".join(names))
+
+    out = Path(args.out)
+    timestamps = "10\n30\n50\n"
+    from .immutable_config import write_immutable_text
+    trace = write_immutable_text(
+        args.out_dir, "timestamps", timestamps)
+    cfg = {
+        "profile_path": str((Path(__file__).resolve().parent.parent /
+                             "configs/profile_validation_small.json")),
+        "endpoint": {
+            "base_url": host,
+            "path": f"/serving-endpoints/{endpoint}/invocations",
+            "auth_profile": args.auth_profile,
+            "adapter": "openai.chat_completions.sse/v1",
+            "temperature": 0.0,
+        },
+        "timestamps_file": str(trace),
+        "duration_s": 60,
+        "calibrate_n": 0,
+        "max_concurrency": 1,
+        "max_pending_requests": 1,
+        "out_dir": args.out_dir,
+        "title": f"3-request Databricks diagnostic starter, {endpoint}",
+        "label": ("LOW-COST DIAGNOSTIC STARTER - NOT CAPACITY EVIDENCE; "
+                  "review workload, quotas, and acceptance targets first"),
+    }
+    from .runner import RunConfig
+    RunConfig(**cfg)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(cfg, indent=2, allow_nan=False) + "\n")
+    print(f"workspace: {host}")
+    print(f"endpoint: {endpoint}")
+    print("planned measured requests: 3; calibration: 0")
+    print("benchmark preflight adds two representative requests; retries may "
+          "add physical attempts and provider quota is not reserved")
+    print(f"starter config: {out}")
+    print("validate: python3 -m traffic_replay validate --port 0 --format json")
+    print("run starter: python3 -m traffic_replay run --config " + str(out))
+    print("guided benchmark: python3 -m traffic_replay benchmark --auth-profile "
+          f"{args.auth_profile!r} --host {host!r} --endpoint {endpoint!r} "
+          "--requests 3 --duration 60 --calibrate-requests 0 "
+          "--verify-after-run")
+    print("verification/report paths are printed by --verify-after-run")
+    return 0
+
+
 def main(argv=None) -> int:
     from . import __version__
 
@@ -2236,6 +3072,11 @@ def main(argv=None) -> int:
     s.set_defaults(fn=cmd_schedule)
 
     s = sub.add_parser(
+        "adapters", help="list installed, versioned endpoint wire adapters")
+    s.add_argument("--format", choices=("text", "json"), default="text")
+    s.set_defaults(fn=cmd_adapters)
+
+    s = sub.add_parser(
         "benchmark",
         help="one command: endpoint in, report out (start here)")
     s.add_argument("--host", required=True,
@@ -2252,6 +3093,15 @@ def main(argv=None) -> int:
                    default=None, help=argparse.SUPPRESS)
     s.add_argument("--duration", type=int, default=300,
                    help="seconds. 300 gives five stability windows")
+    s.add_argument(
+        "--requests", type=int, default=None, metavar="N",
+        help="schedule exactly N measured replay requests, evenly spaced "
+             "across --duration; cannot be combined with rate or sizing flags")
+    s.add_argument(
+        "--calibrate-requests", type=_calibration_request_count_arg,
+        default=12, metavar="N",
+        help="unloaded token-calibration requests before replay (default: 12; "
+             "use 0 only when token calibration is intentionally disabled)")
     s.add_argument("--input-tokens", default="10000",
                    help="prompt size as p50 or p50,p95. default 10000")
     s.add_argument("--output-tokens", default="200",
@@ -2274,6 +3124,12 @@ def main(argv=None) -> int:
                    help="env var holding a bearer token, if not using a profile")
     s.add_argument("--model", default=None,
                    help="only for shared /chat/completions routes")
+    _add_temperature_arguments(s)
+    s.add_argument(
+        "--endpoint-adapter",
+        default="openai.chat_completions.sse/v1",
+        help="versioned request/response wire contract; list installed "
+             "contracts with `traffic-replay adapters`")
     s.add_argument(
         "--production-connection-policy",
         choices=("fresh_http1_per_physical_attempt",), default=None,
@@ -2281,11 +3137,9 @@ def main(argv=None) -> int:
              "connection for every physical attempt. Omit unless this exact "
              "production behavior is known")
     s.add_argument("--extra-body", default=None,
-                   help='JSON merged into each request. Managed Databricks '
-                        'GLM 5.2 thinking off: '
-                        '\'{"reasoning_effort":"none"}\'; direct SGLang: '
-                        '\'{"chat_template_kwargs":'
-                        '{"enable_thinking":false}}\'')
+                   help="provider-documented JSON controls merged into each "
+                        "request; model behavior is never inferred from its "
+                        "name")
     s.add_argument("--ttft-p50", type=float, default=None,
                    help="your TTFT target in ms. same for --ttft-p90/p95/p99")
     s.add_argument("--ttft-p90", type=float, default=None)
@@ -2335,6 +3189,10 @@ def main(argv=None) -> int:
                         "invalid=2. use none to always exit 0")
     s.add_argument("--format", choices=("text", "json"), default="text",
                    help="text prints the report, json prints summary.json")
+    s.add_argument(
+        "--verify-after-run", action="store_true",
+        help="write a sibling verification receipt and print authoritative "
+             "verified report paths after a successful sealed run")
     s.set_defaults(fn=cmd_benchmark)
 
     s = sub.add_parser(
@@ -2374,6 +3232,11 @@ def main(argv=None) -> int:
              "route-optimized serving")
     s.add_argument("--token-env", default="DATABRICKS_TOKEN")
     s.add_argument("--model", default=None)
+    _add_temperature_arguments(s)
+    s.add_argument(
+        "--endpoint-adapter",
+        default="openai.chat_completions.sse/v1",
+        help="versioned request/response wire contract")
     s.add_argument(
         "--production-connection-policy",
         choices=("fresh_http1_per_physical_attempt",), default=None,
@@ -2381,9 +3244,8 @@ def main(argv=None) -> int:
              "behavior; omit for pooled, keep-alive, HTTP/2, or unknown clients")
     s.add_argument(
         "--extra-body", default=None,
-        help='JSON merged into each request. Managed Databricks GLM 5.2 '
-             'thinking off: \'{"reasoning_effort":"none"}\'; direct SGLang: '
-             '\'{"chat_template_kwargs":{"enable_thinking":false}}\'')
+        help="provider-documented JSON controls merged into each request; "
+             "model behavior is never inferred from its name")
     s.add_argument("--ttft-p50", type=float, default=None)
     s.add_argument("--ttft-p90", type=float, default=None)
     s.add_argument("--ttft-p95", type=float, default=None)
@@ -2462,6 +3324,11 @@ def main(argv=None) -> int:
                     help=argparse.SUPPRESS)
     s.add_argument("--duration", type=int, default=240,
                    help="seconds. 240 gives four stability windows")
+    s.add_argument(
+        "--calibrate-requests", type=_calibration_request_count_arg,
+        default=12, metavar="N",
+        help="unloaded token-calibration requests before replay (default: 12; "
+             "use 0 only when token calibration is intentionally disabled)")
     s.add_argument("--auth-profile", default=None,
                    help="a ~/.databrickscfg PAT, databricks-cli U2M, or "
                         "workspace OAuth M2M profile; standard workspace-"
@@ -2470,6 +3337,11 @@ def main(argv=None) -> int:
                    help="env var holding a bearer token, if not using a profile")
     s.add_argument("--model", default=None,
                    help="only for shared /chat/completions routes")
+    _add_temperature_arguments(s)
+    s.add_argument(
+        "--endpoint-adapter",
+        default="openai.chat_completions.sse/v1",
+        help="versioned request/response wire contract")
     s.add_argument(
         "--production-connection-policy",
         choices=("fresh_http1_per_physical_attempt",), default=None,
@@ -2500,6 +3372,21 @@ def main(argv=None) -> int:
              "for user-visible assistant content")
     s.add_argument("--out", default="configs/quickstart.json")
     s.set_defaults(fn=cmd_quickstart)
+
+    s = sub.add_parser(
+        "init-databricks",
+        help="discover READY endpoints from a named profile and write a "
+             "bounded diagnostic starter config")
+    s.add_argument("--auth-profile", required=True,
+                   help="named ~/.databrickscfg workspace profile")
+    s.add_argument("--endpoint", default=None,
+                   help="READY endpoint name; interactively selected when "
+                        "omitted and a terminal is available")
+    s.add_argument("--out", default="configs/databricks-starter.json",
+                   help="editable starter RunConfig path")
+    s.add_argument("--out-dir", default="results/databricks-starter",
+                   help="result directory used by the starter config")
+    s.set_defaults(fn=cmd_init_databricks)
 
     s = sub.add_parser("run", help="replay against a real endpoint")
     s.add_argument("--config", required=True)

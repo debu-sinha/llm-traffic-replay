@@ -75,6 +75,7 @@ NOTEBOOK_SUPPORT_FILES = (
     "scripts/pack_notebook.py",
     "scripts/profile_from_logs.py",
     "docs/ARCHITECTURE.md",
+    "docs/OUTPUT_FIELD_REFERENCE.md",
     "docs/PRODUCTION_TESTING.md",
     "docs/RUN_YOUR_OWN_BENCHMARK.md",
     "docs/customer/benchmark-your-own-endpoint.html",

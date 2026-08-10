@@ -24,21 +24,21 @@ from traffic_replay.runner import RunConfig, run
 from traffic_replay.sse import extract_usage
 
 
-def test_extra_body_merges_but_core_keys_win():
+def test_extra_body_merges_non_owned_provider_controls():
     cfg = EndpointConfig(
         base_url="http://x", path="/p",
         extra_body={"top_p": 0.9,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "max_tokens": 999, "stream": False, "messages": ["nope"],
-                    "model": "evil", "stream_options": {"include_usage": False},
-                    "temperature": 5})
+                    "chat_template_kwargs": {"enable_thinking": False}})
     client = EndpointClient(cfg, None)
     body = json.loads(client._body([{"role": "user", "content": "hi"}], 128,
                                    True))
     # passthrough survives
     assert body["top_p"] == 0.9
     assert body["chat_template_kwargs"] == {"enable_thinking": False}
-    # harness-owned keys always win over anything in extra_body
+    # Adapter-owned keys are supplied only by the typed endpoint/run config;
+    # collisions in extra_body fail during EndpointConfig construction rather
+    # than being silently discarded.  That behavior is covered by the adapter
+    # conformance tests.
     assert body["max_tokens"] == 128
     assert body["stream"] is True
     assert body["temperature"] == 0.0
@@ -156,6 +156,9 @@ def test_reasoning_tokens_reported_end_to_end():
         "completion_tokens_details.reasoning_tokens"
     assert s["run"]["request_params"]["extra_body"] == \
         {"reasoning_effort": "low"}
+    assert s["run"]["request_params"]["endpoint_adapter"] == \
+        "openai.chat_completions.sse/v1"
+    assert s["run"]["request_params"]["response_mode"] == "streaming"
     rows = [json.loads(line) for line in
             Path(out["out_dir"], "requests.jsonl").read_text().splitlines()
             if line.strip()]

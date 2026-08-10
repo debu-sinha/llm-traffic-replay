@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
   <title id="title">LLM traffic replay architecture and evidence lifecycle</title>
-  <desc id="desc">Private input capture and exact local prevalidation precede credential and network access. Fixed-rate, trace, and every sweep-rung schedule are materialized at that boundary; a sizing-derived schedule is the explicit exception because paid sizing must derive its rate first. When quota limits are configured, conservative full-request-body planning and positive READY endpoint binding precede paid inference. A crash-visible setup artifact is claimed before the default two-request preflight. One command-local no-wait guard atomically admits every physical inference POST immediately before the request call; retries and fallbacks are admitted separately. The built-in transport opens a fresh HTTP/1.1 connection for every physical attempt. Request-path and caller clocks, response model plus Databricks served-model-name identity, runtime-admission events, and a normalized subset of pre-run/post-drain endpoint metadata feed a durable journal and exactly five canonical report decisions; identity, stability, and runtime admission are evidence gates. Manifest version 3 and a completion marker are promoted last.</desc>
+  <desc id="desc">Private input capture and exact local prevalidation precede credential and network access. Fixed-rate, trace, and every sweep-rung schedule are materialized at that boundary; a sizing-derived schedule is the explicit exception because paid sizing must derive its rate first. When quota limits are configured, conservative full-request-body planning and positive READY endpoint binding precede paid inference. A crash-visible setup artifact is claimed before the default two-request preflight. One command-local no-wait guard atomically admits every physical inference POST immediately before the request call; retries and fallbacks are admitted separately. A versioned endpoint adapter serializes the request, declares request and accepted response media plus framing, folds provider events into canonical state, normalizes usage, and classifies the terminal outcome. The built-in fresh HTTP/1.1 transport is a separate boundary and opens one connection for every physical attempt. Failed and partial attempts remain in reliability and occupancy evidence; primary latency requires clean acceptable outcomes, while token metrics require clean rows with trustworthy usage and explicit coverage. Request-path and caller clocks, response model plus Databricks served-model-name identity, runtime-admission events, and a normalized subset of pre-run and post-drain endpoint metadata feed a durable journal and exactly five canonical report decisions; identity, stability, and runtime admission are evidence gates. Manifest version 3 and a completion marker are promoted last.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
@@ -28,7 +28,7 @@
   <rect class="warn" x="560" y="104" width="260" height="88" rx="10"/>
   <text class="t" x="690" y="132" text-anchor="middle">Optional quota + READY P2T gate</text>
   <text class="s" x="690" y="154" text-anchor="middle">full JSON bytes + framing</text>
-  <text class="s" x="690" y="174" text-anchor="middle">CPT max(configured,12); tier absent/default</text>
+  <text class="s" x="690" y="174" text-anchor="middle">synthetic: CPT max(configured,12); prompts: exact bytes</text>
   <rect class="evidence" x="875" y="104" width="235" height="88" rx="10"/>
   <text class="t" x="992" y="132" text-anchor="middle">Setup evidence claimed first</text>
   <text class="s" x="992" y="154" text-anchor="middle">sibling writing marker + start.json</text>
@@ -41,39 +41,46 @@
 
   <rect class="lane" x="28" y="235" width="1384" height="245" rx="16"/>
   <text class="lh" x="48" y="263">2. Prepare and dispatch a bounded open-loop workload</text>
-  <rect class="box" x="55" y="292" width="210" height="126" rx="10"/>
-  <text class="t" x="160" y="318" text-anchor="middle">Workload plan</text>
-  <text class="s" x="160" y="342" text-anchor="middle">profile v1 or v2, or prompts</text>
-  <text class="s" x="160" y="363" text-anchor="middle">synthetic schedule or trace</text>
-  <text class="s" x="160" y="384" text-anchor="middle">global indices → shard subset</text>
-  <text class="tiny" x="160" y="405" text-anchor="middle">sizing/calibration are extra traffic</text>
-  <rect class="box" x="325" y="292" width="220" height="126" rx="10"/>
-  <text class="t" x="435" y="318" text-anchor="middle">Monotonic dispatcher</text>
-  <text class="s" x="435" y="342" text-anchor="middle">waits for each scheduled target</text>
-  <text class="s" x="435" y="363" text-anchor="middle">fixed-rate open loop</text>
-  <text class="s" x="435" y="384" text-anchor="middle">max_concurrency workers</text>
-  <text class="s" x="435" y="405" text-anchor="middle">bounded max_pending_requests</text>
-  <rect class="warn" x="605" y="292" width="240" height="126" rx="10"/>
-  <text class="t" x="725" y="318" text-anchor="middle">Runtime-admitted POST attempts</text>
-  <text class="s" x="725" y="342" text-anchor="middle">reserve immediately before conn.request</text>
-  <text class="s" x="725" y="363" text-anchor="middle">local denial sends no physical POST</text>
-  <text class="s" x="725" y="384" text-anchor="middle">retry/fallback/refresh re-admitted</text>
-  <text class="tiny" x="725" y="405" text-anchor="middle">fresh HTTP/1.1 connection each attempt</text>
-  <rect class="muted" x="905" y="292" width="200" height="126" rx="10"/>
-  <text class="t" x="1005" y="318" text-anchor="middle">Serving endpoint</text>
-  <text class="s" x="1005" y="342" text-anchor="middle">streamed chat subset</text>
-  <text class="s" x="1005" y="363" text-anchor="middle">provider dialect and quotas</text>
-  <text class="s" x="1005" y="384" text-anchor="middle">usage may be partial or absent</text>
-  <text class="s" x="1005" y="405" text-anchor="middle">semantic correctness is external</text>
-  <rect class="safe" x="1165" y="292" width="210" height="126" rx="10"/>
-  <text class="t" x="1270" y="318" text-anchor="middle">Stream parser</text>
-  <text class="s" x="1270" y="342" text-anchor="middle">reasoning / visible / refusal / tools</text>
-  <text class="s" x="1270" y="363" text-anchor="middle">corrupt/incomplete = failures</text>
-  <text class="s" x="1270" y="384" text-anchor="middle">failed streams excluded from metrics</text>
-  <text class="tiny" x="1270" y="405" text-anchor="middle">model/entity identity kept; no content</text>
-  <path class="arrow" d="M265 355 H325"/><path class="arrow" d="M545 355 H605"/><path class="arrow" d="M845 355 H905"/><path class="arrow" d="M1105 355 H1165"/>
-  <path class="dash" d="M1005 418 C1005 458 725 458 725 420"/>
-  <text class="tiny" x="865" y="468" text-anchor="middle">explicit retry/fallback path: every repeated POST requires a new reservation</text>
+  <rect class="box" x="48" y="292" width="170" height="126" rx="10"/>
+  <text class="t" x="133" y="318" text-anchor="middle">Workload plan</text>
+  <text class="s" x="133" y="342" text-anchor="middle">profile or prompts</text>
+  <text class="s" x="133" y="363" text-anchor="middle">schedule or trace</text>
+  <text class="s" x="133" y="384" text-anchor="middle">global ID → shard</text>
+  <text class="tiny" x="133" y="405" text-anchor="middle">sizing/calibration extra</text>
+  <rect class="box" x="248" y="292" width="170" height="126" rx="10"/>
+  <text class="t" x="333" y="318" text-anchor="middle">Open-loop dispatch</text>
+  <text class="s" x="333" y="342" text-anchor="middle">monotonic targets</text>
+  <text class="s" x="333" y="363" text-anchor="middle">bounded workers</text>
+  <text class="s" x="333" y="384" text-anchor="middle">bounded pending</text>
+  <text class="tiny" x="333" y="405" text-anchor="middle">caller clock retained</text>
+  <rect class="safe" x="448" y="284" width="265" height="142" rx="10"/>
+  <text class="t" x="580" y="308" text-anchor="middle">Versioned endpoint adapter</text>
+  <text class="s" x="580" y="333" text-anchor="middle">exact request serialization</text>
+  <text class="s" x="580" y="354" text-anchor="middle">declared media + framing</text>
+  <text class="s" x="580" y="375" text-anchor="middle">canonical event fold</text>
+  <text class="s" x="580" y="396" text-anchor="middle">outcome + normalized usage</text>
+  <text class="tiny" x="580" y="417" text-anchor="middle">adapter ID + implementation hash sealed</text>
+  <rect class="box" x="743" y="292" width="170" height="126" rx="10"/>
+  <text class="t" x="828" y="318" text-anchor="middle">Fresh HTTP/1.1</text>
+  <text class="s" x="828" y="342" text-anchor="middle">transport boundary</text>
+  <text class="s" x="828" y="363" text-anchor="middle">one connection per</text>
+  <text class="s" x="828" y="382" text-anchor="middle">physical attempt</text>
+  <text class="tiny" x="828" y="405" text-anchor="middle">bounded response chunks</text>
+  <rect class="warn" x="943" y="292" width="205" height="126" rx="10"/>
+  <text class="t" x="1045" y="318" text-anchor="middle">Runtime admission</text>
+  <text class="s" x="1045" y="342" text-anchor="middle">after connect; before POST</text>
+  <text class="s" x="1045" y="363" text-anchor="middle">reserve exact body bytes</text>
+  <text class="s" x="1045" y="384" text-anchor="middle">denial sends no POST</text>
+  <text class="tiny" x="1045" y="405" text-anchor="middle">every retry re-admitted</text>
+  <rect class="muted" x="1178" y="292" width="185" height="126" rx="10"/>
+  <text class="t" x="1270" y="318" text-anchor="middle">Serving endpoint</text>
+  <text class="s" x="1270" y="342" text-anchor="middle">provider wire dialect</text>
+  <text class="s" x="1270" y="363" text-anchor="middle">quota + response media</text>
+  <text class="s" x="1270" y="384" text-anchor="middle">usage may be absent</text>
+  <text class="tiny" x="1270" y="405" text-anchor="middle">quality remains external</text>
+  <path class="arrow" d="M218 355 H248"/><path class="arrow" d="M418 355 H448"/><path class="arrow" d="M713 355 H743"/><path class="arrow" d="M913 355 H943"/><path class="arrow" d="M1148 355 H1178"/>
+  <path class="dash" d="M1270 418 C1270 458 580 458 580 428"/>
+  <text class="tiny" x="925" y="468" text-anchor="middle">response bytes return through transport; adapter validates framing and folds events</text>
 
   <rect class="lane" x="28" y="500" width="1384" height="135" rx="16"/>
   <text class="lh" x="48" y="528">3. Keep both timing families and journal every observed outcome</text>
@@ -85,8 +92,8 @@
   <text class="s" x="645" y="594" text-anchor="middle">queue + connect + fallback + refresh + retries + response</text>
   <rect class="evidence" x="895" y="550" width="430" height="58" rx="10"/>
   <text class="t" x="1110" y="574" text-anchor="middle">Durable requests.jsonl.partial</text>
-  <text class="s" x="1110" y="592" text-anchor="middle">attempt/admission events + outcomes + exact clocks</text>
-  <text class="tiny" x="1110" y="606" text-anchor="middle">redacted errors + batched fsync</text>
+  <text class="s" x="1110" y="592" text-anchor="middle">failures remain in reliability + occupancy evidence</text>
+  <text class="tiny" x="1110" y="606" text-anchor="middle">latency needs acceptable outcomes; tokens need trustworthy usage</text>
   <path class="arrow" d="M395 579 H465"/><path class="arrow" d="M825 579 H895"/>
 
   <rect class="lane" x="28" y="655" width="1384" height="132" rx="16"/>
@@ -102,6 +109,6 @@
   <text class="s" x="812" y="748" text-anchor="middle">identity + SHA-256 + bytes + row count</text>
   <rect class="safe" x="1000" y="704" width="335" height="55" rx="10"/>
   <text class="t" x="1167" y="728" text-anchor="middle">.traffic-replay-complete promoted last</text>
-  <text class="s" x="1167" y="748" text-anchor="middle">merge and compare accept only sealed, verified inputs</text>
+  <text class="s" x="1167" y="748" text-anchor="middle">merge/compare require sealed, internally hash-verified inputs</text>
   <path class="arrow" d="M320 731 H370"/><path class="arrow" d="M625 731 H675"/><path class="arrow" d="M950 731 H1000"/>
 </svg>

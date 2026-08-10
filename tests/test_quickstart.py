@@ -7,6 +7,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from traffic_replay.cli import main
 from traffic_replay.runner import RunConfig, _token, _token_from_profile
 from traffic_replay.client import EndpointConfig
@@ -29,8 +31,9 @@ def _run_quickstart(out: Path, *extra):
 
 def test_quickstart_writes_a_config_the_runner_accepts():
     cfg = _run_quickstart(_tmp() / "q.json")
-    # the whole point: concurrency is expressible, not derived by the reader
-    assert cfg["concurrency"] == 30
+    # This is an open-loop sizing hint, not a held closed-loop concurrency.
+    assert cfg["sizing_concurrency"] == 30
+    assert "concurrency" not in cfg
     assert cfg["endpoint"]["path"] == "/serving-endpoints/my-endpoint/invocations"
     RunConfig(**cfg)                      # constructs without extra fields
 
@@ -54,9 +57,36 @@ def test_sla_targets_are_expressible_on_the_command_line():
     assert "command line" in at["targets_are"]
 
 
+def test_quickstart_persists_the_configured_first_event_definition():
+    cfg = _run_quickstart(
+        _tmp() / "q.json", "--ttft-definition", "first_visible")
+    assert cfg["ttft_definition"] == "first_visible"
+
+
 def test_no_targets_means_no_acceptance_block_rather_than_a_guess():
     cfg = _run_quickstart(_tmp() / "q.json")
     assert "acceptance_targets" not in cfg
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--ttft-p95", "0"),
+    ("--success-rate", "0"),
+    ("--success-rate", "1.0"),
+    ("--success-rate", "1.1"),
+])
+def test_quickstart_rejects_invalid_sla_instead_of_silently_dropping_it(
+        flag, value):
+    out = _tmp() / "invalid.json"
+    with pytest.raises(SystemExit, match="invalid quickstart"):
+        _run_quickstart(out, flag, value)
+    assert not out.exists()
+
+
+def test_quickstart_rejects_invalid_workload_before_writing(tmp_path):
+    out = tmp_path / "invalid.json"
+    with pytest.raises(SystemExit, match="invalid quickstart"):
+        _run_quickstart(out, "--duration", "0")
+    assert not out.exists()
 
 
 def test_auth_profile_replaces_the_token_env_var():
@@ -78,7 +108,7 @@ def test_a_pat_profile_resolves_without_shelling_out():
     old = os.environ.get("DATABRICKS_CONFIG_FILE")
     os.environ["DATABRICKS_CONFIG_FILE"] = str(d / "cfg")
     try:
-        assert _token_from_profile("work") == "dapi-not-real"
+        assert _token_from_profile("work", "https://x") == "dapi-not-real"
     finally:
         if old is None:
             os.environ.pop("DATABRICKS_CONFIG_FILE", None)
@@ -97,14 +127,21 @@ def test_the_env_var_still_works_when_no_profile_is_set():
         os.environ.pop("TR_TEST_TOKEN", None)
 
 
-def test_an_unresolvable_profile_falls_back_to_the_env_var():
-    """A typo in the profile name must not silently run unauthenticated."""
-    import os
-    os.environ["TR_TEST_TOKEN"] = "fallback"
-    try:
-        cfg = EndpointConfig(base_url="https://x", path="/p",
-                             auth_profile="no-such-profile-here",
-                             auth_token_env="TR_TEST_TOKEN")
-        assert _token(cfg) == "fallback"
-    finally:
-        os.environ.pop("TR_TEST_TOKEN", None)
+def test_an_unresolvable_profile_fails_closed_without_env_fallback(
+        tmp_path, monkeypatch):
+    """A typo must not repurpose an unrelated environment credential."""
+    import pytest
+    from traffic_replay.runner import AuthProfileError
+
+    config_path = tmp_path / "databrickscfg"
+    config_path.write_text(
+        "[some-other-profile]\nhost = https://x\ntoken = dapi-not-real\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("TR_TEST_TOKEN", "fallback")
+
+    cfg = EndpointConfig(base_url="https://x", path="/p",
+                         auth_profile="no-such-profile-here",
+                         auth_token_env="TR_TEST_TOKEN")
+    with pytest.raises(AuthProfileError, match="does not exist"):
+        _token(cfg)

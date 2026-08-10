@@ -1,0 +1,34 @@
+include README.md
+include CHANGELOG.md
+include SECURITY.md
+include TODO.md
+include pyproject.toml
+include setup.py
+
+# Public examples are allowlisted individually so an ignored profile derived
+# from customer logs can never enter a source distribution through a glob.
+include configs/profile_agent_blended.json
+include configs/profile_agent_stated.json
+include configs/profile_glm52_canary_illustrative.json
+include configs/profile_validation_small.json
+include configs/prompts_example.jsonl
+include configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json
+include configs/run_prompts.json
+include configs/run_pt_full.json
+include configs/run_smoke.json
+
+include scripts/build_customer_pdf.py
+include scripts/pack_notebook.py
+include scripts/profile_from_logs.py
+include notebooks/smoke_test_e2e_demo.ipynb
+
+include docs/ARCHITECTURE.md
+include docs/PRODUCTION_TESTING.md
+include docs/RUN_YOUR_OWN_BENCHMARK.md
+include docs/customer/benchmark-your-own-endpoint.html
+include docs/diagrams/architecture.excalidraw
+include docs/diagrams/architecture.svg
+include docs/diagrams/load-model.svg
+include docs/diagrams/request-sequence.svg
+
+recursive-include tests *.py

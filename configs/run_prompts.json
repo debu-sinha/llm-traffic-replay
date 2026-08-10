@@ -11,9 +11,17 @@
   "qps_min": 0.5,
   "qps_max": 4.0,
   "max_concurrency": 8,
+  "max_pending_requests": 16,
   "calibrate_n": 2,
   "max_output_tokens_cap": 300,
-  "acceptance_targets": {"ttft_ms": {"p50": 1500, "p95": 3000}, "success_rate": 0.99},
-  "out_dir": "results/agent_prompts",
-  "title": "agent prompts-mode run"
+  "ttft_definition": "first_visible",
+  "acceptance_targets": {
+    "targets_are": "illustrative example values; replace before performance use",
+    "note": "illustrative targets",
+    "ttft_ms": {"p50": 1500, "p95": 3000},
+    "success_rate": 0.99
+  },
+  "out_dir": "results/prompts",
+  "title": "prompts-mode run",
+  "label": "Template only. Replace prompts, endpoint, and illustrative acceptance targets. Repeated prompts can warm endpoint cache."
 }

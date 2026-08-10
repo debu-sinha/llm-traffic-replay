@@ -5,7 +5,8 @@ anything real. The mock speaks OpenAI-compatible streaming chat completions
 and, per request:
 
   * simulates a block-level prefix cache over the system message text
-    (leading 1 KiB blocks, LRU capacity, TTL), so the pool's constructed
+    (leading 256-character blocks, about 64 mock tokens, LRU capacity, TTL),
+    so the pool's constructed
     cache structure is exercised end to end through real text;
   * sleeps a deterministic, parameterized latency:
         ttft_true_ms = ttft_base_ms
@@ -22,11 +23,14 @@ server and reports instrument error = client-measured minus server-truth.
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 import time
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from .json_input import loads_strict
 
 MOCK_CPT = 4.0
 BLOCK_CHARS = 256  # ~64 tokens per cache block, realistic page granularity
@@ -52,7 +56,7 @@ class _PrefixCache:
     def __init__(self, capacity: int, ttl_s: float):
         self.capacity = capacity
         self.ttl_s = ttl_s
-        self.store: OrderedDict[int, float] = OrderedDict()
+        self.store: OrderedDict[bytes, float] = OrderedDict()
         self.lock = threading.Lock()
 
     def match_and_insert(self, text: str) -> int:
@@ -60,12 +64,15 @@ class _PrefixCache:
         chains. Thread-safe; called once per request."""
         now = time.monotonic()
         chains = []
-        h = 0
+        chain = b""
         n_full = len(text) // BLOCK_CHARS
         for i in range(n_full):
             block = text[i * BLOCK_CHARS:(i + 1) * BLOCK_CHARS]
-            h = hash((h, block))
-            chains.append(h)
+            # Built-in hash() is salted per process, which made the validator
+            # oracle change across interpreter launches. A content digest is
+            # stable and models a chain-keyed prefix cache just as well.
+            chain = hashlib.sha256(chain + block.encode("utf-8")).digest()
+            chains.append(chain)
         matched_blocks = 0
         with self.lock:
             # expire
@@ -102,17 +109,32 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
             t_recv = time.monotonic()
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length))
-            except Exception:
+                if not 0 < length <= 4 * 1024 * 1024:
+                    raise ValueError("invalid content length")
+                payload = loads_strict(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError("request body must be an object")
+                msgs = payload.get("messages")
+                if not isinstance(msgs, list) or not msgs \
+                        or any(not isinstance(message, dict)
+                               for message in msgs):
+                    raise ValueError("messages must be a non-empty array")
+                if any(not isinstance(message.get("role"), str)
+                       or not isinstance(message.get("content"), str)
+                       for message in msgs):
+                    raise ValueError("mock messages need string role/content")
+                max_tokens = payload.get("max_tokens", 32)
+                if not isinstance(max_tokens, int) \
+                        or isinstance(max_tokens, bool) or max_tokens <= 0:
+                    raise ValueError("max_tokens must be a positive integer")
+            except (OSError, TypeError, ValueError):
                 self.send_error(400, "bad json")
                 return
 
             rid = self.headers.get("X-Request-Id", "unknown")
-            msgs = payload.get("messages") or []
             system_text = "".join(m.get("content", "") for m in msgs
                                   if m.get("role") == "system")
             all_text = "".join(m.get("content", "") for m in msgs)
-            max_tokens = int(payload.get("max_tokens", 32))
 
             matched_chars = cache.match_and_insert(system_text) \
                 if system_text else 0
@@ -120,8 +142,6 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
             cached_tokens = min(int(round(matched_chars / MOCK_CPT)),
                                 prompt_tokens)
             uncached = prompt_tokens - cached_tokens
-            completion_tokens = max_tokens
-
             ttft_planned_ms = (params["ttft_base_ms"]
                                + params["ms_per_1k_uncached"] * uncached / 1000.0)
 
@@ -144,15 +164,29 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                                "finish_reason": None}]})
 
             time.sleep(ttft_planned_ms / 1000.0)
-            reasoning_n = int(params.get("reasoning_tokens", 0))
+            configured_reasoning = max(
+                int(params.get("reasoning_tokens", 0)), 0)
+            reasoning_only = bool(params.get("reasoning_only", 0))
+            # max_tokens is a cap on all generated tokens, including hidden
+            # reasoning. Preserve one visible token in ordinary mode; the
+            # explicit reasoning-only mode is allowed to consume the cap.
+            reasoning_n = min(
+                configured_reasoning,
+                max_tokens if reasoning_only else max(max_tokens - 1, 0))
+            visible_n = 0 if reasoning_only else max_tokens - reasoning_n
+            completion_tokens = reasoning_n + visible_n
+            t_first_generated = None
+            t_first_visible = None
             for i in range(reasoning_n):
                 if i:
                     time.sleep(params["per_token_ms"] / 1000.0)
+                if t_first_generated is None:
+                    t_first_generated = time.monotonic()
                 emit({"choices": [{"delta": {"reasoning_content": "hmm"},
                                    "finish_reason": None}]})
             if reasoning_n:
                 time.sleep(params["per_token_ms"] / 1000.0)
-            if int(params.get("reasoning_only", 0)):
+            if reasoning_only:
                 usage = {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": reasoning_n,
@@ -163,38 +197,39 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
                 }
                 emit({"choices": [{"delta": {}, "finish_reason": "length"}],
                       "usage": usage})
-                data = b"data: [DONE]\n\n"
-                self.wfile.write(
-                    f"{len(data):x}\r\n".encode() + data + b"\r\n")
-                self.wfile.write(b"0\r\n\r\n")
-                return
-            t_first_content = time.monotonic()
-            emit({"choices": [{"delta": {"content": "The"},
-                               "finish_reason": None}]})
-            for _ in range(completion_tokens - 1):
-                time.sleep(params["per_token_ms"] / 1000.0)
-                emit({"choices": [{"delta": {"content": " next"},
+            else:
+                t_first_visible = time.monotonic()
+                if t_first_generated is None:
+                    t_first_generated = t_first_visible
+                emit({"choices": [{"delta": {"content": "The"},
                                    "finish_reason": None}]})
-            usage = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-                "prompt_tokens_details": {"cached_tokens": cached_tokens},
-            }
-            if reasoning_n:
-                usage["completion_tokens_details"] = {
-                    "reasoning_tokens": reasoning_n}
-            emit({"choices": [{"delta": {}, "finish_reason": "stop"}],
-                  "usage": usage})
+                for _ in range(visible_n - 1):
+                    time.sleep(params["per_token_ms"] / 1000.0)
+                    emit({"choices": [{"delta": {"content": " next"},
+                                       "finish_reason": None}]})
+                usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "prompt_tokens_details": {"cached_tokens": cached_tokens},
+                }
+                if reasoning_n:
+                    usage["completion_tokens_details"] = {
+                        "reasoning_tokens": reasoning_n}
+                emit({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                      "usage": usage})
             t_done = time.monotonic()
-            data = b"data: [DONE]\n\n"
-            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
-
             truth = {
                 "request_id": rid,
-                "ttft_true_ms": (t_first_content - t_recv) * 1000.0,
+                "ttft_true_ms": (
+                    (t_first_generated - t_recv) * 1000.0
+                    if t_first_generated is not None else None),
+                "ttfr_true_ms": (
+                    (t_first_generated - t_recv) * 1000.0
+                    if reasoning_n and t_first_generated is not None else None),
+                "ttfv_true_ms": (
+                    (t_first_visible - t_recv) * 1000.0
+                    if t_first_visible is not None else None),
                 "e2e_true_ms": (t_done - t_recv) * 1000.0,
                 "prompt_tokens": prompt_tokens,
                 "cached_tokens": cached_tokens,
@@ -203,6 +238,15 @@ def make_handler(params: dict, cache: _PrefixCache, truth_path: Path,
             with truth_lock:
                 with truth_path.open("a") as f:
                     f.write(json.dumps(truth, separators=(",", ":")) + "\n")
+
+            # Persist the oracle before telling the client the event stream is
+            # done. Tests and validators may read it as soon as the client
+            # returns; emitting [DONE] first created a real write-after-read
+            # race on the reasoning-only path.
+            data = b"data: [DONE]\n\n"
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
 
     return Handler
 

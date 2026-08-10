@@ -1,0 +1,19 @@
+{
+  "input_tokens_per_minute": 200000,
+  "output_tokens_per_minute": 20000,
+  "queries_per_hour": 7200,
+  "queries_per_second": 200,
+  "request_bytes_max": 4000000,
+  "warning_utilization": 0.8,
+  "source": "https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits",
+  "as_of": "2026-08-07",
+  "verified_at": "2026-08-08",
+  "max_age_days": 7,
+  "scope": "Published Enterprise workspace pay-per-token endpoint quota row plus Foundation Model API workspace QPS and per-request payload limits; this snapshot does not model other traffic that may consume the same limits",
+  "provider": "databricks",
+  "deployment_mode": "pay_per_token",
+  "workspace_tier": "Enterprise",
+  "model": "databricks-glm-5-2",
+  "accounting_model": "databricks_fmapi_pay_per_token",
+  "note": "Published default snapshot, not measured headroom. The source states a 4 MB payload limit without specifying a binary byte convention; the harness uses the conservative decimal ceiling of 4,000,000 serialized request bytes. Rechecked against the live source on 2026-08-08; the source page was last updated 2026-08-07. Recheck the live source, workspace tier, endpoint mode, and unrelated workspace traffic immediately before every paid run."
+}

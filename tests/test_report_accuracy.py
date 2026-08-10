@@ -73,25 +73,45 @@ def test_report_matches_independent_recomputation():
             assert approx(summ[key][q],
                           pct([r.get(key) for r in ok], int(q[1:]))), key
 
-    # throughput. the run duration is measured from when the client began
-    # sending, not from the attempt that produced each result, so a retried
-    # row cannot stretch the window and understate the rate.
+    # Throughput covers the complete logical load window, including idle time
+    # before the first sampled arrival, plus any response drain beyond that
+    # window. Dividing only from the first sampled send inflates a sparse or
+    # Poisson run whenever its first arrival is later than schedule time zero.
+    # Use the first physical send for each row, not the final retry attempt.
     def sent(r):
         v = r.get("first_send_unix")
         return r["t_send_unix"] if v is None else v
-    t0 = min(sent(r) for r in rep)
-    # the observation interval ends at the last COMPLETION, not the last
-    # send. token totals include generations that finish during the drain,
-    # so ending the window at the last send overstates throughput.
-    # a retried row ends at the SUCCESSFUL attempt's send plus its duration.
-    # first_send_unix is the first attempt, so pairing it with e2e_ms would
-    # end the row before it really finished.
-    t1 = max((r.get("t_send_unix") or sent(r)) + (r.get("e2e_ms") or 0) / 1000.0
-             for r in rep)
-    dmin = max(t1 - t0, 1e-9) / 60.0
+    # finished_unix closes every sent interval, including retries and failed
+    # requests. A service e2e duration belongs only to the final attempt and
+    # cannot reconstruct the whole worker lifetime. Current rows carry exact
+    # monotonic target-to-send time; retain an epoch fallback so this oracle
+    # also describes the legacy contract without subtracting unrelated minima.
+    assert all(r.get("finished_unix") is not None for r in rep)
+    legacy = [r for r in rep
+              if not isinstance(r.get("caller_send_ms"), (int, float))]
+    legacy_origin = min(
+        (sent(r) - float(r["scheduled_s"]) for r in legacy),
+        default=None)
+    completion_positions = []
+    for r in rep:
+        caller_send_ms = r.get("caller_send_ms")
+        if isinstance(caller_send_ms, (int, float)):
+            logical_send = (float(r["scheduled_s"])
+                            + float(caller_send_ms) / 1000.0)
+        elif legacy_origin is not None:
+            logical_send = sent(r) - legacy_origin
+        else:
+            logical_send = float(r["scheduled_s"])
+        completion_positions.append(
+            logical_send + max(r["finished_unix"] - sent(r), 0.0))
+    observation_s = max(float(rc.duration_s), *completion_positions)
+    dmin = observation_s / 60.0
     intok = sum(r["prompt_tokens"] for r in ok if r.get("prompt_tokens"))
     outtok = sum(r["completion_tokens"] for r in ok
                  if r.get("completion_tokens"))
+    assert summ["throughput"]["duration_basis"] == \
+        "max(logical_schedule_seconds,response_drain)"
+    assert approx(summ["throughput"]["observation_seconds"], observation_s)
     assert approx(summ["throughput"]["input_tokens_per_min"], intok / dmin)
     assert approx(summ["throughput"]["output_tokens_per_min"], outtok / dmin)
 

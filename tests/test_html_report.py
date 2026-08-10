@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from traffic_replay.metrics import render_html, write_outputs
+from traffic_replay.metrics import render_html
 from traffic_replay.mock_server import serve
 from traffic_replay.runner import RunConfig, run
 
@@ -22,6 +22,20 @@ def _summary(met_p95, label="run", n=250):
     return {
         "requests_total": n, "requests_ok": n, "requests_failed": 0,
         "error_rate": 0.0, "failures_by_error": {},
+        "http_429_count": 0,
+        "http_429": {
+            "count": 0,
+            "request_rows_examined": n,
+            "http_status_observed_for": n,
+            "phases": {"replay": 0},
+            "scope": "measured replay fixture",
+        },
+        "sample": {
+            "n": n,
+            "supports": ["p50", "p90", "p95"],
+            "indicative_only": [],
+            "warning": None,
+        },
         "ttft_ms": {"p50": 100, "p90": 150, "p95": 180, "p99": 200, "n": n},
         "e2e_ms": {"p50": 300, "p90": 400, "p95": 450, "p99": 500, "n": n},
         "ttfb_ms": {"n": 0}, "interchunk_max_ms": {"n": 0},
@@ -42,6 +56,16 @@ def _summary(met_p95, label="run", n=250):
             for w in (0, 1, 2)]},
         "run": {"input_mode": "profile", "endpoint_path": "/e",
                 "label": label,
+                "transport": {
+                    "connection_policy_id":
+                        "fresh_http1_per_physical_attempt",
+                    "production_connection_policy_declared":
+                        "fresh_http1_per_physical_attempt",
+                    "production_connection_policy_match": True,
+                    "production_connection_policy_assurance":
+                        "operator asserted an exact production policy match",
+                    "production_comparability_warning": None,
+                },
                 "request_params": {"temperature": 0.0,
                                    "max_output_tokens_cap": 40,
                                    "extra_body": {}}},
@@ -49,7 +73,10 @@ def _summary(met_p95, label="run", n=250):
                 "ttft_vs_target": [{"quantile": "p95", "target_ms": 150,
                                     "actual_ms": 180, "met": met_p95}],
                 "ttfg_vs_target": [],
+                "hard_timeout_basis": {
+                    "ttft_cap_ms": 1000, "ttfg_cap_ms": 2000},
                 "hard_timeout_breaches": 0,
+                "hard_timeout_unmeasured": 0,
                 "success_rate": {"target": 0.99, "actual": 1.0, "met": True}},
     }
 
@@ -61,7 +88,7 @@ def test_html_is_self_contained_and_has_units():
     assert "http://" not in h and "https://" not in h
     assert "<link" not in h and "<script" not in h
     # units are spelled out for every metric family
-    for unit in ("milliseconds", "(ms)", "hit fraction (0-1)",
+    for unit in ("milliseconds", "(ms)", "fraction (0-1)",
                  "requests/second (QPS)", "tok/min", "(count)",
                  "fraction 0-1"):
         assert unit in h, f"missing unit label: {unit}"
@@ -108,7 +135,7 @@ def test_write_outputs_emits_html_end_to_end():
     html_path = Path(out["out_dir"], "report.html")
     assert html_path.exists()
     body = html_path.read_text()
-    assert "e2e html" in body and "Latency (milliseconds)" in body
+    assert "e2e html" in body and "Final-attempt request-path latency" in body
     assert body.startswith("<!doctype html>")
 
 

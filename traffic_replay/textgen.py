@@ -78,8 +78,19 @@ class TextMaterializer:
 
     def __init__(self, cpt: float = DEFAULT_CPT, seed_root: int = 1337,
                  doc_cache_size: int = 64):
+        if isinstance(cpt, (bool, np.bool_)) \
+                or not isinstance(cpt, (int, float, np.integer, np.floating)):
+            raise ValueError("cpt must be positive and finite")
         self.cpt = float(cpt)
-        self.seed_root = seed_root
+        if not np.isfinite(self.cpt) or self.cpt <= 0:
+            raise ValueError("cpt must be positive and finite")
+        if not isinstance(seed_root, (int, np.integer)) \
+                or isinstance(seed_root, (bool, np.bool_)) or seed_root < 0:
+            raise ValueError("seed_root must be a non-negative integer")
+        if not isinstance(doc_cache_size, int) \
+                or isinstance(doc_cache_size, bool) or doc_cache_size <= 0:
+            raise ValueError("doc_cache_size must be a positive integer")
+        self.seed_root = int(seed_root)
         # doc text is deterministic given (doc_id, char length); cache the
         # longest cut per doc and slice from it.
         self._doc_full = lru_cache(maxsize=doc_cache_size)(self._doc_full_impl)
@@ -91,19 +102,55 @@ class TextMaterializer:
 
     def prefix_text(self, doc_id: int, prefix_tokens: int,
                     doc_len_tokens: int) -> str:
-        if doc_id < 0 or prefix_tokens <= 0:
+        values = (doc_id, prefix_tokens, doc_len_tokens)
+        if any(not isinstance(x, (int, np.integer))
+               or isinstance(x, (bool, np.bool_)) for x in values):
+            raise ValueError("document and token controls must be integers")
+        if prefix_tokens < 0 or doc_len_tokens < 0:
+            raise ValueError("document and prefix lengths cannot be negative")
+        if prefix_tokens == 0:
             return ""
-        max_chars = int(doc_len_tokens * self.cpt)
-        want_chars = int(prefix_tokens * self.cpt)
+        if doc_id < 0:
+            raise ValueError("a positive prefix requires a non-negative doc_id")
+        if prefix_tokens > doc_len_tokens:
+            raise ValueError("prefix_tokens cannot exceed doc_len_tokens")
+        max_chars = int(round(doc_len_tokens * self.cpt))
+        want_chars = int(round(prefix_tokens * self.cpt))
         return self._doc_full(doc_id, max_chars)[:want_chars]
 
     # -- unique suffixes -------------------------------------------------
-    def suffix_text(self, request_id: str, suffix_tokens: int) -> str:
+    def suffix_text(self, request_id: str, suffix_tokens: int,
+                    target_chars: int | None = None) -> str:
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("request_id must be a non-empty string")
+        if not isinstance(suffix_tokens, (int, np.integer)) \
+                or isinstance(suffix_tokens, (bool, np.bool_)):
+            raise ValueError("suffix_tokens must be an integer")
         rng = _rng_for(f"req:{request_id}", self.seed_root)
-        n_chars = max(int(suffix_tokens * self.cpt) - 64, 32)
-        body = _prose(rng, n_chars)
-        return (f"{body}\n\n[case {request_id}] Given the context above, "
-                f"what is the correct next action for this customer?")
+        if suffix_tokens < 0:
+            raise ValueError("suffix_tokens cannot be negative")
+        if target_chars is not None and (
+                not isinstance(target_chars, (int, np.integer))
+                or isinstance(target_chars, (bool, np.bool_))):
+            raise ValueError("target_chars must be an integer")
+        want = (int(round(suffix_tokens * self.cpt))
+                if target_chars is None else int(target_chars))
+        if want < 0:
+            raise ValueError("target_chars cannot be negative")
+        if want == 0:
+            return ""
+        marker = hashlib.sha256(request_id.encode()).hexdigest()[:16]
+        scaffold = (f"{marker} [case {request_id}] Given the context above, what is "
+                    "the correct next action for this customer?")
+        if want <= len(scaffold):
+            # The request id is at the front, so even tiny suffixes retain a
+            # deterministic per-request identity without exceeding budget.
+            return scaffold[:want]
+        if want <= len(scaffold) + 2:
+            return (scaffold + "\n\n")[:want]
+        body_chars = want - len(scaffold) - 2
+        body = _prose(rng, body_chars)
+        return (body + "\n\n" + scaffold)[:want]
 
     # -- messages ---------------------------------------------------------
     def messages(self, request_id: str, doc_id: int, prefix_tokens: int,
@@ -114,19 +161,61 @@ class TextMaterializer:
         retrieved context, short new user turn) and keeps the shared text
         leading, which is the position prefix caches match on.
         """
+        if any(not isinstance(x, (int, np.integer))
+               or isinstance(x, (bool, np.bool_))
+               for x in (doc_id, prefix_tokens, doc_len_tokens,
+                         suffix_tokens)):
+            raise ValueError("document and token controls must be integers")
+        if prefix_tokens < 0 or suffix_tokens < 0:
+            raise ValueError("prefix_tokens and suffix_tokens must be non-negative")
         msgs = []
         pre = self.prefix_text(doc_id, prefix_tokens, doc_len_tokens)
         if pre:
             msgs.append({"role": "system", "content": pre})
-        msgs.append({"role": "user",
-                     "content": self.suffix_text(request_id, suffix_tokens)})
+        total_target = int(round((prefix_tokens + suffix_tokens) * self.cpt))
+        suffix_chars = max(0, total_target - len(pre))
+        msgs.append({"role": "user", "content": self.suffix_text(
+            request_id, suffix_tokens, target_chars=suffix_chars)})
         return msgs
+
+    def construction_report(self, messages: list[dict],
+                            target_tokens: int) -> dict:
+        """Character-budget error before endpoint tokenization.
+
+        Endpoint-reported tokens remain the achieved source of truth. This
+        only proves that materialization honored its own configured cpt.
+        """
+        if not isinstance(target_tokens, (int, np.integer)) \
+                or isinstance(target_tokens, (bool, np.bool_)) \
+                or target_tokens < 0:
+            raise ValueError("target_tokens must be a non-negative integer")
+        if not isinstance(messages, list) or any(
+                not isinstance(m, dict)
+                or not isinstance(m.get("content"), str) for m in messages):
+            raise ValueError("messages must contain string content")
+        target_chars = int(round(target_tokens * self.cpt))
+        actual_chars = sum(len(m["content"]) for m in messages)
+        return {
+            "target_chars": target_chars,
+            "actual_chars": actual_chars,
+            "error_chars": actual_chars - target_chars,
+        }
 
 
 def calibrate_cpt(cpt_used: float, chars_sent: int,
                   prompt_tokens_reported: int) -> float:
     """New cpt from endpoint-reported truth. Guarded against silly values."""
+    if isinstance(cpt_used, (bool, np.bool_)) \
+            or not isinstance(cpt_used, (int, float, np.integer, np.floating)) \
+            or not np.isfinite(cpt_used) or cpt_used <= 0:
+        raise ValueError("cpt_used must be positive and finite")
+    if any(not isinstance(x, (int, np.integer))
+           or isinstance(x, (bool, np.bool_))
+           for x in (chars_sent, prompt_tokens_reported)):
+        raise ValueError("calibration counts must be integers")
+    if chars_sent < 0 or prompt_tokens_reported < 0:
+        raise ValueError("calibration counts cannot be negative")
     if prompt_tokens_reported <= 0 or chars_sent <= 0:
-        return cpt_used
+        return float(cpt_used)
     measured = chars_sent / prompt_tokens_reported
     return min(max(measured, 1.5), 12.0)

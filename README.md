@@ -93,6 +93,46 @@ not capacity evidence and does not reserve provider quota.
 
 ## Run one endpoint
 
+Customers do not need to edit nested JSON or learn report abbreviations first.
+`init-config` accepts Databricks or OpenAI token-telemetry column presets (or
+explicit custom mappings), asks plain-language service questions when run in a
+terminal, and is fully scriptable with flags. It writes four separate files:
+`workload-profile.json`, `customer-sla.json`,
+`workload-schedule.timestamps`, and `run-config.json`.
+
+```bash
+python3 -m traffic_replay init-config \
+  --telemetry request-token-telemetry.csv \
+  --provider openai \
+  --name customer_workload \
+  --response-start-ms 500 \
+  --response-finish-ms 3000 \
+  --success-percent 99 \
+  --abandon-start-ms 2000 \
+  --abandon-finish-ms 10000 \
+  --sla-source "Customer contract dated 2026-08-10" \
+  --host https://YOUR-WORKSPACE-HOST \
+  --endpoint YOUR-ENDPOINT-NAME \
+  --requests 1000 \
+  --duration 300 \
+  --out-dir configs/customer-benchmark
+```
+
+The command immediately runs the zero-traffic plain-language preview. Repeat
+it at any time with:
+
+```bash
+python3 -m traffic_replay check-config \
+  --config configs/customer-benchmark/run-config.json
+```
+
+The preview explains modeled p50/p90/p95/p99 prompt and answer sizes, dropped
+telemetry rows, cache fraction, the customer SLA, exact replay/calibration/
+preflight counts, estimated tokens, cost status, and remaining illustrative or
+missing inputs. A referenced `customer_sla_path` supplies acceptance targets;
+an expert inline `acceptance_targets` object remains supported and explicitly
+overrides that file.
+
 This command performs a real preflight and then a measured run:
 
 ```bash

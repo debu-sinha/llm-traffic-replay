@@ -117,6 +117,31 @@ tails, targets, or provider recommendations.
 
 ## 4. Run preflight and a small benchmark
 
+## Guided workload and customer SLA setup
+
+Use `traffic_replay init-config` to turn a common Databricks/OpenAI telemetry
+export and plain-language service expectations into separately owned
+`workload-profile.json`, `customer-sla.json`, a timestamp schedule, and
+`run-config.json`. Omit values in a terminal to be prompted, or supply every
+flag for automation. Use `--provider custom` with `--input-field`,
+`--output-field`, and `--cached-field` for another export schema.
+
+The generated configuration selects `first_visible`: "response starts" means
+the customer sees assistant answer content. Cache fraction means the share of
+prompt tokens intended for reuse, not the percentage of requests with any
+cache hit. The SLA file records the required customer-owned source and hard
+abandonment limits. The run config references that file. If an expert also
+adds inline `acceptance_targets`, the inline object explicitly overrides the
+referenced SLA and both `run` and `check-config` print that precedence.
+
+`traffic_replay check-config --config PATH` validates and explains the setup
+without credentials, endpoint discovery, or inference traffic. It prints
+modeled p50/p90/p95/p99 token values, extraction/drop counts, modeling choice,
+the SLA in ordinary language, exact request-phase counts, estimated tokens,
+and either a cost status or `COST NOT CALCULATED`.
+
+## Run with an existing profile
+
 With a profile:
 
 ```bash

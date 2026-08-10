@@ -267,12 +267,21 @@ def test_payload_source_commit_survives_an_artifact_only_commit(
         "user.email=debusinha2009@gmail.com", "commit", "-qm", "artifact")
     assert git("rev-parse", "HEAD") != source_commit
 
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", repo.as_uri(), str(shallow)],
+        capture_output=True, text=True, check=True)
+
     monkeypatch.setattr(pack_notebook, "ROOT", repo)
     assert pack_notebook._payload_source_commit(["payload.txt"]) == \
         source_commit
 
     (repo / "payload.txt").write_text("dirty bytes\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="requires a clean Git tree"):
+        pack_notebook._payload_source_commit(["payload.txt"])
+
+    monkeypatch.setattr(pack_notebook, "ROOT", shallow)
+    with pytest.raises(SystemExit, match="requires complete Git history"):
         pack_notebook._payload_source_commit(["payload.txt"])
 
 

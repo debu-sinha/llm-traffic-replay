@@ -4639,10 +4639,46 @@ def render_markdown(summary: dict, title: str, *,
             f"> {inline(verified_view['assurance'])}",
             "",
         ]
+    customer_first = s.get(first_event["corrected_key"]) or {}
+    customer_e2e = s.get("e2e_corrected_ms") or {}
+    customer_answers = s.get("answers") or {}
+    calibration_count = (s.get("calibration_warmth") or {}).get(
+        "calibration_requests", 0)
+    customer_lines = [
+        "## Customer takeaway",
+        "",
+        f"- **At this tested load:** {s['requests_ok']}/{s['requests_total']} "
+        f"measured replay requests were harness-successful; "
+        f"{s['requests_failed']} failed and "
+        f"{s.get('requests_retried', 'an unknown number')} were retried.",
+        "- **Answer quality:** not evaluated. Harness success and structural "
+        "readability do not establish correctness, task success, or usefulness.",
+        f"- **Completion caveat:** {customer_answers.get('truncated', 'unknown')}"
+        f"/{s['requests_total']} responses stopped at the requested output "
+        "length; natural completion behavior was not measured for those "
+        "responses.",
+        "- **Scope:** results apply only to this recorded workload and tested "
+        "load. They do not establish an endpoint ceiling, quota headroom, or "
+        "a production SLA.",
+        f"- **Extra traffic:** {calibration_count} calibration request row(s) "
+        "were outside the measured replay population. Calibration estimates "
+        "characters per token; it is not a latency or capacity sample.",
+        "- **Evidence terms:** integrity says whether the recorded artifact "
+        "bytes verify; source reproducibility separately says whether the exact "
+        "source checkout can be reconstructed.",
+        "",
+        "| user-perceived latency from scheduled request time (ms) | p50 | "
+        "p90 | p95 | p99 | n |",
+        "|---|---|---|---|---|---|",
+        row(f"Caller {first_event['short_label']}", customer_first),
+        row("Caller end-to-end", customer_e2e),
+        "",
+    ]
     lines = [
         f"# {inline(title)}",
         "",
         *verified_intro,
+        *customer_lines,
         "## Decision states",
         "",
         "These states are independent. A quota-limited run can still retain "
@@ -7608,6 +7644,81 @@ def render_html(summary: dict, title: str, *,
 
     decision = (verified_view["decision"] if verified_view
                 else build_report_decision(s))
+    customer_latency_rows = []
+    customer_first = s.get(first_event["corrected_key"]) or {}
+    customer_e2e = s.get("e2e_corrected_ms") or {}
+    if has(customer_first):
+        customer_latency_rows.append((
+            f"Caller {first_event['short_label']}", customer_first))
+    if has(customer_e2e):
+        customer_latency_rows.append(("Caller end-to-end", customer_e2e))
+    customer_latency_html = (
+        "<table class='dense-table customer-latency'><caption>"
+        "User-perceived latency from scheduled request time, in milliseconds"
+        "</caption><thead><tr><th scope='col' class='lbl'>metric</th>"
+        "<th scope='col'>p50</th><th scope='col'>p95</th>"
+        "<th scope='col'>p99</th></tr></thead><tbody>"
+        + "".join(
+            f"<tr><th scope='row' class='lbl'>{esc(name)}</th>"
+            f"<td>{num(table.get('p50'))}</td>"
+            f"<td>{num(table.get('p95'))}</td>"
+            f"<td>{num(table.get('p99'))}</td></tr>"
+            for name, table in customer_latency_rows)
+        + "</tbody></table>"
+        if customer_latency_rows else
+        "<div class='banner warn'>User-perceived latency was not available; "
+        "do not substitute final-attempt request-path latency.</div>")
+    customer_answers = s.get("answers") or {}
+    truncated = customer_answers.get("truncated")
+    calibration_count = (s.get("calibration_warmth") or {}).get(
+        "calibration_requests", 0)
+    retry_count = s.get("requests_retried")
+    achieved_text = (
+        f" at {achieved_qps:,.2f} achieved RPS"
+        if isinstance(achieved_qps, (int, float))
+        and not isinstance(achieved_qps, bool) else "")
+    outcome_text = (
+        f"{ok_text}/{total_text} measured replay requests were "
+        f"harness-successful{achieved_text}; {failed_text} failed and "
+        f"{retry_count if isinstance(retry_count, int) else 'an unknown number'} "
+        "were retried.")
+    completion_text = (
+        f"{truncated}/{total_text} measured responses stopped at the requested "
+        "output length; natural completion behavior was not measured for "
+        "those responses."
+        if isinstance(truncated, int) else
+        "Output-length completion evidence was not recorded.")
+    mode_scope = (
+        "synthetic workload shape" if mode == "profile" else
+        "supplied prompt workload")
+    capacity_label = str(decision["endpoint_capacity"].get("label") or
+                         "not established")
+    customer_takeaway_html = (
+        "<section class='card customer-takeaway' id='customer-takeaway' "
+        "aria-labelledby='customer-takeaway-heading'>"
+        "<div class='status-kicker'>Read this first</div>"
+        "<h2 id='customer-takeaway-heading'>Customer takeaway</h2>"
+        f"<p><b>At this tested load:</b> {esc(outcome_text)}</p>"
+        + customer_latency_html
+        + "<ul>"
+        "<li><b>Answer quality:</b> not evaluated. Harness success and a "
+        "readable response or structurally valid tool call do not establish "
+        "correctness, task success, or usefulness.</li>"
+        f"<li><b>Completion caveat:</b> {esc(completion_text)}</li>"
+        f"<li><b>Workload scope:</b> {esc(mode_scope)}. Results apply only "
+        "to the recorded workload and load shape, not production traffic in "
+        "general.</li>"
+        f"<li><b>Capacity conclusion:</b> {esc(capacity_label)}. A clean run "
+        "at this load does not establish an endpoint ceiling, quota headroom, "
+        "or a production SLA.</li>"
+        f"<li><b>Extra traffic:</b> {esc(str(calibration_count))} calibration "
+        "request row(s) were sent outside the measured replay population. "
+        "Calibration estimates characters per token and is not a latency or "
+        "capacity sample.</li>"
+        "<li><b>Evidence terms:</b> integrity says whether the recorded artifact "
+        "bytes verify; source reproducibility separately says whether the exact "
+        "source checkout can be reconstructed.</li>"
+        "</ul></section>")
     decision_html = _html_decision_hero(decision, banner)
     glossary_html = (
         "<section class='card' id='field-glossary' "
@@ -7650,7 +7761,8 @@ def render_html(summary: dict, title: str, *,
             "requires manifest verification</div>")
     body = (
         f"<main class='wrap'>{verified_banner_html}{header_html}{print_stamp}"
-        f"{nav_html}{decision_html}{glossary_html}{provenance_html}"
+        f"{nav_html}{customer_takeaway_html}{decision_html}{glossary_html}"
+        f"{provenance_html}"
         f"{facts_html}{sample_banner}{stats}{believe}"
         f"{em_html}{ans_html}{sla_html}{corr_html}{lat_html}"
         f"{drift_html}{extra_cards}{cost_html}"

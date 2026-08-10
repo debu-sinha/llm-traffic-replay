@@ -29,6 +29,7 @@ import statistics
 import time
 
 from .client import normalized_origin
+from .network import bounded_getaddrinfo
 
 
 def measure_network_path(
@@ -48,8 +49,9 @@ def measure_network_path(
             return None
         _, host, port = normalized_origin(base_url)
 
-        infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
+        infos = bounded_getaddrinfo(
+            host, port, timeout=float(timeout), family=socket.AF_UNSPEC,
+            socktype=socket.SOCK_STREAM)
         endpoints = []
         seen = set()
         for family, socktype, proto, _, address in infos:

@@ -17,7 +17,7 @@
       --cyan: #00a7b5;
       --cyan-dark: #007b86;
       --cyan-wash: #e6f7f8;
-      --amber: #d88600;
+      --amber: #925400;
       --amber-wash: #fff4dc;
       --red: #be3a45;
       --red-wash: #fff0f1;
@@ -29,18 +29,19 @@
 
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: #dbe3e8; color: var(--ink); }
-    body { font-family: var(--sans); font-size: 10.15px; line-height: 1.42; }
+    body { font-family: var(--sans); font-size: 13.35px; line-height: 1.43; }
     a { color: var(--cyan-dark); text-decoration: none; border-bottom: 1px solid #9bd2d7; }
+    a:focus-visible { outline: 3px solid var(--cyan-dark); outline-offset: 3px; border-radius: 2px; }
     strong { font-weight: 720; }
     code { font-family: var(--mono); }
 
     .page {
       position: relative;
       width: 8.5in;
-      height: 11in;
+      min-height: 11in;
       margin: 18px auto;
       padding: 0.43in 0.50in 0.43in;
-      overflow: hidden;
+      overflow: visible;
       background: var(--paper);
       box-shadow: 0 16px 42px rgba(11, 31, 51, 0.14);
       break-after: page;
@@ -68,37 +69,37 @@
     }
 
     .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
-    .brand { display: flex; align-items: center; gap: 9px; font-size: 8.5px; font-weight: 760; letter-spacing: 0.12em; text-transform: uppercase; color: var(--navy); }
+    .brand { display: flex; align-items: center; gap: 9px; font-size: 11.5px; font-weight: 760; letter-spacing: 0.12em; text-transform: uppercase; color: var(--navy); }
     .mark { position: relative; width: 23px; height: 23px; border: 2px solid var(--cyan); border-radius: 7px; }
     .mark::before, .mark::after { content: ""; position: absolute; background: var(--navy); border-radius: 2px; }
     .mark::before { width: 9px; height: 2px; left: 5px; top: 6px; box-shadow: 0 5px 0 var(--navy); }
     .mark::after { width: 2px; height: 14px; left: 9px; top: 3px; opacity: 0.18; }
-    .date { font-size: 8px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; }
+    .date { font-size: 10.8px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; }
 
     h1, h2, h3, p { margin-top: 0; }
     h1 { max-width: 620px; margin-bottom: 10px; font-size: 34px; line-height: 1.02; letter-spacing: -0.042em; color: var(--navy); }
     h2 { margin-bottom: 7px; font-size: 22px; line-height: 1.08; letter-spacing: -0.025em; color: var(--navy); }
-    h3 { margin-bottom: 5px; font-size: 10.5px; line-height: 1.22; color: var(--navy); }
+    h3 { margin-bottom: 5px; font-size: 14px; line-height: 1.22; color: var(--navy); }
     p { margin-bottom: 7px; }
-    .kicker { margin: 0 0 8px; color: var(--cyan-dark); font-size: 8px; font-weight: 800; letter-spacing: 0.15em; text-transform: uppercase; }
-    .lede { max-width: 665px; margin-bottom: 18px; color: #3f5269; font-size: 13px; line-height: 1.48; }
+    .kicker { margin: 0 0 8px; color: var(--cyan-dark); font-size: 11px; font-weight: 800; letter-spacing: 0.15em; text-transform: uppercase; }
+    .lede { max-width: 665px; margin-bottom: 18px; color: #3f5269; font-size: 15px; line-height: 1.48; }
     .lede strong { color: var(--navy); }
 
     .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; margin: 15px 0 8px; }
-    .section-head h2 { margin: 0; font-size: 15px; letter-spacing: -0.01em; }
-    .section-note { max-width: 320px; color: var(--muted); font-size: 8.5px; text-align: right; }
+    .section-head h2 { margin: 0; font-size: 17px; letter-spacing: -0.01em; }
+    .section-note { max-width: 320px; color: var(--muted); font-size: 11.5px; text-align: right; }
 
     .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin: 0 0 15px; }
-    .flow-card { position: relative; min-height: 105px; padding: 11px 10px 9px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
+    .flow-card { position: relative; min-height: 132px; padding: 11px 10px 9px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
     .flow-card:not(:last-child)::after { content: ">"; position: absolute; z-index: 2; right: -8px; top: 42px; width: 15px; height: 20px; color: var(--cyan-dark); background: white; font-size: 12px; font-weight: 800; line-height: 20px; text-align: center; }
     .flow-num { display: inline-flex; width: 20px; height: 20px; margin-bottom: 7px; align-items: center; justify-content: center; border-radius: 6px; background: var(--navy); color: white; font-size: 8px; font-weight: 800; }
-    .flow-card p { margin: 0; color: var(--muted); font-size: 8.8px; line-height: 1.42; }
+    .flow-card p { margin: 0; color: var(--muted); font-size: 11.5px; line-height: 1.42; }
 
     .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .panel { padding: 12px 13px; border: 1px solid var(--line); border-radius: 10px; background: var(--wash); }
     .panel.good { border-top: 3px solid var(--green); background: linear-gradient(180deg, var(--green-wash), #fff 54%); }
     .panel.boundary { border-top: 3px solid var(--amber); background: linear-gradient(180deg, var(--amber-wash), #fff 54%); }
-    .panel h3 { font-size: 11.5px; }
+    .panel h3 { font-size: 14px; }
     ul.clean { margin: 6px 0 0; padding: 0; list-style: none; }
     ul.clean li { position: relative; margin: 0 0 6px; padding-left: 15px; color: #405269; }
     ul.clean li::before { content: ""; position: absolute; width: 5px; height: 5px; left: 1px; top: 5px; border-radius: 50%; background: var(--cyan); }
@@ -107,9 +108,9 @@
     .evidence-strip { display: grid; grid-template-columns: 1.13fr repeat(4, 1fr); margin-top: 10px; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
     .evidence-strip > div { min-height: 58px; padding: 9px 8px; border-left: 1px solid var(--line); background: #fff; }
     .evidence-strip > div:first-child { border-left: 0; background: var(--navy); color: white; }
-    .file { display: block; margin-bottom: 4px; color: var(--navy); font: 700 8px/1.2 var(--mono); overflow-wrap: anywhere; }
+    .file { display: block; margin-bottom: 4px; color: var(--navy); font: 700 10.5px/1.2 var(--mono); overflow-wrap: anywhere; }
     .evidence-strip > div:first-child .file { color: white; }
-    .tiny { color: var(--muted); font-size: 7.8px; line-height: 1.35; }
+    .tiny { color: var(--muted); font-size: 10.5px; line-height: 1.35; }
     .evidence-strip > div:first-child .tiny { color: #b9c9d8; }
 
     .callout { display: flex; gap: 10px; margin: 11px 0; padding: 10px 12px; border: 1px solid #b8e0e3; border-radius: 10px; background: var(--cyan-wash); }
@@ -118,70 +119,102 @@
     .callout-icon { display: flex; flex: 0 0 auto; width: 23px; height: 23px; align-items: center; justify-content: center; border-radius: 7px; background: var(--cyan-dark); color: white; font-size: 10px; font-weight: 850; }
     .callout.warning .callout-icon { background: var(--amber); }
     .callout.stop .callout-icon { background: var(--red); }
-    .callout p { margin: 0; color: #33475d; font-size: 8.9px; }
+    .callout p { margin: 0; color: #33475d; font-size: 12px; }
 
-    .quota-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin: 8px 0 11px; }
+    .quota-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 8px 0 11px; }
     .stat { padding: 9px 9px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
     .stat .value { display: block; margin-bottom: 2px; color: var(--navy); font-size: 16px; font-weight: 790; letter-spacing: -0.03em; }
-    .stat .label { display: block; color: var(--muted); font-size: 7.5px; line-height: 1.3; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat .label { display: block; color: var(--muted); font-size: 10.3px; line-height: 1.3; text-transform: uppercase; letter-spacing: 0.05em; }
 
-    .code-title { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; padding: 6px 10px; border-radius: 8px 8px 0 0; background: #243a50; color: #c9d7e4; font-size: 7.5px; letter-spacing: 0.08em; text-transform: uppercase; }
-    pre { margin: 0 0 10px; padding: 10px 12px; border-radius: 0 0 8px 8px; background: var(--navy); color: #e9f3f8; font: 7.55px/1.47 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .code-title { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; padding: 6px 10px; border-radius: 8px 8px 0 0; background: #243a50; color: #c9d7e4; font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; }
+    pre { margin: 0 0 10px; padding: 10px 12px; border-radius: 0 0 8px 8px; background: var(--navy); color: #e9f3f8; font: 12.1px/1.47 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
     pre .cmd { color: #75ded7; }
     pre .arg { color: #f6c36a; }
     pre .dim { color: #90a7bb; }
 
     .checklist { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 8px 0 10px; }
     .check { min-height: 65px; padding: 9px 9px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--wash); }
-    .check b { display: block; margin-bottom: 4px; color: var(--navy); font-size: 8.5px; }
-    .check span { color: var(--muted); font-size: 7.8px; line-height: 1.35; }
+    .check b { display: block; margin-bottom: 4px; color: var(--navy); font-size: 11.5px; }
+    .check span { color: var(--muted); font-size: 10.8px; line-height: 1.35; }
 
     .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 8px 0 10px; }
     .step { padding: 10px; border-left: 3px solid var(--cyan); background: var(--wash); border-radius: 0 8px 8px 0; }
-    .step b { display: block; margin-bottom: 4px; color: var(--navy); font-size: 8.7px; }
-    .step p { margin: 0; color: var(--muted); font-size: 7.8px; line-height: 1.38; }
+    .step b { display: block; margin-bottom: 4px; color: var(--navy); font-size: 11.5px; }
+    .step p { margin: 0; color: var(--muted); font-size: 10.8px; line-height: 1.38; }
 
-    .decision-table { width: 100%; border-collapse: collapse; margin-top: 7px; font-size: 7.9px; }
+    .decision-table { width: 100%; border-collapse: collapse; margin-top: 7px; font-size: 11.2px; }
     .decision-table th, .decision-table td { padding: 6px 7px; border: 1px solid var(--line); vertical-align: top; }
-    .decision-table th { color: #fff; background: var(--navy); font-size: 7px; letter-spacing: 0.05em; text-transform: uppercase; text-align: left; }
+    .decision-table th { color: #fff; background: var(--navy); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; text-align: left; }
     .decision-table td:first-child { width: 22%; color: var(--navy); font-weight: 720; }
     .decision-table tr:nth-child(even) td { background: var(--wash); }
 
     .receipt { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 10px; margin-top: 9px; }
     .receipt-card { padding: 10px 11px; border: 1px solid var(--line); border-radius: 9px; background: #fff; }
     .receipt-card h3 { margin-bottom: 5px; }
-    .receipt-card p { color: var(--muted); font-size: 8px; }
-    .receipt-card pre { margin-bottom: 0; font-size: 7.2px; }
-
-    .page3 .lede { margin-bottom: 6px !important; }
-    .page3 .code-title { margin-top: 6px; padding-top: 5px; padding-bottom: 5px; }
-    .page3 pre { margin-bottom: 7px; padding-top: 8px; padding-bottom: 8px; font-size: 7.15px; line-height: 1.39; }
-    .page3 .callout { margin: 7px 0; padding-top: 8px; padding-bottom: 8px; }
-    .page3 .section-head { margin-top: 10px; margin-bottom: 6px; }
-    .page3 .decision-table { margin-top: 5px; }
-    .page3 .decision-table th, .page3 .decision-table td { padding: 4px 6px; }
-    .page3 .receipt { margin-top: 6px; }
-    .page3 .receipt-card { padding: 8px 10px; }
-    .page3 .receipt-card p { margin-bottom: 4px; line-height: 1.33; }
-    .page3 .receipt-card pre { padding: 7px 9px; font-size: 6.85px; line-height: 1.35; }
-    .page3 .source-links { margin-top: 4px; }
+    .receipt-card p { color: var(--muted); font-size: 11.2px; }
+    .receipt-card pre { margin-bottom: 0; font-size: 11px; }
+    .page1 .topbar { margin-bottom: 12px; }
+    .page1 .section-head { margin-block: 10px 6px; }
+    .page1 .flow { margin-bottom: 10px; }
+    .page1 .flow-card { min-height: 118px; }
+    .page1 .evidence-strip > div { min-height: 52px; }
     .page2 .topbar { margin-top: 0.04in; }
     .page2 .footer { right: 0.58in; }
+    .page4 { padding-top: 0.34in; }
+    .page4 .topbar { margin-bottom: 9px; }
+    .page4 .lede { margin-bottom: 10px; font-size: 13.4px; line-height: 1.34; }
+    .page4 .code-title { margin-top: 5px; padding-block: 4px; }
+    .page4 pre { margin-bottom: 6px; padding-block: 7px; font-size: 10px; line-height: 1.27; }
+    .page4 .callout { gap: 8px; margin: 6px 0; padding: 7px 9px; }
+    .page4 .callout p { font-size: 10.7px; line-height: 1.3; }
+    .page4 .callout-icon { width: 20px; height: 20px; }
 
-    .source-links { display: flex; flex-wrap: wrap; gap: 7px 12px; margin-top: 7px; font-size: 7.7px; }
-    .footer { position: absolute; left: 0.50in; right: 0.50in; bottom: 0.21in; display: flex; justify-content: space-between; align-items: center; padding-top: 6px; border-top: 1px solid var(--line); color: #718196; font-size: 7.2px; }
+    .source-links { display: flex; flex-wrap: wrap; gap: 7px 12px; margin-top: 7px; font-size: 10.7px; }
+    .source-stamp { margin-top: 12px; padding: 8px 10px; border: 1px dashed #aebccc; border-radius: 7px; color: var(--muted); font: 11px/1.4 var(--mono); overflow-wrap: anywhere; }
+    .footer { position: absolute; left: 0.50in; right: 0.50in; bottom: 0.21in; display: flex; justify-content: space-between; align-items: center; padding-top: 6px; border-top: 1px solid var(--line); color: #53647a; font-size: 10px; }
     .footer strong { color: var(--navy); }
+
+    @media screen and (max-width: 850px) {
+      html, body { width: 100%; background: var(--paper); }
+      .page { width: 100%; min-height: 0; margin: 0; padding: 28px 20px 24px; overflow: hidden; box-shadow: none; break-after: auto; page-break-after: auto; }
+      .page::after { display: none; }
+      .topbar, .section-head { align-items: flex-start; gap: 10px; }
+      .topbar { margin-bottom: 15px; }
+      .section-head { flex-direction: column; }
+      .section-note { max-width: none; text-align: left; }
+      h1 { font-size: clamp(29px, 9vw, 34px); }
+      .lede { font-size: 14px; }
+      .flow, .two-col, .checklist, .steps, .receipt { grid-template-columns: 1fr; }
+      .flow-card { min-height: 0; }
+      .flow-card:not(:last-child)::after { display: none; }
+      .evidence-strip { grid-template-columns: 1fr; }
+      .evidence-strip > div { border-left: 0; border-top: 1px solid var(--line); }
+      .evidence-strip > div:first-child { border-top: 0; }
+      .quota-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .decision-table { display: block; overflow-x: auto; }
+      pre { font-size: 11px; }
+      .footer { position: static; margin-top: 24px; gap: 12px; }
+    }
+
+    @media screen and (max-width: 520px) {
+      .page { padding-inline: 15px; }
+      .brand { font-size: 10px; letter-spacing: 0.08em; }
+      .date { font-size: 9.5px; text-align: right; }
+      .quota-grid { grid-template-columns: 1fr; }
+      .footer { align-items: flex-start; flex-direction: column; }
+    }
 
     @media print {
       html, body { background: #fff; }
-      .page { margin: 0; box-shadow: none; }
+      .page { width: 8.5in; height: 11in; min-height: 11in; margin: 0; overflow: hidden; box-shadow: none; }
+      .page::after { display: none; }
       * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
     }
     @page { size: Letter; margin: 0; }
   </style>
 </head>
 <body>
-  <section class="page" aria-label="What this benchmark proves">
+  <section class="page page1" aria-label="What this benchmark proves">
     <div class="topbar">
       <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / Field Guide</div>
       <div class="date">Evidence boundary: 08 Aug 2026</div>
@@ -189,7 +222,7 @@
 
     <p class="kicker">Benchmark your own endpoint</p>
     <h1>Turn a traffic profile into evidence you can defend.</h1>
-    <p class="lede">Replay a measured workload as <strong>open-loop traffic</strong>, score it against the customer's own SLA, preserve the exact run record, and state only what the evidence supports.</p>
+    <p class="lede">Replay a measured workload as <strong>open-loop traffic</strong>, score it against customer-owned acceptance targets, preserve the exact run record, and state only what the evidence supports.</p>
 
     <div class="section-head">
       <h2>The decision path</h2>
@@ -204,12 +237,12 @@
       <div class="flow-card">
         <span class="flow-num">02</span>
         <h3>Freeze and bound inputs</h3>
-        <p>Validate the exact workload, schedule, endpoint identity, and dated quota snapshot before paid inference.</p>
+        <p>Validate exact workload bytes and, for fixed-rate/trace runs, the complete schedule before paid inference. A sizing-derived schedule is the explicit exception: paid sizing must derive its rate first.</p>
       </div>
       <div class="flow-card">
         <span class="flow-num">03</span>
         <h3>Preflight the contract</h3>
-        <p>Send exactly two representative inference requests. Require a clean, completed answer outcome.</p>
+        <p>Send exactly two representative inference requests. Seal each paid setup row separately and require a clean, completed answer outcome.</p>
       </div>
       <div class="flow-card">
         <span class="flow-num">04</span>
@@ -223,9 +256,9 @@
         <h3>What one valid run can establish</h3>
         <ul class="clean">
           <li>Caller-experienced latency and delivery at the exact tested arrival schedule.</li>
-          <li>Whether caller-supplied TTFT, full-generation, and answer-rate targets held.</li>
+          <li>Whether customer-owned TTFT, full-generation, and answer-rate targets held.</li>
           <li>HTTP status, stream completion, parse integrity, usage coverage, and observed 429 evidence.</li>
-          <li>Achieved cache reuse only where the endpoint reports cached-token usage.</li>
+          <li>Achieved cache reuse only where the endpoint reports cached-token usage, plus response-model identity and pre-run/post-drain endpoint stability.</li>
         </ul>
       </div>
       <div class="panel boundary">
@@ -245,15 +278,15 @@
     </div>
     <div class="evidence-strip">
       <div><span class="file">start.json</span><span class="tiny">Exact configuration, source state, input identities, and declared experiment.</span></div>
-      <div><span class="file">requests.jsonl</span><span class="tiny">Recorded metadata rows for setup and replay request phases.</span></div>
-      <div><span class="file">summary.json</span><span class="tiny">Canonical metrics and independent decision dimensions.</span></div>
+      <div><span class="file">requests.jsonl</span><span class="tiny">One metadata row per request operation, with per-attempt admission events, attempt counts, and the terminal outcome.</span></div>
+      <div><span class="file">summary.json</span><span class="tiny">Canonical metrics and exactly five independent decision dimensions.</span></div>
       <div><span class="file">manifest.json</span><span class="tiny">Schema-v3 artifact hashes, byte counts, row counts, and run identity.</span></div>
       <div><span class="file">report.html / .md</span><span class="tiny">Readable views derived from the same canonical summary.</span></div>
     </div>
 
     <div class="footer">
       <span><strong>Debu Sinha</strong> / customer-ready benchmark protocol</span>
-      <span>01 / 03</span>
+      <span>01 / 05</span>
     </div>
   </section>
 
@@ -265,7 +298,7 @@
 
     <p class="kicker">Stage one</p>
     <h2>Prove mechanics with minimal, quota-planned traffic.</h2>
-    <p class="lede" style="font-size:11px; margin-bottom:10px;">This shipped profile is deliberately illustrative. It tests transport, parsing, timing, usage, and answer completeness. <strong>It is not Decagon demand and cannot support a performance or capacity claim.</strong></p>
+    <p class="lede">This shipped profile is deliberately illustrative. It tests transport, parsing, timing, usage, and answer completeness. <strong>It is not measured customer demand and cannot support a performance or capacity claim.</strong></p>
 
     <div class="checklist">
       <div class="check"><b>Authorization</b><span>Confirm the workspace, endpoint, operator, stop conditions, and approved test window.</span></div>
@@ -278,20 +311,43 @@
 <span class="cmd">python3</span> -m traffic_replay validate <span class="arg">--port 0 --format json</span></pre>
 
     <div class="section-head">
-      <h2>Current Enterprise P2T quota snapshot</h2>
-      <div class="section-note">Provider fact dated 2026-08-07; operator rechecked 2026-08-08; freshness window 7 days.</div>
+      <h2>Published Enterprise P2T defaults: tier and headroom not verified</h2>
+      <div class="section-note">Dated 2026-08-07; rechecked 2026-08-08. Verify Enterprise tier and shared-workspace headroom before paid traffic.</div>
     </div>
     <div class="quota-grid">
       <div class="stat"><span class="value">200,000</span><span class="label">Input tokens / minute</span></div>
       <div class="stat"><span class="value">20,000</span><span class="label">Output tokens / minute; max_tokens reserved</span></div>
       <div class="stat"><span class="value">7,200</span><span class="label">Queries / hour</span></div>
+      <div class="stat"><span class="value">200</span><span class="label">Queries / second / workspace</span></div>
+      <div class="stat"><span class="value">4,000,000</span><span class="label">Serialized request bytes; conservative 4 MB boundary</span></div>
       <div class="stat"><span class="value">80%</span><span class="label">Harness warning boundary</span></div>
     </div>
 
     <div class="callout warning">
       <span class="callout-icon">!</span>
-      <p><strong>Quota evidence is intentionally narrow.</strong> The gate budgets offered <code>max_tokens</code>, worst-case physical POST attempts, preflight, calibration, and replay against the dated snapshot. It cannot see unrelated workspace traffic, cannot verify the asserted workspace tier, and does not prove provider headroom. Recheck the live source before every paid run. Do not add a service-tier override to this command.</p>
+      <p><strong>Quota evidence is intentionally narrow.</strong> A single command-local, no-wait guard atomically reserves every physical inference POST immediately before <code>conn.request</code>. It enforces QPS, QPH, input/output TPM, and serialized request bytes across preflight, probes, calibration, and replay. A local denial sends no POST and is not an HTTP 429 or endpoint-capacity result. The guard cannot see unrelated workspace traffic, verify the asserted tier, or prove provider headroom. Recheck the live source before every paid run.</p>
     </div>
+
+    <div class="callout">
+      <span class="callout-icon">E</span>
+      <p><strong>Paid setup traffic is crash-visible evidence.</strong> Before preflight, the command claims a sibling <code>*-setup-traffic</code> artifact and durably appends each completed row. A refused benchmark seals that setup-only artifact with <code>performance_result=false</code>, <code>sla_result=false</code>, and <code>capacity_result=false</code>. If <code>--force</code> continues after an unreadable answer, the durable outcome is <code>preflight_forced_unreadable</code>, never passed, and every downstream run or sweep remains INVALID diagnostic evidence.</p>
+    </div>
+
+    <div class="footer">
+      <span><strong>Provider limits are dated inputs</strong>, not measured headroom.</span>
+      <span>02 / 05</span>
+    </div>
+  </section>
+
+  <section class="page page3" aria-label="GLM 5.2 diagnostic canary">
+    <div class="topbar">
+      <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / GLM 5.2</div>
+      <div class="date">Minimal protocol canary</div>
+    </div>
+
+    <p class="kicker">Stage one, continued</p>
+    <h2>Exercise the endpoint contract without making a timing claim.</h2>
+    <p class="lede">This command deterministically plans <strong>two preflight rows + one calibration row + one measured replay row</strong>, with no probes. Its illustrative output-budget p50/p95 is <strong>320/480 tokens</strong>, deriving a <strong>720-token request cap</strong>. The default fallback envelope permits at most <strong>12 physical POST attempts</strong>. With the explicit managed thinking-off control, its offline peak plan is <strong>89,202 input and 4,464 output tokens/minute</strong>. Those are conservative admission reservations, not observed usage. It qualifies mechanics only: <strong>no report-latency, throughput, SLA, or capacity claim.</strong></p>
 
     <div class="code-title"><span>GLM 5.2 instrument canary</span><span>Real, billable requests</span></div>
     <pre><span class="cmd">python3</span> -m traffic_replay benchmark \
@@ -299,34 +355,37 @@
   <span class="arg">--endpoint</span> databricks-glm-5-2 \
   <span class="arg">--auth-profile</span> YOUR-DATABRICKS-PROFILE \
   <span class="arg">--profile</span> configs/profile_glm52_canary_illustrative.json \
-  <span class="arg">--fixed-rate</span> 0.25 <span class="arg">--duration</span> 2 \
+  <span class="arg">--extra-body</span> '{"reasoning_effort":"none"}' \
+  <span class="arg">--fixed-rate</span> 0.1 <span class="arg">--duration</span> 12 \
+  <span class="arg">--ttft-definition</span> first_visible \
   <span class="arg">--rate-limits</span> configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json \
   <span class="arg">--out-dir</span> results/glm52-instrument-canary \
   <span class="arg">--label</span> "INSTRUMENT CONFORMANCE ONLY - NOT CUSTOMER DEMAND OR CAPACITY"</pre>
 
     <div class="steps">
       <div class="step"><b>1. Exact representatives</b><p>Profile mode sends its concrete p50 and p95 requests. Prompt mode sends the first two approved prompts, cycling only if one exists.</p></div>
-      <div class="step"><b>2. Exact pass condition</b><p>HTTP 200 plus visible content or a valid tool call, clean stream completion, and zero parse errors.</p></div>
-      <div class="step"><b>3. Exact refusal</b><p>If either representative is incomplete, the measured load stops unless the operator explicitly uses <code>--force</code>.</p></div>
+      <div class="step"><b>2. Exact pass condition</b><p>HTTP 200 plus non-refusal visible content or a valid non-refusal tool call, clean stream completion, and zero parse errors.</p></div>
+      <div class="step"><b>3. Exact refusal</b><p>If either representative is incomplete, the measured load stops unless the operator explicitly uses <code>--force</code>. Force permits only an explicitly INVALID diagnostic after reachable HTTP responses; it does not turn the gate into a pass or override transport failure.</p></div>
     </div>
 
     <div class="callout stop">
       <span class="callout-icon">R</span>
-      <p><strong>Managed GLM 5.2 reasoning boundary:</strong> Databricks currently classifies <code>databricks-glm-5-2</code> as reasoning-only and publishes no GLM-specific value that disables it. The tool ships no off control and guesses none. Only explicitly supplied <code>--probe-extra-body</code> candidates are tested, one real request each. An answered probe still does not prove the provider applied the candidate or disabled reasoning; rerun the complete two-representative preflight and inspect reasoning evidence.</p>
+      <p><strong>Managed GLM 5.2 reasoning control:</strong> Owner-confirmed behavior establishes that top-level <code>{"reasoning_effort":"none"}</code> disables reasoning on Unity AI Gateway <code>system.ai.glm-5-2</code> and the direct endpoint; omission selects maximum reasoning. The public guide names the field without enumerating GLM values. This release qualifies only direct <code>/serving-endpoints/.../invocations</code>; Gateway is protocol-diagnostic because destination identity, routing/fallback, and combined quotas are not bound, so it supports no quota or capacity conclusion. Direct SGLang uses <code>{"chat_template_kwargs":{"enable_thinking":false}}</code>; with thinking on, unset is <code>Max</code> and <code>"high"</code> is <code>High</code>. The canary selects no reasoning and must still pass full preflight; HTTP 200 alone is insufficient.</p>
     </div>
 
     <div class="source-links">
       <a href="https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits">Databricks limits and quotas</a>
       <a href="https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models">Databricks reasoning-model guide</a>
+      <a href="https://docs.databricks.com/aws/en/ai-gateway/query-model-services">Unity AI Gateway model services</a>
     </div>
 
     <div class="footer">
-      <span><strong>Use the canary to qualify the instrument</strong>, then replace the profile with measured customer demand.</span>
-      <span>02 / 03</span>
+      <span><strong>Canary result:</strong> correctness smoke only; no performance or capacity verdict.</span>
+      <span>03 / 05</span>
     </div>
   </section>
 
-  <section class="page page3" aria-label="Measured fixed rate, sweep, and verification">
+  <section class="page page4" aria-label="Measured fixed rate and guarded sweep">
     <div class="topbar">
       <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / Production Protocol</div>
       <div class="date">Measure, decide, verify</div>
@@ -334,7 +393,7 @@
 
     <p class="kicker">Stage two</p>
     <h2>Run the customer contract, then separate SLA from capacity.</h2>
-    <p class="lede" style="font-size:11px; margin-bottom:8px;">Build <code>configs/profile_measured.json</code> from approved request metrics, review its digest and dropped rows, then set rates, targets, and client bounds from the authorized experiment.</p>
+    <p class="lede">Build <code>configs/profile_measured.json</code> from approved request metrics, review its digest and dropped rows, then set rates, customer-owned targets, and client bounds from the authorized experiment.</p>
 
     <div class="code-title"><span>Measured fixed-rate run</span><span>Template - replace every YOUR_* value</span></div>
     <pre><span class="cmd">python3</span> -m traffic_replay benchmark \
@@ -345,13 +404,14 @@
   <span class="arg">--fixed-rate</span> YOUR-AUTHORIZED-RPS <span class="arg">--duration</span> 300 \
   <span class="arg">--max-concurrency</span> YOUR-TESTED-WORKER-BOUND \
   <span class="arg">--max-pending-requests</span> YOUR-TESTED-PENDING-BOUND \
+  <span class="arg">--ttft-definition</span> first_visible \
   <span class="arg">--ttft-p95</span> YOUR-TTFT-MS <span class="arg">--ttfg-p95</span> YOUR-TTFG-MS \
-  <span class="arg">--success-rate</span> YOUR-FRACTION-0..1 <span class="arg">--rate-limits</span> RATE_LIMITS.json \
+  <span class="arg">--success-rate</span> YOUR-FRACTION-STRICTLY-BETWEEN-0-AND-1 <span class="arg">--rate-limits</span> RATE_LIMITS.json \
   <span class="arg">--fail-on</span> caution <span class="arg">--out-dir</span> results/customer-fixed-rate</pre>
 
     <div class="callout">
       <span class="callout-icon">R</span>
-      <p><strong>Arrival rate is the load axis.</strong> Do not use legacy <code>--concurrency</code>. <code>--max-concurrency</code> is only a client safety bound; the report shows the in-flight concurrency that the offered rate actually carried. TTFT is scored with the selected caller definition. Full-generation latency is reported separately.</p>
+      <p><strong>Arrival rate is the load axis.</strong> Do not use legacy <code>--concurrency</code>. <code>--max-concurrency</code> is only a client safety bound; the report shows observed in-flight concurrency. The harness opens a fresh HTTP/1.1 connection per physical attempt, so capacity stays inconclusive for an unknown, pooled, or HTTP/2 production client. Add <code>--production-connection-policy fresh_http1_per_physical_attempt</code> only when that is the real application's exact policy; the recorded assertion is not an observation of production. For reasoning models this template explicitly scores <code>first_visible</code>; use <code>first_content</code> only when visible, reasoning, or refusal onset is the customer-owned target.</p>
     </div>
 
     <div class="code-title"><span>Guarded rate sweep</span><span>Sequential and stateful</span></div>
@@ -364,26 +424,48 @@
   <span class="arg">--cpt</span> YOUR-PREMEASURED-CHARACTERS-PER-TOKEN \
   <span class="arg">--max-concurrency</span> YOUR-TESTED-WORKER-BOUND \
   <span class="arg">--max-pending-requests</span> YOUR-TESTED-PENDING-BOUND \
+  <span class="arg">--ttft-definition</span> first_visible \
   <span class="arg">--ttft-p95</span> YOUR-TTFT-MS <span class="arg">--ttfg-p95</span> YOUR-TTFG-MS \
-  <span class="arg">--success-rate</span> YOUR-FRACTION-0..1 <span class="arg">--rate-limits</span> RATE_LIMITS.json \
+  <span class="arg">--success-rate</span> YOUR-FRACTION-STRICTLY-BETWEEN-0-AND-1 <span class="arg">--rate-limits</span> RATE_LIMITS.json \
   <span class="arg">--out-dir</span> results/customer-rate-sweep</pre>
 
     <div class="callout warning">
       <span class="callout-icon">!</span>
-      <p>Cooldown is spacing, not proof that rolling quotas, autoscaling, cache state, or unrelated traffic reset. The whole requested ladder is budgeted before preflight. The built-in snapshot gate covers direct Databricks pay-per-token routes only; other modes need their own guard. Stop on 429s, parse errors, answer failures, target misses, load shortfall, pending drops, generator saturation, or production impact. The highest valid rung tested is still not an endpoint ceiling.</p>
+      <p>Cooldown is spacing, not proof that rolling quotas, autoscaling, cache state, or unrelated traffic reset. The whole requested ladder is budgeted before preflight, then every physical POST is admitted again at runtime. Stop on local admission denial, 429s, parse errors, answer failures, target misses, load shortfall, pending drops, generator saturation, or production impact. A top rung that holds establishes no ceiling; extend only in a newly authorized window after quota, cost, generator, and endpoint telemetry review.</p>
     </div>
+
+    <div class="callout">
+      <span class="callout-icon">i</span>
+      <p><strong>Interchunk is a stream-gap diagnostic, not token-to-token latency.</strong> It is the maximum gap between consecutive nonempty visible, reasoning, or refusal SSE delta events. Tool fragments, usage-only events, heartbeats, and streams with only one eligible event are excluded. TTFB is the first nonempty bounded response-body chunk returned by the client read, not the first socket byte or first parsed SSE line.</p>
+    </div>
+
+    <div class="footer">
+      <span><strong>The sealed sweep includes sweep.html and sweep.md</strong>, each bound by the aggregate manifest.</span>
+      <span>04 / 05</span>
+    </div>
+  </section>
+
+  <section class="page page5" aria-label="Decision gates and external verification">
+    <div class="topbar">
+      <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / Evidence Review</div>
+      <div class="date">Decide, verify, share</div>
+    </div>
+
+    <p class="kicker">Stage three</p>
+    <h2>Read independent gates before quoting any number.</h2>
+    <p class="lede">A target pass can coexist with invalid identity, unstable deployment metadata, local quota denial, or weak measurement evidence. Preserve the exact qualification and the source directory.</p>
 
     <div class="section-head">
       <h2>Read five decisions, not one green badge</h2>
-      <div class="section-note">A target pass can coexist with invalid measurement evidence. Preserve the qualification.</div>
+      <div class="section-note">Identity, stability, and runtime admission are evidence gates within these five decisions, not extra canonical dimensions.</div>
     </div>
     <table class="decision-table" aria-label="Report decision dimensions">
       <thead><tr><th>Dimension</th><th>Question answered</th><th>Required reading</th></tr></thead>
       <tbody>
         <tr><td>Evidence integrity</td><td>Do current bytes match the manifest and completion chain?</td><td>Verify externally; a fresh run cannot verify the manifest that encloses it.</td></tr>
-        <tr><td>Measurement validity</td><td>Did errors, delivery, parsing, sample size, or missing evidence undermine inference?</td><td>CAUTION and INVALID qualify every downstream number.</td></tr>
-        <tr><td>Acceptance checks</td><td>Did the run meet the customer's explicit targets?</td><td>PASS, MISS, INCONCLUSIVE, or NOT EVALUATED.</td></tr>
-        <tr><td>Quota state</td><td>Was an HTTP 429 observed in any recorded request phase?</td><td>Zero observed 429s is not quota headroom.</td></tr>
+        <tr><td>Measurement validity</td><td>Did errors, delivery, parsing, sample size, response identity, transport mismatch, or endpoint stability undermine inference?</td><td>Mixed response models, mismatch with an explicit request model, an unexpected Databricks served-model-name, or changed endpoint metadata invalidates the claim; incomplete or production-mismatched transport evidence is caution.</td></tr>
+        <tr><td>Acceptance checks</td><td>Did the run meet the customer-owned explicit targets?</td><td>PASS, MISS, INCONCLUSIVE, or NOT EVALUATED. A reliability pass also requires the one-sided 95% Wilson lower confidence bound to meet the target.</td></tr>
+        <tr><td>Quota state</td><td>Was every physical POST locally admitted, and was terminal HTTP 429 observed on any supplied request row?</td><td>A local denial sends no POST and is not provider rate limiting. Zero observed 429s is not quota headroom. One row can contain multiple attempts.</td></tr>
         <tr><td>Endpoint capacity</td><td>Did the endpoint hold at this exact tested load?</td><td>Never translate one held rung into a ceiling or guarantee.</td></tr>
       </tbody>
     </table>
@@ -392,24 +474,28 @@
       <div class="receipt-card">
         <h3>Create a separate run-verification receipt</h3>
         <p>The verifier re-reads the sealed source, cross-checks the canonical journal and summary, and writes a new receipt without modifying the run.</p>
-        <pre><span class="cmd">python3</span> -m traffic_replay verify-run \
-  results/customer-fixed-rate/RUN-DIRECTORY \
-  <span class="arg">--out</span> results/receipts/customer-fixed-rate
+        <pre><span class="dim">RUN_DIR=results/customer-fixed-rate/RUN-DIRECTORY</span>
+<span class="cmd">python3</span> -m traffic_replay verify-run "$RUN_DIR" \
+  <span class="arg">--out</span> "${RUN_DIR}-verification"
 
 <span class="cmd">python3</span> -m traffic_replay verify-sweep \
   results/customer-rate-sweep</pre>
+        <p class="tiny">The receipt path resolves to <code>results/customer-fixed-rate/RUN-DIRECTORY-verification</code>.</p>
       </div>
       <div class="receipt-card">
         <h3>Receipt boundary</h3>
         <p><code>verification.json</code>, <code>verified-report.html</code>, and <code>verified-report.md</code> are sealed in the receipt. SHA-256 consistency is not a digital signature: it does not prove authorship, trusted time, repository availability, or immutability after verification.</p>
         <p><strong>Before sharing:</strong> review labels, endpoint metadata, file paths, and configuration. Run artifacts are designed to retain metadata and hashes rather than raw request or response content; the measured <code>extra_body</code> remains part of reproducibility evidence.</p>
-        <div class="source-links"><a href="https://github.com/debu-sinha/llm-traffic-replay">github.com/debu-sinha/llm-traffic-replay</a></div>
+        <div class="source-links"><a href="https://github.com/debu-sinha/llm-traffic-replay">Repository landing page</a></div>
+        <p class="tiny">Before external sharing, confirm the stamped source commit is published; the repository's default branch may not yet contain this revision.</p>
       </div>
     </div>
 
+    <div class="source-stamp" data-build-source>UNSTAMPED SOURCE - build the distributable PDF with scripts/build_customer_pdf.py</div>
+
     <div class="footer">
-      <span><strong>Share the receipt with the complete sealed run</strong>, plus the workload and quota limitations.</span>
-      <span>03 / 03</span>
+      <span><strong>Share the receipt with the complete sealed run</strong>, plus workload, quota, and deployment limitations.</span>
+      <span>05 / 05</span>
     </div>
   </section>
 </body>

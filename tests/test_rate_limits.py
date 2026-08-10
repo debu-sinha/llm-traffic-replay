@@ -1,7 +1,7 @@
 """Rolling quota evidence must expose bursts without claiming provider state."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -9,6 +9,7 @@ from traffic_replay.config_validation import validate_rate_limits
 from traffic_replay.metrics import (_rate_limit_evidence, _rolling_peak,
                                     _verdict, render_html, render_markdown,
                                     summarize)
+from traffic_replay.quota_planner import RuntimeQuotaGuard
 from traffic_replay.runner import RunConfig, _prepare_prior_request_rows
 
 
@@ -85,7 +86,7 @@ def _meta() -> dict:
     }
 
 
-def test_rolling_peak_uses_a_true_half_open_sliding_window():
+def test_rolling_peak_keeps_exact_boundary_conservatively():
     peak = _rolling_peak([
         (100.0, 100.0),
         (159.9, 200.0),
@@ -93,10 +94,10 @@ def test_rolling_peak_uses_a_true_half_open_sliding_window():
         (220.0, 50.0),
     ], 60.0)
 
-    # At t=160 the event at t=100 is exactly 60 seconds old and is excluded;
-    # the 159.9 and 160.0 events remain together.
-    assert peak["max"] == 600
-    assert peak["events_in_peak"] == 2
+    # Provider boundary semantics are not published, so the pretraffic and
+    # postrun paths both retain the exact-boundary event.
+    assert peak["max"] == 700
+    assert peak["events_in_peak"] == 3
     assert peak["window_end_unix"] == 160.0
     assert peak["window_start_unix"] == 100.0
 
@@ -108,13 +109,13 @@ def test_summary_reports_burst_and_compares_as_of_limits():
         rate_limits=_limits(queries_per_hour=None))
 
     windows = summary["observed_rate_windows"]
-    assert windows["input_tokens_by_first_send"]["max"] == 600
+    assert windows["input_tokens_by_first_send"]["max"] == 700
     assert windows["input_tokens_by_first_send"]["coverage"] == 1.0
     assert windows[
-        "offered_output_token_reservation_demand_by_first_send"]["max"] == 40
+        "offered_output_token_reservation_demand_by_first_send"]["max"] == 60
     comparison = summary["rate_limits"]["comparisons"][
         "input_tokens_per_minute"]
-    assert comparison["utilization"] == 0.6
+    assert comparison["utilization"] == 0.7
     assert comparison["status"] == \
         "run_evidence_below_warning_threshold"
     assert comparison["provider_headroom_established"] is False
@@ -124,12 +125,12 @@ def test_summary_reports_burst_and_compares_as_of_limits():
     markdown = render_markdown(summary, "quota evidence")
     html = render_html(summary, "quota evidence")
     assert "rolling rate-window evidence" in markdown
-    assert "observed 600 / configured 1000.0" in markdown
-    assert "ratio 60.0%" in markdown
+    assert "observed 700 / configured 1000.0" in markdown
+    assert "ratio 70.0%" in markdown
     assert "operator reverified" in markdown
     assert date.today().isoformat() in markdown
     assert "Rolling rate windows" in html
-    assert "60.0%" in html
+    assert "70.0%" in html
     assert "operator reverified" in html
 
 
@@ -478,6 +479,9 @@ def test_rate_limit_warning_downgrades_an_otherwise_green_verdict():
      "verified_at must be YYYY-MM-DD"),
     (_limits(verified_at="9999-12-31"),
      "verified_at cannot be in the future"),
+    (_limits(as_of=date.today().isoformat(),
+             verified_at=(date.today() - timedelta(days=1)).isoformat()),
+     "verified_at cannot be earlier than as_of"),
     (_limits(max_age_days=0), "max_age_days must be a positive integer"),
     (_limits(max_age_days=1.5), "max_age_days must be a positive integer"),
     (_limits(max_age_days=True), "max_age_days must be a positive integer"),
@@ -486,6 +490,11 @@ def test_rate_limit_warning_downgrades_an_otherwise_green_verdict():
     (_limits(input_tokens_per_minute=True),
      "input_tokens_per_minute must be a number"),
     (_limits(input_tokens_per_minute=10 ** 400), "finite number"),
+    (_limits(queries_per_second=0),
+     "queries_per_second must be greater than zero"),
+    (_limits(request_bytes_max=4.5),
+     "request_bytes_max must be a positive integer byte count"),
+    (_limits(request_bytes_max=True), "request_bytes_max must be a number"),
     (_limits(source="quota page"), "source must be an https URL"),
     (_limits(provider="openai"), "provider must be 'databricks'"),
     (_limits(deployment_mode="provisioned"),
@@ -577,3 +586,239 @@ def test_new_rate_limits_argument_does_not_break_positional_concurrency():
 
     assert summary["concurrency"]["sizing_concurrency_requested"] == 7
     assert "rate_limits" not in summary
+
+
+def test_runtime_quota_evidence_covers_all_captured_phases_and_denials():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 2,
+    }, guard_id="quota-guard-test")
+    first = guard.reserve(
+        b"{}", 1, 8, "preflight-1", 1)
+    guard.mark_post_may_have_started(first)
+    guard.commit(first, reason="response_headers_received")
+    denied = guard.reserve(
+        b"{}", 1, 8, "replay-1", 1)
+
+    preflight = _row(100.0, 10)
+    preflight.update(
+        request_id="preflight-1", phase="preflight",
+        quota_guard_id=guard.guard_id,
+        quota_guard_denied=False, quota_guard_events=[first.event])
+    replay = _row(101.0, None, attempts=0)
+    replay.update(
+        request_id="replay-1", ok=False, status=None, stream_complete=False,
+        visible_content_seen=False, finish_reason=None,
+        phase="replay", quota_guard_id=guard.guard_id,
+        quota_guard_denied=True, quota_guard_events=[denied.event])
+    run_meta = {
+        **_meta(),
+        "runtime_quota_guard": guard.snapshot(),
+    }
+
+    summary = summarize(
+        [replay], run_meta=run_meta,
+        rate_limit_results=[preflight, replay])
+    evidence = summary["runtime_quota_admission"]
+
+    assert evidence["status"] == "denied"
+    assert evidence["request_rows_examined"] == 2
+    assert evidence["admitted_post_attempts_in_captured_rows"] == 1
+    assert evidence["denied_attempts_in_captured_rows"] == 1
+    assert evidence["denied_rows"] == 1
+    assert evidence["invariant_errors"] == []
+    assert summary["quota_limited"] is True
+    assert _verdict(summary)[0] == "invalid"
+    assert "quota-limited locally" in _verdict(summary)[1]
+
+
+def test_runtime_quota_attempt_mismatch_is_invalid_evidence():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 3,
+    }, guard_id="quota-guard-mismatch")
+    admitted = guard.reserve(b"{}", 1, 8, "replay-1", 1)
+    guard.mark_post_may_have_started(admitted)
+    guard.commit(admitted)
+    row = _row(100.0, 10, attempts=2)
+    row.update(
+        request_id="replay-1", quota_guard_id=guard.guard_id,
+        quota_guard_denied=False,
+        quota_guard_events=[admitted.event])
+
+    summary = summarize(
+        [row], run_meta={
+            **_meta(), "runtime_quota_guard": guard.snapshot()})
+
+    assert summary["runtime_quota_admission"]["status"] == \
+        "invalid_evidence"
+    assert any("request_attempts" in error for error in
+               summary["runtime_quota_admission"]["invariant_errors"])
+
+
+def test_runtime_quota_per_run_baseline_accepts_later_sweep_suffix():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+    }, guard_id="quota-guard-shared-sweep")
+    earlier = guard.reserve(b"{}", 1, 8, "rung-1", 1)
+    guard.mark_post_may_have_started(earlier)
+    guard.commit(earlier)
+    baseline = guard.snapshot()
+
+    current = guard.reserve(b"{}", 1, 8, "rung-2", 1)
+    guard.mark_post_may_have_started(current)
+    guard.commit(current)
+    row = _row(101.0, 10)
+    row.update(
+        request_id="rung-2", quota_guard_id=guard.guard_id,
+        quota_guard_denied=False, quota_guard_events=[current.event])
+
+    summary = summarize([row], run_meta={
+        **_meta(),
+        "runtime_quota_guard_baseline": baseline,
+        "runtime_quota_guard": guard.snapshot(),
+    })
+
+    assert summary["runtime_quota_admission"]["status"] == "enforced"
+    assert summary["runtime_quota_admission"]["invariant_errors"] == []
+
+
+def test_runtime_quota_baseline_rejects_stale_event_on_replay_row():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+    }, guard_id="quota-guard-stale-event")
+    old = guard.reserve(b"{}", 1, 8, "old-replay", 1)
+    guard.mark_post_may_have_started(old)
+    guard.commit(old)
+    baseline = guard.snapshot()
+    forged = _row(101.0, 10)
+    forged.update(
+        request_id="old-replay", quota_guard_id=guard.guard_id,
+        quota_guard_denied=False, quota_guard_events=[old.event])
+
+    summary = summarize([forged], run_meta={
+        **_meta(),
+        "runtime_quota_guard_baseline": baseline,
+        "runtime_quota_guard": guard.snapshot(),
+    })
+
+    evidence = summary["runtime_quota_admission"]
+    assert evidence["status"] == "invalid_evidence"
+    assert any("pre-baseline" in error
+               for error in evidence["invariant_errors"])
+
+
+def test_sent_row_without_guard_evidence_invalidates_quota_report():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+    }, guard_id="quota-guard-missing-row")
+    row = _row(100.0, 10, attempts=1)
+
+    summary = summarize(
+        [row], run_meta={
+            **_meta(), "runtime_quota_guard": guard.snapshot()})
+
+    evidence = summary["runtime_quota_admission"]
+    assert evidence["status"] == "invalid_evidence"
+    assert any("no runtime quota guard identity" in error
+               for error in evidence["invariant_errors"])
+
+
+def test_nonterminal_post_event_invalidates_quota_report():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+    }, guard_id="quota-guard-provisional-row")
+    handle = guard.reserve(b"{}", 1, 8, "provisional", 1)
+    guard.mark_post_may_have_started(handle)
+    copied_before_commit = dict(handle.event)
+    guard.commit(handle)
+    row = _row(100.0, 10)
+    row.update(
+        request_id="provisional", quota_guard_id=guard.guard_id,
+        quota_guard_denied=False,
+        quota_guard_events=[copied_before_commit])
+
+    summary = summarize(
+        [row], run_meta={
+            **_meta(), "runtime_quota_guard": guard.snapshot()})
+
+    evidence = summary["runtime_quota_admission"]
+    assert evidence["status"] == "invalid_evidence"
+    assert any("valid terminal" in error
+               for error in evidence["invariant_errors"])
+
+
+def test_runtime_events_make_retry_qps_and_payload_bytes_exact():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+        "queries_per_second": 100,
+        "request_bytes_max": 1_000,
+    }, guard_id="quota-guard-retry-evidence")
+    events = []
+    for ordinal, body in enumerate((b"{}", b'{"retry":true}'), start=1):
+        handle = guard.reserve(
+            body, 1, 8, "replay-retry", ordinal,
+            None if ordinal == 1 else "transport_error_after_post")
+        guard.mark_post_may_have_started(handle)
+        guard.commit(handle, reason="response_headers_received")
+        events.append(handle.event)
+    row = _row(100.0, 10, attempts=2)
+    row.update(
+        request_id="replay-retry", quota_guard_id=guard.guard_id,
+        quota_guard_denied=False,
+        quota_guard_events=events)
+    limits = _limits(
+        input_tokens_per_minute=1_000_000,
+        output_tokens_per_minute=1_000_000,
+        queries_per_hour=1_000,
+        queries_per_second=200,
+        request_bytes_max=1_000)
+
+    summary = summarize(
+        [row], run_meta={
+            **_meta(), "runtime_quota_guard": guard.snapshot()},
+        rate_limits=limits)
+    windows = summary["observed_rate_windows"]
+
+    assert windows["physical_queries_per_one_second_by_request_start"][
+        "max"] == 2
+    assert windows["physical_attempt_timestamps_complete"] is True
+    assert windows["single_physical_attempt_per_row"] is False
+    assert windows["request_payload_bytes_by_physical_post"]["max"] == \
+        len(b'{"retry":true}')
+    assert summary["rate_limits"]["hard_limit_comparisons"][
+        "request_bytes_max"]["status"] == \
+        "all_captured_posts_within_hard_limit"
+    assert "queries_per_second" in summary["rate_limits"]["comparisons"]
+
+
+def test_unknown_outcome_makes_payload_hard_limit_comparison_incomplete():
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+        "request_bytes_max": 1_000,
+    })
+    handle = guard.reserve(b"{}", 1, 8, "known", 1)
+    guard.mark_post_may_have_started(handle)
+    guard.commit(handle)
+    known = _row(10.0, 10)
+    known.update(
+        request_id="known", quota_guard_id=guard.guard_id,
+        quota_guard_denied=False, quota_guard_events=[handle.event])
+    unknown = {
+        "phase": "preflight", "request_id": "unknown",
+        "first_send_unix": None, "request_attempts": None,
+        "connection_attempts": None,
+    }
+
+    _observed, block = _rate_limit_evidence(
+        [known, unknown], _limits(request_bytes_max=1_000), _meta())
+
+    comparison = block["hard_limit_comparisons"]["request_bytes_max"]
+    assert comparison["comparison_is_complete"] is False
+    assert comparison["status"] == "incomplete_run_evidence"

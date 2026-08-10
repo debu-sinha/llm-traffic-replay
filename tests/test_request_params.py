@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -193,8 +194,15 @@ def test_compare_table_has_reasoning_tokens_row():
                                "output_tokens_per_min": 50}}
         raw = json.dumps(summ).encode()
         (d / "summary.json").write_bytes(raw)
-        requests_raw = b""
+        request_row = {
+            "phase": "replay", "request_id": f"request-{title}",
+            "global_index": 0, "scheduled_s": 0.0,
+        }
+        requests_raw = (json.dumps(
+            request_row, separators=(",", ":")) + "\n").encode()
         (d / "requests.jsonl").write_bytes(requests_raw)
+        timestamps = struct.pack("<d", 0.0)
+        indices = struct.pack("<q", 0)
         manifest = {
             "manifest_schema_version": 3,
             "git_commit": "a" * 40,
@@ -214,18 +222,20 @@ def test_compare_table_has_reasoning_tokens_row():
             "artifact_id": f"artifact-{title}",
             "schedule_identity": {
                 "encoding": "float64-le-seconds-from-run-start",
-                "global_timestamps_sha256": "c" * 64,
+                "global_timestamps_sha256": hashlib.sha256(
+                    timestamps).hexdigest(),
                 "global_count": 1,
                 "global_min_s": 0.0,
                 "global_max_s": 0.0,
-                "shard_timestamps_sha256": "c" * 64,
+                "shard_timestamps_sha256": hashlib.sha256(
+                    timestamps).hexdigest(),
                 "shard_count": 1,
                 "shard_min_s": 0.0,
                 "shard_max_s": 0.0,
             },
             "index_identity": {
                 "encoding": "int64-le",
-                "global_indices_sha256": "d" * 64,
+                "global_indices_sha256": hashlib.sha256(indices).hexdigest(),
                 "count": 1,
                 "min": 0,
                 "max": 0,
@@ -242,7 +252,7 @@ def test_compare_table_has_reasoning_tokens_row():
                 "requests.jsonl": {
                     "sha256": hashlib.sha256(requests_raw).hexdigest(),
                     "bytes": len(requests_raw),
-                    "row_count": 0,
+                    "row_count": 1,
                 },
             },
         }
@@ -253,7 +263,7 @@ def test_compare_table_has_reasoning_tokens_row():
             "status": "complete",
             "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
             "manifest_bytes": len(manifest_raw),
-            "request_rows": 0,
+            "request_rows": 1,
         }) + "\n")
         return str(d)
 

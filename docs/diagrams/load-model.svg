@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="650" viewBox="0 0 1280 650" role="img" aria-labelledby="title desc">
   <title id="title">Workload and open-loop load model</title>
-  <desc id="desc">Real prompts or profile schemas create request bodies. A synthetic burst schedule or shifted arrival trace creates monotonic target times. Global indices are assigned before sharding. A bounded open-loop dispatcher offers requests, while achieved token, cache, rate, and concurrency evidence are measured rather than assumed.</desc>
+  <desc id="desc">Real prompts or profile schemas create request bodies. A synthetic burst schedule or shifted arrival trace creates monotonic target times. Fixed-rate and trace schedules can be materialized before network access; a sizing-derived schedule is the explicit exception because paid sizing must derive its rate first. Global indices are assigned before sharding. A bounded open-loop dispatcher offers request operations. Immediately before every physical inference POST, one command-local no-wait guard atomically reserves query, token, and exact serialized-byte budget; a local denial sends no POST. The built-in transport opens a fresh HTTP/1.1 connection for each admitted physical attempt. Achieved token, cache, rate, concurrency, response identity, runtime admission, and the normalized post-drain endpoint-stability subset are measured rather than assumed. The report has exactly five canonical decisions; identity, stability, and admission are evidence gates.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
     <style>
@@ -39,7 +39,7 @@
   <text class="s" x="1035" y="141">messages + max_tokens</text>
   <text class="s" x="1035" y="165">fixed seed and global request ID</text>
   <text class="s" x="1035" y="189">model-specific extra_body</text>
-  <text class="s" x="1035" y="213">provider conformance still required</text>
+  <text class="s" x="1035" y="213">exact bytes; provider contract required</text>
   <path class="a" d="M305 158 H360"/><path class="a" d="M670 158 H725"/><path class="a" d="M960 158 H1015"/>
   <text class="note" x="515" y="265" text-anchor="middle">Real-prompts mode bypasses profile sampling and synthetic text construction.</text>
 
@@ -56,25 +56,25 @@
   <text class="s" x="380" y="428">round-robin modulo shard selection</text>
 
   <rect class="green" x="675" y="310" width="280" height="150" rx="12"/>
-  <text class="t" x="815" y="338" text-anchor="middle">Bounded open-loop dispatcher</text>
-  <text class="s" x="695" y="367">monotonic scheduled targets</text>
-  <text class="s" x="695" y="390">fixed arrival plan; no response pacing</text>
-  <text class="s" x="695" y="413">max_concurrency worker bound</text>
-  <text class="s" x="695" y="433">max_pending_requests bounds</text>
-  <text class="s" x="695" y="452">running + queued work</text>
+  <text class="t" x="815" y="334" text-anchor="middle">Open-loop dispatch</text>
+  <text class="t" x="815" y="353" text-anchor="middle">+ fresh HTTP/1.1 POST admission</text>
+  <text class="s" x="695" y="378">fixed targets; bounded workers + pending</text>
+  <text class="s" x="695" y="399">one no-wait guard spans the command</text>
+  <text class="s" x="695" y="420">reserve QPS/QPH, TPM, exact bytes</text>
+  <text class="s" x="695" y="441">local denial sends no POST; stop ladder</text>
 
   <rect class="amber" x="1015" y="310" width="220" height="150" rx="12"/>
   <text class="t" x="1125" y="338" text-anchor="middle">Endpoint outcomes</text>
   <text class="s" x="1035" y="367">service time changes occupancy</text>
-  <text class="s" x="1035" y="390">quota or errors can shed work</text>
+  <text class="s" x="1035" y="390">provider 429/errors can shed work</text>
   <text class="s" x="1035" y="413">usage/cache fields can be missing</text>
   <text class="s" x="1035" y="436">retries can add physical POSTs</text>
   <path class="a" d="M305 385 H360"/><path class="a" d="M620 385 H675"/><path class="a" d="M955 385 H1015"/>
 
   <rect class="violet" x="235" y="515" width="810" height="92" rx="12"/>
-  <text class="t" x="640" y="544" text-anchor="middle">Measured evidence, never inferred from requested settings</text>
+  <text class="t" x="640" y="544" text-anchor="middle">Measured evidence feeds exactly five canonical decisions</text>
   <text class="s" x="640" y="569" text-anchor="middle">delivered rate and queue wait | observed in-flight concurrency | prompt/output token coverage</text>
-  <text class="s" x="640" y="591" text-anchor="middle">endpoint-reported cached prompt-token fraction | acceptable content/tool outcomes | caller latency</text>
+  <text class="s" x="640" y="591" text-anchor="middle">cached fraction | answer outcomes | caller latency | identity / stability / admission evidence gates</text>
   <path class="a" d="M815 460 V492 H640 V515"/>
   <text class="note" x="640" y="632" text-anchor="middle">A fixed seed reproduces the client plan, not endpoint timing, autoscaling, cache state, or network conditions.</text>
 </svg>

@@ -41,6 +41,7 @@ def test_valid_acceptance_and_pricing_schemas():
     {"hard_timeouts": {"note": "no actual cap"}},
     {"success_rate": -1},
     {"success_rate": 1.01},
+    {"success_rate": 1.0},
     {"success_rate": True},
     {"interchunk_ms": math.inf},
     {"unknown": 1},

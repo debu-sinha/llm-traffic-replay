@@ -27,6 +27,8 @@ import uuid
 from . import __version__
 from .aggregate import (
     _COMPLETE_MARKER,
+    _MAX_REQUEST_JSONL_LINE_BYTES,
+    _MAX_REQUEST_JOURNAL_BYTES,
     _WRITING_MARKER,
     _artifact_declarations,
     _fsync_directory,
@@ -36,6 +38,7 @@ from .aggregate import (
     _load_json_object,
     _measure_regular,
     _read_regular_bytes,
+    _regular_identity,
     _require_regular,
     _require_run_dir,
     _verify_artifacts,
@@ -76,6 +79,7 @@ _VERIFICATION_SCOPE = {
         "replay scheduled-time digest and bounds",
         "replay total/ok/failed",
         "judged/acceptable outcomes",
+        "preflight gate counts and acceptable outcomes",
         "all-phase HTTP 429 count, status coverage, denominator, and phases",
     ],
     "source_bindings_reread_before_receipt_seal": True,
@@ -117,7 +121,8 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
     name = "requests.jsonl"
     expected = _artifact_declarations(manifest, d)[name]
     path = d / name
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -134,16 +139,36 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
     http_429_phases: dict[str, int] = {}
     answer_rows_judged = 0
     acceptable_outcomes = 0
+    preflight_rows_judged = 0
+    preflight_acceptable_outcomes = 0
+    preflight_http_200 = 0
     replay_identity_rows: list[tuple[int, float, str]] = []
     replay_request_ids: set[str] = set()
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"artifact is not a regular file: {path}")
+        if before.st_size != expected["bytes"] \
+                or before.st_size > _MAX_REQUEST_JOURNAL_BYTES:
+            raise ValueError(f"artifact byte count is invalid for {path}")
         with os.fdopen(fd, "rb") as handle:
             fd = -1
-            for line_number, raw in enumerate(handle, 1):
+            line_number = 0
+            while True:
+                raw = handle.readline(_MAX_REQUEST_JSONL_LINE_BYTES + 1)
+                if not raw:
+                    break
+                line_number += 1
+                if len(raw) > _MAX_REQUEST_JSONL_LINE_BYTES:
+                    raise ValueError(
+                        f"requests.jsonl line {line_number} exceeds the "
+                        f"{_MAX_REQUEST_JSONL_LINE_BYTES:,}-byte limit in {d}")
                 digest.update(raw)
                 size += len(raw)
+                if size > expected["bytes"]:
+                    raise ValueError(
+                        f"requests.jsonl exceeds its declared byte count in "
+                        f"{d}")
                 if not raw.endswith(b"\n") or not raw.strip():
                     raise ValueError(
                         f"invalid requests.jsonl record {line_number} in {d}")
@@ -177,6 +202,40 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
                 if status == 429:
                     http_429 += 1
                     http_429_phases[phase] = http_429_phases.get(phase, 0) + 1
+                if phase == "preflight":
+                    if status == 200:
+                        preflight_http_200 += 1
+                    observed = any(field in row for field in (
+                        "visible_content_seen", "reasoning_seen",
+                        "valid_tool_calls", "refusal_seen"))
+                    if not observed and row.get("ok") is False:
+                        # Legacy transport failures remain judgeable failures.
+                        preflight_rows_judged += 1
+                    elif observed:
+                        visible = row.get("visible_content_seen", False)
+                        stream_complete = row.get("stream_complete", False)
+                        valid_tool_calls = row.get("valid_tool_calls", 0)
+                        parse_errors = row.get("parse_errors", 0)
+                        refusal_seen = row.get("refusal_seen", False)
+                        if not isinstance(visible, bool) \
+                                or not isinstance(stream_complete, bool) \
+                                or isinstance(valid_tool_calls, bool) \
+                                or not isinstance(valid_tool_calls, int) \
+                                or valid_tool_calls < 0 \
+                                or isinstance(parse_errors, bool) \
+                                or not isinstance(parse_errors, int) \
+                                or parse_errors < 0 \
+                                or not isinstance(refusal_seen, bool):
+                            raise ValueError(
+                                "requests.jsonl line "
+                                f"{line_number} has invalid preflight "
+                                f"answer-outcome fields in {d}")
+                        preflight_rows_judged += 1
+                        if status == 200 \
+                                and (visible or valid_tool_calls > 0) \
+                                and not refusal_seen and stream_complete \
+                                and parse_errors == 0:
+                            preflight_acceptable_outcomes += 1
                 if phase != "replay":
                     continue
                 replay_rows += 1
@@ -217,7 +276,7 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
 
                 observed = any(field in row for field in (
                     "visible_content_seen", "reasoning_seen",
-                    "valid_tool_calls"))
+                    "valid_tool_calls", "refusal_seen"))
                 # Current failure rows carry these fields too. Legacy failures
                 # remain judgeable as failures; a legacy success does not.
                 if not observed and not ok:
@@ -229,6 +288,7 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
                 stream_complete = row.get("stream_complete", False)
                 valid_tool_calls = row.get("valid_tool_calls", 0)
                 parse_errors = row.get("parse_errors", 0)
+                refusal_seen = row.get("refusal_seen", False)
                 if not isinstance(visible, bool) \
                         or not isinstance(stream_complete, bool) \
                         or isinstance(valid_tool_calls, bool) \
@@ -236,17 +296,22 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
                         or valid_tool_calls < 0 \
                         or isinstance(parse_errors, bool) \
                         or not isinstance(parse_errors, int) \
-                        or parse_errors < 0:
+                        or parse_errors < 0 \
+                        or not isinstance(refusal_seen, bool):
                     raise ValueError(
                         f"requests.jsonl line {line_number} has invalid "
                         f"answer-outcome fields in {d}")
                 answer_rows_judged += 1
                 if (visible or valid_tool_calls > 0) \
+                        and not refusal_seen \
                         and stream_complete and parse_errors == 0:
                     acceptable_outcomes += 1
+            after = os.fstat(handle.fileno())
     finally:
         if fd >= 0:
             os.close(fd)
+    if _regular_identity(before) != _regular_identity(after):
+        raise ValueError(f"requests.jsonl changed while reading in {d}")
     actual = {"sha256": digest.hexdigest(), "bytes": size, "row_count": rows}
     if not hmac.compare_digest(actual["sha256"], expected["sha256"]):
         raise ValueError(f"artifact SHA-256 mismatch for {path}")
@@ -330,6 +395,9 @@ def _strict_bound_requests(d: Path, manifest: dict) -> tuple[dict, dict]:
         },
         "answer_rows_judged": answer_rows_judged,
         "acceptable_outcomes": acceptable_outcomes,
+        "preflight_rows_judged": preflight_rows_judged,
+        "preflight_acceptable_outcomes": preflight_acceptable_outcomes,
+        "preflight_http_200": preflight_http_200,
         "replay_global_indices_sha256": index_digest,
         "replay_schedule_sha256": schedule_digest,
     }
@@ -406,6 +474,100 @@ def _validate_summary_request_consistency(
     return evidence
 
 
+def _validate_preflight_gate_consistency(
+        d: Path, summary: dict, start: dict, evidence: dict) -> None:
+    """Bind every durable preflight label to its rows and answer facts."""
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    gate = run.get("preflight_gate")
+    start_gate = start.get("preflight_gate")
+    setup_kind = run.get("artifact_kind") == "command_setup_traffic"
+    if gate is None:
+        if start_gate is not None or setup_kind:
+            raise ValueError(f"missing preflight gate evidence in {d}")
+        return
+    expected = {
+        "skipped", "attempted", "reachable", "readable",
+        "reasoning_probe_requests", "outcome", "force_requested",
+        "gate_satisfied",
+    }
+    if not isinstance(gate, dict) or set(gate) != expected \
+            or start_gate != gate:
+        raise ValueError(f"invalid or inconsistent preflight gate in {d}")
+    if gate.get("skipped") is not False \
+            or not isinstance(gate.get("force_requested"), bool) \
+            or not isinstance(gate.get("gate_satisfied"), bool):
+        raise ValueError(f"invalid preflight gate flags in {d}")
+    counts = {}
+    for field in ("attempted", "reachable", "readable",
+                  "reasoning_probe_requests"):
+        item = gate.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError(f"invalid preflight gate {field} in {d}")
+        counts[field] = item
+    if counts["attempted"] <= 0 \
+            or counts["reachable"] > counts["attempted"] \
+            or counts["readable"] > counts["reachable"]:
+        raise ValueError(f"preflight gate counts disagree in {d}")
+    if evidence["phases"].get("preflight", 0) != counts["attempted"] \
+            or evidence["phases"].get("probe", 0) != \
+            counts["reasoning_probe_requests"] \
+            or evidence["preflight_rows_judged"] != counts["attempted"] \
+            or evidence["preflight_http_200"] != counts["reachable"] \
+            or evidence["preflight_acceptable_outcomes"] != \
+            counts["readable"]:
+        raise ValueError(
+            f"preflight gate counts disagree with requests.jsonl in {d}")
+    complete = (
+        counts["reachable"] == counts["attempted"]
+        and counts["readable"] == counts["attempted"])
+    outcome = gate.get("outcome")
+    valid = (
+        (outcome == "preflight_passed" and complete
+         and gate["gate_satisfied"] is True)
+        or (outcome == "preflight_forced_unreadable"
+            and gate["force_requested"] is True
+            and gate["gate_satisfied"] is False
+            and counts["reachable"] == counts["attempted"]
+            and counts["readable"] < counts["attempted"])
+        or (setup_kind and outcome == "preflight_refused"
+            and gate["gate_satisfied"] is False and not complete)
+        or (setup_kind and outcome == "preflight_forced_failed"
+            and gate["force_requested"] is True
+            and gate["gate_satisfied"] is False
+            and counts["reachable"] < counts["attempted"])
+        or (setup_kind and outcome == "preflight_state_unknown"
+            and gate["gate_satisfied"] is False)
+    )
+    if not valid:
+        raise ValueError(f"preflight gate outcome disagrees with evidence in {d}")
+
+    if setup_kind:
+        setup = summary.get("setup_traffic")
+        if not isinstance(setup, dict) \
+                or setup.get("artifact_kind") != "command_setup_traffic" \
+                or setup.get("outcome") != outcome \
+                or setup.get("preflight_gate") != gate \
+                or setup.get("request_rows") != evidence["request_rows"] \
+                or setup.get("performance_result") is not False \
+                or setup.get("sla_result") is not False \
+                or setup.get("capacity_result") is not False \
+                or run.get("setup_outcome") != outcome \
+                or start.get("setup_outcome") != outcome:
+            raise ValueError(f"setup traffic outcome disagrees in {d}")
+        exit_code = setup.get("exit_code")
+        if outcome == "preflight_refused":
+            if isinstance(exit_code, bool) or not isinstance(exit_code, int) \
+                    or exit_code <= 0:
+                raise ValueError(f"invalid refused preflight exit code in {d}")
+        elif exit_code is not None:
+            raise ValueError(f"continued preflight claims an exit code in {d}")
+    elif outcome not in {
+            "preflight_passed", "preflight_forced_unreadable"}:
+        raise ValueError(
+            f"measured run carries a non-executable preflight state in {d}")
+
+
 def _remeasure_nonstructured_artifacts(d: Path, manifest: dict) -> None:
     """Second-pass every bound artifact not already read as strict JSON."""
     declarations = _artifact_declarations(manifest, d)
@@ -464,7 +626,8 @@ def _source_reconstructibility(manifest: dict, start: dict) -> dict:
         "reason_codes": reason_codes,
         "reason": (
             "A clean Git commit and SHA-256 source-tree identity are recorded "
-            "consistently in start.json and manifest.json."
+            "consistently in start.json and manifest.json; repository and "
+            "commit availability were not checked."
             if not reason_codes else "; ".join(details)
         ),
         "boundary": (
@@ -498,7 +661,8 @@ def _generator_reconstructibility(source: dict) -> dict:
         "reason_codes": reasons,
         "reason": (
             "The external verifier ran from a clean recorded Git commit and "
-            "SHA-256 source-tree identity."
+            "SHA-256 source-tree identity; repository and commit availability "
+            "were not checked."
             if not reasons else "; ".join(details)
         ),
         "boundary": (
@@ -632,6 +796,8 @@ def verify_run_output(run_dir: str | Path) -> dict:
     requests_meta, request_evidence = _strict_bound_requests(d, manifest)
     _validate_summary_request_consistency(
         d, manifest, summary, request_evidence)
+    _validate_preflight_gate_consistency(
+        d, summary, start, request_evidence)
 
     manifest_raw = _read_regular_bytes(d / "manifest.json")
     try:
@@ -1005,7 +1171,9 @@ def _validate_receipt_binding_shape(binding: object, d: Path) -> dict:
     for field in (
             "request_rows", "replay_rows", "replay_ok", "replay_failed",
             "http_status_observed_for", "http_429_count",
-            "answer_rows_judged", "acceptable_outcomes"):
+            "answer_rows_judged", "acceptable_outcomes",
+            "preflight_rows_judged", "preflight_acceptable_outcomes",
+            "preflight_http_200"):
         value = request_evidence.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(
@@ -1024,7 +1192,13 @@ def _validate_receipt_binding_shape(binding: object, d: Path) -> dict:
             or request_evidence["http_429_count"] > request_evidence[
                 "http_status_observed_for"] \
             or request_evidence["acceptable_outcomes"] > request_evidence[
-                "answer_rows_judged"]:
+                "answer_rows_judged"] \
+            or request_evidence["preflight_acceptable_outcomes"] > \
+            request_evidence["preflight_rows_judged"] \
+            or request_evidence["preflight_acceptable_outcomes"] > \
+            request_evidence["preflight_http_200"] \
+            or request_evidence["preflight_http_200"] > \
+            request_evidence["preflight_rows_judged"]:
         raise ValueError(f"source request evidence counts disagree in receipt {d}")
     for field in ("phases", "http_429_phases"):
         counts = request_evidence.get(field)

@@ -114,6 +114,92 @@ def test_provisioned_known_unsent_row_keeps_exact_denominator():
     assert c["effective_dbu_per_1m_tokens"] is not None
 
 
+def test_summarize_cost_covers_known_unsent_scheduled_tail():
+    rows = _rows(1000, 0, 100, n=1)
+    rows[0].update({
+        "scheduled_s": 0.0,
+        "first_send_unix": 1_700_000_000.0,
+        "finished_unix": 1_700_000_001.0,
+    })
+    for i in range(1, 100):
+        rows.append({
+            "ok": False,
+            "error": "cancelled before HTTP POST",
+            "scheduled_s": i / 10.0,
+            "connection_attempts": 0,
+            "request_attempts": 0,
+            "retries": 0,
+            "retry_reasons": [],
+            "prompt_tokens": None,
+            "completion_tokens": None,
+        })
+
+    summary = summarize(
+        rows,
+        pricing={"mode": "provisioned", "dbu_per_hour": 10.0},
+    )
+    cost = summary["cost"]
+    assert cost["complete"] is True
+    assert cost["known_unsent_rows"] == 99
+    assert cost["observation_seconds"] == pytest.approx(9.9)
+    assert cost["duration_basis"] == (
+        "max(logical_schedule_span,response_drain)")
+    # The old one-second sent-prefix duration under-reported effective cost
+    # by almost tenfold.
+    expected = 10.0 / ((1100 / 9.9 * 3600.0) / 1e6)
+    assert cost["effective_dbu_per_1m_tokens"] == pytest.approx(expected)
+
+
+def test_pre_post_connection_retry_keeps_exact_cost_accounting():
+    rows = _rows(1000, 400, 50)
+    rows[0].update({
+        "connection_attempts": 2,
+        "request_attempts": 1,
+        "retries": 1,
+        "retry_reasons": ["connection_error_before_post"],
+    })
+    pricing = {
+        "mode": "per_token",
+        "input_dbu_per_m": 10.0,
+        "output_dbu_per_m": 30.0,
+        "cache_read_dbu_per_m": 2.0,
+    }
+    c = _cost_block(
+        rows, dur=60, in_tok=1000, out_tok=50, cached_tok=400,
+        pricing=pricing,
+    )
+
+    expected = 600 / 1e6 * 10 + 400 / 1e6 * 2 + 50 / 1e6 * 30
+    assert c["ambiguous_retry_rows"] == 0
+    assert c["unknown_attempt_rows"] == 0
+    assert c["coverage"] == 1.0
+    assert c["complete"] is True
+    assert c["dbu_total"] == pytest.approx(expected)
+
+
+def test_pre_post_connection_retry_with_zero_posts_is_known_unsent():
+    rows = [{
+        "ok": False,
+        "error": "connection failed before HTTP POST",
+        "connection_attempts": 2,
+        "request_attempts": 0,
+        "retries": 1,
+        "retry_reasons": ["connection_error_before_post"],
+        "prompt_tokens": None,
+        "completion_tokens": None,
+    }]
+    c = _cost_block(
+        rows, dur=60, in_tok=0, out_tok=0, cached_tok=0,
+        pricing={"mode": "provisioned", "dbu_per_hour": 10.0},
+    )
+
+    assert c["known_unsent_rows"] == 1
+    assert c["ambiguous_retry_rows"] == 0
+    assert c["unknown_attempt_rows"] == 0
+    assert c["coverage"] == 1.0
+    assert c["complete"] is True
+
+
 def test_zero_attempts_with_response_evidence_is_not_treated_as_unsent():
     rows = _rows(1000, 0, 50)
     rows[0]["request_attempts"] = 0

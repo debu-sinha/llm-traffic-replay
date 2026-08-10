@@ -2,7 +2,7 @@
 
 Every latency table is printed WITH the context that decides whether it can
 be believed: cached prompt-token fraction (endpoint-reported), achieved
-arrival rate vs scheduled, wire lateness, error rate, and token
+arrival rate vs scheduled, HTTP request-start lateness, error rate, and token
 targeting error. A good p50 at the wrong cached-token fraction is a fake
 result; this
 module makes the pairing unavoidable.
@@ -217,6 +217,33 @@ def _wilson_lower_95(successes: int, total: int) -> float | None:
     return max(0.0, (center - radius) / (1.0 + z2 / total))
 
 
+def _decision_pair_display(
+        target: object, actual: object, *, minimum_decimals: int,
+        maximum_decimals: int = 12) -> tuple[str, str]:
+    """Render a scored pair without rounding unequal values to equality.
+
+    Stored decision values remain full precision.  Reports begin with a
+    human-scale precision, then add only enough decimals to distinguish two
+    unequal finite numbers.  This prevents a row from visibly saying
+    ``100.0 <= 100.0: NO`` or ``0.9990: NOT PROVEN`` when the hidden values
+    fall on opposite sides of the boundary.
+    """
+    values = (target, actual)
+    if any(isinstance(value, bool)
+           or not isinstance(value, (int, float))
+           or not math.isfinite(float(value)) for value in values):
+        return tuple(str(value) for value in values)  # type: ignore[return-value]
+    target_number, actual_number = (float(value) for value in values)
+    for decimals in range(minimum_decimals, maximum_decimals + 1):
+        rendered = (
+            f"{target_number:,.{decimals}f}",
+            f"{actual_number:,.{decimals}f}",
+        )
+        if target_number == actual_number or rendered[0] != rendered[1]:
+            return rendered
+    return (format(target_number, ".17g"), format(actual_number, ".17g"))
+
+
 def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
     """How many requests were actually in flight, by exact interval overlap.
 
@@ -256,10 +283,16 @@ def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
     # percent, and the reported concurrency collapsed to 1.
     first_send = min(a for a, _ in spans)
     last_send = max(a for a, _ in spans)
-    if last_send <= first_send:
-        return None
-    lo = first_send + (last_send - first_send) * 0.2
-    hi = first_send + (last_send - first_send) * 0.8
+    zero_width_load_window = last_send <= first_send
+    if zero_width_load_window:
+        # Equal timestamps are valid for a trace burst. There is no positive
+        # send window over which to take a middle 60%, so use the observed
+        # response-drain interval and label it explicitly; never discard the
+        # exact N-way whole-run peak.
+        lo, hi = first_send, max(b for _, b in spans)
+    else:
+        lo = first_send + (last_send - first_send) * 0.2
+        hi = first_send + (last_send - first_send) * 0.8
     if hi <= lo:
         lo, hi = first_send, last_send
 
@@ -271,6 +304,8 @@ def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
                 ev.append((a2, 1))
                 ev.append((b2, -1))
         if not ev:
+            if w_lo is not None and w_hi is not None and w_hi > w_lo:
+                return 0, {0: w_hi - w_lo}
             return None, {}
         ev.sort()
         c = pk = 0
@@ -322,14 +357,24 @@ def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
         "in_flight_max_in_window": float(peak),
         "measured_over": "sent request rows with a recorded completion time",
         "method": ("exact interval overlap. percentiles are time weighted "
-                   "over the middle 60 percent of the LOAD interval, bounded "
-                   "by send times so one straggler cannot stretch the "
-                   "window. the maximum is a true peak over the whole run"),
+                   + ("over the response-drain interval because every send "
+                      "had the same timestamp"
+                      if zero_width_load_window else
+                      "over the middle 60 percent of the LOAD interval, "
+                      "bounded by send times so one straggler cannot stretch "
+                      "the window")
+                   + ". the maximum is a true peak over the whole run"),
         "sent_requests": sent_n,
         "measured_requests": len(spans),
         "coverage": (len(spans) / sent_n) if sent_n else None,
     }
     warnings = []
+    if zero_width_load_window:
+        warnings.append(
+            "all measured HTTP sends had the same timestamp, so a positive "
+            "load window does not exist; occupancy percentiles use the "
+            "response-drain interval while the whole-run burst peak remains "
+            "exact")
     if sent_n and len(spans) / sent_n < 0.99:
         warnings.append(
             f"completion time was available for only {len(spans)} of "
@@ -466,11 +511,11 @@ def _usage_is_trustworthy(row: dict) -> bool:
 
 def _rolling_peak(entries: list[tuple[float, float]],
                   window_seconds: float) -> dict:
-    """Exact maximum sum over trailing half-open time windows.
+    """Conservative maximum sum over trailing rolling windows.
 
-    An event exactly ``window_seconds`` before another is outside the same
-    window.  This matches a continuously sliding interval rather than a pair
-    of inclusive endpoints whose elapsed duration is longer than the label.
+    Provider boundary accounting is not observable. Keep an event exactly on
+    the boundary, matching the pretraffic planner, so postrun evidence never
+    manufactures headroom from a more permissive convention.
     """
     if not _nonnegative_finite(window_seconds) or window_seconds <= 0:
         raise ValueError("rolling window must be positive and finite")
@@ -496,7 +541,7 @@ def _rolling_peak(entries: list[tuple[float, float]],
     peak_right = 0
     for right, (stamp, value) in enumerate(ordered):
         running += value
-        while left <= right and stamp - ordered[left][0] >= window_seconds:
+        while left <= right and stamp - ordered[left][0] > window_seconds:
             running -= ordered[left][1]
             left += 1
         if running > peak:
@@ -584,9 +629,43 @@ def _rate_limit_evidence(results: list[dict], limits: dict | None,
 
     attempt_info = [(row, *attempt_observation(row)) for row in sent_rows]
     attempt_counts_exact = all(exact for _row, _count, exact in attempt_info)
-    attempt_timestamps_exact = all(
+    def guarded_attempts(row: dict, expected: int) -> list[dict] | None:
+        events = row.get("quota_guard_events")
+        if not isinstance(events, list):
+            return None
+        physical = []
+        for event in events:
+            if not isinstance(event, dict) \
+                    or event.get("decision") != "admitted" \
+                    or event.get("state") != "committed" \
+                    or event.get("post_may_have_started") is not True:
+                continue
+            stamp = event.get("post_started_at_unix")
+            reservation = event.get("reservation")
+            if not _nonnegative_finite(stamp) \
+                    or not isinstance(reservation, dict):
+                return None
+            required = {
+                "request_bytes", "input_tokens", "output_tokens", "queries"}
+            if not required.issubset(reservation) or any(
+                    not isinstance(reservation[name], int)
+                    or isinstance(reservation[name], bool)
+                    or reservation[name] < 0 for name in required) \
+                    or reservation["queries"] != 1:
+                return None
+            physical.append(event)
+        return physical if len(physical) == expected else None
+
+    guarded_by_row = [
+        (row, count, guarded_attempts(row, count))
+        for row, count, _exact in attempt_info]
+    guarded_attempt_evidence_complete = bool(sent_rows) and all(
+        events is not None for _row, _count, events in guarded_by_row)
+    attempt_timestamps_exact = bool(
+        guarded_attempt_evidence_complete or all(
+            exact and count == 1 for _row, count, exact in attempt_info))
+    single_attempt = bool(sent_rows) and all(
         exact and count == 1 for _row, count, exact in attempt_info)
-    single_attempt = bool(sent_rows) and attempt_timestamps_exact
     clean_usage_rows = {id(row) for row in sent_rows
                         if _usage_is_trustworthy(row)}
     protocol_evidence_complete = all(
@@ -602,17 +681,39 @@ def _rate_limit_evidence(results: list[dict], limits: dict | None,
         for r, _count, _exact in attempt_info
         if _completed_at(r) is not None
         and (id(r) in clean_usage_rows or r.get("status") == 429)]
-    reservation_entries = [
-        (_sent_at(r), float(r["max_tokens_requested"]) * count)
-        for r, count, _exact in attempt_info
-        if _nonnegative_finite(r.get("max_tokens_requested"))]
-    query_entries = [
-        (_sent_at(r), float(count)) for r, count, _exact in attempt_info]
+    if guarded_attempt_evidence_complete:
+        reservation_entries = [
+            (float(event["post_started_at_unix"]),
+             float(event["reservation"]["output_tokens"]))
+            for _row, _count, events in guarded_by_row
+            for event in (events or [])]
+        query_entries = [
+            (float(event["post_started_at_unix"]), 1.0)
+            for _row, _count, events in guarded_by_row
+            for event in (events or [])]
+    else:
+        reservation_entries = [
+            (_sent_at(r), float(r["max_tokens_requested"]) * count)
+            for r, count, _exact in attempt_info
+            if _nonnegative_finite(r.get("max_tokens_requested"))]
+        query_entries = [
+            (_sent_at(r), float(count)) for r, count, _exact in attempt_info]
+    request_byte_entries = [
+        (float(event["post_started_at_unix"]),
+         float(event["reservation"]["request_bytes"]))
+        for _row, _count, events in guarded_by_row
+        for event in (events or [])]
 
     sent_n = len(sent_rows)
     input_coverage = len(input_entries) / sent_n if sent_n else None
     output_coverage = len(output_entries) / sent_n if sent_n else None
-    reservation_coverage = len(reservation_entries) / sent_n if sent_n else None
+    reservation_coverage = (
+        1.0 if guarded_attempt_evidence_complete else
+        len(reservation_entries) / sent_n if sent_n else None)
+    physical_attempt_n = sum(count for _row, count, _exact in attempt_info)
+    request_bytes_coverage = (
+        len(request_byte_entries) / physical_attempt_n
+        if physical_attempt_n else None)
 
     def add_horizon(evidence: dict, entries: list[tuple[float, float]],
                     window_seconds: float) -> dict:
@@ -703,13 +804,34 @@ def _rate_limit_evidence(results: list[dict], limits: dict | None,
                 "logical_rows": sent_n,
                 "attempt_counts_exact": attempt_counts_exact,
                 "all_attempt_timestamps_exact": attempt_timestamps_exact,
+                "runtime_guard_attempt_timestamps_complete": (
+                    guarded_attempt_evidence_complete),
                 "confirmed_http_200_rows": sum(
                     row.get("status") == 200 for row in sent_rows),
                 "provider_processing_ambiguous_rows": sum(
                     row.get("status") != 200 for row in sent_rows),
                 "is_observed_provider_processed_count": False,
             }, query_entries, 3600.0),
+        "physical_queries_per_one_second_by_request_start": add_horizon(
+            _rolling_peak(query_entries, 1.0) | {
+                "logical_rows": sent_n,
+                "attempt_counts_exact": attempt_counts_exact,
+                "all_attempt_timestamps_exact": attempt_timestamps_exact,
+                "runtime_guard_attempt_timestamps_complete": (
+                    guarded_attempt_evidence_complete),
+                "is_observed_provider_processed_count": False,
+            }, query_entries, 1.0),
+        "request_payload_bytes_by_physical_post": {
+            "max": (max((value for _stamp, value in request_byte_entries),
+                        default=None)),
+            "physical_attempts_reported": len(request_byte_entries),
+            "physical_attempts_expected": physical_attempt_n,
+            "coverage": request_bytes_coverage,
+            "measurement": "exact_serialized_request_body_bytes",
+            "timestamp": "immediately_before_http_request_call",
+        },
         "single_physical_attempt_per_row": single_attempt,
+        "physical_attempt_timestamps_complete": attempt_timestamps_exact,
         "protocol_evidence_complete": protocol_evidence_complete,
         "service_tier": {
             "configured": configured_service_tier,
@@ -727,8 +849,10 @@ def _rate_limit_evidence(results: list[dict], limits: dict | None,
             "because per-token generation timestamps are unavailable. offered "
             "output demand groups requested max_tokens at first send and does "
             "not claim rejected demand was reserved or model provider "
-            "credit-back. retry timestamps, provider burst-buffer state, and "
-            "traffic from other callers are not observable in a run artifact"),
+            "credit-back. physical retry request-start timestamps and exact "
+            "payload bytes are retained when runtime-admission evidence is "
+            "complete. provider burst-buffer state and traffic from other "
+            "callers are not observable in a run artifact"),
     }
     if limits is None:
         return observed, None
@@ -838,21 +962,67 @@ def _rate_limit_evidence(results: list[dict], limits: dict | None,
         "output_tokens_per_minute", "output_tokens_per_minute",
         observed["offered_output_token_reservation_demand_by_first_send"],
         trustworthy=(sent_n > 0 and reservation_coverage == 1.0
-                     and single_attempt),
+                     and attempt_timestamps_exact),
         qualifier=("conservative gross max_tokens demand offered to "
                    "pre-admission checks before rejection or credit-back"))
     compare(
         "queries_per_hour", "queries_per_hour",
         observed["physical_queries_by_first_send"],
-        trustworthy=(sent_n > 0 and single_attempt
+        trustworthy=(sent_n > 0 and attempt_timestamps_exact
                      and not observed["physical_queries_by_first_send"][
                          "provider_processing_ambiguous_rows"]),
-        qualifier=("physical POST demand grouped at client first send; not "
-                   "the provider's processed-query counter"))
+        qualifier=("physical POST demand at each client request-start when "
+                   "runtime evidence is complete, otherwise conservatively "
+                   "grouped at row first send; not the provider's "
+                   "processed-query counter"))
+    compare(
+        "queries_per_second", "queries_per_second",
+        observed["physical_queries_per_one_second_by_request_start"],
+        trustworthy=(sent_n > 0 and attempt_timestamps_exact),
+        qualifier=("physical POST demand at the client HTTP request-start "
+                   "clock; unrelated workspace traffic is absent"))
+
+    hard_limit_comparisons = {}
+    if "request_bytes_max" in limits:
+        payload = observed["request_payload_bytes_by_physical_post"]
+        configured = int(limits["request_bytes_max"])
+        measured = payload.get("max")
+        complete = bool(
+            physical_attempt_n > 0 and request_bytes_coverage == 1.0
+            and not unknown_outcome_rows and not invalid_timestamp_rows)
+        if measured is None:
+            status = "unmeasured"
+        elif not complete:
+            status = "incomplete_run_evidence"
+        elif float(measured) > configured:
+            status = "hard_limit_exceeded"
+        else:
+            status = "all_captured_posts_within_hard_limit"
+        hard_limit_comparisons["request_bytes_max"] = {
+            "configured_limit": configured,
+            "observed_max": measured,
+            "ratio_to_configured_limit": (
+                None if measured is None else float(measured) / configured),
+            "comparison_is_complete": complete,
+            "status": status,
+            "measurement": "exact_serialized_request_body_bytes",
+            "provider_headroom_established": False,
+        }
+        if status == "unmeasured":
+            warnings.append("request payload bytes could not be measured")
+        elif status == "incomplete_run_evidence":
+            warnings.append(
+                "request payload byte evidence is incomplete across physical "
+                "POST attempts")
+        elif status == "hard_limit_exceeded":
+            warnings.append(
+                "a captured physical POST exceeded the configured hard "
+                "request payload limit")
     block = {
         "configured": _redact_secrets(limits),
         "binding": binding,
         "comparisons": comparisons,
+        "hard_limit_comparisons": hard_limit_comparisons,
         "warning": "; ".join(warnings) if warnings else None,
         "external_usage_warning": (
             "these comparisons cover only traffic recorded by this run. "
@@ -888,6 +1058,54 @@ def _verdict(s: dict) -> tuple[str, str]:
     "meets every acceptance target". Anything that undermines the
     measurement now downgrades the verdict and says which thing did.
     """
+    # The five-state decision model is the canonical invalidity gate used by
+    # reports and external verification. Keep the compact legacy banner text
+    # below for miss/caution wording, but never let CLI exit status or a sweep
+    # rung call an artifact PASS when the canonical measurement state is
+    # INVALID (for example response-identity mismatch, endpoint config drift,
+    # or an explicitly forced unreadable preflight).
+    from .report_decision import build_report_decision
+    canonical_measurement = build_report_decision(s)["measurement_validity"]
+    canonical_only_invalidity = {
+        "RESPONSE_MODEL_IDENTITY_INVALID",
+        "ENDPOINT_METADATA_CHANGED_DURING_RUN",
+        "FORCED_UNREADABLE_PREFLIGHT",
+    }
+    canonical_reason_codes = set(
+        canonical_measurement.get("reason_codes") or [])
+    # All current summaries carry the three request-count fields.  Once that
+    # contract is present, the canonical measurement axis is authoritative in
+    # full: count contradictions, quota-evidence contradictions, aggregate
+    # incompatibility, and every future invalidity gate must dominate the
+    # legacy banner. ``any`` also fails a partially deleted count contract
+    # closed.  The named gates retain safe behavior for small legacy/unit
+    # summaries which intentionally predate request-count accounting.
+    current_count_contract = any(
+        key in s for key in (
+            "requests_total", "requests_ok", "requests_failed"))
+    canonical_invalid_reason = None
+    if canonical_measurement.get("code") == "INVALID" and (
+            current_count_contract
+            or canonical_only_invalidity.intersection(
+                canonical_reason_codes)):
+        canonical_invalid_reason = canonical_measurement["reason"]
+    # These cautions are independent of the older banner's latency and load
+    # checks.  If they are omitted here, a response whose model identity was
+    # not verified, or a run whose endpoint metadata could not be compared,
+    # can still become an ``ok`` CLI result and a PASS sweep rung even though
+    # the canonical decision model calls the measurement CAUTION.  Preserve
+    # legacy summaries that simply predate these fields, while binding every
+    # concrete current-format warning to the canonical state.
+    canonical_only_caution = {
+        "RESPONSE_MODEL_IDENTITY_UNVERIFIED",
+        "ENDPOINT_METADATA_STABILITY_UNVERIFIED",
+    }
+    canonical_caution_reason = None
+    if canonical_measurement.get("code") == "CAUTION" and (
+            current_count_contract
+            or canonical_only_caution.intersection(canonical_reason_codes)):
+        canonical_caution_reason = canonical_measurement["reason"]
+
     sla = s.get("sla") or {}
     a = s.get("answers") or {}
     rows = [r for k in ("ttft_vs_target", "ttfg_vs_target")
@@ -921,6 +1139,26 @@ def _verdict(s: dict) -> tuple[str, str]:
             f"{'row returned' if http_429_count == 1 else 'rows returned'} "
             "HTTP 429. this run supports no endpoint-capacity conclusion; "
             "identify the enforcing limit and dimension in provider telemetry")
+
+    runtime_quota = s.get("runtime_quota_admission") or {}
+    if isinstance(runtime_quota, dict) \
+            and runtime_quota.get("status") == "denied":
+        return "invalid", (
+            "quota-limited locally: the command-level runtime guard refused "
+            "one or more physical POSTs before send. the requested load was "
+            "not delivered, so this is safety-stop evidence and supports no "
+            "endpoint-capacity conclusion")
+    if isinstance(runtime_quota, dict) \
+            and runtime_quota.get("status") == "invalid_evidence":
+        return "invalid", (
+            "runtime quota-admission evidence failed its internal invariants; "
+            "physical POST coverage cannot be trusted")
+
+    # Keep the established, specific quota messages above (they include the
+    # operational remediation), then let every other canonical invalidity
+    # dominate answer/SLA interpretation.
+    if canonical_invalid_reason is not None:
+        return "invalid", canonical_invalid_reason
 
     if a.get("invalid"):
         return "invalid", a["invalid"]
@@ -979,6 +1217,18 @@ def _verdict(s: dict) -> tuple[str, str]:
         doubts.append("the load did not reach the endpoint on schedule")
     if sla.get("caller_latency_warning"):
         doubts.append(sla["caller_latency_warning"])
+    hard_unmeasured = sla.get("hard_timeout_unmeasured")
+    if isinstance(hard_unmeasured, int) and hard_unmeasured > 0:
+        doubts.append(
+            f"hard-timeout caller timing was unmeasured for "
+            f"{hard_unmeasured} request"
+            f"{'s' if hard_unmeasured != 1 else ''}")
+    inter_unmeasured = sla.get("interchunk_unmeasured")
+    if isinstance(inter_unmeasured, int) and inter_unmeasured > 0:
+        doubts.append(
+            f"interchunk latency was unmeasured for {inter_unmeasured} "
+            f"protocol-clean outcome"
+            f"{'s' if inter_unmeasured != 1 else ''}")
     if (s.get("throughput") or {}).get("coverage_warning"):
         doubts.append("token usage was missing on many responses, so "
                       "throughput and cost cover a subset")
@@ -997,6 +1247,13 @@ def _verdict(s: dict) -> tuple[str, str]:
         doubts.append((s.get("token_targeting") or {})["warning"])
     if (s.get("latency_population") or {}).get("warning"):
         doubts.append((s.get("latency_population") or {})["warning"])
+    _identity_warning = (s.get("response_identity") or {}).get("warning")
+    if _identity_warning:
+        doubts.append(str(_identity_warning))
+    _endpoint_warning = (s.get("run") or {}).get(
+        "endpoint_metadata_warning")
+    if _endpoint_warning:
+        doubts.append(str(_endpoint_warning))
     _npw = (s.get("network_path") or {})
     if _npw.get("warning"):
         doubts.append(str(_npw["warning"]))
@@ -1044,7 +1301,12 @@ def _verdict(s: dict) -> tuple[str, str]:
         doubts.append(f"{', '.join(_scored_weak)} scored on "
                       f"{_samp.get('n')} requests, which cannot support "
                       f"{'that quantile' if len(_scored_weak) == 1 else 'those quantiles'}")
-    _had_targets = bool(rows or sla.get("success_rate"))
+    _acceptance = sla.get("acceptance_config") or {}
+    _hard = _acceptance.get("hard_timeouts") or {}
+    _had_targets = bool(
+        rows or sla.get("success_rate")
+        or any(_hard.get(key) for key in ("ttft_s", "ttfg_s"))
+        or _acceptance.get("interchunk_ms") is not None)
     _lead = ("met every acceptance target, but " if _had_targets
              else "no acceptance targets were given, and ")
     if doubts:
@@ -1053,6 +1315,12 @@ def _verdict(s: dict) -> tuple[str, str]:
     if not _had_targets:
         return "caution", ("no acceptance targets were given, so nothing was "
                            "scored. pass your own to get a verdict")
+    # If no legacy banner check above explains the canonical measurement
+    # caution, retain the canonical reason as the final anti-green fallback.
+    # This preserves more actionable established wording (sample size,
+    # stability, truncation, confidence) without ever promoting CAUTION to OK.
+    if canonical_caution_reason is not None:
+        return "caution", canonical_caution_reason
     return "ok", "meets every acceptance target"
 
 
@@ -1073,6 +1341,7 @@ def _answered(r: dict) -> bool:
     """
     return bool((r.get("visible_content_seen")
                  or (r.get("valid_tool_calls") or 0) > 0)
+                and not r.get("refusal_seen")
                 and r.get("stream_complete")
                 and not r.get("parse_errors"))
 
@@ -1100,12 +1369,13 @@ def _answer_block(results: list[dict]) -> dict | None:
     """
     ok = [r for r in results if _protocol_clean_success(r)]
     observed_fields = {
-        "visible_content_seen", "reasoning_seen", "valid_tool_calls"}
+        "visible_content_seen", "reasoning_seen", "valid_tool_calls",
+        "refusal_seen"}
     scored = [r for r in results if observed_fields.intersection(r)]
     legacy_failures = [r for r in results
                        if not r.get("ok")
                        and not observed_fields.intersection(r)]
-    if not scored and not legacy_failures:
+    if results and not scored and not legacy_failures:
         return None          # rows written before this was recorded
     n_observed = len(scored)
     complete = sum(1 for r in scored if _answered(r))
@@ -1132,6 +1402,11 @@ def _answer_block(results: list[dict]) -> dict | None:
         "scored": n_observed,
         "answered": complete,
         "acceptable_outcomes": complete,
+        "model_refusal_outcomes": sum(
+            1 for r in scored if r.get("refusal_seen")),
+        "model_refusal_rate": (round(sum(
+            1 for r in scored if r.get("refusal_seen")) / judged, 6)
+            if judged else None),
         "valid_tool_call_outcomes": sum(
             1 for r in scored if (r.get("valid_tool_calls") or 0) > 0),
         "tool_call_only_outcomes": sum(
@@ -1143,9 +1418,12 @@ def _answer_block(results: list[dict]) -> dict | None:
         "no_visible_content": sum(
             1 for r in scored if not r.get("visible_content_seen")),
         "no_acceptable_outcome": sum(
+            1 for r in scored if not _answered(r)),
+        "no_nonrefusal_content_or_valid_tool": sum(
             1 for r in scored
-            if not r.get("visible_content_seen")
-            and not (r.get("valid_tool_calls") or 0) > 0),
+            if not r.get("refusal_seen")
+            and not r.get("visible_content_seen")
+            and (r.get("valid_tool_calls") or 0) <= 0),
         "stream_incomplete": sum(
             1 for r in scored if not r.get("stream_complete")),
         "parse_errors": sum(1 for r in scored if r.get("parse_errors")),
@@ -1166,36 +1444,532 @@ def _answer_block(results: list[dict]) -> dict | None:
             if r.get("truncated") and r.get("max_tokens_requested")
             and r.get("intended_output_tokens")
             and r["max_tokens_requested"] < r["intended_output_tokens"]),
-        "answer_rate": (round(complete / judged, 6) if judged else None),
-        "answer_rate_of_transport_ok": (round(complete / len(ok), 6)
+        "answer_rate": (complete / judged if judged else None),
+        "answer_rate_of_transport_ok": (complete / len(ok)
                                         if ok else None),
-        "note": "an acceptable outcome means visible content or at least one "
+        "note": "an acceptable outcome means non-refusal visible content or "
+                "at least one "
                 "structurally valid tool call arrived and the stream finished "
                 "cleanly. it does NOT mean the answer or tool choice was "
-                "correct. truncation alone is not counted as a failure. a "
+                "correct. model refusals are reported separately and are "
+                "unacceptable by default for customer task replay. truncation "
+                "alone is not counted as a failure. a "
                 "partial or malformed tool-call fragment is not accepted.",
     }
     if complete == 0 and judged:
         # name the counter that actually drove it. asserting "produced no
         # visible content" when the real cause was a stream that never
         # terminated puts a false statement next to a zero counter.
-        cause = max((("returned no visible content or valid tool call",
-                      out["no_acceptable_outcome"]),
+        cause = max((("were model refusals", out["model_refusal_outcomes"]),
                      ("never terminated their stream", out["stream_incomplete"]),
                      ("hit unrecoverable parse errors", out["parse_errors"]),
+                     ("produced no non-refusal visible content or valid tool call",
+                      out["no_nonrefusal_content_or_valid_tool"]),
                      ("failed before a content stream was established",
                       len(legacy_failures))),
                     key=lambda kv: kv[1])
         out["invalid"] = (
             f"not one of the {judged} requests with answer observability "
             "produced a reportable completed answer. a reportable answer "
-            "requires visible content or a valid tool call, a complete "
+            "requires non-refusal visible content or a valid tool call, a complete "
             "stream, and no unrecoverable parse error. most requests "
             f"{cause[0]} "
             f"({cause[1]} of {judged}). there is no latency-to-answer in this "
             "run and nothing "
             "here is a performance result.")
     return out
+
+
+def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
+    """Summarize and bind response identity without unbounded cardinality.
+
+    Stable latency over two response models is not a valid single-model
+    benchmark. Fingerprints may rotate during deployment, so they remain
+    context rather than a hard model-identity gate.
+    """
+    identity_fields = (
+        "response_model", "served_model_name", "response_object",
+        "response_id_sha256", "system_fingerprint")
+    eligible = [
+        row for row in rows
+        if row.get("status") == 200
+        or ("status" not in row and row.get("ok") is True
+            and any(key in row for key in identity_fields))
+    ]
+    schema_rows = sum(
+        any(key in row for key in identity_fields) for row in rows)
+
+    def distribution(key: str, *, limit: int = 32) -> dict:
+        counts: dict[str, int] = {}
+        missing = 0
+        overflow_observations = 0
+        for row in eligible:
+            value = row.get(key)
+            if not isinstance(value, str) or not value:
+                missing += 1
+                continue
+            if value in counts:
+                counts[value] += 1
+            elif len(counts) < limit:
+                counts[value] = 1
+            else:
+                overflow_observations += 1
+        ordered = {
+            value: count for value, count in sorted(
+                counts.items(), key=lambda item: (-item[1], item[0]))
+        }
+        return {
+            "counts": ordered,
+            "reported_rows": sum(ordered.values()) + overflow_observations,
+            "missing_rows": missing,
+            "distinct_values_at_least": (
+                len(ordered) + (1 if overflow_observations else 0)),
+            "category_limit": limit,
+            "overflow_observations": overflow_observations,
+            "truncated": bool(overflow_observations),
+        }
+
+    models = distribution("response_model")
+    served_models = distribution("served_model_name")
+    objects = distribution("response_object")
+    fingerprints = distribution("system_fingerprint")
+
+    expected_sources: dict[str, str] = {}
+    configured_model = run_meta.get("endpoint_model")
+    if isinstance(configured_model, str) and configured_model:
+        expected_sources[configured_model] = "request body model"
+    endpoint_metadata = run_meta.get("endpoint_metadata")
+    expected_models = sorted(expected_sources)
+    served_entities = (endpoint_metadata.get("served_entities")
+                       if isinstance(endpoint_metadata, dict) else None)
+    expected_served_models = sorted({
+        entity.get("name") for entity in served_entities
+        if isinstance(entity, dict)
+        and isinstance(entity.get("name"), str)
+        and entity.get("name")
+    }) if isinstance(served_entities, list) else []
+    observed_models = set(models["counts"])
+    unexpected_models = (sorted(observed_models - set(expected_models))
+                         if expected_models else [])
+    observed_served_models = set(served_models["counts"])
+    unexpected_served_models = (
+        sorted(observed_served_models - set(expected_served_models))
+        if expected_served_models else [])
+
+    invalid_reasons = []
+    if models["distinct_values_at_least"] > 1:
+        invalid_reasons.append(
+            "multiple response model values were observed in one benchmark")
+    if unexpected_models:
+        invalid_reasons.append(
+            "response model did not match the bound request-body "
+            "identity: " + ", ".join(unexpected_models))
+    if unexpected_served_models:
+        invalid_reasons.append(
+            "served-model-name response header did not match any active "
+            "served entity captured from the control plane: "
+            + ", ".join(unexpected_served_models))
+    if models["truncated"]:
+        invalid_reasons.append(
+            "response model cardinality exceeded the bounded evidence table")
+
+    warning = None
+    if not invalid_reasons and eligible:
+        if models["reported_rows"] < len(eligible):
+            warning = (
+                f"response model was reported for only "
+                f"{models['reported_rows']} of {len(eligible)} eligible HTTP "
+                "200 response rows")
+        elif not expected_models and not (
+                expected_served_models
+                and served_models["reported_rows"] == len(eligible)):
+            warning = (
+                "one consistent response model was observed, but neither a "
+                "request-body model nor complete served-model-name headers "
+                "bound every response to captured active served entities")
+    if invalid_reasons:
+        status = "invalid"
+    elif warning:
+        status = "caution"
+    elif eligible and models["reported_rows"] == len(eligible):
+        route_bound = bool(
+            expected_served_models
+            and served_models["reported_rows"] == len(eligible))
+        status = "bound" if expected_models or route_bound \
+            else "observed_unbound"
+    elif schema_rows:
+        status = "not_reported"
+        warning = warning or "no eligible response reported a model identity"
+    else:
+        status = "legacy_unobserved"
+
+    return {
+        "status": status,
+        "eligible_response_rows": len(eligible),
+        "identity_schema_rows": schema_rows,
+        "expected_models": expected_models,
+        "expected_model_sources": expected_sources,
+        "models": models,
+        "served_model_names": served_models,
+        "expected_served_model_names": expected_served_models,
+        "unexpected_served_model_names": unexpected_served_models,
+        "objects": objects,
+        "system_fingerprints": fingerprints,
+        "unexpected_models": unexpected_models,
+        "invalid": "; ".join(invalid_reasons) if invalid_reasons else None,
+        "warning": warning,
+        "note": (
+            "response model identity is a run-level compatibility gate. The "
+            "serving endpoint name is not treated as an expected OpenAI model "
+            "value; Databricks served-model-name headers are instead bound to "
+            "the active served entities captured from the control plane. "
+            "system fingerprints are retained as deployment context and may "
+            "rotate without implying a different requested model."),
+    }
+
+
+def _runtime_quota_admission_block(rows: list[dict], run_meta: dict) -> dict:
+    """Validate persisted per-attempt guard evidence against row counters."""
+    snapshot = run_meta.get("runtime_quota_guard")
+    if not isinstance(snapshot, dict):
+        return {
+            "status": "not_configured",
+            "guard_id": None,
+            "observed_guard_ids": [],
+            "admitted_post_attempts_in_captured_rows": 0,
+            "denied_attempts_in_captured_rows": 0,
+            "denied_rows": 0,
+            "omitted_after_trip_rows": 0,
+            "tripped": False,
+            "snapshot": None,
+            "request_rows_examined": len(rows),
+            "invariant_errors": [],
+            "note": (
+                "runtime quota admission was not configured for this run"),
+        }
+    expected_guard_id = snapshot.get("guard_id")
+    denied_rows = 0
+    denied_attempts = 0
+    admitted_post_attempts = 0
+    omitted_after_trip_rows = 0
+    invariant_errors: list[str] = []
+    observed_guard_ids: set[str] = set()
+    seen_event_ids: set[tuple[str, int]] = set()
+    current_sequences: set[int] = set()
+    new_current_sequences: set[int] = set()
+    current_counts = {
+        "admission_decisions": 0,
+        "admitted": 0,
+        "denied": 0,
+        "committed": 0,
+        "cancelled_before_post": 0,
+    }
+    seeded_committed = 0
+
+    if snapshot.get("schema_version") != 1:
+        invariant_errors.append(
+            "runtime quota snapshot schema was invalid")
+    if not isinstance(expected_guard_id, str) or not expected_guard_id:
+        invariant_errors.append(
+            "runtime quota snapshot guard_id was invalid")
+    expected_scope_id = snapshot.get("scope_id")
+    if not isinstance(expected_scope_id, str) or not expected_scope_id:
+        invariant_errors.append(
+            "runtime quota snapshot scope_id was invalid")
+    expected_shard_index = snapshot.get("shard_index")
+    expected_shard_total = snapshot.get("shard_total")
+    if not isinstance(expected_shard_index, int) \
+            or isinstance(expected_shard_index, bool) \
+            or not isinstance(expected_shard_total, int) \
+            or isinstance(expected_shard_total, bool) \
+            or expected_shard_total <= 0 \
+            or not 0 <= expected_shard_index < expected_shard_total:
+        invariant_errors.append(
+            "runtime quota snapshot shard allocation was invalid")
+    expected_sequence = snapshot.get("sequence")
+    if not isinstance(expected_sequence, int) \
+            or isinstance(expected_sequence, bool) or expected_sequence < 0:
+        invariant_errors.append(
+            "runtime quota snapshot sequence was invalid")
+        expected_sequence = None
+    baseline = run_meta.get("runtime_quota_guard_baseline")
+    if baseline is None:
+        # Backward-compatible direct summarization: without an explicit
+        # per-run baseline, the supplied rows must explain the guard from its
+        # creation through the final snapshot.
+        baseline = {
+            "schema_version": 1,
+            "guard_id": expected_guard_id,
+            "scope_id": expected_scope_id,
+            "shard_index": expected_shard_index,
+            "shard_total": expected_shard_total,
+            "sequence": 0,
+            "counts": {
+                "admission_decisions": 0, "admitted": 0, "denied": 0,
+                "committed": 0, "cancelled_before_post": 0,
+                "seeded_committed": 0,
+            },
+        }
+    if not isinstance(baseline, dict) \
+            or baseline.get("schema_version") != 1 \
+            or baseline.get("guard_id") != expected_guard_id \
+            or baseline.get("scope_id") != expected_scope_id \
+            or baseline.get("shard_index") != expected_shard_index \
+            or baseline.get("shard_total") != expected_shard_total:
+        invariant_errors.append(
+            "runtime quota per-run baseline did not match the final snapshot")
+        baseline = {"sequence": 0, "counts": {}}
+    baseline_sequence = baseline.get("sequence")
+    if not isinstance(baseline_sequence, int) \
+            or isinstance(baseline_sequence, bool) \
+            or baseline_sequence < 0 \
+            or (expected_sequence is not None
+                and baseline_sequence > expected_sequence):
+        invariant_errors.append(
+            "runtime quota per-run baseline sequence was invalid")
+        baseline_sequence = 0
+    baseline_counts = baseline.get("counts")
+    if not isinstance(baseline_counts, dict):
+        invariant_errors.append(
+            "runtime quota per-run baseline counts were invalid")
+        baseline_counts = {}
+    seeded_guard_ids = snapshot.get("seeded_guard_ids")
+    if seeded_guard_ids is None:
+        seeded_guard_ids = []
+    if not isinstance(seeded_guard_ids, list) or any(
+            not isinstance(item, str) or not item
+            for item in seeded_guard_ids):
+        invariant_errors.append(
+            "runtime quota snapshot seeded_guard_ids was invalid")
+        seeded_guard_ids = []
+    allowed_guard_ids = {
+        item for item in (expected_guard_id, *seeded_guard_ids)
+        if isinstance(item, str) and item}
+
+    for position, row in enumerate(rows):
+        if not isinstance(row, dict):
+            invariant_errors.append(
+                f"row {position} was not an object")
+            continue
+        row_guard_id = row.get("quota_guard_id")
+        events = row.get("quota_guard_events")
+        if events is None:
+            events = []
+        if not isinstance(events, list):
+            invariant_errors.append(
+                f"row {position} quota_guard_events was not a list")
+            continue
+        if isinstance(row_guard_id, str) and row_guard_id:
+            observed_guard_ids.add(row_guard_id)
+        attempts = row.get("request_attempts")
+        attempts_valid = (
+            isinstance(attempts, int) and not isinstance(attempts, bool)
+            and attempts >= 0)
+        if not attempts_valid:
+            invariant_errors.append(
+                f"row {position} request_attempts was not a known "
+                "non-negative integer")
+        elif attempts > 0 and not (
+                isinstance(row_guard_id, str) and row_guard_id):
+            invariant_errors.append(
+                f"row {position} has {attempts} request_attempts but no "
+                "runtime quota guard identity")
+        if events and not (
+                isinstance(row_guard_id, str) and row_guard_id):
+            invariant_errors.append(
+                f"row {position} has quota events but no guard identity")
+        if row.get("quota_guard_denied") is True:
+            denied_rows += 1
+            if not events and attempts == 0:
+                omitted_after_trip_rows += 1
+        row_admitted_posts = 0
+        for event in events:
+            if not isinstance(event, dict):
+                invariant_errors.append(
+                    f"row {position} quota guard event was not an object")
+                continue
+            if event.get("schema_version") != 1:
+                invariant_errors.append(
+                    f"row {position} quota guard event schema was invalid")
+            event_guard_id = event.get("guard_id")
+            if not isinstance(event_guard_id, str) \
+                    or event_guard_id != row_guard_id:
+                invariant_errors.append(
+                    f"row {position} quota guard event identity disagreed "
+                    "with its row")
+            if event_guard_id not in allowed_guard_ids:
+                invariant_errors.append(
+                    f"row {position} quota guard event identity was not "
+                    "allowed by the final snapshot")
+            if event.get("scope_id") != expected_scope_id:
+                invariant_errors.append(
+                    f"row {position} quota guard event scope disagreed "
+                    "with the final snapshot")
+            if event.get("shard_index") != expected_shard_index \
+                    or event.get("shard_total") != expected_shard_total:
+                invariant_errors.append(
+                    f"row {position} quota guard event shard allocation "
+                    "disagreed with the final snapshot")
+            sequence = event.get("sequence")
+            if not isinstance(sequence, int) \
+                    or isinstance(sequence, bool) or sequence <= 0:
+                invariant_errors.append(
+                    f"row {position} quota guard event sequence was invalid")
+            elif isinstance(event_guard_id, str):
+                event_id = (event_guard_id, sequence)
+                if event_id in seen_event_ids:
+                    invariant_errors.append(
+                        f"row {position} repeated quota guard event identity")
+                seen_event_ids.add(event_id)
+                if event_guard_id == expected_guard_id:
+                    current_sequences.add(sequence)
+                    if sequence <= baseline_sequence \
+                            and row.get("phase") not in {"preflight", "probe"}:
+                        invariant_errors.append(
+                            f"row {position} reused a pre-baseline quota "
+                            "event outside an imported preflight/probe phase")
+                    if expected_sequence is not None \
+                            and sequence > expected_sequence:
+                        invariant_errors.append(
+                            f"row {position} quota guard event sequence "
+                            "exceeded the final snapshot")
+                    if sequence > baseline_sequence:
+                        new_current_sequences.add(sequence)
+                        current_counts["admission_decisions"] += 1
+                elif event_guard_id in seeded_guard_ids \
+                        and row.get("phase") not in {"preflight", "probe"}:
+                    invariant_errors.append(
+                        f"row {position} used seeded quota evidence outside "
+                        "an imported preflight/probe phase")
+            event_request_id = event.get("request_id")
+            if not isinstance(event_request_id, str) \
+                    or event_request_id != row.get("request_id"):
+                invariant_errors.append(
+                    f"row {position} quota guard event request identity "
+                    "disagreed with its row")
+            decision = event.get("decision")
+            if decision == "denied":
+                denied_attempts += 1
+                if event_guard_id == expected_guard_id \
+                        and isinstance(sequence, int) \
+                        and sequence > baseline_sequence:
+                    current_counts["denied"] += 1
+                if event.get("state") != "denied" \
+                        or event.get("post_may_have_started") is not False:
+                    invariant_errors.append(
+                        f"row {position} denied quota event was not a "
+                        "terminal pre-POST denial")
+            elif decision == "admitted":
+                if event_guard_id == expected_guard_id \
+                        and isinstance(sequence, int) \
+                        and sequence > baseline_sequence:
+                    current_counts["admitted"] += 1
+                state = event.get("state")
+                if state == "committed" \
+                        and event.get("post_may_have_started") is True:
+                    row_admitted_posts += 1
+                    admitted_post_attempts += 1
+                    if event_guard_id == expected_guard_id \
+                            and isinstance(sequence, int) \
+                            and sequence > baseline_sequence:
+                        current_counts["committed"] += 1
+                    elif event_guard_id in seeded_guard_ids:
+                        seeded_committed += 1
+                elif state == "cancelled_before_post" \
+                        and event.get("post_may_have_started") is False:
+                    if event_guard_id == expected_guard_id \
+                            and isinstance(sequence, int) \
+                            and sequence > baseline_sequence:
+                        current_counts["cancelled_before_post"] += 1
+                else:
+                    invariant_errors.append(
+                        f"row {position} admitted quota event was not in a "
+                        "valid terminal committed/cancelled state")
+            else:
+                invariant_errors.append(
+                    f"row {position} quota guard event decision was invalid")
+        if attempts_valid and row_admitted_posts != attempts:
+            invariant_errors.append(
+                f"row {position} has {attempts} request_attempts but "
+                f"{row_admitted_posts} admitted POST guard events")
+    if any(guard_id not in allowed_guard_ids
+           for guard_id in observed_guard_ids):
+        invariant_errors.append(
+            "row guard IDs do not match the final guard snapshot")
+    if expected_sequence is not None and new_current_sequences != set(
+            range(baseline_sequence + 1, expected_sequence + 1)):
+        invariant_errors.append(
+            "captured rows do not contain the exact current-guard sequence "
+            "suffix created during this run")
+    snapshot_counts = snapshot.get("counts")
+    snapshot_counts = snapshot_counts if isinstance(snapshot_counts, dict) \
+        else {}
+    for name, observed in current_counts.items():
+        value = snapshot_counts.get(name)
+        baseline_value = baseline_counts.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0 \
+                or not isinstance(baseline_value, int) \
+                or isinstance(baseline_value, bool) or baseline_value < 0 \
+                or baseline_value > value:
+            invariant_errors.append(
+                f"runtime quota snapshot/baseline {name} count was invalid")
+        elif value - baseline_value != observed:
+            invariant_errors.append(
+                f"runtime quota {name} count delta disagreed with events "
+                "created during this run")
+    snapshot_seeded = snapshot_counts.get("seeded_committed")
+    baseline_seeded = baseline_counts.get("seeded_committed")
+    if not isinstance(snapshot_seeded, int) \
+            or isinstance(snapshot_seeded, bool) or snapshot_seeded < 0 \
+            or not isinstance(baseline_seeded, int) \
+            or isinstance(baseline_seeded, bool) or baseline_seeded < 0 \
+            or baseline_seeded > snapshot_seeded:
+        invariant_errors.append(
+            "runtime quota snapshot/baseline seeded_committed count was "
+            "invalid")
+    elif snapshot_seeded - baseline_seeded != 0:
+        invariant_errors.append(
+            "runtime quota guard imported seeded events after the per-run "
+            "baseline")
+    snapshot_denials = snapshot_counts.get("denied")
+    if (snapshot_denials is not None
+            and (not isinstance(snapshot_denials, int)
+                 or isinstance(snapshot_denials, bool)
+                 or snapshot_denials < 0)):
+        invariant_errors.append(
+            "runtime quota snapshot denied count was invalid")
+        snapshot_denials = None
+    provisional = snapshot.get("provisional_reservations")
+    if not isinstance(provisional, int) or isinstance(provisional, bool) \
+            or provisional < 0:
+        invariant_errors.append(
+            "runtime quota snapshot provisional count was invalid")
+    elif provisional:
+        invariant_errors.append(
+            "runtime quota guard retained provisional reservations after run")
+    tripped = snapshot.get("tripped") is True
+    denial_observed = bool(
+        denied_rows or denied_attempts or tripped
+        or (isinstance(snapshot_denials, int) and snapshot_denials > 0))
+    status = ("invalid_evidence" if invariant_errors else
+              "denied" if denial_observed else "enforced")
+    return {
+        "status": status,
+        "guard_id": expected_guard_id,
+        "request_rows_examined": len(rows),
+        "observed_guard_ids": sorted(observed_guard_ids),
+        "admitted_post_attempts_in_captured_rows": admitted_post_attempts,
+        "denied_attempts_in_captured_rows": denied_attempts,
+        "denied_rows": denied_rows,
+        "omitted_after_trip_rows": omitted_after_trip_rows,
+        "tripped": tripped,
+        "snapshot": snapshot,
+        "invariant_errors": invariant_errors,
+        "note": (
+            "a local no-sleep guard reserves every physical inference POST "
+            "against the configured harness warning budget. It does not see "
+            "unrelated workspace traffic or prove provider headroom."),
+    }
 
 
 def summarize(results: list[dict], schedule_meta: dict | None = None,
@@ -1206,10 +1980,18 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
               concurrency_target: int | None = None,
               rate_limits: dict | None = None,
               rate_limit_results: list[dict] | None = None) -> dict:
+    if ttft_definition not in {"first_content", "first_visible"}:
+        raise ValueError(
+            "ttft_definition must be first_content or first_visible")
     ok = [r for r in results if _protocol_clean_success(r)]
     failed = [r for r in results if not _protocol_clean_success(r)]
     safe_run_meta = _redact_secrets(run_meta or {})
-
+    declared_definition = safe_run_meta.get("ttft_definition")
+    if (declared_definition is not None
+            and declared_definition != ttft_definition):
+        raise ValueError(
+            "run_meta.ttft_definition conflicts with the summarize argument")
+    safe_run_meta["ttft_definition"] = ttft_definition
     # Current rows say whether visible content arrived and the stream ended
     # cleanly. When that observability exists, the primary latency tables are
     # answer latencies, not percentiles over reasoning-only or malformed HTTP
@@ -1234,9 +2016,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                                 if answer_observed else 0),
         "unclassified_legacy_rows": unclassified_ok,
         "note": (
-            "primary latency percentiles include only requests that produced "
-            "visible content or a structurally valid tool call and finished "
-            "with no parse errors"
+            "primary latency percentiles include only non-refusal requests "
+            "that produced visible content or a structurally valid tool call "
+            "and finished with no parse errors"
             if answer_observed else
             "these legacy rows do not record answer observability, so latency "
             "percentiles describe content-bearing response streams and cannot "
@@ -1371,14 +2153,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # on a retried row it carries the endpoint's delay rather than saying
     # when the load was offered. no row needs excluding once the honest
     # stamp is available. older rows without the field fall back.
-    exact_wait = [float(r["queue_wait_ms"]) for r in results
-                  if r.get("queue_wait_ms") is not None]
-    wire.extend(exact_wait)
+    exact_wire = [float(r["caller_send_ms"]) for r in results
+                  if r.get("caller_send_ms") is not None]
+    wire.extend(exact_wire)
     # Rows from harnesses predating exact monotonic caller clocks can still be
     # reconstructed from epoch send stamps. Never overwrite an exact field:
     # an explicit None means the newer client did not put a request on wire.
     stamped = [r for r in results
-               if "queue_wait_ms" not in r
+               if "caller_send_ms" not in r
                and r.get("scheduled_s") is not None
                and _sent_at(r) is not None]
     if stamped:
@@ -1400,9 +2182,59 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             r["queue_wait_ms"] = max(late, 0.0)
     wire_note = None
     if results and not wire:
-        wire_note = ("wire lateness is not reported: no request carried an "
-                     "exact queue-wait clock or legacy schedule/send stamps.")
+        wire_note = ("HTTP request-start lateness is not reported: no request "
+                     "carried an exact queue-wait clock or legacy "
+                     "schedule/send stamps.")
+    # Keep retry-trigger evidence separate from exact physical-POST counts.
+    # A retry can follow a connection failure before any POST, while auth,
+    # fallback, and transport retries can create another physical POST.  The
+    # request_attempts field is therefore the only row-level source used for
+    # the "additional physical POST" count shown in reports.
     retried = sum(1 for r in results if r.get("retries"))
+    additional_post_rows = []
+    legacy_retry_rows = 0
+    for result in results:
+        attempts = result.get("request_attempts")
+        if isinstance(attempts, int) and not isinstance(attempts, bool) \
+                and attempts >= 0:
+            if attempts > 1:
+                additional_post_rows.append(result)
+        elif isinstance(result.get("retries"), int) \
+                and not isinstance(result.get("retries"), bool) \
+                and result["retries"] > 0:
+            legacy_retry_rows += 1
+    retry_reason_counts: dict[str, int] = {}
+    retry_reason_rows = 0
+    for result in additional_post_rows:
+        reasons = result.get("retry_reasons")
+        if not isinstance(reasons, list) or not reasons or not all(
+                isinstance(reason, str) and reason for reason in reasons):
+            continue
+        retry_reason_rows += 1
+        for reason in reasons:
+            bounded_reason = sanitize_display_text(reason)[:80]
+            retry_reason_counts[bounded_reason] = (
+                retry_reason_counts.get(bounded_reason, 0) + 1)
+    retry_trigger_category_count = len(retry_reason_counts)
+    retry_reason_counts = dict(sorted(
+        retry_reason_counts.items(), key=lambda item: (-item[1], item[0]))[:8])
+    physical_post_attempts = {
+        "logical_rows_with_additional_attempts": len(additional_post_rows),
+        "additional_attempts": sum(
+            int(result["request_attempts"]) - 1
+            for result in additional_post_rows),
+        "recorded_retry_triggers": retry_reason_counts,
+        "distinct_retry_triggers_at_least": retry_trigger_category_count,
+        "retry_trigger_categories_truncated": (
+            retry_trigger_category_count > len(retry_reason_counts)),
+        "retry_trigger_coverage_rows": retry_reason_rows,
+        "legacy_retry_marked_rows_without_attempt_count": legacy_retry_rows,
+        "note": (
+            "request_attempts counts calls that may have emitted an HTTP "
+            "POST. Retry triggers explain why another attempt was made; a "
+            "trigger is not itself proof that the preceding attempt reached "
+            "the provider."),
+    }
 
     # observation interval, not the send window. token totals include
     # generations that finish after the last request went out, so dividing
@@ -1425,6 +2257,131 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             # understate the load that was actually offered.
             send_span = max(max(sent) - min(sent), 1e-9)
 
+    # Delivery is judged against the complete logical schedule, including
+    # rows that never reached conn.request. Measuring only the sent prefix
+    # makes a generator that drops the tail look as if it achieved full QPS.
+    scheduled_rows = [r for r in results
+                      if isinstance(r.get("scheduled_s"), (int, float))
+                      and not isinstance(r.get("scheduled_s"), bool)
+                      and math.isfinite(float(r["scheduled_s"]))]
+    delivered_scheduled_rows = [r for r in scheduled_rows
+                                if _sent_at(r) is not None]
+    scheduled_n = len(scheduled_rows)
+    delivered_n = len(delivered_scheduled_rows)
+    unsent_scheduled_n = scheduled_n - delivered_n
+    delivery_fraction = (delivered_n / scheduled_n
+                         if scheduled_n else None)
+    logical_schedule_seconds = (schedule_meta or {}).get("seconds")
+    if isinstance(logical_schedule_seconds, bool) \
+            or not isinstance(logical_schedule_seconds, (int, float)) \
+            or not math.isfinite(float(logical_schedule_seconds)) \
+            or float(logical_schedule_seconds) <= 0:
+        logical_schedule_seconds = None
+    else:
+        logical_schedule_seconds = float(logical_schedule_seconds)
+    offered = None
+    offered_basis = None
+    if logical_schedule_seconds is not None and scheduled_n:
+        # The schedule is defined over its complete logical load window, not
+        # merely between the first and last sampled arrival. Sparse Poisson
+        # draws and sharded schedules can have a tiny local active span inside
+        # a long authorized window; using (N-1)/active-span can overstate the
+        # offered average by orders of magnitude.
+        offered = scheduled_n / logical_schedule_seconds
+        offered_basis = "scheduled requests / logical schedule seconds"
+    elif scheduled_n > 1:
+        schedule_values = [float(r["scheduled_s"]) for r in scheduled_rows]
+        schedule_span = max(schedule_values) - min(schedule_values)
+        if schedule_span > 0:
+            offered = (scheduled_n - 1) / schedule_span
+            offered_basis = "legacy scheduled active span"
+    on_wire_qps_active_span = ((len(sent) - 1) / send_span
+                               if send_span and len(sent) > 1 else None)
+    delivery_stretch = None
+    achieved_delivery_qps = None
+    if offered is not None and delivery_fraction is not None:
+        normalized_actual = []
+        exact_delays = [
+            float(r["caller_send_ms"]) / 1000.0
+            for r in delivered_scheduled_rows
+            if isinstance(r.get("caller_send_ms"), (int, float))
+            and not isinstance(r.get("caller_send_ms"), bool)
+            and math.isfinite(float(r["caller_send_ms"]))]
+        if delivered_n and len(exact_delays) == delivered_n:
+            uniform_offset = min(exact_delays)
+            normalized_actual = [
+                float(r["scheduled_s"])
+                + float(r["caller_send_ms"]) / 1000.0 - uniform_offset
+                for r in delivered_scheduled_rows]
+        elif delivered_n:
+            # Legacy epoch stamps need one shared alignment. Subtracting the
+            # earliest send/schedule offset preserves shape while ignoring a
+            # harmless uniform run-start delay.
+            offsets = [_sent_at(r) - float(r["scheduled_s"])
+                       for r in delivered_scheduled_rows]
+            epoch_offset = min(offsets)
+            normalized_actual = [
+                _sent_at(r) - epoch_offset for r in delivered_scheduled_rows]
+        if normalized_actual and (
+                logical_schedule_seconds is not None or scheduled_n > 1):
+            if logical_schedule_seconds is not None:
+                schedule_min = 0.0
+                full_span = logical_schedule_seconds
+            else:
+                schedule_min = min(float(r["scheduled_s"])
+                                   for r in scheduled_rows)
+                schedule_max = max(float(r["scheduled_s"])
+                                   for r in scheduled_rows)
+                full_span = schedule_max - schedule_min
+            delivery_extent = max(
+                full_span, max(normalized_actual) - schedule_min)
+            if full_span > 0:
+                delivery_stretch = delivery_extent / full_span
+        timing_factor = max(delivery_stretch or 1.0, 1.0)
+        achieved_delivery_qps = (
+            offered * delivery_fraction / timing_factor)
+    elif on_wire_qps_active_span is not None:
+        # Legacy/hand-built evidence without a logical schedule can only state
+        # what appeared on wire during its observed active span.
+        achieved_delivery_qps = on_wire_qps_active_span
+
+    throughput_duration_basis = "first_send_to_last_completion"
+    if logical_schedule_seconds is not None:
+        # Reconstruct completion positions on the logical schedule clock. A
+        # sparse schedule may place every sampled arrival in a 100 ms cluster
+        # halfway through a 60 s load window; its token rate is totals / 60 s,
+        # not totals / 100 ms. Include any response drain beyond the planned
+        # end so throughput and provisioned-cost denominators reconcile.
+        legacy_offsets = [
+            _sent_at(row) - float(row["scheduled_s"])
+            for row in delivered_scheduled_rows
+            if _sent_at(row) is not None
+            and not isinstance(row.get("caller_send_ms"), (int, float))]
+        legacy_origin = min(legacy_offsets) if legacy_offsets else None
+        logical_completions = []
+        for row in delivered_scheduled_rows:
+            sent_at = _sent_at(row)
+            completed_at = _completed_at(row)
+            if sent_at is None or completed_at is None:
+                continue
+            caller_send_ms = row.get("caller_send_ms")
+            if isinstance(caller_send_ms, (int, float)) \
+                    and not isinstance(caller_send_ms, bool) \
+                    and math.isfinite(float(caller_send_ms)):
+                logical_send = (float(row["scheduled_s"])
+                                + float(caller_send_ms) / 1000.0)
+            elif legacy_origin is not None:
+                logical_send = sent_at - legacy_origin
+            else:
+                logical_send = float(row["scheduled_s"])
+            logical_completions.append(
+                logical_send + max(completed_at - sent_at, 0.0))
+        dur = max(
+            [logical_schedule_seconds, *logical_completions],
+            default=logical_schedule_seconds)
+        throughput_duration_basis = \
+            "max(logical_schedule_seconds,response_drain)"
+
     # throughput in the customer's own vocabulary (tokens per minute)
     usage_rows = [r for r in results if _usage_is_trustworthy(r)]
     in_tok = sum(float(r["prompt_tokens"]) for r in usage_rows)
@@ -1438,6 +2395,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     usage_coverage = (usage_n / len(results)) if results else None
     complete_request_evidence = (
         results if rate_limit_results is None else rate_limit_results)
+    runtime_quota_admission = _runtime_quota_admission_block(
+        complete_request_evidence, safe_run_meta)
     http_429 = _http_429_evidence(
         complete_request_evidence,
         scope=("measured replay rows" if rate_limit_results is None else
@@ -1450,6 +2409,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "requests_ok": len(ok),
         "requests_failed": len(failed),
         "requests_retried": retried,
+        "physical_post_attempts": physical_post_attempts,
         "error_rate": len(failed) / len(results) if results else None,
         "failures_by_error": _top_errors(failed),
         "failures_by_http_status": _failures_by_http_status(failed),
@@ -1461,6 +2421,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "http_429_rate": http_429["rate"],
         "http_429": http_429,
         "quota_limited": http_429["quota_limited"],
+        "runtime_quota_admission": runtime_quota_admission,
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in latency_ok]),
         "ttf_tool_call_ms": _pct_table(
             [r.get("ttf_tool_call_ms") for r in latency_ok]),
@@ -1472,13 +2433,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "throughput": {
             "input_tokens_per_min": in_tok / dur_min if dur_min else None,
             "output_tokens_per_min": out_tok / dur_min if dur_min else None,
+            "observation_seconds": dur,
+            "duration_basis": throughput_duration_basis,
             "usage_coverage": usage_coverage,
             "completion_time_coverage": (
                 len(done) / len(sent) if sent else None),
-            "note": ("endpoint-reported token counts over the observation "
-                     "interval, which runs from the first send to the last "
-                     "completion so generations finishing during the drain "
-                     "are inside the window they belong to"),
+            "note": ("endpoint-reported token counts over the complete "
+                     "logical load window plus response drain when a logical "
+                     "schedule is available; legacy evidence without that "
+                     "window uses first send through last completion"),
             "coverage_warning": (
                 (f"completion time was available for only {len(done)} of "
                  f"{len(sent)} requests that reached the wire, so token "
@@ -1541,24 +2504,51 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "arrivals": {
             # count the rows the span was measured over, not every row. a
             # half-stamped input would otherwise report double the rate.
-            "achieved_qps_overall": ((len(sent) - 1) / send_span
-                                     if send_span and len(sent) > 1
-                                     else None),
+            "achieved_qps_overall": achieved_delivery_qps,
+            "achieved_qps_basis": (
+                "delivered scheduled requests over the full logical load "
+                "window, adjusted for delivery stretch"
+                if offered is not None else
+                "first HTTP sends over their observed active span; no "
+                "logical schedule was available"),
+            "on_wire_qps_active_span": on_wire_qps_active_span,
+            "scheduled_requests": scheduled_n,
+            "requests_reaching_http_post": delivered_n,
+            "scheduled_requests_not_sent": unsent_scheduled_n,
+            "schedule_delivery_fraction": delivery_fraction,
+            "scheduled_qps": offered,
+            "scheduled_qps_basis": offered_basis,
+            "logical_schedule_seconds": logical_schedule_seconds,
+            "delivery_span_stretch": delivery_stretch,
             "dispatch_lag_ms": _pct_table(lags),
+            "worker_queue_wait_ms": _pct_table([
+                r.get("queue_wait_ms") for r in results]),
+            # Preferred public name. ``wire_lateness_ms`` remains a
+            # compatibility alias for pre-rename artifact consumers.
+            "http_request_start_lateness_ms": _pct_table(wire),
             "wire_lateness_ms": _pct_table(wire),
             **({"wire_lateness_note": wire_note} if wire_note else {}),
-            "note": "dispatch lag is how late the dispatcher handed the "
-                    "request to the pool. wire lateness is how late the "
-                    "client began sending the request, which is the one "
-                    "that grows when the client is the bottleneck, because a "
-                    "saturated pool queues rather than blocking the "
-                    "dispatcher.",
+            "note": "achieved_qps_overall accounts for scheduled requests "
+                    "that never reached HTTP POST; on_wire_qps_active_span "
+                    "is retained only as a sent-traffic diagnostic. dispatch "
+                    "lag is how late the dispatcher handed the "
+                    "request to the pool. worker queue wait ends when a worker "
+                    "starts connection setup. HTTP request-start lateness is "
+                    "stamped immediately before the client invokes its first "
+                    "HTTP request; it includes worker wait plus DNS, TCP and "
+                    "TLS setup. It does not observe socket upload completion "
+                    "or endpoint receipt, so it is a client-side request-start "
+                    "clock, not endpoint latency.",
         },
         "schedule": schedule_meta or {},
         "run": safe_run_meta,
+        "ttft_definition": ttft_definition,
+        "response_identity": _response_identity_block(results, safe_run_meta),
     }
     if rate_limit_block is not None:
         summary["rate_limits"] = rate_limit_block
+    if runtime_quota_admission["status"] == "denied":
+        summary["quota_limited"] = True
     for field in ("ttft_ms", "ttf_tool_call_ms"):
         values = [r.get(field) for r in latency_ok]
         summary[field]["missing"] = sum(v is None for v in values)
@@ -1620,11 +2610,10 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "measurement and must not be subtracted from TTFT.")
         summary["network_path"] = _np
 
-    # time per output token, after the first. this is the metric the serving
-    # docs use to reason about generation length: latency is roughly
-    # TTFT + TPOT * output_tokens, so TPOT is what says whether a longer
-    # answer still fits the budget. every other serving benchmark reports
-    # it, under this name or as time-between-tokens.
+    # Time per output token after the first. Keep this as an observed per-row
+    # distribution. Combining an independently selected TTFT percentile with
+    # a TPOT percentile to project a hypothetical answer length is not a
+    # statistically defensible result, so reports deliberately do not do it.
     tpot = []
     for r in latency_ok:
         n_out = r.get("completion_tokens")
@@ -1635,10 +2624,11 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         summary["tpot_ms"] = _pct_table(tpot)
         summary["tpot_note"] = (
             "time per output token after the first, (e2e - ttft) / "
-            "(output_tokens - 1). latency for a longer answer is roughly "
-            "ttft + tpot * output_tokens, so this is the number that says "
-            "whether a longer generation still fits the budget. computed "
-            f"over the {len(tpot)} requests that produced more than one token")
+            "(output_tokens - 1), computed independently for each eligible "
+            f"request. p50 and p95 summarize {len(tpot)} observed requests "
+            "that produced more than one token; do not combine these "
+            "percentiles with a TTFT percentile to project an unobserved "
+            "generation length")
 
     answers = _answer_block(results)
     if answers:
@@ -1647,17 +2637,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         vals = [r.get(fld) for r in latency_ok]
         if any(v is not None for v in vals):
             summary[fld] = _pct_table(vals)
-            # a reasoning model that runs out of max_tokens mid-thought
-            # returns a successful response with no visible content at all.
-            # those rows carry no ttfv, so the percentiles above describe
-            # only the requests that finished thinking soonest. that is the
-            # same survivorship the error path already guards against, and
-            # it is worse here because nothing failed.
+            # Rows without the event carry no TTFV, so the percentile above
+            # describes only the visible-content subset. The absence alone
+            # does not prove whether generation stopped at a token cap,
+            # refused, failed to finish, or produced another outcome.
             summary[fld]["missing"] = sum(1 for v in vals if v is None)
             summary[fld]["of"] = len(vals)
     # Latency as the caller experienced it includes time the scheduled
     # request waited in the load generator. SLA evaluation below prefers these
-    # tables; the service-time tables remain available for endpoint diagnosis.
+    # tables; final-attempt request-path tables remain available for diagnosis.
     # TTFV must be corrected too when first_visible is the configured TTFT.
     caller_fields = (
         ("ttft_ms", "caller_ttft_ms", "ttft_corrected_ms"),
@@ -1688,9 +2676,9 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "caller-experienced figures measure from the exact monotonic "
             "scheduled target through the observed event, including worker "
             "queueing, connection setup, retries and fallbacks. Legacy rows "
-            "without exact clocks are reconstructed as service time plus "
-            "queue wait. Configured latency targets and hard caps prefer these "
-            "figures whenever available.")
+            "without exact clocks are reconstructed as final-attempt "
+            "request-path time plus queue wait. Configured latency targets "
+            "and hard caps prefer these figures whenever available.")
         summary["latency_correction_provenance"] = {
             "exact_values": exact_caller_n,
             "legacy_reconstructed_values": reconstructed_caller_n,
@@ -1764,31 +2752,17 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # it. the PRINTED rates count every scheduled row, so "delivered" lines
     # up with the achieved arrival rate in the believability block rather
     # than being quietly scaled down by the retry fraction.
-    offered = None
-    all_sched = [r["scheduled_s"] for r in results
-                 if r.get("scheduled_s") is not None]
-    if len(all_sched) > 1:
-        span_all = max(all_sched) - min(all_sched)
-        if span_all > 0:
-            # n-1 intervals across n arrivals
-            offered = (len(all_sched) - 1) / span_all
-    # measure the achieved rate over the same population as wire lateness.
-    # a single retried request stamps its LAST attempt, which can stretch the
-    # run's apparent span by a read timeout and halve the apparent rate.
+    # Measure the achieved rate over every scheduled row, including known
+    # unsent requests. A single retried request uses first_send_unix, not its
+    # final-attempt stamp, so endpoint retry delay does not become client lag.
     achieved = summary["arrivals"]["achieved_qps_overall"]
-    stretch = None
-    if len(stamped) > 1 and offered:
-        sends = [_sent_at(r) for r in stamped]
-        scheds = [r["scheduled_s"] for r in stamped]
-        span_send = max(sends) - min(sends)
-        span_sched = max(scheds) - min(scheds)
-        if span_send > 0 and span_sched > 0:
-            stretch = span_send / span_sched
-            achieved = offered / stretch
-    wire_p95 = (summary["arrivals"]["wire_lateness_ms"] or {}).get("p95")
-    short = bool(offered and achieved and achieved < offered * 0.8)
+    wire_p95 = (summary["arrivals"][
+        "http_request_start_lateness_ms"] or {}).get("p95")
+    short = bool(offered is not None and achieved is not None
+                 and achieved < offered * 0.8)
     drifting = bool(wire_p95 and wire_p95 > 1000.0)
-    if short or drifting:
+    dropped = bool(unsent_scheduled_n)
+    if short or drifting or dropped:
         parts, conclusion = [], []
         if short:
             parts.append(
@@ -1798,12 +2772,20 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 "the run delivered fewer requests per second than the "
                 "schedule asked for, so these latency numbers describe a "
                 "lighter load than the one on the label")
+        if dropped:
+            parts.append(
+                f"{unsent_scheduled_n} of {scheduled_n} scheduled requests "
+                "never reached an HTTP POST")
+            conclusion.append(
+                "unsent scheduled work is a load-generator delivery failure, "
+                "not endpoint-capacity evidence")
         if drifting:
             lp = (f"{wire_p95 / 1000:.1f}s" if wire_p95 < 10_000
                   else f"{wire_p95 / 1000:.0f}s")
             parts.append(
-                f"95 percent of requests reached the endpoint within {lp} of "
-                f"their scheduled time, the rest later")
+                f"95 percent of HTTP request calls started within {lp} of "
+                "their scheduled time; upload completion and endpoint receipt "
+                "were not observed")
             if not short:
                 conclusion.append(
                     "the run-average rate stayed within 20 percent of the "
@@ -1812,10 +2794,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                     "the one the schedule describes")
         summary["client"] = {
             "offered_qps": offered, "achieved_qps": achieved,
+            "scheduled_requests": scheduled_n,
+            "requests_reaching_http_post": delivered_n,
+            "scheduled_requests_not_sent": unsent_scheduled_n,
+            "schedule_delivery_fraction": delivery_fraction,
             "wire_lateness_p95_ms": wire_p95,
             "warning": (
                 f"{'. '.join(parts)}. {'. '.join(conclusion)}. the offered "
-                "load did not reach the endpoint on schedule, either because "
+                "load did not start HTTP requests on schedule, either because "
                 "the client could not keep up or because the endpoint slowed "
                 "and back-pressured the pool. read the stability card to tell "
                 "them apart, since a client-side limit leaves endpoint latency "
@@ -1832,7 +2818,59 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     if conc:
         summary["concurrency"] = conc
 
-    summary["drift"] = _drift_block(latency_ok, failed)
+    # Stability must follow the same first-event definition as the customer
+    # acceptance target.  A reasoning model can keep first-content flat while
+    # visible output gets dramatically slower, so hard-wiring this block to
+    # service TTFT can produce a false green.  Select one run-wide population:
+    # exact caller clocks only when they cover every row where the configured
+    # event occurred, otherwise the corresponding final-attempt clock for all
+    # rows.
+    # Never mix exact and service values row by row; that would make the
+    # population itself change over time and could manufacture drift.
+    drift_service_key = ("ttft_ms" if ttft_definition == "first_content"
+                         else "ttfv_ms")
+    drift_caller_key = ("caller_ttft_ms"
+                        if ttft_definition == "first_content"
+                        else "caller_ttfv_ms")
+    # Stability must use the same acceptable-answer population as the
+    # headline latency tables. A clean refusal or reasoning-only completion
+    # cannot be excluded from answer latency yet quietly counted as a fast
+    # success in the stability chart. Treat every non-answer outcome as a
+    # failed attempt for window survivorship/error gates; legacy artifacts
+    # without answer observability retain their original protocol-clean split.
+    drift_population = latency_ok
+    drift_population_ids = {id(row) for row in drift_population}
+    drift_failed = [row for row in results
+                    if id(row) not in drift_population_ids]
+    drift_event_rows = [r for r in drift_population
+                        if r.get(drift_service_key) is not None]
+    drift_exact_complete = bool(drift_event_rows) and all(
+        drift_caller_key in r and r.get(drift_caller_key) is not None
+        for r in drift_event_rows)
+    if drift_exact_complete:
+        drift_key = drift_caller_key
+        drift_basis = ("exact caller-experienced monotonic clock, including "
+                       "queueing, connection setup, retries and fallbacks")
+    else:
+        drift_key = drift_service_key
+        drift_basis = (
+            "final-attempt request-path clock; exact caller clock coverage "
+            "was incomplete")
+    drift_label = (
+        ("Caller " if drift_exact_complete else "Final-attempt ")
+        + ("TTFT (first content)" if ttft_definition == "first_content"
+           else "TTFV (first visible content)"))
+    summary["drift"] = _drift_block(
+        drift_population, drift_failed, latency_key=drift_key,
+        latency_label=drift_label, latency_basis=drift_basis,
+        latency_event=("ttft" if ttft_definition == "first_content"
+                       else "ttfv"))
+    summary["drift"]["outcome_population"] = (
+        "same acceptable-answer population as headline latency; every "
+        "other replay outcome contributes to the window error population"
+        if answer_observed else
+        "legacy protocol-clean success population; answer observability was "
+        "not recorded")
 
     # every report states which harness produced it and what the latency
     # numbers include. 0.3.0 moved the TCP/TLS handshake out of the timed
@@ -1842,9 +2880,10 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     summary["latency_basis"] = (
         "final-attempt clocks begin immediately before conn.request on an "
         "already-established connection, so they include request upload. "
-        "ttfb ends at the first iterated response-body line (not necessarily "
-        "the first response byte). ttft ends at the first nonempty visible or "
-        "reasoning content delta and excludes tool-call fragments; first "
+        "ttfb ends at the first bounded response-body chunk returned by "
+        "HTTPResponse.read1 (not necessarily the first response byte). ttft "
+        "ends at the first nonempty visible, reasoning, or refusal delta and "
+        "excludes tool-call fragments; first "
         "visible content and first tool-call fragment remain separate metrics. "
         "TCP and TLS setup is measured separately as connect_ms and is NOT "
         "included. changed in 0.3.0: 0.2.x and earlier included connection "
@@ -1877,16 +2916,43 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 if n_ok > pc else None),
         }
     if pricing:
-        summary["cost"] = _cost_block(results, dur, in_tok, out_tok, cached_tok,
-                                      pricing)
+        # Capacity is paid across the logical replay window even when the
+        # client fails to send its tail. Use whichever ends later: the planned
+        # load window or the actual response drain. Falling back to the
+        # scheduled timestamp span keeps hand-built/legacy evidence honest.
+        planned_cost_window = None
+        schedule_seconds = (schedule_meta or {}).get("seconds")
+        if (isinstance(schedule_seconds, (int, float))
+                and not isinstance(schedule_seconds, bool)
+                and math.isfinite(float(schedule_seconds))
+                and float(schedule_seconds) > 0):
+            planned_cost_window = float(schedule_seconds)
+            duration_basis = "max(logical_schedule_seconds,response_drain)"
+        elif len(scheduled_rows) > 1:
+            values = [float(r["scheduled_s"]) for r in scheduled_rows]
+            planned_cost_window = max(values) - min(values)
+            duration_basis = "max(logical_schedule_span,response_drain)"
+        else:
+            duration_basis = "response_drain"
+        cost_dur = max(
+            [value for value in (dur, planned_cost_window)
+             if isinstance(value, (int, float)) and value > 0],
+            default=None)
+        summary["cost"] = _cost_block(
+            results, cost_dur, in_tok, out_tok, cached_tok, pricing,
+            duration_basis=duration_basis)
     if acceptance:
-        summary["sla"] = _evaluate_sla(ok, len(results), summary, acceptance,
+        summary["sla"] = _evaluate_sla(results, ok, summary, acceptance,
                                        ttft_definition)
     return summary
 
 
 def _drift_block(ok: list[dict], failed: list[dict] | None = None,
-                 window_s: int = 60, min_window_n: int = 20) -> dict:
+                 window_s: int = 60, min_window_n: int = 20,
+                 *, latency_key: str = "ttft_ms",
+                 latency_label: str = "TTFT",
+                 latency_basis: str = "final-attempt request-path clock",
+                 latency_event: str = "ttft") -> dict:
     """Per-window errors and p95 over the run, and whether it held steady.
 
     Two questions, two gates. "Was the endpoint erroring" is answered from
@@ -1901,45 +2967,95 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     before it names a direction, since two points cannot separate a trend
     from noise.
     """
+    metric_meta = {
+        "latency_metric": latency_key,
+        "latency_metric_label": latency_label,
+        "latency_metric_basis": latency_basis,
+        "latency_event": latency_event,
+    }
+    failed = failed or []
+
+    # Every request in a run must be assigned with one run-wide cohort clock.
+    # Mixing run-relative scheduled seconds with Unix send stamps would create
+    # meaningless windows. Prefer the logical scheduled target when it covers
+    # the run; otherwise use whichever single clock places the most attempts,
+    # with first-send preferred over the final-attempt stamp on equal coverage.
+    # The latter can move after a retry and is therefore only a legacy fallback.
+    attempted = ok + failed
+
+    def _finite_clock(row: dict, field: str) -> float | None:
+        value = row.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
+
+    clock_candidates = (
+        ("scheduled_s", "scheduled target (run-relative monotonic clock)"),
+        ("first_send_unix", "first HTTP POST wall-clock time"),
+        ("t_send_unix", "final-attempt HTTP POST wall-clock time (legacy)"),
+    )
+    clock_counts = {
+        field: sum(_finite_clock(row, field) is not None for row in attempted)
+        for field, _ in clock_candidates
+    }
+    clock_field, clock_basis = max(
+        clock_candidates,
+        key=lambda item: (clock_counts[item[0]],
+                          -next(i for i, candidate in
+                                enumerate(clock_candidates)
+                                if candidate[0] == item[0])),
+    )
+    clock_n = clock_counts[clock_field]
+    metric_meta.update({
+        "window_clock": clock_field,
+        "window_clock_basis": clock_basis,
+        "window_clock_n": clock_n,
+        "window_clock_of": len(attempted),
+    })
+
     if not ok:
-        n_failed = len([f for f in (failed or [])
-                        if f.get("t_send_unix") is not None])
+        n_failed = sum(_finite_clock(f, clock_field) is not None
+                       for f in failed)
         if n_failed:
             return {
+                **metric_meta,
                 "windows": [], "window_seconds": window_s,
                 "drift_kind": "failing", "drift_flag": True,
                 "drift_headline": (
-                    f"every request failed ({n_failed} of them). there is no "
-                    "latency to report, and nothing here is a performance "
-                    "result. read the failures block"),
-                "note": "no successful requests",
+                    f"no request belonged to the scored latency-outcome "
+                    f"population ({n_failed} attempts were outside it). "
+                    "there is no latency to report, and nothing here is a "
+                    "performance result. read the outcome and failures "
+                    "blocks"),
+                "note": "no scored latency outcomes",
             }
-        return {"windows": [], "note": "no successful requests"}
-    failed = failed or []
-    # a row with no send stamp cannot be placed in a window. failures were
-    # already filtered for it; successes were not, and a pooled or
-    # hand-built input without the field raised a KeyError here.
-    ok = [r for r in ok if r.get("t_send_unix") is not None]
-    everything = ok + [f for f in failed if f.get("t_send_unix") is not None]
+        return {**metric_meta, "windows": [],
+                "note": "no scored latency outcomes"}
+    # A row without the selected run-wide clock cannot be placed. Do not fall
+    # back per row: that would mix incompatible time domains.
+    ok = [r for r in ok if _finite_clock(r, clock_field) is not None]
+    failed = [r for r in failed
+              if _finite_clock(r, clock_field) is not None]
+    everything = ok + failed
     if not everything:
-        return {"windows": [], "note": "no request carried a send time, so "
-                                       "stability cannot be judged"}
-    t0 = min(r["t_send_unix"] for r in everything)
+        return {**metric_meta, "windows": [],
+                "note": "no request carried a send time, so "
+                        "stability cannot be judged"}
+    t0 = min(_finite_clock(r, clock_field) for r in everything)
     buckets: dict[int, list] = {}
     errs: dict[int, int] = {}
     for r in ok:
-        w = int((r["t_send_unix"] - t0) // window_s)
+        w = int((_finite_clock(r, clock_field) - t0) // window_s)
         buckets.setdefault(w, []).append(r)
     # failures get their own count per window. an endpoint that collapses
     # serves fewer successes, and those survivors are often the fast ones, so
     # looking at successes alone reads a breakdown as "it got faster".
     for r in failed:
-        if r.get("t_send_unix") is None:
-            continue
-        w = int((r["t_send_unix"] - t0) // window_s)
+        w = int((_finite_clock(r, clock_field) - t0) // window_s)
         buckets.setdefault(w, [])
         errs[w] = errs.get(w, 0) + 1
-    short = {"windows": [], "window_seconds": window_s,
+    short = {**metric_meta, "windows": [], "window_seconds": window_s,
              "note": f"run shorter than two {window_s}s windows, cannot show "
                      "drift. run for minutes to test sustained acceptance "
                      "targets."}
@@ -1948,16 +3064,32 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     rows = []
     for w in sorted(buckets):
         rs = buckets[w]
-        tt = [x.get("ttft_ms") for x in rs if x.get("ttft_ms") is not None]
+        tt = [x.get(latency_key) for x in rs
+              if x.get(latency_key) is not None]
         ee = [x.get("e2e_ms") for x in rs if x.get("e2e_ms") is not None]
         e = errs.get(w, 0)
         attempts = len(rs) + e
-        rows.append({
+        latency_p95 = float(np.percentile(tt, 95)) if tt else None
+        row = {
             "window": w, "n": len(rs), "errors": e, "attempts": attempts,
             "error_rate": (e / attempts) if attempts else 0.0,
-            "ttft_p95": float(np.percentile(tt, 95)) if tt else None,
+            "latency_n": len(tt),
+            # Event coverage is over acceptable outcomes. Errors are scored
+            # separately by error_rate; folding them into event coverage
+            # would discard otherwise valid survivor latency in a mildly,
+            # uniformly lossy run. A failure-only window is explicitly 0%
+            # rather than an ambiguous null value.
+            "latency_coverage": (
+                len(tt) / len(rs) if rs else
+                0.0 if attempts else None),
+            "latency_p95": latency_p95,
             "e2e_p95": float(np.percentile(ee, 95)) if ee else None,
-        })
+        }
+        # Preserve the established TTFT JSON contract for first-content
+        # reports. First-visible reports get an accurately named TTFV field;
+        # both expose latency_p95 as the definition-neutral canonical field.
+        row[f"{latency_event}_p95"] = latency_p95
+        rows.append(row)
     # a window has to be big enough, both absolutely and relative to the rest
     # of the run, before its p95 is allowed to move the verdict.
     # true median, and cap the relative term so one very large window cannot
@@ -1970,8 +3102,8 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     # handful of survivors is not a latency measurement.
     med_att = float(np.median([r["attempts"] for r in rows]))
     err_floor = max(min_window_n, min(0.25 * med_att, 50.0))
-    med_ok = float(np.median([r["n"] for r in rows]))
-    p95_floor = max(min_window_n, min(0.25 * med_ok, 50.0))
+    med_latency = float(np.median([r["latency_n"] for r in rows]))
+    p95_floor = max(min_window_n, min(0.25 * med_latency, 50.0))
     for r in rows:
         # a window that shed heavily is evidence regardless of size. a
         # trailing partial window is exactly where a breaking-point run ends,
@@ -1986,8 +3118,11 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
         # a higher bar than the failing verdict on purpose. losing a few
         # percent still leaves a p95 worth comparing, losing a fifth does not.
         r["p95_survivorship"] = bool(r["error_rate"] > 0.20)
-        r["counted"] = bool(r["n"] >= p95_floor
-                            and r["ttft_p95"] is not None
+        r["event_survivorship"] = bool(
+            r["n"] and (r["latency_coverage"] or 0.0) < 0.95)
+        r["counted"] = bool(r["latency_n"] >= p95_floor
+                            and r["latency_p95"] is not None
+                            and not r["event_survivorship"]
                             and not r["p95_survivorship"])
     err_counted = [r for r in rows if r["error_counted"]]
     counted = [r for r in rows if r["counted"]]
@@ -1998,12 +3133,13 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
             "window is losing more than 10 percent, because a p95 over "
             "survivors is not a latency result. otherwise the run is "
             "unstable when the worst "
-            "counted window's TTFT p95 is more than 1.3x the best, in either "
+            f"counted window's {latency_label} p95 is more than 1.3x the "
+            "best, in either "
             "direction, so warmup and mid-run spikes both show up. E2E p95 is "
             "printed alongside but not scored. a window is left out of the "
             f"latency comparison when it has fewer than {p95_floor:.0f} "
-            "successful requests, when no request returned a content delta, "
-            "or "
+            f"measured {latency_label} events, when more than 5 percent of "
+            "successful outcomes lack that event, or "
             "when it lost more than a fifth of its requests.")
     worst_err = max((r["error_rate"] for r in err_counted), default=0.0)
     base_err = min((r["error_rate"] for r in err_counted), default=0.0)
@@ -2027,6 +3163,7 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
             also = (f" the highest loss rate was window {top['window']} at "
                     f"{top['error_rate'] * 100:.0f} percent.")
         return {
+            **metric_meta,
             "windows": rows, "window_seconds": window_s,
             "counted_windows": len(counted), "skipped_windows": skipped,
             "worst_window_error_rate": worst_err,
@@ -2044,7 +3181,7 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
         }
     if len(counted) < 2:
         errs_dominate = any(r["error_rate"] > 0.05 for r in rows)
-        return {"windows": rows, "window_seconds": window_s,
+        return {**metric_meta, "windows": rows, "window_seconds": window_s,
                 "counted_windows": len(counted), "skipped_windows": skipped,
                 "note": ("not enough windows carry a usable latency sample, "
                          "so stability cannot be judged. "
@@ -2054,7 +3191,7 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
                             "run longer, or raise the rate so each window "
                             "holds enough requests."))}
 
-    vals = [r["ttft_p95"] for r in counted]
+    vals = [r["latency_p95"] for r in counted]
     first, last = vals[0], vals[-1]
     best, worst = min(vals), max(vals)
     ratio = (last / first) if first else None
@@ -2071,11 +3208,13 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
                     "direction. run longer to tell a trend from noise")
     elif rising and worst == vals[-1]:
         kind = "degrading"
-        headline = ("TTFT p95 rises across every counted window: the endpoint "
+        headline = (f"{latency_label} p95 rises across every counted window: "
+                    "the endpoint "
                     "got slower as the run went on")
     elif falling and worst == vals[0]:
         kind = "warming"
-        headline = ("TTFT p95 is worst in the first window and falls from "
+        headline = (f"{latency_label} p95 is worst in the first window and "
+                    "falls from "
                     "there: early requests are cold start, not steady state. "
                     "quote the later windows or warm up before measuring")
     elif worst not in (vals[0], vals[-1]):
@@ -2087,21 +3226,28 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
         headline = ("windows move up and down without a clear trend. the run "
                     "is noisy rather than drifting, so one p95 from it is not "
                     "a steady-state number")
-    return {
+    result = {
+        **metric_meta,
         "windows": rows, "window_seconds": window_s,
         "counted_windows": len(counted), "skipped_windows": skipped,
-        "ttft_p95_drift_ratio": ratio,
-        "ttft_p95_spread_ratio": spread,
-        "ttft_p95_best": best, "ttft_p95_worst": worst,
+        "latency_p95_drift_ratio": ratio,
+        "latency_p95_spread_ratio": spread,
+        "latency_p95_best": best, "latency_p95_worst": worst,
         "drift_kind": kind,
         "drift_headline": headline,
         "drift_flag": unstable,
         "note": note,
     }
+    result[f"{latency_event}_p95_drift_ratio"] = ratio
+    result[f"{latency_event}_p95_spread_ratio"] = spread
+    result[f"{latency_event}_p95_best"] = best
+    result[f"{latency_event}_p95_worst"] = worst
+    return result
 
 
 def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
-                cached_tok: int, pricing: dict) -> dict:
+                cached_tok: int, pricing: dict,
+                *, duration_basis: str = "caller_supplied_interval") -> dict:
     """Diagnostic arithmetic over replay rows using unverified input rates.
 
     The harness does not fetch a price, bind the supplied rate to a commercial
@@ -2157,10 +3303,18 @@ def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
             return "unknown"
         if retries_present and reasons_present and retries != len(reasons):
             return "unknown"
-        if ((retries_present and retries > 0)
-                or (reasons_present and reasons)):
-            return "ambiguous"
+        # A connection failure before POST can increase retries and connection
+        # attempts without creating another billable request. Do not discard
+        # exact final-response usage solely because that safe retry occurred.
+        # Every other retry marker either proves a prior POST or is an unknown
+        # future class, so it remains conservatively ambiguous.
+        safe_pre_post_retries = bool(reasons_present and reasons) and all(
+            reason == "connection_error_before_post" for reason in reasons)
+        ambiguous_retry = bool(reasons_present and reasons) \
+            and not safe_pre_post_retries
         if value == 0:
+            if ambiguous_retry:
+                return "ambiguous"
             response_evidence = (
                 row.get("ok") is True
                 or _sent_at(row) is not None
@@ -2171,6 +3325,8 @@ def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
                 return "unknown"
             return "unsent"
         if value == 1:
+            if ambiguous_retry:
+                return "ambiguous"
             return "single"
         return "ambiguous"
 
@@ -2234,6 +3390,8 @@ def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
                  "unknown_attempt_rows": unknown_attempt_rows,
                  "coverage": coverage,
                  "complete": complete,
+                 "observation_seconds": dur,
+                 "duration_basis": duration_basis,
                  "scope": "measured_replay_interval_only",
                  "provenance_verified": False,
                  "applicability_warning": applicability_warning,
@@ -2298,6 +3456,8 @@ def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
         "unknown_attempt_rows": unknown_attempt_rows,
         "coverage": coverage,
         "complete": complete,
+        "observation_seconds": dur,
+        "duration_basis": duration_basis,
         "scope": "measured_replay_rows_only",
         "provenance_verified": False,
         "applicability_warning": applicability_warning,
@@ -2336,7 +3496,7 @@ def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
     return block
 
 
-def _evaluate_sla(ok: list[dict], total: int, summary: dict,
+def _evaluate_sla(results: list[dict], ok: list[dict], summary: dict,
                   acceptance: dict,
                   ttft_definition: str = "first_content") -> dict:
     """Score the run against customer acceptance targets.
@@ -2361,19 +3521,6 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
             "example numbers rather than yours. pass your own with "
             "--ttft-p95 and --ttfg-p95, or put them in your profile.")
 
-    def score(name, table_key, targets, service_key):
-        rows = []
-        for q, target in (targets or {}).items():
-            actual = (summary.get(table_key) or {}).get(q)
-            rows.append({
-                "quantile": q, "target_ms": target,
-                "actual_ms": round(actual, 1) if actual is not None else None,
-                "met": (actual <= target) if actual is not None else None,
-                "scored_metric": table_key,
-                "service_metric": service_key,
-            })
-        out[name] = rows
-
     raw_ttft_key = ("ttft_ms" if ttft_definition == "first_content"
                     else "ttfv_ms")
     corrected_ttft_key = ("ttft_corrected_ms"
@@ -2390,17 +3537,96 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
         "caller_experienced" if (ttft_key.endswith("_corrected_ms")
                                   or ttfg_key.endswith("_corrected_ms"))
         else "service_time_no_schedule_wait_available")
-    score("ttft_vs_target", ttft_key, acceptance.get("ttft_ms"), raw_ttft_key)
+
+    quantile_fraction = {"p50": 0.50, "p90": 0.90,
+                         "p95": 0.95, "p99": 0.99}
+
+    def row_latency(row: dict, raw_key: str, caller_key: str,
+                    corrected: bool) -> float | None:
+        if not corrected:
+            return row.get(raw_key)
+        if caller_key in row:
+            return row.get(caller_key)
+        if row.get(raw_key) is not None \
+                and row.get("queue_wait_ms") is not None:
+            return row[raw_key] + row["queue_wait_ms"]
+        return None
+
+    def score(name, table_key, targets, service_key, caller_key):
+        rows = []
+        corrected = table_key.endswith("_corrected_ms")
+        values = [row_latency(r, service_key, caller_key, corrected)
+                  for r in ok]
+        eligible = len(values)
+        for q, target in (targets or {}).items():
+            survivor_actual = (summary.get(table_key) or {}).get(q)
+            required = quantile_fraction.get(q)
+            meeting = sum(value is not None and value <= target
+                          for value in values)
+            observed = (meeting / eligible) if eligible else None
+            acceptance_actual = None
+            acceptance_actual_kind = "not_measured"
+            if eligible and required is not None:
+                ordered = sorted(
+                    float(value) if value is not None else math.inf
+                    for value in values)
+                rank = max(1, math.ceil(required * eligible))
+                ranked_value = ordered[rank - 1]
+                if math.isfinite(ranked_value):
+                    acceptance_actual = ranked_value
+                    acceptance_actual_kind = "nearest_rank"
+                else:
+                    acceptance_actual_kind = "missing_event_at_quantile"
+            # Percentiles over event-bearing survivors can be fast even when
+            # enough requests never emitted the event to fail the SLO. Score
+            # the equivalent compliance statement over every protocol-clean
+            # outcome: p95 <= T means at least 95% completed by T; a missing
+            # event is non-meeting. Keep the survivor percentile only as the
+            # descriptive `actual_ms` column.
+            met = (acceptance_actual <= target
+                   if acceptance_actual is not None else
+                   False if acceptance_actual_kind ==
+                   "missing_event_at_quantile" else None)
+            rows.append({
+                "quantile": q, "target_ms": target,
+                "actual_ms": acceptance_actual,
+                "actual_estimator": acceptance_actual_kind,
+                "descriptive_event_only_percentile_ms": (
+                    round(survivor_actual, 1)
+                    if survivor_actual is not None else None),
+                "met": met,
+                "scored_metric": table_key,
+                "service_metric": service_key,
+                "eligible_outcomes": eligible,
+                "meeting_outcomes": meeting,
+                "observed_meeting_fraction": (
+                    observed if observed is not None else None),
+                "required_meeting_fraction": required,
+                "scoring_rule": (
+                    "nearest-rank empirical quantile over every "
+                    "protocol-clean outcome; missing events sort after all "
+                    "measured latencies and do not meet the target"),
+            })
+        out[name] = rows
+
+    score("ttft_vs_target", ttft_key, acceptance.get("ttft_ms"),
+          raw_ttft_key,
+          ("caller_ttft_ms" if ttft_definition == "first_content"
+           else "caller_ttfv_ms"))
     _miss = (summary.get(raw_ttft_key) or {}).get("missing") or 0
     _of = (summary.get(raw_ttft_key) or {}).get("of") or 0
     if _of and _miss / _of > 0.05:
         out["coverage_warning"] = (
             f"{_miss} of {_of} successful requests never produced the token "
-            f"this scores ({raw_ttft_key}), so the marks below describe the "
-            f"{_of - _miss} that did. those are the fastest ones. raise the "
+            f"this scores ({raw_ttft_key}). the acceptance actual uses every "
+            "protocol-clean outcome and sorts those missing events after all "
+            "measured latencies; only the separately labeled descriptive "
+            f"event-only percentile describes the {_of - _miss} that did, "
+            "which is a survivor subset. raise the "
             "output token budget until responses stop truncating, then "
             "re-run.")
-    score("ttfg_vs_target", ttfg_key, acceptance.get("ttfg_ms"), "e2e_ms")
+    score("ttfg_vs_target", ttfg_key, acceptance.get("ttfg_ms"),
+          "e2e_ms", "caller_e2e_ms")
 
     # A partial corrected population is not safe to green-light: it can omit
     # precisely the requests that queued. Score what is available, but make
@@ -2424,9 +3650,10 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
     ttft_cap = (hard.get("ttft_s") or 0) * 1000.0
     ttfg_cap = (hard.get("ttfg_s") or 0) * 1000.0
     inter_cap = acceptance.get("interchunk_ms")
-    timeouts = inter_breaches = 0
-    failing = set()
-    for idx, r in enumerate(ok):
+    timeouts = clean_timeouts = hard_unmeasured = inter_breaches = 0
+    failing_clean = set()
+    for idx, r in enumerate(results):
+        clean = _protocol_clean_success(r)
         first = r.get(raw_ttft_key)
         end = r.get("e2e_ms")
         caller_first_key = ("caller_ttft_ms"
@@ -2437,67 +3664,106 @@ def _evaluate_sla(ok: list[dict], total: int, summary: dict,
         elif first is not None and r.get("queue_wait_ms") is not None:
             first_for_caller = first + r["queue_wait_ms"]
         else:
-            first_for_caller = first
+            first_for_caller = None
         if "caller_e2e_ms" in r:
             end_for_caller = r.get("caller_e2e_ms")
         elif end is not None and r.get("queue_wait_ms") is not None:
             end_for_caller = end + r["queue_wait_ms"]
         else:
-            end_for_caller = end
-        missing_visible_breach = bool(
-            ttft_cap and ttft_definition == "first_visible"
-            and "visible_content_seen" in r
-            and not r.get("visible_content_seen"))
+            end_for_caller = None
+        # A configured first-token cap cannot pass when that event never
+        # happened. This includes valid tool-call-only responses under the
+        # first-content definition. If the event happened but the exact
+        # caller clock is unavailable, preserve that as unmeasured instead of
+        # silently scoring the cap as met.
+        missing_first_breach = bool(
+            ttft_cap and first is None
+            and (clean or (end_for_caller is not None
+                           and end_for_caller > ttft_cap)))
+        missing_caller_first = bool(
+            ttft_cap and first is not None and first_for_caller is None)
+        missing_caller_end = bool(
+            ttfg_cap and end_for_caller is None)
+        # A failed/unsent request with no first event and no elapsed caller
+        # clock cannot prove whether the hard TTFT deadline elapsed. It is
+        # already a success-rate failure, but the hard-cap evidence itself is
+        # incomplete and therefore cannot support a green decision.
+        missing_failed_first_evidence = bool(
+            ttft_cap and not clean and first is None
+            and end_for_caller is None)
         over_time = bool(
-            missing_visible_breach
+            missing_first_breach
             or (ttft_cap and first_for_caller is not None
                 and first_for_caller > ttft_cap)
             or (ttfg_cap and end_for_caller is not None
                 and end_for_caller > ttfg_cap))
+        if (missing_caller_first or missing_caller_end
+                or missing_failed_first_evidence):
+            hard_unmeasured += 1
         over_inter = bool(inter_cap) and r.get("interchunk_max_ms") is not None \
             and r["interchunk_max_ms"] > inter_cap
         if over_time:
             timeouts += 1
+            if clean:
+                clean_timeouts += 1
         if over_inter:
             inter_breaches += 1
-        if over_time or over_inter:
-            failing.add(idx)
+        if clean and (over_time or over_inter):
+            failing_clean.add(idx)
         # a request that came back 200 with nothing readable is not a
         # success at any target. rows written before this was recorded
         # do not carry the field, and are left alone.
-        if "visible_content_seen" in r and not _answered(r):
-            failing.add(idx)
+        if clean and "visible_content_seen" in r and not _answered(r):
+            failing_clean.add(idx)
     out["hard_timeout_breaches"] = timeouts
+    out["hard_timeout_breaches_among_protocol_clean_successes"] = \
+        clean_timeouts
+    out["hard_timeout_unmeasured"] = hard_unmeasured
     out["hard_timeout_basis"] = {
         "ttft_metric": raw_ttft_key,
         "ttft_cap_ms": ttft_cap or None,
         "ttfg_cap_ms": ttfg_cap or None,
         "interchunk_cap_ms": inter_cap,
         "includes_client_queue_wait": any(
-            r.get("queue_wait_ms") is not None for r in ok),
+            r.get("queue_wait_ms") is not None for r in results),
         "prefers_exact_monotonic_caller_clocks": True,
-        "missing_first_visible_counts_as_breach": (
-            ttft_definition == "first_visible"),
+        "missing_configured_first_event_counts_as_breach": (
+            "for protocol-clean outcomes; failed requests require elapsed "
+            "caller evidence"),
     }
     if inter_cap is not None:
         out["interchunk_breaches"] = inter_breaches
+        out["interchunk_measured"] = sum(
+            r.get("interchunk_max_ms") is not None for r in ok)
+        out["interchunk_eligible"] = len(ok)
+        out["interchunk_unmeasured"] = (
+            len(ok) - out["interchunk_measured"])
 
     target_sr = acceptance.get("success_rate")
+    total = len(results)
     if target_sr and total:
-        successes = len(ok) - len(failing)
+        observed_fields = {
+            "visible_content_seen", "reasoning_seen", "valid_tool_calls",
+            "refusal_seen"}
+        successes = sum(
+            1 for idx, row in enumerate(results)
+            if _protocol_clean_success(row)
+            and idx not in failing_clean
+            and (not observed_fields.intersection(row) or _answered(row)))
         actual_sr = successes / total
         lower_95 = _wilson_lower_95(successes, total)
         out["success_rate"] = {
             "target": target_sr,
-            "actual": round(actual_sr, 6),
+            "actual": actual_sr,
             "met": actual_sr >= target_sr,
             "successes": successes,
             "attempts": total,
-            "one_sided_95pct_wilson_lower": round(lower_95, 6),
+            "one_sided_95pct_wilson_lower": lower_95,
             "statistically_demonstrated": lower_95 >= target_sr,
             "note": "failures, hard-timeout breaches, interchunk breaches, "
-                    "and responses that returned 200 with neither visible "
-                    "content nor a structurally valid tool call count against "
+                    "model refusals, and responses that returned 200 with "
+                    "neither non-refusal visible content nor a structurally "
+                    "valid tool call count against "
                     "it. a clean benchmark verdict also requires the "
                     "one-sided 95% Wilson lower confidence bound to meet the "
                     "target; this assumes request outcomes are independent",
@@ -2583,9 +3849,13 @@ def _err_cell(w: dict) -> str:
 
 
 def _wire_p95(arr: dict) -> str:
-    """How late the client began sending, versus the schedule. Unlike
-    dispatch lag, this grows when the offered load is not being delivered."""
-    v = (arr.get("wire_lateness_ms") or {}).get("p95")
+    """How late the client invoked its HTTP request, versus the schedule.
+
+    This is a client-side start clock. It does not observe request-body upload
+    completion or endpoint receipt. The legacy key is accepted for old runs.
+    """
+    v = (arr.get("http_request_start_lateness_ms")
+         or arr.get("wire_lateness_ms") or {}).get("p95")
     if v is None:
         return "n/a"
     return f"{v / 1000:.1f} s" if v >= 1000 else f"{v:.0f} ms"
@@ -2620,9 +3890,41 @@ def _traffic_phase_summary(traffic_scope: dict) -> str:
     return "; ".join(parts) or "none"
 
 
+def _first_event_contract(summary: dict) -> dict[str, str]:
+    """One source of truth for the configured first-event report vocabulary."""
+    sla = summary.get("sla") or {}
+    run = summary.get("run") or {}
+    definition = (sla.get("ttft_definition")
+                  or run.get("ttft_definition")
+                  or summary.get("ttft_definition")
+                  or "first_content")
+    if definition == "first_visible":
+        return {
+            "definition": definition,
+            "service_key": "ttfv_ms",
+            "corrected_key": "ttfv_corrected_ms",
+            "caller_key": "caller_ttfv_ms",
+            "short_label": "TTFV",
+            "primary_label": "TTFV (configured first visible content)",
+            "diagnostic_key": "ttft_ms",
+            "diagnostic_label": "TTFT (first content; diagnostic)",
+        }
+    return {
+        "definition": "first_content",
+        "service_key": "ttft_ms",
+        "corrected_key": "ttft_corrected_ms",
+        "caller_key": "caller_ttft_ms",
+        "short_label": "TTFT",
+        "primary_label": "TTFT (configured first content)",
+        "diagnostic_key": "ttfv_ms",
+        "diagnostic_label": "TTFV (first visible content)",
+    }
+
+
 def render_markdown(summary: dict, title: str, *,
                     verification_context: dict | None = None) -> str:
     s = summary
+    first_event = _first_event_contract(s)
     from .markdown import markdown_plain_text
     from .report_decision import build_report_decision
     verified_view = _external_report_context(s, verification_context)
@@ -2648,6 +3950,60 @@ def render_markdown(summary: dict, title: str, *,
     arr = s["arrivals"]
     sched_src = (s.get("schedule") or {}).get("source", "synthetic")
     mode = (s.get("run") or {}).get("input_mode", "profile")
+    caller_provenance = s.get("latency_correction_provenance") or {}
+    exact_caller_display = bool(
+        caller_provenance.get("exact_values")
+        and not caller_provenance.get("legacy_reconstructed_values"))
+    caller_table_heading = (
+        "exact caller-experienced latency" if exact_caller_display else
+        "caller-experienced latency")
+    caller_row_prefix = (
+        "Exact caller" if exact_caller_display else "Caller-experienced")
+
+    post_attempts = s.get("physical_post_attempts") or {}
+    extra_post_rows = post_attempts.get(
+        "logical_rows_with_additional_attempts")
+    extra_posts = post_attempts.get("additional_attempts")
+    retry_triggers = post_attempts.get("recorded_retry_triggers") or {}
+    trigger_coverage = post_attempts.get("retry_trigger_coverage_rows")
+    trigger_truncation = (
+        "; only the eight most frequent trigger categories are shown"
+        if post_attempts.get("retry_trigger_categories_truncated") else "")
+    if isinstance(extra_post_rows, int) and not isinstance(
+            extra_post_rows, bool):
+        if extra_post_rows:
+            trigger_detail = (
+                f"; recorded retry triggers {json.dumps(retry_triggers, sort_keys=True)}; "
+                f"trigger coverage {trigger_coverage or 0} of "
+                f"{extra_post_rows} rows{trigger_truncation}"
+                if retry_triggers else
+                "; retry triggers were not recorded for these rows")
+            post_attempt_line = (
+                "- logical rows with additional physical POST attempts: "
+                f"{extra_post_rows} ({extra_posts} additional attempts"
+                f"{trigger_detail}). Final-attempt request-path percentiles "
+                "exclude time spent in earlier attempts; use the exact "
+                "caller table for total wait when it is available. An "
+                "attempt is a client call that may have emitted a POST; it "
+                "does not prove provider receipt")
+        else:
+            post_attempt_line = (
+                "- logical rows with additional physical POST attempts: "
+                "none observed")
+        legacy_retry_rows = post_attempts.get(
+            "legacy_retry_marked_rows_without_attempt_count")
+        if legacy_retry_rows:
+            post_attempt_line += (
+                f"; {legacy_retry_rows} legacy retry-marked rows did not "
+                "record a physical-attempt count")
+    elif s.get("requests_retried"):
+        post_attempt_line = (
+            f"- legacy retry-marked logical rows: {s['requests_retried']}; "
+            "physical POST attempt counts and triggers were not recorded")
+    else:
+        post_attempt_line = (
+            "- logical rows with additional physical POST attempts: not "
+            "recorded")
 
     # disqualifiers go ABOVE the tables. report.md is the file that gets pasted
     # into a ticket, and a caution printed below the numbers is one nobody
@@ -2668,6 +4024,10 @@ def render_markdown(summary: dict, title: str, *,
     _cachew = (s.get("cache_fidelity") or {}).get("warning")
     if _cachew:
         cautions += [f"CAUTION (cache fidelity): {inline(_cachew)}", ""]
+    _identityw = (s.get("response_identity") or {}).get("warning")
+    if _identityw:
+        cautions += [
+            f"CAUTION (response identity): {inline(_identityw)}", ""]
     _tokenw = (s.get("token_targeting") or {}).get("warning")
     if _tokenw:
         cautions += [f"CAUTION (workload token fidelity): {inline(_tokenw)}", ""]
@@ -2691,6 +4051,7 @@ def render_markdown(summary: dict, title: str, *,
         cautions += [f"CAUTION (rate-limit evidence): {inline(_ratew)}", ""]
     _http429 = s.get("http_429") or {}
     _http429_count = s.get("http_429_count")
+    _runtime_quota = s.get("runtime_quota_admission") or {}
     if isinstance(_http429_count, int) \
             and not isinstance(_http429_count, bool) \
             and _http429_count > 0:
@@ -2705,10 +4066,31 @@ def render_markdown(summary: dict, title: str, *,
             "provider telemetry to identify the enforcing limit and dimension.",
             "",
         ]
+    if _runtime_quota.get("status") == "denied":
+        cautions += [
+            "INVALID (local quota safety stop): the command-level runtime "
+            "guard refused one or more physical POSTs before send. The "
+            "requested load was not delivered; this is not endpoint-capacity "
+            "evidence.",
+            "",
+        ]
+    elif _runtime_quota.get("status") == "invalid_evidence":
+        cautions += [
+            "INVALID (runtime quota evidence): admission evidence failed its "
+            "internal invariants, so physical-POST coverage is not trusted.",
+            "",
+        ]
 
     decision = (verified_view["decision"] if verified_view
                 else build_report_decision(s))
     decision_rows = []
+    decision_detail_lines = [
+        "### Canonical gate details",
+        "",
+        "Every gate code and its full recorded message is listed here before "
+        "the measured values.",
+        "",
+    ]
     for heading, key in (
             ("Evidence integrity", "evidence_integrity"),
             ("Measurement validity", "measurement_validity"),
@@ -2719,6 +4101,13 @@ def render_markdown(summary: dict, title: str, *,
         decision_rows.append(
             f"| {heading} | {inline(state['label'])} | "
             f"{inline(state['reason'])} |")
+        for item in _decision_reason_details(state):
+            gate_code = inline(item["code"]).replace("\\_", "_").replace(
+                "`", "&#96;")
+            decision_detail_lines.append(
+                f"- **{heading} - `{gate_code}`:** "
+                f"{inline(item['message'])}")
+    decision_detail_lines.append("")
 
     verified_intro = []
     if verified_view:
@@ -2764,6 +4153,7 @@ def render_markdown(summary: dict, title: str, *,
         "|---|---|---|",
         *decision_rows,
         "",
+        *decision_detail_lines,
         "Claim boundary: observed tested-load facts do not establish an "
         "endpoint ceiling or provider quota headroom.",
         "",
@@ -2776,9 +4166,14 @@ def render_markdown(summary: dict, title: str, *,
         f"latency population: "
         f"{(s.get('latency_population') or {}).get('note', 'not recorded')}",
         "",
-        "| endpoint service metric (ms, from send) | p50 | p90 | p95 | p99 | n |",
+        "| final-attempt request-path metric (ms; clock starts immediately "
+        "before conn.request; connection setup excluded) | p50 | p90 | p95 "
+        "| p99 | n |",
         "|---|---|---|---|---|---|",
-        row("TTFT", s["ttft_ms"]),
+        row(first_event["primary_label"],
+            s.get(first_event["service_key"])),
+        row(first_event["diagnostic_label"],
+            s.get(first_event["diagnostic_key"])),
         row("TTF valid tool call", s.get("ttf_tool_call_ms")),
         row("TTFB", s["ttfb_ms"]),
         row("TTFG (E2E)", s["e2e_ms"]),
@@ -2787,6 +4182,12 @@ def render_markdown(summary: dict, title: str, *,
         "## Believability block (read before quoting any number above)",
         f"- achieved cached prompt-token fraction, endpoint-reported: "
         f"{ach_line}",
+        ("- response model identity: "
+         f"{(s.get('response_identity') or {}).get('status', 'not recorded')}; "
+         "observed models "
+         f"{json.dumps(((s.get('response_identity') or {}).get('models') or {}).get('counts') or {})}; "
+         "expected models "
+         f"{json.dumps((s.get('response_identity') or {}).get('expected_models') or [])}"),
         ("- input: real prompts replayed verbatim, sizes and any cache "
          "reuse are the prompts' own"
          if mode == "prompts" else
@@ -2811,13 +4212,20 @@ def render_markdown(summary: dict, title: str, *,
          "- output tokens: endpoint did not report completion_tokens"),
         f"- achieved arrival rate: {arr['achieved_qps_overall']:.2f} QPS "
         f"overall, dispatch lag p95 "
-        f"{_lag_p95(arr)} ms, wire lateness p95 "
+        f"{_lag_p95(arr)} ms, HTTP request-start lateness p95 "
         f"{_wire_p95(arr)}"
         + (f" ({arr['wire_lateness_note']})" if arr.get("wire_lateness_note")
            else "")
         if arr.get("achieved_qps_overall") else "- arrivals: n/a",
         f"- arrival schedule: from trace {sched_src}"
         if sched_src != "synthetic" else "- arrival schedule: synthetic bursts",
+        ("- transport: "
+         f"{inline(((s.get('run') or {}).get('transport') or {}).get('connection_policy') or 'not recorded')}; "
+         f"{inline(((s.get('run') or {}).get('transport') or {}).get('production_comparability_warning') or ((s.get('run') or {}).get('transport') or {}).get('production_connection_policy_assurance') or 'production comparability was not recorded')}"),
+        ("- endpoint metadata stability: "
+         f"{inline((s.get('run') or {}).get('endpoint_metadata_stability') or 'not recorded')}"
+         + (f" ({inline((s.get('run') or {}).get('endpoint_metadata_warning'))})"
+            if (s.get('run') or {}).get('endpoint_metadata_warning') else "")),
         f"- failures: {json.dumps(s['failures_by_error'])}"
         if s["requests_failed"] else "- failures: none",
         f"- failed requests by HTTP status: "
@@ -2832,10 +4240,15 @@ def render_markdown(summary: dict, title: str, *,
          if isinstance(_http429_count, int) and _http429_count > 0
          and isinstance(_http429.get("rate"), (int, float)) else
          "- HTTP 429 rate-limit responses: none observed in supplied evidence"),
-        f"- requests that needed a connection retry: {s['requests_retried']} "
-        "(retried requests restart their latency clock. a nonzero count "
-        "here means the tail has survivorship bias, read with care)"
-        if s.get("requests_retried") else "- connection retries: none",
+        ("- runtime quota admission: "
+         f"{inline(_runtime_quota.get('status') or 'not configured')}; "
+         f"guard {inline(_runtime_quota.get('guard_id') or 'n/a')}; "
+         f"denied rows {_runtime_quota.get('denied_rows', 0)}; "
+         f"denied physical attempts "
+         f"{_runtime_quota.get('denied_attempts_in_captured_rows', 0)}. "
+         "This guard covers only this harness command and does not observe "
+         "unrelated workspace traffic."),
+        post_attempt_line,
     ]
     npth = s.get("network_path") or {}
     floor = _tcp_connect_floor(npth)
@@ -2853,9 +4266,11 @@ def render_markdown(summary: dict, title: str, *,
         lines.append(
             f"- connection setup (DNS, TCP and TLS, ms): p50 "
             f"{conn['p50']:.0f} / p95 {conn['p95']:.0f}. this is EXCLUDED "
-            f"from ttft/ttfb/ttfg, do not subtract it again. a handshake is "
-            f"several round trips, so it is not the per-request network cost "
-            f"of a pooled production client, it is an upper bound on it")
+            "from ttft/ttfb/ttfg. this is a fresh-connection setup "
+            "diagnostic, not RTT, endpoint processing time, or the "
+            "per-request cost of a connection-reusing or HTTP/2 production "
+            "client. do not subtract it from measured latency or extrapolate "
+            "it to a pooled transport")
     cc = s.get("concurrency") or {}
     if cc.get("in_flight_p50") is not None:
         sized = (f", open-loop sizing input "
@@ -2870,33 +4285,50 @@ def render_markdown(summary: dict, title: str, *,
     if tp.get("n"):
         lines.append(
             f"- time per output token (TPOT): p50 {tp['p50']:.1f} / p95 "
-            f"{tp['p95']:.1f} ms. latency for a longer answer is roughly "
-            f"ttft + tpot x output_tokens, so a {tp['p50']:.1f} ms TPOT puts "
-            f"a 500-token answer near "
-            f"{(s.get('ttft_ms') or {}).get('p50', 0) + tp['p50'] * 500:.0f} "
-            "ms")
+            f"{tp['p95']:.1f} ms across {tp['n']} observed requests. each "
+            "row is (e2e - ttft) / (completion_tokens - 1); do not combine "
+            "independently selected TPOT and TTFT percentiles to project an "
+            "unobserved answer length")
 
     if s.get("e2e_corrected_ms"):
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
         ct = s.get("ttf_tool_call_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]
-        lines += ["", "### latency as the caller experienced it", "",
-                  "Includes time the request waited on the client, so these "
-                  "are what someone asking at the scheduled moment actually "
-                  "waited.", "",
+        lines += ["", f"### {caller_table_heading}", "",
+                  "Includes time the request waited on the client. This is "
+                  "the wait the caller experienced from the scheduled "
+                  "request time.", "",
                   "| metric | p50 | p95 | p99 |", "|---|---|---|---|"]
-        if c1.get("p50") is not None:
-            lines.append(f"| TTFT corrected | {c1['p50']:.0f} | "
-                         f"{c1['p95']:.0f} | {c1['p99']:.0f} |")
-        if cv.get("p50") is not None:
-            lines.append(f"| TTFV corrected | {cv['p50']:.0f} | "
-                         f"{cv['p95']:.0f} | {cv['p99']:.0f} |")
+        corrected_tables = {
+            "ttft_corrected_ms": c1,
+            "ttfv_corrected_ms": cv,
+        }
+        primary_corrected = corrected_tables[first_event["corrected_key"]]
+        diagnostic_corrected = corrected_tables[
+            ("ttft_corrected_ms"
+             if first_event["corrected_key"] == "ttfv_corrected_ms"
+             else "ttfv_corrected_ms")]
+        if primary_corrected.get("p50") is not None:
+            lines.append(
+                f"| {caller_row_prefix} {first_event['short_label']} "
+                "(configured) | "
+                f"{primary_corrected['p50']:.0f} | "
+                f"{primary_corrected['p95']:.0f} | "
+                f"{primary_corrected['p99']:.0f} |")
+        if diagnostic_corrected.get("p50") is not None:
+            diagnostic_short = ("TTFT" if first_event["short_label"] == "TTFV"
+                                else "TTFV")
+            lines.append(f"| {caller_row_prefix} {diagnostic_short} "
+                         "(diagnostic) | "
+                         f"{diagnostic_corrected['p50']:.0f} | "
+                         f"{diagnostic_corrected['p95']:.0f} | "
+                         f"{diagnostic_corrected['p99']:.0f} |")
         if ct.get("p50") is not None:
-            lines.append(f"| TTF valid tool call corrected | "
+            lines.append(f"| {caller_row_prefix} TTF valid tool call | "
                          f"{ct['p50']:.0f} | {ct['p95']:.0f} | "
                          f"{ct['p99']:.0f} |")
-        lines.append(f"| end-to-end corrected | {c2['p50']:.0f} | "
+        lines.append(f"| {caller_row_prefix} end-to-end | {c2['p50']:.0f} | "
                      f"{c2['p95']:.0f} | {c2['p99']:.0f} |")
         lines += ["", s["latency_correction_note"]]
 
@@ -2953,8 +4385,14 @@ def render_markdown(summary: dict, title: str, *,
             "offered_output_token_reservation_demand_by_first_send") or {})
     win_actual = windows.get("actual_output_tokens_by_completion") or {}
     win_queries = windows.get("physical_queries_by_first_send") or {}
+    win_qps = windows.get(
+        "physical_queries_per_one_second_by_request_start") or {}
+    win_payload = windows.get(
+        "request_payload_bytes_by_physical_post") or {}
     if any(window.get("max") is not None
-           for window in (win_input, win_reserved, win_actual, win_queries)):
+           for window in (
+               win_input, win_reserved, win_actual, win_queries, win_qps,
+               win_payload)):
         def rolling_value(window: dict) -> str:
             value = window.get("max")
             return "NOT REPORTED" if value is None else f"{value:,.0f}"
@@ -2978,7 +4416,16 @@ def render_markdown(summary: dict, title: str, *,
                   f"- offered physical POST demand: "
                   f"{rolling_value(win_queries)} maximum in a trailing "
                   "3,600-second cohort; this is not the provider's confirmed "
-                  "processed-query counter"]
+                  "processed-query counter",
+                  f"- offered physical POST demand: "
+                  f"{rolling_value(win_qps)} maximum in a conservative "
+                  "inclusive trailing 1-second cohort",
+                  f"- serialized request payload: "
+                  f"{rolling_value(win_payload)} bytes maximum across "
+                  "physical POSTs; exact runtime evidence coverage "
+                  + (f"{win_payload['coverage']:.1%}"
+                     if win_payload.get("coverage") is not None else
+                     "NOT REPORTED")]
     limit_block = s.get("rate_limits") or {}
     if limit_block:
         configured = limit_block.get("configured") or {}
@@ -3032,6 +4479,15 @@ def render_markdown(summary: dict, title: str, *,
                    if projected is not None else "")
                 + f", conservative gate ratio {decision_rendered} "
                 f"({inline(str(comparison.get('status')).replace('_', ' '))})")
+        for name, comparison in (
+                limit_block.get("hard_limit_comparisons") or {}).items():
+            ratio = comparison.get("ratio_to_configured_limit")
+            lines.append(
+                f"  - {inline(name.replace('_', ' '))}: observed maximum "
+                f"{comparison.get('observed_max')} / configured "
+                f"{comparison.get('configured_limit')}"
+                + (" (ratio n/a)" if ratio is None else f" ({ratio:.1%})")
+                + f" ({inline(str(comparison.get('status')).replace('_', ' '))})")
         if limit_block.get("warning"):
             lines.append(
                 f"- rate-limit warning: {inline(limit_block['warning'])}")
@@ -3127,8 +4583,13 @@ def render_markdown(summary: dict, title: str, *,
                   f"{a.get('valid_tool_call_outcomes', 0)} "
                   f"({a.get('tool_call_only_outcomes', 0)} tool-call-only; "
                   f"{a.get('valid_tool_calls_total', 0)} calls total)",
-                  f"- judged requests with neither visible content nor a "
-                  f"valid tool call: {a.get('no_acceptable_outcome', a['no_visible_content'])}",
+                  f"- model refusals (unacceptable by default): "
+                  f"{a.get('model_refusal_outcomes', 0)}"
+                  + (f" ({a['model_refusal_rate']:.1%} of judged)"
+                     if a.get("model_refusal_rate") is not None else ""),
+                  f"- judged requests with no acceptable non-refusal content "
+                  f"or valid tool call: "
+                  f"{a.get('no_acceptable_outcome', a['no_visible_content'])}",
                   f"- judged requests with no visible content: "
                   f"{a['no_visible_content']}",
                   f"- stream never terminated: {a['stream_incomplete']}",
@@ -3159,37 +4620,66 @@ def render_markdown(summary: dict, title: str, *,
                       f"{inline(sla['caller_latency_warning'])}"]
         lines += ["", "| metric | quantile | target ms | actual ms | met |",
                   "|---|---|---|---|---|"]
-        for name, key in (("TTFT", "ttft_vs_target"),
+        for name, key in ((first_event["short_label"], "ttft_vs_target"),
                           ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
                 met = {True: "yes", False: "NO", None: "-"}[r["met"]]
-                act = r["actual_ms"] if r["actual_ms"] is not None \
-                    else "not measured"
-                lines.append(f"| {name} | {r['quantile']} | {r['target_ms']} "
+                if r["actual_ms"] is not None:
+                    target_text, act = _decision_pair_display(
+                        r["target_ms"], r["actual_ms"],
+                        minimum_decimals=0)
+                else:
+                    target_text, act = str(r["target_ms"]), "not measured"
+                lines.append(f"| {name} | {r['quantile']} | {target_text} "
                              f"| {act} | {met} |")
+            scored_rows = [r for key in ("ttft_vs_target", "ttfg_vs_target")
+                           for r in (sla.get(key) or [])
+                           if r.get("eligible_outcomes")
+                           and r.get("required_meeting_fraction") is not None]
+        if scored_rows:
+            lines += ["", "latency-target compliance (missing configured "
+                      "events do not meet the target):"]
+            for r in scored_rows:
+                lines.append(
+                    f"- {r['scored_metric']} {r['quantile']}: "
+                    f"{r['meeting_outcomes']} of {r['eligible_outcomes']} "
+                    f"({r['observed_meeting_fraction']:.1%}) met "
+                    f"{r['target_ms']} ms; requires "
+                    f"{r['required_meeting_fraction']:.0%}")
         hard_basis = sla.get("hard_timeout_basis") or {}
         hard_timeout_configured = any(
             hard_basis.get(key) is not None
             for key in ("ttft_cap_ms", "ttfg_cap_ms"))
         if hard_timeout_configured:
             hard_breaches = sla.get("hard_timeout_breaches", 0)
+            hard_unmeasured = sla.get("hard_timeout_unmeasured")
+            hard_result = (
+                "NO" if hard_breaches else
+                "INCONCLUSIVE" if hard_unmeasured else "yes")
             lines.append(f"| hard timeout breaches | - | - | "
-                         f"{hard_breaches} | "
-                         f"{'yes' if not hard_breaches else 'NO'} |")
+                         f"{hard_breaches} breaches; "
+                         f"{hard_unmeasured or 0} unmeasured | "
+                         f"{hard_result} |")
         if "interchunk_breaches" in sla:
             ib = sla["interchunk_breaches"]
-            lines.append(f"| interchunk breaches | - | - | {ib} | "
-                         f"{'yes' if not ib else 'NO'} |")
+            iu = sla.get("interchunk_unmeasured")
+            inter_result = (
+                "NO" if ib else "INCONCLUSIVE" if iu else "yes")
+            lines.append(f"| interchunk breaches | - | - | {ib} breaches; "
+                         f"{iu or 0} unmeasured | {inter_result} |")
         sr = sla.get("success_rate")
         if sr:
             lines.append(f"| success rate | - | {sr['target']} | "
                          f"{sr['actual']} | {'yes' if sr['met'] else 'NO'} |")
             demonstrated = sr.get("statistically_demonstrated")
             if demonstrated is not None:
+                _target_text, lower_text = _decision_pair_display(
+                    sr["target"], sr["one_sided_95pct_wilson_lower"],
+                    minimum_decimals=6)
                 lines += ["", "success-rate evidence: "
                           f"{sr['successes']} successes in {sr['attempts']} "
                           "attempts; one-sided 95% Wilson lower bound "
-                          f"{sr['one_sided_95pct_wilson_lower']:.6f}. "
+                          f"{lower_text}. "
                           + ("the confidence bound meets the target."
                              if demonstrated else
                              "the observed fraction meets the target, but "
@@ -3203,12 +4693,15 @@ def render_markdown(summary: dict, title: str, *,
         tfv = _v.get("p50")
         _miss, _of = _v.get("missing") or 0, _v.get("of") or 0
         if tfv is None:
-            vis = "no request emitted visible content within max_tokens"
+            vis = ("no request had an observed visible-content event; the "
+                   "artifact does not establish why")
         elif _miss:
             vis = (f"ttfv (first visible content) p50 {tfv:.0f} ms, but over "
                    f"only the {_of - _miss} of {_of} requests that produced "
-                   "visible content. the rest ran out of output tokens still "
-                   "reasoning, so that p50 is the fastest subset, not the run")
+                   "visible content. the remaining requests had no observed "
+                   "visible-content event, and the artifact does not "
+                   "establish why; that p50 describes the visible-content "
+                   "subset, not the run")
         else:
             vis = f"ttfv (first visible content) p50 {tfv:.0f} ms"
         lines += ["", "note: reasoning model detected. ttft (first visible-"
@@ -3227,18 +4720,21 @@ def render_markdown(summary: dict, title: str, *,
             flag = "stable"
         else:
             flag = f"UNSTABLE ({kind})"
-        spread = drift.get("ttft_p95_spread_ratio")
+        spread = drift.get("latency_p95_spread_ratio",
+                           drift.get("ttft_p95_spread_ratio"))
         sp = (f" worst window is {spread:.1f}x the best."
               if spread else "")
         lines += ["", f"stability over time ({inline(flag)})."
                   f"{sp} {inline(drift.get('drift_headline') or drift.get('note', ''))}"]
         if drift.get("windows"):
+            latency_label = drift.get("latency_metric_label") or "TTFT"
             lines += ["", f"per-{drift.get('window_seconds', 60)}s windows, p95 in ms:",
                       "",
-                      "| window | content-bearing streams | errors | TTFT p95 | E2E p95 |",
+                      f"| window | acceptable outcomes | errors | {latency_label} p95 | E2E p95 |",
                       "|---|---|---|---|---|"]
         for w in (drift.get("windows") or []):
-            tt = f"{w['ttft_p95']:.0f}" if w['ttft_p95'] is not None else "-"
+            latency_p95 = w.get("latency_p95", w.get("ttft_p95"))
+            tt = f"{latency_p95:.0f}" if latency_p95 is not None else "-"
             ee = f"{w['e2e_p95']:.0f}" if w['e2e_p95'] is not None else "-"
             mark = "" if w.get("counted", True) else " (not counted)"
             er = _err_cell(w)
@@ -3586,13 +5082,18 @@ h1{font-size:clamp(25px,3vw,38px);line-height:1.14;letter-spacing:-.025em;
 .state-card .why{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.35}
 .state-card .why{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
  overflow:hidden}
-.gate-detail{margin-top:13px;border-top:1px solid var(--line);padding-top:10px}
-.gate-detail summary{cursor:pointer;color:var(--muted);font-size:11px;font-weight:800;
+.gate-detail{margin-top:13px;border-top:1px solid var(--line);padding-top:12px}
+.gate-detail>h3{margin:0;color:var(--muted);font-size:11px;font-weight:800;
  text-transform:uppercase;letter-spacing:.045em}.gate-detail .banner{margin-bottom:0}
-.decision-reasons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;
- margin:10px 0 0}.decision-reasons div{min-width:0}.decision-reasons dt{font-size:10px;
- color:var(--quiet);font-weight:800;text-transform:uppercase;letter-spacing:.04em}
-.decision-reasons dd{margin:3px 0 0;color:var(--muted);font-size:12px}
+.decision-reasons{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 18px;
+ margin:10px 0 0}.decision-reason-group{min-width:0}.decision-reason-group h4{margin:0;
+ font-size:10px;color:var(--quiet);font-weight:800;text-transform:uppercase;
+ letter-spacing:.04em}.gate-reason-list{list-style:none;margin:5px 0 0;padding:0}
+.gate-reason-list li{display:grid;grid-template-columns:minmax(120px,.55fr) minmax(0,1.45fr);
+ gap:7px;margin-top:5px;color:var(--muted);font-size:11px;line-height:1.38}
+.gate-reason-list code{align-self:start;color:#344054;background:#eef1f5;border-radius:4px;
+ padding:1px 4px;font:9px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+ overflow-wrap:anywhere}.gate-reason-list span{min-width:0;overflow-wrap:anywhere}
 .tone-ok .v{color:var(--green)}.tone-bad .v{color:var(--red)}
 .tone-warn .v{color:var(--amber)}.tone-neutral .v{color:var(--gray)}
 .section-head{display:flex;justify-content:space-between;align-items:end;gap:18px;
@@ -3697,19 +5198,23 @@ td.na{color:var(--muted);font-weight:650}
  .meta-row{margin-top:10px;gap:6px}.meta-chip{font-size:11px;min-height:26px;padding:4px 8px}
  .report-nav{margin:10px 0 14px;border-radius:9px}
  .report-nav a{padding:6px 9px;font-size:11px}.decision-hero{padding:14px 16px;
- margin-top:12px}.decision-hero h2{font-size:19px;margin:5px 0}.decision-hero .claim-box{display:none}
+ margin-top:12px}.decision-hero h2{font-size:19px;margin:5px 0}.decision-hero .claim-box{
+ display:block;border-left:0;border-top:2px solid var(--line);padding:9px 0 0;font-size:11px}
  .status-kicker{font-size:10px}.decision-copy{font-size:12px}
  .decision-copy{display:block;overflow:visible}.state-grid{grid-template-columns:1fr;gap:0;
  border:1px solid var(--line);border-radius:10px;overflow:hidden}
- .state-card{display:flex;align-items:center;justify-content:space-between;gap:10px;
+ .state-card{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:2px 10px;
  border:0;border-bottom:1px solid var(--line);border-radius:0;padding:6px 9px}
  .state-card:last-child{border-bottom:0}.state-card .v{margin:0;text-align:right}
- .state-card .k{font-size:9px}.state-card .v{font-size:11px}.state-card .why{display:none}
+ .state-card .k{font-size:9px}.state-card .v{font-size:11px}.state-card .why{display:block;
+ grid-column:1/-1;-webkit-line-clamp:unset;overflow:visible;font-size:10px}
  .fact-strip{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.stats{grid-template-columns:repeat(2,minmax(0,1fr))}
- .section-head{margin:14px 2px 7px}.section-head h2{font-size:16px}.section-head p{display:none}
+ .section-head{margin:14px 2px 7px}.section-head h2{font-size:16px}.section-head p{
+ display:block;font-size:10px;line-height:1.35}
  .fact{padding:8px}.fact .k{font-size:8px}.fact .v{font-size:15px}.fact .u{font-size:9px}
- .fact .note{display:none}
- .decision-reasons{grid-template-columns:1fr}.decision-reasons dd{font-size:11px}
+ .fact .note{display:block;font-size:9px;line-height:1.3}
+ .decision-reasons{grid-template-columns:1fr}.gate-reason-list li{
+ grid-template-columns:1fr;gap:2px}.gate-reason-list code{justify-self:start}
  .card{padding:15px 14px;border-radius:11px}.stat .v{font-size:21px}
  .scroll-hint{display:flex;align-items:center;gap:7px;margin:0 0 7px;padding:7px 9px;
  border-radius:8px;background:var(--blue-soft);color:#174ea6;font-size:12px;
@@ -3737,15 +5242,22 @@ td.na{color:var(--muted);font-weight:650}
  .eyebrow,.sub{color:#344054}.meta-row{margin-top:8px}.meta-chip{background:#fff;color:#111;
  border-color:#aeb8c6;min-height:22px;padding:2px 7px;font-size:9px}.report-nav{display:none}
  .decision-hero,.card,.stat,.fact,.state-card,details.evidence{box-shadow:none;break-inside:avoid;
- page-break-inside:avoid}.decision-hero{margin-top:8px;padding:11px 13px}.decision-hero h2{font-size:18px;
+ page-break-inside:avoid}.decision-hero{margin-top:8px;padding:11px 13px;break-inside:auto;
+ page-break-inside:auto}.decision-hero h2{font-size:18px;
  margin:4px 0}.decision-copy{font-size:10px}.decision-lead{gap:12px}.claim-box{font-size:9px;
- padding-left:10px}.claim-box b{font-size:8px}.state-grid{grid-template-columns:repeat(5,minmax(0,1fr));
+ padding-left:10px}.claim-box b{font-size:8px}.state-grid{grid-template-columns:repeat(2,minmax(0,1fr));
  gap:4px;margin-top:9px}.state-card{padding:6px}.state-card .k{font-size:7px}.state-card .v{font-size:9px}
- .state-card .why,.gate-detail{display:none}.section-head{break-after:avoid;page-break-after:avoid;
+ .state-card .why{display:block;-webkit-line-clamp:unset;overflow:visible;font-size:8px}
+ .gate-detail{display:block;break-inside:auto;page-break-inside:auto}
+ .gate-detail>h3{display:block}.gate-detail>.decision-reasons{display:grid}
+ .decision-reason-group,.gate-reason-list li{break-inside:avoid;page-break-inside:avoid}
+ .gate-reason-list li{grid-template-columns:38mm minmax(0,1fr);font-size:7.5pt;
+ gap:2mm}.gate-reason-list code{font-size:6.8pt}.gate-detail>.banner{display:block}
+ .section-head{break-after:avoid;page-break-after:avoid;
  margin:12px 2px 6px}.section-head h2{font-size:15px}.section-head p{display:none}#workload{break-inside:avoid;
  page-break-inside:avoid}.fact-strip{grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;margin:6px 0}
  .fact{padding:6px}.fact .k{font-size:7px}.fact .v{font-size:12px}.fact .u{font-size:8px}
- .fact .note{display:none}
+ .fact .note{display:block;font-size:6.8pt;line-height:1.25}
  .stats{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:8px 0}
  .stat{padding:8px}.stat .k{font-size:8px}.stat .v{font-size:17px}
  table{break-inside:auto}th,td{padding:6px 7px}thead{display:table-header-group}
@@ -3787,8 +5299,12 @@ def _html_stability_chart(drift: dict) -> str:
     """
     windows = drift.get("windows") or []
     series = []
+    latency_key = ("latency_p95"
+                   if any("latency_p95" in window for window in windows)
+                   else "ttft_p95")
+    latency_label = drift.get("latency_metric_label") or "TTFT"
     for key, label, css in (
-            ("ttft_p95", "TTFT p95", "chart-line"),
+            (latency_key, f"{latency_label} p95", "chart-line"),
             ("e2e_p95", "E2E p95", "chart-line chart-secondary")):
         points = []
         for position, window in enumerate(windows):
@@ -3964,6 +5480,54 @@ def _html_quota_gauges(rate: dict) -> str:
     return "<div class='quota-grid'>" + "".join(gauges) + "</div>"
 
 
+def _decision_reason_details(state: dict) -> list[dict[str, str]]:
+    """Return a complete, ordered reason-code/message list for one state.
+
+    Current canonical decisions persist ``reason_details``.  The fallback keeps
+    older sealed decisions readable and makes any code added by an external
+    verifier visible even when that verifier predates the detailed field.
+    """
+    details = []
+    seen: set[tuple[str, str]] = set()
+    raw_details = state.get("reason_details")
+    if isinstance(raw_details, list):
+        for raw in raw_details:
+            if not isinstance(raw, dict):
+                continue
+            code = raw.get("code")
+            message = raw.get("message")
+            if not isinstance(code, str) or not code.strip() \
+                    or not isinstance(message, str) or not message.strip():
+                continue
+            item = (
+                sanitize_display_text(code).strip(),
+                sanitize_display_text(message).strip(),
+            )
+            if item in seen:
+                continue
+            seen.add(item)
+            details.append({"code": item[0], "message": item[1]})
+
+    present_codes = {item["code"] for item in details}
+    fallback_message = sanitize_display_text(
+        state.get("reason") or "No reason was recorded.").strip()
+    reason_codes = state.get("reason_codes")
+    if isinstance(reason_codes, list):
+        for raw_code in reason_codes:
+            if not isinstance(raw_code, str) or not raw_code.strip():
+                continue
+            code = sanitize_display_text(raw_code).strip()
+            if code in present_codes:
+                continue
+            details.append({"code": code, "message": fallback_message})
+            present_codes.add(code)
+    if not details:
+        code = sanitize_display_text(
+            state.get("code") or "REASON_NOT_RECORDED").strip()
+        details.append({"code": code, "message": fallback_message})
+    return details
+
+
 def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
     """Render independent decision states before any performance number."""
     ordered = (
@@ -3978,7 +5542,7 @@ def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
         "neutral": "neutral",
     }
     cards = []
-    reason_rows = []
+    reason_groups = []
     severities = []
     for heading, key in ordered:
         state = decision[key]
@@ -3992,9 +5556,19 @@ def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
             f"<div class='v'>{html.escape(state_label)}</div>"
             f"<div class='why'>{html.escape(str(state.get('reason') or ''))}</div>"
             "</div>")
-        reason_rows.append(
-            f"<div><dt>{html.escape(heading)}</dt>"
-            f"<dd>{html.escape(str(state.get('reason') or ''))}</dd></div>")
+        detail_items = "".join(
+            "<li>"
+            f"<code>{html.escape(item['code'])}</code>"
+            f"<span>{html.escape(item['message'])}</span>"
+            "</li>"
+            for item in _decision_reason_details(state)
+        )
+        reason_groups.append(
+            "<section class='decision-reason-group' "
+            f"aria-labelledby='decision-reason-{html.escape(key)}'>"
+            f"<h4 id='decision-reason-{html.escape(key)}'>"
+            f"{html.escape(heading)}</h4>"
+            f"<ul class='gate-reason-list'>{detail_items}</ul></section>")
     quota = decision["quota_state"]
     measurement = decision["measurement_validity"]
     sla = decision["customer_sla"]
@@ -4005,6 +5579,10 @@ def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
         lead = integrity["reason"]
     elif quota.get("code") == "EXCEEDED":
         headline = "No endpoint-capacity conclusion: quota rejection observed."
+        lead = quota["reason"]
+    elif quota.get("code") == "LOCAL_GUARD_REFUSED":
+        headline = (
+            "No endpoint-capacity conclusion: local quota safety stop.")
         lead = quota["reason"]
     elif measurement.get("code") == "INVALID":
         headline = "No performance conclusion: the measurement is invalid."
@@ -4050,10 +5628,12 @@ def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
         f"<p><b>Capacity state</b>{html.escape(str(capacity['label']))}</p>"
         "</div></div>"
         f"<div class='state-grid'>{''.join(cards)}</div>"
-        "<details class='gate-detail' id='decision-reasons'>"
-        "<summary>Why these states · combined CLI exit-code gate</summary>"
-        f"<dl class='decision-reasons'>{''.join(reason_rows)}</dl>"
-        + combined_gate_html + "</details></section>")
+        "<section class='gate-detail' id='decision-reasons' "
+        "aria-labelledby='decision-reasons-heading'>"
+        "<h3 id='decision-reasons-heading'>Why these states · every canonical "
+        "gate code and message · combined CLI exit-code gate</h3>"
+        f"<div class='decision-reasons'>{''.join(reason_groups)}</div>"
+        + combined_gate_html + "</section></section>")
 
 
 def render_html(summary: dict, title: str, *,
@@ -4062,11 +5642,21 @@ def render_html(summary: dict, title: str, *,
     markdown uses. Stdlib only, no external assets, safe to open in a browser
     or attach to a deck."""
     s = summary
+    first_event = _first_event_contract(s)
     verified_view = _external_report_context(s, verification_context)
     def esc(value: object) -> str:
         return html.escape(sanitize_display_text(value), quote=True)
     run = s.get("run") or {}
     mode = run.get("input_mode", "profile")
+    caller_provenance = s.get("latency_correction_provenance") or {}
+    exact_caller_display = bool(
+        caller_provenance.get("exact_values")
+        and not caller_provenance.get("legacy_reconstructed_values"))
+    caller_heading = (
+        "Exact caller-experienced latency" if exact_caller_display else
+        "Caller-experienced latency")
+    caller_row_prefix = (
+        "Exact caller" if exact_caller_display else "Caller-experienced")
 
     def num(v, nd=0):
         return f"{v:,.{nd}f}" if isinstance(v, (int, float)) else "n/a"
@@ -4188,7 +5778,7 @@ def render_html(summary: dict, title: str, *,
         + "</div></header>")
     nav_links = [
         ("overview", "Decision"), ("workload", "Workload"),
-        ("validity", "Validity"),
+        ("validity", "Cautions"),
     ]
     if s.get("sla"):
         nav_links.append(("sla", "Acceptance"))
@@ -4214,7 +5804,10 @@ def render_html(summary: dict, title: str, *,
             and not isinstance(load_seconds, bool) \
             and math.isfinite(float(load_seconds)) and float(load_seconds) > 0:
         scheduled_avg = scheduled_requests / float(load_seconds)
-    achieved_qps = (s.get("arrivals") or {}).get("achieved_qps_overall")
+    arrivals_block = s.get("arrivals") or {}
+    achieved_qps = arrivals_block.get("achieved_qps_overall")
+    achieved_qps_basis = arrivals_block.get("achieved_qps_basis") or (
+        "arrival-rate basis was not recorded")
     conc = s.get("concurrency") or {}
     throughput = s.get("throughput") or {}
     throughput_coverage = throughput.get("usage_coverage")
@@ -4233,7 +5826,7 @@ def render_html(summary: dict, title: str, *,
                    f"{achieved_qps:,.2f}" if isinstance(
                        achieved_qps, (int, float)) and not isinstance(
                            achieved_qps, bool) else "NOT MEASURED", "RPS",
-                   "first sends over observed span"),
+                   achieved_qps_basis),
         _html_fact("Load window",
                    f"{float(load_seconds):,.0f}" if isinstance(
                        load_seconds, (int, float)) and not isinstance(
@@ -4282,18 +5875,22 @@ def render_html(summary: dict, title: str, *,
             return corrected
         return None
 
-    ttft_service = s.get("ttft_ms") or {}
-    ttft_caller = exact_caller_table("ttft_corrected_ms", "ttft_ms")
-    ttft = ttft_caller or ttft_service
-    ttft_label = "Caller TTFT" if ttft_caller else "Service-path TTFT"
-    if has(ttft):
-        cards.append(_html_stat(f"{ttft_label} p50", num(ttft["p50"]), "ms"))
-        cards.append(_html_stat(f"{ttft_label} p95", num(ttft["p95"]), "ms"))
+    first_service = s.get(first_event["service_key"]) or {}
+    first_caller = exact_caller_table(
+        first_event["corrected_key"], first_event["service_key"])
+    first_table = first_caller or first_service
+    first_label = (("Exact caller " if first_caller else "Final-attempt ")
+                   + first_event["short_label"])
+    if has(first_table):
+        cards.append(_html_stat(
+            f"{first_label} p50", num(first_table["p50"]), "ms"))
+        cards.append(_html_stat(
+            f"{first_label} p95", num(first_table["p95"]), "ms"))
     e2e_service = s.get("e2e_ms") or {}
     e2e_caller = exact_caller_table("e2e_corrected_ms", "e2e_ms")
     e2e = e2e_caller or e2e_service
-    e2e_label = "Caller end to end" if e2e_caller else \
-        "Service-path end to end"
+    e2e_label = "Exact caller end to end" if e2e_caller else \
+        "Final-attempt end to end"
     if has(e2e):
         cards.append(_html_stat(f"{e2e_label} p95", num(e2e["p95"]), "ms"))
     err_cls = (
@@ -4306,6 +5903,7 @@ def render_html(summary: dict, title: str, *,
                  f"{err_text}</span></div></div>")
     http_429_count = s.get("http_429_count")
     http_429 = s.get("http_429") or {}
+    runtime_quota = s.get("runtime_quota_admission") or {}
     if isinstance(http_429_count, int) \
             and not isinstance(http_429_count, bool) \
             and http_429_count > 0:
@@ -4317,6 +5915,11 @@ def render_html(summary: dict, title: str, *,
             "<div class='stat'><div class='k'>HTTP 429 rate</div>"
             "<div class='v'><span class='pill bad'>"
             f"{rendered_rate}</span></div></div>")
+    if runtime_quota.get("status") == "denied":
+        cards.append(
+            "<div class='stat'><div class='k'>Runtime quota admission</div>"
+            "<div class='v'><span class='pill bad'>local stop</span>"
+            "</div></div>")
     ach = s.get("achieved_cache_fraction") or {}
     if has(ach):
         cards.append(_html_stat("cached prompt-token fraction p50",
@@ -4341,7 +5944,8 @@ def render_html(summary: dict, title: str, *,
         rows = []
         misses = 0
         unmeasured = 0
-        for name, key in (("TTFT", "ttft_vs_target"), ("TTFG", "ttfg_vs_target")):
+        for name, key in ((first_event["short_label"], "ttft_vs_target"),
+                          ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
                 met = r["met"]
                 if met is False:
@@ -4350,11 +5954,17 @@ def render_html(summary: dict, title: str, *,
                     unmeasured += 1
                 cls = "yes" if met else ("no" if met is False else "na")
                 cell = {True: "PASS", False: "NO", None: "-"}[met]
+                if r["actual_ms"] is not None:
+                    target_text, actual_text = _decision_pair_display(
+                        r["target_ms"], r["actual_ms"],
+                        minimum_decimals=0)
+                else:
+                    target_text, actual_text = num(r["target_ms"]), "-"
                 rows.append(
                     f"<tr><th scope='row' class='lbl sticky-col'>{name} "
                     f"{esc(r['quantile'])} (ms)</th>"
-                    f"<td>{num(r['target_ms'])}</td>"
-                    f"<td>{num(r['actual_ms']) if r['actual_ms'] is not None else '-'}</td>"
+                    f"<td>{target_text}</td>"
+                    f"<td>{actual_text}</td>"
                     f"<td class='{cls}'>{cell}</td></tr>")
         hard_basis = sla.get("hard_timeout_basis") or {}
         hard_timeout_configured = any(
@@ -4362,48 +5972,80 @@ def render_html(summary: dict, title: str, *,
             for key in ("ttft_cap_ms", "ttfg_cap_ms"))
         ht = sla.get("hard_timeout_breaches")
         if hard_timeout_configured and ht is not None:
-            cls = "yes" if ht == 0 else "no"
+            hu = sla.get("hard_timeout_unmeasured")
+            cls = "no" if ht else ("na" if hu else "yes")
+            result = str(ht) if ht else ("INCONCLUSIVE" if hu else "PASS")
             rows.append(f"<tr><th scope='row' class='lbl sticky-col'>"
                         f"hard timeout "
                         f"breaches (count)</th>"
-                        f"<td>-</td><td>{ht}</td>"
-                        f"<td class='{cls}'>{'PASS' if ht == 0 else ht}</td></tr>")
+                        f"<td>-</td><td>{ht} breaches; {hu or 0} "
+                        f"unmeasured</td>"
+                        f"<td class='{cls}'>{result}</td></tr>")
             if ht:
                 misses += 1
+            elif hu:
+                unmeasured += 1
         ib = sla.get("interchunk_breaches")
         if ib is not None:
-            cls = "yes" if ib == 0 else "no"
+            iu = sla.get("interchunk_unmeasured")
+            cls = "no" if ib else ("na" if iu else "yes")
+            result = str(ib) if ib else ("INCONCLUSIVE" if iu else "PASS")
             rows.append(f"<tr><th scope='row' class='lbl sticky-col'>"
                         f"interchunk "
                         f"breaches (count)</th>"
-                        f"<td>-</td><td>{ib}</td>"
-                        f"<td class='{cls}'>{'PASS' if ib == 0 else ib}</td></tr>")
+                        f"<td>-</td><td>{ib} breaches; {iu or 0} "
+                        f"unmeasured</td>"
+                        f"<td class='{cls}'>{result}</td></tr>")
             if ib:
                 misses += 1
+            elif iu:
+                unmeasured += 1
         sr = sla.get("success_rate")
         if sr:
             met = sr["met"]
             cls = "yes" if met else "no"
             if met is False:
                 misses += 1
+            success_target_text, success_actual_text = \
+                _decision_pair_display(
+                    sr["target"], sr["actual"], minimum_decimals=4)
             rows.append(
                 f"<tr><th scope='row' class='lbl sticky-col'>success rate "
                 f"(fraction 0-1)</th>"
-                f"<td>{num(sr['target'], 4)}</td><td>{num(sr['actual'], 4)}</td>"
+                f"<td>{success_target_text}</td>"
+                f"<td>{success_actual_text}</td>"
                 f"<td class='{cls}'>{'PASS' if met else 'NO'}</td></tr>")
             lower = sr.get("one_sided_95pct_wilson_lower")
             demonstrated = sr.get("statistically_demonstrated")
             if lower is not None:
                 confidence_cls = "yes" if demonstrated else "no"
+                target_text, lower_text = _decision_pair_display(
+                    sr["target"], lower, minimum_decimals=4)
                 rows.append(
                     "<tr><th scope='row' class='lbl sticky-col'>"
                     "success-rate one-sided "
                     "95% Wilson lower bound</th>"
-                    f"<td>{num(sr['target'], 4)}</td><td>{num(lower, 4)}</td>"
+                    f"<td>{target_text}</td><td>{lower_text}</td>"
                     f"<td class='{confidence_cls}'>"
                     f"{'PASS' if demonstrated else 'NOT PROVEN'}</td></tr>")
         defn = esc(sla.get("ttft_definition", "first_content"))
         note_bits = []
+        compliance_rows = [
+            row for key in ("ttft_vs_target", "ttfg_vs_target")
+            for row in (sla.get(key) or [])
+            if row.get("eligible_outcomes")
+            and row.get("required_meeting_fraction") is not None]
+        if compliance_rows:
+            compliance = "; ".join(
+                f"{row['scored_metric']} {row['quantile']}: "
+                f"{row['meeting_outcomes']}/{row['eligible_outcomes']} "
+                f"({row['observed_meeting_fraction']:.1%}) met the target, "
+                f"requires {row['required_meeting_fraction']:.0%}"
+                for row in compliance_rows)
+            note_bits.append(
+                "Latency targets use outcome compliance, not a percentile over "
+                "event-bearing survivors; missing configured events do not "
+                f"meet the target. {esc(compliance)}.")
         ttft_rows = sla.get("ttft_vs_target") or []
         if ttft_rows and all(r["actual_ms"] is None for r in ttft_rows):
             # in profile mode the per-request budget is
@@ -4425,11 +6067,11 @@ def render_html(summary: dict, title: str, *,
                    " On a reasoning-only model no budget may be enough, and"
                    " the mode is the decision rather than the budget.")
             note_bits.append(
-                f"TTFT actual is <b>-</b> because it is scored on "
+                f"{first_event['short_label']} actual is <b>-</b> because it is scored on "
                 f"<b>{defn}</b> and no request emitted that content within "
                 f"max_tokens (a reasoning model can spend the whole token "
-                f"budget thinking).{fix} The latency table below still shows "
-                f"TTFT for the first visible-or-reasoning content delta.")
+                f"budget thinking).{fix} The latency table below separately "
+                "labels the configured first event and its diagnostic peer.")
         if s.get("ttfr_ms"):
             tft = (s.get("ttft_ms") or {}).get("p50")
             note_bits.append(
@@ -4442,7 +6084,7 @@ def render_html(summary: dict, title: str, *,
         sla_html = (
             f"<div class='card' id='sla'><h2 id='sla-heading'>"
             f"Acceptance scorecard "
-            f"(TTFT definition: {defn}; latency basis: {basis})</h2>"
+            f"(first-event definition: {defn}; latency basis: {basis})</h2>"
             f"<div class='cap'>targets from {esc(sla.get('targets_source') or 'the run configuration')}. "
             f"target and actual share each row's unit, shown in the metric "
             f"name</div>"
@@ -4480,13 +6122,15 @@ def render_html(summary: dict, title: str, *,
 
     # ---- latency table ----
     lat = []
-    for label, key in (("TTFT (first content delta)", "ttft_ms"),
+    for label, key in ((first_event["primary_label"],
+                        first_event["service_key"]),
+                       (first_event["diagnostic_label"],
+                        first_event["diagnostic_key"]),
                        ("TTF valid tool call", "ttf_tool_call_ms"),
-                       ("TTFB (first response-body line)", "ttfb_ms"),
+                       ("TTFB (first bounded response-body chunk)", "ttfb_ms"),
                        ("TTFG (end to end)", "e2e_ms"),
                        ("interchunk max", "interchunk_max_ms"),
-                       ("TTFR (first reasoning)", "ttfr_ms"),
-                       ("TTFV (first visible)", "ttfv_ms")):
+                       ("TTFR (first reasoning)", "ttfr_ms")):
         t = s.get(key)
         if has(t):
             lat.append(
@@ -4498,9 +6142,11 @@ def render_html(summary: dict, title: str, *,
                    or "latency population was not recorded")
     lat_html = (
         "<div class='card' id='performance'><h2 id='performance-heading'>"
-        "Endpoint service latency "
-        "(milliseconds, from send)</h2>"
-        f"<div class='cap'>{pop_note}. p50 to p99 are percentiles across that "
+        "Final-attempt request-path latency</h2>"
+        "<div class='cap'>The clock starts immediately before "
+        "<code>conn.request</code> on an established connection and excludes "
+        "connection setup. "
+        f"{pop_note}. p50 to p99 are percentiles across that "
         "population, lower is better. n is the measured count; all values are "
         "in ms.</div><div class='scroll-hint' id='performance-scroll-hint' "
         "role='note'><span aria-hidden='true'>↔</span> Scroll horizontally; "
@@ -4509,7 +6155,7 @@ def render_html(summary: dict, title: str, *,
         "aria-labelledby='performance-heading' "
         "aria-describedby='performance-scroll-hint'>"
         "<table class='dense-table'><caption class='sr-only'>"
-        "Endpoint-service latency "
+        "Final-attempt request-path latency "
         "percentiles in milliseconds</caption><thead>"
         "<tr><th scope='col' class='lbl sticky-col'>metric</th>"
         "<th scope='col'>p50</th>"
@@ -4542,6 +6188,15 @@ def render_html(summary: dict, title: str, *,
         bel.append("<li><b>Achieved cached prompt-token fraction</b>: not "
                    "reported by this "
                    "endpoint (shown as unknown, never guessed)</li>")
+    identity = s.get("response_identity") or {}
+    if identity:
+        model_counts = ((identity.get("models") or {}).get("counts") or {})
+        bel.append(
+            "<li><b>Response model identity</b>: "
+            f"{esc(identity.get('status') or 'not recorded')}; observed "
+            f"{esc(json.dumps(model_counts, sort_keys=True))}; expected "
+            f"{esc(json.dumps(identity.get('expected_models') or []))}. "
+            f"{esc(identity.get('note') or '')}</li>")
     if mode == "prompts":
         bel.append("<li><b>Input</b>: real prompts replayed verbatim, sizes "
                    "and any cache reuse are the prompts' own</li>")
@@ -4588,11 +6243,11 @@ def render_html(summary: dict, title: str, *,
                    f"{num(arr['achieved_qps_overall'], 2)} requests/second "
                    f"(QPS) overall. Dispatch lag p95 {num(lag)} ms is how "
                    f"late the dispatcher handed the request to the pool. "
-                   f"Wire lateness p95 {_wire_p95(arr)} is how late it "
-                   f"actually reached the endpoint, which is the one that "
-                   f"grows when the offered load is not being delivered: a "
-                   f"full pool queues rather than blocking the dispatcher. "
-                   f"Neither is endpoint latency."
+                   f"HTTP request-start lateness p95 {_wire_p95(arr)} is how "
+                   f"late the client invoked its request. It grows when a "
+                   f"full pool queues rather than blocking the dispatcher, "
+                   f"but it does not observe upload completion or endpoint "
+                   f"receipt. Neither clock is endpoint latency."
                    + (f" {esc(arr['wire_lateness_note'])}"
                       if arr.get("wire_lateness_note") else "")
                    + "</li>")
@@ -4601,12 +6256,28 @@ def render_html(summary: dict, title: str, *,
         bel.append(f"<li><b>Connection setup</b> (DNS, TCP and TLS "
                    f"setup, in ms): p50 {num(conn['p50'])} / "
                    f"p95 {num(conn['p95'])}. This is <b>excluded</b> from "
-                   f"TTFT, TTFB and TTFG, so do not subtract it again. A "
-                   f"handshake takes several round trips, so treat it as an "
-                   f"upper bound on network distance rather than the "
-                   f"per-request network cost a pooled production client "
-                   f"pays. Run the client from where production traffic "
-                   f"originates for it to mean anything.</li>")
+                   "TTFT, TTFB and TTFG. This is a fresh-connection setup "
+                   "diagnostic, not RTT, endpoint processing time, or the "
+                   "per-request cost of a connection-reusing or HTTP/2 "
+                   "production client. Do not subtract it from measured "
+                   "latency or extrapolate it to a pooled transport. Run the "
+                   "client from where production traffic originates for the "
+                   "diagnostic to be relevant.</li>")
+    transport = run.get("transport") or {}
+    if transport:
+        bel.append(
+            "<li><b>Transport comparability</b>: "
+            f"{esc(transport.get('connection_policy') or 'not recorded')}; "
+            f"{esc(transport.get('production_comparability_warning') or transport.get('production_connection_policy_assurance') or 'production comparability was not recorded')}"
+            "</li>")
+    metadata_state = run.get("endpoint_metadata_stability")
+    if metadata_state:
+        bel.append(
+            "<li><b>Endpoint metadata stability</b>: "
+            f"{esc(metadata_state)}"
+            + (f". {esc(run.get('endpoint_metadata_warning'))}"
+               if run.get("endpoint_metadata_warning") else "")
+            + "</li>")
     fr = (s.get("token_targeting") or {}).get("finish_reasons")
     if fr:
         bel.append(f"<li><b>Finish reasons</b>: {esc(json.dumps(fr))} "
@@ -4634,6 +6305,54 @@ def render_html(summary: dict, title: str, *,
             f"scope: {esc(str(http_429.get('scope') or 'not recorded'))}. "
             "This is quota-limited evidence, not an endpoint-capacity "
             "result.</li>")
+    bel.append(
+        "<li><b>Runtime quota admission</b>: "
+        f"{esc(str(runtime_quota.get('status') or 'not configured'))}; guard "
+        f"{esc(str(runtime_quota.get('guard_id') or 'n/a'))}; denied rows "
+        f"{esc(str(runtime_quota.get('denied_rows', 0)))}; denied physical "
+        "attempts "
+        f"{esc(str(runtime_quota.get('denied_attempts_in_captured_rows', 0)))}. "
+        "This covers one harness command and excludes unrelated workspace "
+        "traffic.</li>")
+    post_attempts = s.get("physical_post_attempts") or {}
+    extra_post_rows = post_attempts.get(
+        "logical_rows_with_additional_attempts")
+    extra_posts = post_attempts.get("additional_attempts")
+    retry_triggers = post_attempts.get("recorded_retry_triggers") or {}
+    trigger_coverage = post_attempts.get("retry_trigger_coverage_rows")
+    trigger_truncation = (
+        " Only the eight most frequent trigger categories are shown."
+        if post_attempts.get("retry_trigger_categories_truncated") else "")
+    if isinstance(extra_post_rows, int) and not isinstance(
+            extra_post_rows, bool):
+        trigger_text = (
+            f" Recorded retry triggers: "
+            f"{esc(json.dumps(retry_triggers, sort_keys=True))}; trigger "
+            f"coverage {esc(str(trigger_coverage or 0))} of "
+            f"{extra_post_rows} rows.{trigger_truncation}"
+            if retry_triggers else
+            " Retry triggers were not recorded for these rows."
+            if extra_post_rows else "")
+        bel.append(
+            "<li><b>Logical rows with additional physical POST attempts</b>: "
+            f"{extra_post_rows}; additional attempts "
+            f"{esc(str(extra_posts))}.{trigger_text} Final-attempt "
+            "request-path percentiles exclude time spent in earlier "
+            "attempts; use the exact caller table for total wait when it is "
+            "available. An attempt is a client call that may have emitted a "
+            "POST; it does not prove provider receipt.</li>")
+        legacy_retry_rows = post_attempts.get(
+            "legacy_retry_marked_rows_without_attempt_count")
+        if legacy_retry_rows:
+            bel.append(
+                "<li><b>Legacy retry evidence</b>: "
+                f"{esc(str(legacy_retry_rows))} retry-marked logical rows did "
+                "not record a physical-attempt count.</li>")
+    elif s.get("requests_retried"):
+        bel.append(
+            "<li><b>Legacy retry-marked logical rows</b>: "
+            f"{esc(str(s['requests_retried']))}; physical POST attempt "
+            "counts and triggers were not recorded.</li>")
     rp = run.get("request_params")
     if rp:
         eb = rp.get("extra_body") or {}
@@ -4699,8 +6418,14 @@ def render_html(summary: dict, title: str, *,
             "offered_output_token_reservation_demand_by_first_send") or {})
     win_actual = windows.get("actual_output_tokens_by_completion") or {}
     win_queries = windows.get("physical_queries_by_first_send") or {}
+    win_qps = windows.get(
+        "physical_queries_per_one_second_by_request_start") or {}
+    win_payload = windows.get(
+        "request_payload_bytes_by_physical_post") or {}
     if any(window.get("max") is not None
-           for window in (win_input, win_reserved, win_actual, win_queries)) \
+           for window in (
+               win_input, win_reserved, win_actual, win_queries, win_qps,
+               win_payload)) \
             or s.get("rate_limits"):
         traffic_scope = windows.get("traffic_scope") or {}
         phase_text = _traffic_phase_summary(traffic_scope)
@@ -4718,6 +6443,16 @@ def render_html(summary: dict, title: str, *,
              f"{num(win_actual.get('max'))} tok (approximate timing)"),
             ("offered physical POST demand / trailing 3,600 s",
              f"{num(win_queries.get('max'))}; not confirmed processed QPH"),
+            ("offered physical POST demand / trailing 1 s",
+             f"{num(win_qps.get('max'))}; inclusive client request-start "
+             "window"),
+            ("serialized request payload / physical POST",
+             f"{num(win_payload.get('max'))} bytes max; exact-evidence "
+             "coverage "
+             + (f"{num(win_payload['coverage'] * 100, 1)}%"
+                if isinstance(win_payload.get("coverage"), (int, float))
+                and not isinstance(win_payload.get("coverage"), bool)
+                else "n/a")),
         ]
         rate = s.get("rate_limits") or {}
         for name, comparison in (rate.get("comparisons") or {}).items():
@@ -4744,6 +6479,16 @@ def render_html(summary: dict, title: str, *,
                    if projected is not None else "")
                 + ("; conservative gate ratio n/a" if ratio is None else
                    f"; conservative gate ratio {ratio:.1%}")
+                + f" ({str(comparison.get('status')).replace('_', ' ')})"))
+        for name, comparison in (
+                rate.get("hard_limit_comparisons") or {}).items():
+            ratio = comparison.get("ratio_to_configured_limit")
+            rows.append((
+                name.replace("_", " "),
+                f"observed max {comparison.get('observed_max')} / configured "
+                f"{comparison.get('configured_limit')}"
+                + ("; ratio n/a" if ratio is None else
+                   f"; ratio {ratio:.1%}")
                 + f" ({str(comparison.get('status')).replace('_', ' ')})"))
         warning = ""
         if rate:
@@ -4917,12 +6662,55 @@ def render_html(summary: dict, title: str, *,
               (s.get("token_targeting") or {}).get("warning"))
     add_issue("Latency population",
               (s.get("latency_population") or {}).get("warning"))
+    identity_state = s.get("response_identity") or {}
+    identity_issue = identity_state.get("invalid") or identity_state.get(
+        "warning")
+    if not identity_issue and identity_state.get("status") in {
+            "legacy_unobserved", "not_reported", "observed_unbound"}:
+        identity_issue = (
+            "response model identity was not bound to the requested model "
+            f"(status: {identity_state.get('status')})")
+    add_issue("Response model identity", identity_issue)
+    transport_state = run.get("transport")
+    if not isinstance(transport_state, dict):
+        transport_issue = (
+            "the benchmark transport contract was not recorded, so its "
+            "connection behavior cannot be compared with production")
+    else:
+        transport_issue = transport_state.get(
+            "production_comparability_warning")
+        if not transport_issue and transport_state.get(
+                "production_connection_policy_match") is not True:
+            transport_issue = (
+                "the transport artifact did not contain an explicit exact "
+                "production-policy match")
+    add_issue("Transport parity", transport_issue)
+    stability_state = s.get("drift") or {}
+    stability_kind = stability_state.get("drift_kind")
+    if stability_kind != "stable":
+        add_issue(
+            "Stability",
+            stability_state.get("drift_headline")
+            or stability_state.get("note")
+            or "stability over the run was not established")
+    runtime_status = runtime_quota.get("status")
+    if runtime_status != "enforced":
+        add_issue(
+            "Runtime quota admission",
+            ("runtime quota admission was not configured for this run"
+             if not runtime_status or runtime_status == "not_configured" else
+             "runtime quota admission denied traffic before send"
+             if runtime_status == "denied" else
+             "runtime quota-admission evidence failed its invariants"
+             if runtime_status == "invalid_evidence" else
+             f"runtime quota-admission status was {runtime_status}"))
     sample_banner = ""
     if issues:
         sample_banner = (
             "<section class='card issue-card' id='validity' "
             "aria-labelledby='validity-heading'>"
-            "<h2 id='validity-heading'>Validity and workload-fidelity gates</h2>"
+            "<h2 id='validity-heading'>Additional measurement and workload "
+            "cautions</h2>"
             f"<div class='banner warn'>{len(issues)} issue"
             f"{'s' if len(issues) != 1 else ''} must be read before using "
             "the latency or cost figures.</div><ul>"
@@ -4934,20 +6722,23 @@ def render_html(summary: dict, title: str, *,
         sample_banner = (
             "<section class='card issue-card' id='validity' "
             "aria-labelledby='validity-heading'>"
-            "<h2 id='validity-heading'>Validity and workload-fidelity gates"
+            "<h2 id='validity-heading'>Additional measurement and workload "
+            "cautions"
             "</h2><span class='pill neutral'>No additional warning blocks</span>"
             "<p class='cap' style='margin-top:8px'>Use the independent "
-            "Measurement validity, Quota, and Evidence integrity states above "
+            "Measurement validity, Response identity, Stability, Runtime "
+            "quota admission, Quota, and Evidence integrity evidence above "
             "as the decision gates.</p></section>")
 
     drift = s.get("drift") or {}
     if drift.get("windows") or drift.get("drift_kind"):
         wr = "".join(
             f"<tr><th scope='row' class='lbl sticky-col'>window {w['window']} "
-            f"({w['n']} content-bearing streams)"
+            f"({w['n']} acceptable outcomes)"
             f"{'' if w.get('counted', True) else ', not counted'}</th>"
             f"<td>{_err_cell(w)}</td>"
-            f"<td>{num(w['ttft_p95'])}</td><td>{num(w['e2e_p95'])}</td></tr>"
+            f"<td>{num(w.get('latency_p95', w.get('ttft_p95')))}</td>"
+            f"<td>{num(w['e2e_p95'])}</td></tr>"
             for w in (drift.get("windows") or []))
         kind = drift.get("drift_kind")
         if not kind:
@@ -4956,7 +6747,8 @@ def render_html(summary: dict, title: str, *,
             flag = "<span class='pill ok'>stable</span>"
         else:
             flag = f"<span class='pill bad'>unstable: {esc(kind)}</span>"
-        spread = drift.get("ttft_p95_spread_ratio")
+        spread = drift.get("latency_p95_spread_ratio",
+                           drift.get("ttft_p95_spread_ratio"))
         sp = (f"worst window is {spread:.1f}x the best. " if spread else "")
         drift_html = (
             f"<div class='card' id='stability'><h2 id='stability-heading'>"
@@ -4979,7 +6771,8 @@ def render_html(summary: dict, title: str, *,
                f"Exact per-window stability "
                f"values in milliseconds</caption><thead><tr>"
                f"<th scope='col' class='lbl sticky-col'>window</th>"
-               f"<th scope='col'>errors</th><th scope='col'>TTFT p95</th>"
+               f"<th scope='col'>errors</th><th scope='col'>"
+               f"{esc(drift.get('latency_metric_label') or 'TTFT')} p95</th>"
                f"<th scope='col'>E2E p95</th></tr></thead><tbody>{wr}</tbody>"
                f"</table></div>"
                if drift.get("windows") else "")
@@ -5036,7 +6829,11 @@ def render_html(summary: dict, title: str, *,
                    f"{a.get('valid_tool_call_outcomes', 0)} "
                    f"({a.get('tool_call_only_outcomes', 0)} tool-call-only; "
                    f"{a.get('valid_tool_calls_total', 0)} calls total)"),
-                  ("judged request with neither visible content nor a valid tool call",
+                  ("model refusals (unacceptable by default)",
+                   f"{a.get('model_refusal_outcomes', 0)}"
+                   + (f" ({a['model_refusal_rate']:.1%} of judged)"
+                      if a.get("model_refusal_rate") is not None else "")),
+                  ("judged request with no acceptable non-refusal content or valid tool call",
                    a.get("no_acceptable_outcome", a.get("no_visible_content"))),
                   ("judged request with no visible content",
                    a.get("no_visible_content")),
@@ -5073,18 +6870,33 @@ def render_html(summary: dict, title: str, *,
         ct = s.get("ttf_tool_call_corrected_ms") or {}
         c2 = s["e2e_corrected_ms"]
         r_ = []
-        if c1.get("p50") is not None:
-            r_.append(("TTFT corrected (ms)", c1))
-        if cv.get("p50") is not None:
-            r_.append(("TTFV corrected (ms)", cv))
+        corrected_tables = {
+            "ttft_corrected_ms": c1,
+            "ttfv_corrected_ms": cv,
+        }
+        primary_corrected = corrected_tables[first_event["corrected_key"]]
+        diagnostic_key = ("ttft_corrected_ms"
+                          if first_event["corrected_key"] == "ttfv_corrected_ms"
+                          else "ttfv_corrected_ms")
+        diagnostic_corrected = corrected_tables[diagnostic_key]
+        if primary_corrected.get("p50") is not None:
+            r_.append((f"{caller_row_prefix} "
+                       f"{first_event['short_label']} (configured, ms)",
+                       primary_corrected))
+        if diagnostic_corrected.get("p50") is not None:
+            diagnostic_short = ("TTFT" if first_event["short_label"] == "TTFV"
+                                else "TTFV")
+            r_.append((f"{caller_row_prefix} {diagnostic_short} "
+                       "(diagnostic, ms)", diagnostic_corrected))
         if ct.get("p50") is not None:
-            r_.append(("TTF valid tool call corrected (ms)", ct))
-        r_.append(("end-to-end corrected (ms)", c2))
+            r_.append((f"{caller_row_prefix} TTF valid tool call (ms)", ct))
+        r_.append((f"{caller_row_prefix} end-to-end (ms)", c2))
         corr_html = (
             "<div class='card'><h2 id='caller-latency-heading'>"
-            "Latency as the caller experienced it</h2>"
+            f"{esc(caller_heading)}</h2>"
             "<div class='cap'>Includes time the request waited on the "
-            "client.</div><div class='scroll-hint' "
+            "client: this is the wait the caller experienced from the "
+            "scheduled request time.</div><div class='scroll-hint' "
             "id='caller-latency-scroll-hint' role='note'>"
             "<span aria-hidden='true'>↔</span> Scroll horizontally; the "
             "Metric column stays visible.</div>"
@@ -5092,8 +6904,8 @@ def render_html(summary: dict, title: str, *,
             "aria-labelledby='caller-latency-heading' "
             "aria-describedby='caller-latency-scroll-hint'>"
             "<table class='dense-table'><caption class='sr-only'>"
-            "Client-corrected "
-            "latency percentiles in milliseconds</caption><thead><tr>"
+            f"{esc(caller_heading)} percentiles in milliseconds"
+            "</caption><thead><tr>"
             "<th scope='col' class='lbl sticky-col'>metric</th>"
             "<th scope='col'>p50</th>"
             "<th scope='col'>p95</th><th scope='col'>p99</th></tr></thead><tbody>"

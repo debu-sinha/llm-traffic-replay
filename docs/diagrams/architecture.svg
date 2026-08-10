@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
   <title id="title">LLM traffic replay architecture and evidence lifecycle</title>
-  <desc id="desc">Private input capture and exact local prevalidation precede credential and network access. When quota limits are configured, conservative full-request-body planning and positive READY endpoint binding precede paid inference. The default CLI preflight sends two real requests before replay. Streaming clients may issue duplicate physical posts through explicit retry and fallback paths. Request-path and caller clocks feed a durable journal, reports, manifest version 3, and a completion marker promoted last.</desc>
+  <desc id="desc">Private input capture and exact local prevalidation precede credential and network access. Fixed-rate, trace, and every sweep-rung schedule are materialized at that boundary; a sizing-derived schedule is the explicit exception because paid sizing must derive its rate first. When quota limits are configured, conservative full-request-body planning and positive READY endpoint binding precede paid inference. A crash-visible setup artifact is claimed before the default two-request preflight. One command-local no-wait guard atomically admits every physical inference POST immediately before the request call; retries and fallbacks are admitted separately. The built-in transport opens a fresh HTTP/1.1 connection for every physical attempt. Request-path and caller clocks, response model plus Databricks served-model-name identity, runtime-admission events, and a normalized subset of pre-run/post-drain endpoint metadata feed a durable journal and exactly five canonical report decisions; identity, stability, and runtime admission are evidence gates. Manifest version 3 and a completion marker are promoted last.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
       <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
@@ -24,19 +24,19 @@
   <rect class="box" x="315" y="112" width="190" height="72" rx="10"/>
   <text class="t" x="410" y="133" text-anchor="middle">Freeze + prevalidate</text>
   <text class="s" x="410" y="154" text-anchor="middle">private bytes; SHA-256 + size</text>
-  <text class="tiny" x="410" y="174" text-anchor="middle">exact schedule; every sweep rung</text>
+  <text class="tiny" x="410" y="174" text-anchor="middle">fixed/trace schedules; sizing waits</text>
   <rect class="warn" x="560" y="104" width="260" height="88" rx="10"/>
   <text class="t" x="690" y="132" text-anchor="middle">Optional quota + READY P2T gate</text>
   <text class="s" x="690" y="154" text-anchor="middle">full JSON bytes + framing</text>
   <text class="s" x="690" y="174" text-anchor="middle">CPT max(configured,12); tier absent/default</text>
   <rect class="evidence" x="875" y="104" width="235" height="88" rx="10"/>
-  <text class="t" x="992" y="132" text-anchor="middle">Billable preflight (default)</text>
-  <text class="s" x="992" y="154" text-anchor="middle">2 representatives + optional probes</text>
-  <text class="s" x="992" y="174" text-anchor="middle">artifact rows omit prompt text</text>
+  <text class="t" x="992" y="132" text-anchor="middle">Setup evidence claimed first</text>
+  <text class="s" x="992" y="154" text-anchor="middle">sibling writing marker + start.json</text>
+  <text class="s" x="992" y="174" text-anchor="middle">row sink fsyncs each paid outcome</text>
   <rect class="evidence" x="1165" y="104" width="210" height="88" rx="10"/>
-  <text class="t" x="1270" y="132" text-anchor="middle">Start journal claimed</text>
-  <text class="s" x="1270" y="154" text-anchor="middle">writing marker + start.json</text>
-  <text class="s" x="1270" y="174" text-anchor="middle">setup metadata appended first</text>
+  <text class="t" x="1270" y="132" text-anchor="middle">Billable preflight</text>
+  <text class="s" x="1270" y="154" text-anchor="middle">2 representatives + explicit probes</text>
+  <text class="s" x="1270" y="174" text-anchor="middle">refusal seals no performance result</text>
   <path class="arrow" d="M260 148 H315"/><path class="arrow" d="M505 148 H560"/><path class="arrow" d="M820 148 H875"/><path class="arrow" d="M1110 148 H1165"/>
 
   <rect class="lane" x="28" y="235" width="1384" height="245" rx="16"/>
@@ -54,11 +54,11 @@
   <text class="s" x="435" y="384" text-anchor="middle">max_concurrency workers</text>
   <text class="s" x="435" y="405" text-anchor="middle">bounded max_pending_requests</text>
   <rect class="warn" x="605" y="292" width="240" height="126" rx="10"/>
-  <text class="t" x="725" y="318" text-anchor="middle">Streaming client attempts</text>
-  <text class="s" x="725" y="342" text-anchor="middle">cancel shuts active sockets; blocks retries</text>
-  <text class="s" x="725" y="363" text-anchor="middle">transport retries default 0</text>
-  <text class="s" x="725" y="384" text-anchor="middle">usage fallback or auth refresh</text>
-  <text class="s" x="725" y="405" text-anchor="middle">may issue a duplicate physical POST</text>
+  <text class="t" x="725" y="318" text-anchor="middle">Runtime-admitted POST attempts</text>
+  <text class="s" x="725" y="342" text-anchor="middle">reserve immediately before conn.request</text>
+  <text class="s" x="725" y="363" text-anchor="middle">local denial sends no physical POST</text>
+  <text class="s" x="725" y="384" text-anchor="middle">retry/fallback/refresh re-admitted</text>
+  <text class="tiny" x="725" y="405" text-anchor="middle">fresh HTTP/1.1 connection each attempt</text>
   <rect class="muted" x="905" y="292" width="200" height="126" rx="10"/>
   <text class="t" x="1005" y="318" text-anchor="middle">Serving endpoint</text>
   <text class="s" x="1005" y="342" text-anchor="middle">streamed chat subset</text>
@@ -67,13 +67,13 @@
   <text class="s" x="1005" y="405" text-anchor="middle">semantic correctness is external</text>
   <rect class="safe" x="1165" y="292" width="210" height="126" rx="10"/>
   <text class="t" x="1270" y="318" text-anchor="middle">Stream parser</text>
-  <text class="s" x="1270" y="342" text-anchor="middle">content, reasoning, tool fragments</text>
+  <text class="s" x="1270" y="342" text-anchor="middle">reasoning / visible / refusal / tools</text>
   <text class="s" x="1270" y="363" text-anchor="middle">corrupt/incomplete = failures</text>
-  <text class="s" x="1270" y="384" text-anchor="middle">not in latency/usage/cost populations</text>
-  <text class="s" x="1270" y="405" text-anchor="middle">response content not persisted</text>
+  <text class="s" x="1270" y="384" text-anchor="middle">failed streams excluded from metrics</text>
+  <text class="tiny" x="1270" y="405" text-anchor="middle">model/entity identity kept; no content</text>
   <path class="arrow" d="M265 355 H325"/><path class="arrow" d="M545 355 H605"/><path class="arrow" d="M845 355 H905"/><path class="arrow" d="M1105 355 H1165"/>
   <path class="dash" d="M1005 418 C1005 458 725 458 725 420"/>
-  <text class="tiny" x="865" y="468" text-anchor="middle">explicit retry/fallback path: possible repeated POST</text>
+  <text class="tiny" x="865" y="468" text-anchor="middle">explicit retry/fallback path: every repeated POST requires a new reservation</text>
 
   <rect class="lane" x="28" y="500" width="1384" height="135" rx="16"/>
   <text class="lh" x="48" y="528">3. Keep both timing families and journal every observed outcome</text>
@@ -85,18 +85,18 @@
   <text class="s" x="645" y="594" text-anchor="middle">queue + connect + fallback + refresh + retries + response</text>
   <rect class="evidence" x="895" y="550" width="430" height="58" rx="10"/>
   <text class="t" x="1110" y="574" text-anchor="middle">Durable requests.jsonl.partial</text>
-  <text class="s" x="1110" y="592" text-anchor="middle">attempts + outcomes + global indices + exact clocks</text>
+  <text class="s" x="1110" y="592" text-anchor="middle">attempt/admission events + outcomes + exact clocks</text>
   <text class="tiny" x="1110" y="606" text-anchor="middle">redacted errors + batched fsync</text>
   <path class="arrow" d="M395 579 H465"/><path class="arrow" d="M825 579 H895"/>
 
   <rect class="lane" x="28" y="655" width="1384" height="132" rx="16"/>
-  <text class="lh" x="48" y="683">4. Seal evidence only after traffic drains</text>
+  <text class="lh" x="48" y="683">4. Re-snapshot the endpoint after traffic drains, then seal evidence</text>
   <rect class="evidence" x="70" y="704" width="250" height="55" rx="10"/>
-  <text class="t" x="195" y="728" text-anchor="middle">requests.jsonl promoted</text>
-  <text class="s" x="195" y="748" text-anchor="middle">newline row count checked</text>
+  <text class="t" x="195" y="728" text-anchor="middle">Post-drain endpoint snapshot</text>
+  <text class="s" x="195" y="748" text-anchor="middle">normalized-subset change invalidates claim</text>
   <rect class="evidence" x="370" y="704" width="255" height="55" rx="10"/>
-  <text class="t" x="497" y="728" text-anchor="middle">summary + reports</text>
-  <text class="s" x="497" y="748" text-anchor="middle">sample floors; cost withheld if ambiguous</text>
+  <text class="t" x="497" y="728" text-anchor="middle">requests + summary + reports</text>
+  <text class="s" x="497" y="748" text-anchor="middle">five decisions + evidence gates</text>
   <rect class="evidence" x="675" y="704" width="275" height="55" rx="10"/>
   <text class="t" x="812" y="728" text-anchor="middle">manifest schema v3 last</text>
   <text class="s" x="812" y="748" text-anchor="middle">identity + SHA-256 + bytes + row count</text>

@@ -51,10 +51,14 @@ The runner follows this order:
 13. Append each observed outcome to the durable partial journal as collection
     sees it. Rows can be in completion order; `global_index` retains workload
     order.
-14. Drain outstanding work, sync the journal, and summarize persisted replay
-    rows for acceptance metrics while using all sealed phases for quota-window
-    evidence.
-15. Atomically promote `requests.jsonl`, write summary and reports, write the
+14. Drain outstanding work and sync the journal.
+15. When endpoint metadata capture is enabled, take a second normalized
+    control-plane summary only after response drain and compare it with the
+    pre-run summary. Record changed or incomplete stability evidence together
+    with the final runtime-quota snapshot.
+16. Summarize persisted replay rows for acceptance and stability metrics while
+    using all sealed phases for quota-window and admission evidence.
+17. Atomically promote `requests.jsonl`, write summary and reports, write the
     manifest last, and promote the writing marker to
     `.traffic-replay-complete` only after the manifest is durable.
 
@@ -65,11 +69,19 @@ before credential or network access. Unloaded sizing validates the frozen
 workload and representatives at this gate but cannot construct its schedule
 until the authorized sizing requests derive a rate. For a sweep, every
 requested rung is separately constructed and checked while sharing the same
-frozen workload source. Its two representative preflight
-requests and any explicitly supplied model-control candidate probes occur only
-after that gate and are real, billable traffic. Metadata-only result rows are
-passed through a private API and sealed into the first run's journal as
-`preflight` and `probe` phases; request and response content is not included.
+frozen workload source. Before its two representative preflight requests or
+any explicitly supplied model-control candidate probes, the CLI claims a
+separate `OUT_DIR-setup-traffic/TIMESTAMP` artifact. Every completed
+metadata-only row is fsynced. A normal pass or refusal seals that artifact as
+an explicit non-performance/non-SLA/non-capacity result; a crash leaves an
+incomplete diagnostic journal. If `--force` permits continuation after both
+representatives were reachable but an answer was unreadable, the gate outcome
+is `preflight_forced_unreadable`, never `preflight_passed`; the measured run
+or sweep remains explicitly INVALID diagnostic evidence. Force does not
+override an unreachable or failed transport preflight. On a pass, the same
+rows are passed through a
+private API and included once in the first measured run's journal as
+`preflight` and `probe` phases. Request and response content is not included.
 They participate in quota-window evidence but not replay acceptance
 percentiles. A sweep attaches them only to its first rung. The tool does not
 guess provider controls.
@@ -78,7 +90,10 @@ For `benchmark` and `sweep`, the offline quota gate runs after exact local
 prevalidation and before credential lookup. It budgets setup requests and the
 complete measured schedule, then resolves credentials and uses a control-plane
 endpoint read to bind a passing plan before the first inference `POST`. The
-lower-level `run` repeats input capture, exact prevalidation, and the offline
+passing high-level plan also constructs one command-scoped runtime guard that
+is shared by preflight, probes, automatic physical fallbacks/retries, replay,
+and all sweep rungs. The lower-level `run` repeats input capture, exact
+prevalidation, and the offline
 plan before claiming its directory; it performs endpoint binding inside that
 directory before sizing, calibration, or replay. A control-plane read or TCP
 diagnostic can still make a network connection after the local gate; the
@@ -128,22 +143,41 @@ For one logical replay row:
 2. It submits to the worker pool if the pending bound has room.
 3. The worker records exact queue wait, opens a fresh connection, and records
    `connect_ms` across DNS, TCP, and TLS setup.
-4. The final-attempt request-path clock begins immediately before the blocking
+4. When `rate_limits` is configured, the command-scoped guard atomically
+   reserves exact serialized bytes, the conservative input-token bound,
+   offered `max_tokens`, and one query for this physical attempt. Admission
+   happens after connection setup and immediately before the last safe point
+   preceding `conn.request`; a refusal sends no `POST` for that attempt.
+5. The final-attempt request-path clock begins immediately before the blocking
    `conn.request` call. It includes request upload; it does not claim to begin
    when the first or last request byte reaches the socket or provider.
-5. Streaming events update TTFB, first content, first reasoning, first visible
+6. Streaming events update TTFB, first content, first reasoning, first visible
    content, first tool-call fragment, interchunk gaps, and end-to-end time.
-   TTFB ends at the first iterated response-body/SSE line, not necessarily the
-   first response byte. TTFT ends only at a nonempty visible or reasoning
-   content delta, never a tool-call fragment. End-to-end stops at
+   TTFB ends at the first nonempty bounded response-body chunk returned by the
+   client read, not the first socket byte or first parsed SSE line. TTFT under
+   `first_content` ends at a nonempty visible, reasoning, or refusal delta,
+   never a tool-call fragment. End-to-end stops at
    `[DONE]`, or at response EOF when `[DONE]` is absent; a `finish_reason`
    records completion semantics but does not itself stop the response reader.
-6. Tool-call fragments are assembled only long enough to verify a nonempty
+   The interchunk maximum is the widest elapsed gap between successive SSE
+   events with a nonempty visible, reasoning, or refusal delta. It is not
+   token-level inter-token latency; heartbeat, usage-only, and tool-call-only
+   events do not advance it.
+7. Tool-call fragments are assembled only long enough to verify a nonempty
    function name and arguments that decode to a JSON object. Argument content
    is not persisted.
-7. The caller clocks measure from the scheduled target to the same observed
+8. The caller clocks measure from the scheduled target to the same observed
    events. They include queueing, connection setup, fallback requests,
    credential refresh, and configured transport retries.
+
+The client opens a fresh HTTP/1.1 connection for every physical attempt. The
+sealed run records this machine-readable contract and an optional closed
+operator declaration of the real application's connection policy. If the
+production policy is absent or differs, the canonical decision marks the
+measurement `CAUTION` and capacity `INCONCLUSIVE`; a pooled keep-alive or HTTP/2
+client can have materially different edge and connection pressure. The only
+accepted matching declaration is `fresh_http1_per_physical_attempt`. It records
+an operator assertion and does not claim the harness observed production.
 
 The final-attempt metrics exclude connection setup but include request upload,
 network and edge transit, endpoint work, and response transit. They must not be
@@ -152,14 +186,23 @@ outside its timer and records `tcp_connect_min_ms` and
 `tcp_connect_median_ms`. Those fields are not exact RTT and cannot be
 subtracted to recover endpoint time.
 
+Every runtime hostname resolution is deadline-bounded. Resolver helpers are
+daemon-only and single-flight identical concurrent lookups, with a hard cap on
+active unique lookups; a caller timeout or cancellation cannot later open a
+socket or send a `POST`. Inference, endpoint-metadata, and OAuth M2M transports
+also apply one absolute watchdog across DNS, connect, response headers, and
+body consumption, so a peer that continually dribbles bytes cannot extend an
+operation forever. These are client safety bounds, not endpoint latency
+measurements.
+
 ## Outcome populations
 
 These populations are not interchangeable:
 
 - HTTP status describes transport response status when observed.
 - A content stream means visible or reasoning content arrived.
-- An acceptable outcome means visible content or a structurally valid tool
-  call, clean stream completion, and no parse errors.
+- An acceptable outcome has no refusal marker and contains visible content or
+  a structurally valid tool call, clean stream completion, and no parse errors.
 - Semantic correctness is not measured.
 
 Primary answer-latency percentiles use acceptable outcomes when current answer
@@ -178,14 +221,47 @@ cheaper.
 Tool-call-only outcomes can be acceptable without first-visible-content
 timing. Their first tool-call timing is reported separately.
 
-HTTP 429 evidence uses only a valid integer `status` value from every sealed
-logical request row supplied to quota accounting. It does not infer status from
-error text. Preflight, explicit probe, sizing, calibration, and replay rows all
-contribute to the exact count, denominator, status-coverage count, and phase
-breakdown. Redacted response-body digests remain row evidence but do not split
-the stable 429 failure aggregate. Any 429 makes measurement validity invalid
-and endpoint capacity inconclusive; no 429 with complete coverage means only
-that a rejection was not observed, not that provider headroom exists.
+The SSE parser retains bounded response `model`, `object`, and
+`system_fingerprint` fields and SHA-256 of the response ID; the HTTP layer also
+retains bounded Databricks `served-model-name`. Conflicting values inside one
+stream are protocol errors. Across eligible HTTP 200 rows, multiple response
+models or a response model outside an explicit request-body model invalidates a
+single-model benchmark. Endpoint names are not expected OpenAI model values.
+Instead, `served-model-name` is bound to active control-plane served entities;
+an unexpected entity invalidates the result and incomplete binding is caution.
+
+After response drain, stability windows are computed from persisted replay
+rows using the same acceptable-outcome population as headline latency.
+Failures and unacceptable outcomes remain separate per-window errors. A
+failure-only window has zero event coverage and no latency percentile, so
+survivor p95 cannot hide shedding. Endpoint configuration stability is a
+separate pre-runner-target versus post-drain normalized control-plane-summary
+comparison.
+That summary is a selected subset: endpoint name, task, `route_optimized`,
+READY state, and selected active served-entity identity, foundation-model,
+workload/provisioning, version, and scale-to-zero fields. Changed subset
+metadata invalidates the single-configuration result; incomplete capture
+remains explicit uncertainty. Omitted control-plane fields and undocumented
+data-plane revisions are outside this comparison.
+
+HTTP 429 evidence uses only the valid integer terminal `status` captured on
+each supplied request-operation row. It does not infer status from error text.
+Preflight, explicit probe, sizing, calibration, and replay rows all contribute
+to the exact row count, denominator, status-coverage count, and phase
+breakdown. A row can contain multiple physical attempts, so this is not an
+attempt-by-attempt HTTP-status counter; attempt admission events and
+`request_attempts` remain separate evidence. Redacted response-body digests do
+not split the stable 429 failure aggregate. Any 429 makes measurement validity
+invalid and endpoint capacity inconclusive; no 429 with complete coverage
+means only that a rejection was not observed, not that provider headroom
+exists.
+
+Local runtime-admission evidence is separate from HTTP 429. A guard denial
+sends no physical `POST` for that attempt, permanently trips the command, and
+makes the requested-load measurement invalid and capacity inconclusive. Guard
+IDs, scope, sequence, reservations, transitions, run-local baseline/final
+snapshots, and physical-attempt counters must reconcile. Missing or conflicting
+evidence fails closed even if no HTTP 429 was captured.
 
 ## Pay-per-token planning boundary
 
@@ -206,10 +282,12 @@ future, invalid, or stale review evidence refuses with the same fail-closed
 policy as an unsafe schedule.
 
 The planner forecasts the harness in isolation. The complete serialized JSON
-request is bounded at one token per UTF-8 byte plus 64 chat-framing tokens per
-message and one additional 64-token request block. That includes roles,
-message metadata, model, tools, provider controls, and JSON syntax. Synthetic
-content also uses the larger of configured characters/token and the
+request uses an engineering bound of one token per UTF-8 byte plus a
+harness-defined 64-token allowance per message and one additional 64-token
+request allowance. Those constants are conservative harness assumptions, not a
+Databricks-published tokenizer or chat-framing contract. The bound includes
+roles, message metadata, model, tools, provider controls, and JSON syntax.
+Synthetic content also uses the larger of configured characters/token and the
 calibration hard maximum of 12, so post-authorization calibration cannot
 enlarge planned input demand. Output is the offered `max_tokens` reservation.
 Planning includes worst-case physical
@@ -219,8 +297,18 @@ and checks every exact requested rung and does not treat cooldown as proof of a
 quota-window reset. A peak at or above `warning_utilization`, or a required
 dimension that cannot be bounded, refuses paid inference.
 
-Endpoint binding verifies only facts present in the captured serving-endpoint
-document. The direct request route must name the configured model,
+The closed schema supports rolling
+`input_tokens_per_minute`, `output_tokens_per_minute`, `queries_per_hour`, and
+`queries_per_second` dimensions plus an inclusive integer
+`request_bytes_max` ceiling over the exact serialized body of each physical
+`POST`. The current Databricks limits page publishes a Foundation Model API
+workspace limit of 200 QPS and 4 MB per request. The bundled snapshot uses a
+conservative 4,000,000-byte ceiling because the source does not state a decimal
+or binary MB convention; these facts must still be rechecked live.
+
+Endpoint binding verifies only facts present in the captured normalized
+serving-endpoint summary. The direct request route must name the configured
+model,
 `route_optimized` must be exactly false, each active served entity must have the
 same name, and each must positively identify
 `foundation_model.name=system.ai.<rate_limits.model>`. Absence of provisioned
@@ -230,10 +318,22 @@ observed non-default response tier invalidates its comparison. Workspace tier
 and unrelated workspace traffic remain outside that evidence. Consequently,
 `may_start=true` never sets provider-headroom proof.
 
+The runtime guard enforces the same configured contract without waiting. Each
+physical attempt reserves query count, offered output, conservative input, and
+exact bytes atomically. Rolling totals must stay strictly below
+`limit * warning_utilization`; request bytes may equal `request_bytes_max`.
+Reservations remain provisional until the client can prove the `POST` did not
+start (release) or observes response headers/ambiguous transport outcome
+(conservative commit). A denial or internal state/clock uncertainty permanently
+trips the guard. Shards receive deterministic static partitions of each
+integer warning budget. The guard covers one harness command only and cannot
+observe unrelated workspace traffic or provider burst state.
+
 ## Retry model
 
-The configured transport retry count defaults to zero. Connection and request
-attempt counters show whether a physical `POST` was attempted. When a
+The configured transport retry count is an integer from 0 through 2 and
+defaults to zero. Connection and request attempt counters show whether a
+physical `POST` was attempted. When a
 configured transport retry occurs, `retry_reasons` distinguishes a connection
 failure before `POST` from a transport error after a possible `POST`; the
 latter can duplicate inference and billing. A final failure that is not
@@ -269,10 +369,44 @@ attempts are not known.
 
 ## Evidence model
 
+### Exact-analysis resource envelope
+
+The current analyzer computes exact percentiles from materialized request
+records, so one run is limited to **50,000 logical rows total** across replay,
+calibration, concurrency-sizing probes, and carried command setup traffic. A
+sweep applies the same 50,000-row limit to the cumulative population of every
+rung, and merge applies it to the combined input population. Fixed schedules,
+timestamp traces, and sizing ceilings are counted before credential lookup,
+control-plane access, preflight, or inference traffic. Exceeding the limit is
+a refusal, not sampling. Raising it requires bounded-memory streaming
+statistics and new resource tests.
+
+Generated CLI sizing configs reserve setup, calibration, and sizing-probe rows
+first. Their QPS ceiling uses the remaining replay budget with eight Poisson
+standard deviations of headroom; prevalidation then counts the actual seeded
+schedule and still refuses any overage. Shorter duration or an explicit
+fixed-rate workload within the envelope is the supported escape path.
+
+Input and artifact bounds are part of that contract: profiles and timestamp
+traces are at most 16 MiB, prompt inputs at most 64 MiB, one decoded prompt or
+prompt-JSONL line at most 4 MiB, and one timestamp line at most 64 KiB.
+Manifest-bound metadata artifacts are at most 16 MiB. A request journal is at
+most 256 MiB, 50,000 rows, and 256 KiB per JSONL row. These readers require a
+stable regular file, reject symlinks and special files, and detect replacement,
+growth, or truncation while reading.
+
 `start.json` is the pre-traffic and in-progress provenance record. It includes
 redacted effective configuration, workload/input digests, source identity,
 logical/execution/artifact IDs, target evidence when available, exact schedule
-and shard identities, and calibration results.
+and shard identities, calibration results, runtime-guard baseline/final state,
+and pre/post-drain endpoint metadata stability when captured.
+
+High-level preflight/probe traffic has its own standard manifest-v3 setup
+artifact. Its active journal syncs every completed row rather than every 16.
+The sealed summary explicitly sets performance, SLA, and capacity result flags
+false. A passing command duplicates those metadata-only rows into the measured
+artifact exactly once so that artifact's quota population is complete; the
+setup artifact remains the crash/refusal-visible evidence boundary.
 
 Generated rerun configs retain durable external input paths and a closed
 `input_expectations` map of SHA-256 plus byte count. The manifest-bound run
@@ -320,6 +454,12 @@ retained acceptance pass is qualified when measurement validity is not
 `VALID`. Endpoint capacity
 can say only held/not-held at a verified, bound test point; the model never
 sets endpoint-ceiling or provider-headroom proof.
+
+Response identity, the normalized pre-run/post-drain endpoint-stability
+comparison, and runtime-admission reconciliation are evidence gates rather
+than additional canonical decisions. Identity and stability feed measurement
+validity; admission feeds quota state and measurement validity. The canonical
+object remains exactly the five dimensions above.
 
 Stored run reports use evidence state `VERIFY_REQUIRED`. A summary cannot
 authenticate the future manifest that will contain its own bytes, so integrity

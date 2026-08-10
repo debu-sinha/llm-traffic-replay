@@ -15,6 +15,12 @@ from typing import Iterable, Iterator
 
 from .json_input import loads_strict
 
+_MAX_CHOICES_PER_EVENT = 16
+_MAX_TOOL_CALLS_PER_EVENT = 128
+_MAX_TOOL_CALL_KEYS = 256
+_MAX_TOOL_FRAGMENT_CHARS = 1024 * 1024
+_MAX_IDENTITY_FIELD_CHARS = 512
+
 
 @dataclass
 class StreamState:
@@ -24,6 +30,7 @@ class StreamState:
     saw_first_tool_call: bool = False     # first tool/function-call delta
     content_chunks: int = 0
     reasoning_chunks: int = 0             # count of reasoning-channel deltas
+    refusal_chunks: int = 0
     tool_call_chunks: int = 0
     valid_tool_calls: int = 0
     finish_reason: str | None = None
@@ -31,6 +38,17 @@ class StreamState:
     service_tier: str | None = None
     done: bool = False
     errors: list[str] = field(default_factory=list)
+    saw_refusal: bool = False
+    response_content_type: str | None = None
+    # Databricks identifies the actually routed served entity in the
+    # ``served-model-name`` HTTP response header.  It is distinct from the
+    # OpenAI ``model`` field in SSE payloads (custom endpoints often expose an
+    # underlying model name there).
+    served_model_name: str | None = None
+    response_model: str | None = None
+    response_id: str | None = None
+    response_object: str | None = None
+    system_fingerprint: str | None = None
     _tool_names: dict[tuple[int, int], list[str]] = field(
         default_factory=dict, repr=False)
     _tool_arguments: dict[tuple[int, int], list[str]] = field(
@@ -41,6 +59,10 @@ class StreamState:
     _conflicting_usage_reported: bool = field(default=False, repr=False)
     _conflicting_service_tier_reported: bool = field(
         default=False, repr=False)
+    _conflicting_identity_fields: set[str] = field(
+        default_factory=set, repr=False)
+    _tool_fragment_chars: int = field(default=0, repr=False)
+    _tool_limit_reported: bool = field(default=False, repr=False)
 
 
 def _safe_parse_error(kind: str, payload: str | bytes) -> dict:
@@ -394,6 +416,11 @@ def _update_tool_calls(state: StreamState, value: object,
         state.errors.append(
             f"stream choice {choice_index} tool call must be an object or list")
         return False
+    if len(items) > _MAX_TOOL_CALLS_PER_EVENT:
+        state.errors.append(
+            "stream event exceeded the tool-call count safety limit "
+            f"({_MAX_TOOL_CALLS_PER_EVENT})")
+        items = items[:_MAX_TOOL_CALLS_PER_EVENT]
     meaningful = False
     for position, item in enumerate(items):
         if not isinstance(item, dict):
@@ -408,6 +435,14 @@ def _update_tool_calls(state: StreamState, value: object,
                 "non-negative integer")
             continue
         call_key = (choice_index, index)
+        known_keys = set(state._tool_names) | set(state._tool_arguments)
+        if call_key not in known_keys and len(known_keys) >= _MAX_TOOL_CALL_KEYS:
+            if not state._tool_limit_reported:
+                state.errors.append(
+                    "stream exceeded the distinct tool-call safety limit "
+                    f"({_MAX_TOOL_CALL_KEYS})")
+                state._tool_limit_reported = True
+            continue
         function = item if legacy else item.get("function")
         fragment = False
         for metadata in ("id", "type"):
@@ -432,8 +467,18 @@ def _update_tool_calls(state: StreamState, value: object,
                             f"stream choice {choice_index} tool call name "
                             "must be a string")
                     elif name:
-                        state._tool_names.setdefault(call_key, []).append(name)
-                        fragment = True
+                        if state._tool_fragment_chars + len(name) \
+                                > _MAX_TOOL_FRAGMENT_CHARS:
+                            if not state._tool_limit_reported:
+                                state.errors.append(
+                                    "stream exceeded the cumulative tool "
+                                    "fragment safety limit")
+                                state._tool_limit_reported = True
+                        else:
+                            state._tool_fragment_chars += len(name)
+                            state._tool_names.setdefault(call_key, []).append(
+                                name)
+                            fragment = True
                 if "arguments" in function:
                     arguments = function["arguments"]
                     if not isinstance(arguments, str):
@@ -441,9 +486,18 @@ def _update_tool_calls(state: StreamState, value: object,
                             f"stream choice {choice_index} tool call arguments "
                             "must be a string")
                     else:
-                        state._tool_arguments.setdefault(call_key, []).append(
-                            arguments)
-                        fragment = True
+                        if state._tool_fragment_chars + len(arguments) \
+                                > _MAX_TOOL_FRAGMENT_CHARS:
+                            if not state._tool_limit_reported:
+                                state.errors.append(
+                                    "stream exceeded the cumulative tool "
+                                    "fragment safety limit")
+                                state._tool_limit_reported = True
+                        else:
+                            state._tool_fragment_chars += len(arguments)
+                            state._tool_arguments.setdefault(
+                                call_key, []).append(arguments)
+                            fragment = True
         if not fragment:
             state.errors.append(
                 f"stream choice {choice_index} tool call {position} was empty")
@@ -507,6 +561,47 @@ def update_state(state: StreamState, event: object) -> bool:
         state.errors.append(event["__parse_error__"])
         return False
 
+    for wire_key, attr in (
+            ("model", "response_model"),
+            ("id", "response_id"),
+            ("object", "response_object"),
+            ("system_fingerprint", "system_fingerprint")):
+        if wire_key not in event or event[wire_key] is None:
+            continue
+        value = event[wire_key]
+        if not isinstance(value, str) or not value.strip():
+            state.errors.append(
+                f"stream event {wire_key} must be a non-empty string or null")
+            continue
+        if len(value) > _MAX_IDENTITY_FIELD_CHARS:
+            state.errors.append(
+                f"stream event {wire_key} exceeded the "
+                f"{_MAX_IDENTITY_FIELD_CHARS}-character safety limit")
+            continue
+        try:
+            value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            # JSON permits escaped lone UTF-16 surrogates, but they are not
+            # Unicode scalar values and cannot be encoded as UTF-8. Identity
+            # fields are later hashed/persisted, so reject them here as
+            # response protocol errors instead of allowing _finish() to raise
+            # and lose the request row.
+            state.errors.append(
+                f"stream event {wire_key} contained a lone Unicode surrogate")
+            continue
+        if wire_key == "object" and value != "chat.completion.chunk":
+            state.errors.append(
+                "stream event object was not chat.completion.chunk")
+            continue
+        previous = getattr(state, attr)
+        if previous is None:
+            setattr(state, attr, value)
+        elif previous != value and wire_key not in \
+                state._conflicting_identity_fields:
+            state.errors.append(
+                f"stream reported conflicting {wire_key} values")
+            state._conflicting_identity_fields.add(wire_key)
+
     if "service_tier" in event:
         service_tier = event["service_tier"]
         if not isinstance(service_tier, str) or not service_tier.strip():
@@ -514,13 +609,29 @@ def update_state(state: StreamState, event: object) -> bool:
                     not in state.errors:
                 state.errors.append(
                     "stream event service_tier must be a non-empty string")
-        elif state.service_tier is None:
-            state.service_tier = service_tier
-        elif service_tier != state.service_tier \
-                and not state._conflicting_service_tier_reported:
-            state.errors.append(
-                "stream reported conflicting service_tier values")
-            state._conflicting_service_tier_reported = True
+        elif len(service_tier) > _MAX_IDENTITY_FIELD_CHARS:
+            detail = (
+                "stream event service_tier exceeded the "
+                f"{_MAX_IDENTITY_FIELD_CHARS}-character safety limit")
+            if detail not in state.errors:
+                state.errors.append(detail)
+        else:
+            try:
+                service_tier.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                detail = (
+                    "stream event service_tier contained a lone Unicode "
+                    "surrogate")
+                if detail not in state.errors:
+                    state.errors.append(detail)
+            else:
+                if state.service_tier is None:
+                    state.service_tier = service_tier
+                elif service_tier != state.service_tier \
+                        and not state._conflicting_service_tier_reported:
+                    state.errors.append(
+                        "stream reported conflicting service_tier values")
+                    state._conflicting_service_tier_reported = True
 
     choices = event.get("choices")
     if choices is None:
@@ -528,6 +639,11 @@ def update_state(state: StreamState, event: object) -> bool:
     elif not isinstance(choices, list):
         state.errors.append("stream event choices must be a list")
         choices = []
+    elif len(choices) > _MAX_CHOICES_PER_EVENT:
+        state.errors.append(
+            "stream event exceeded the choice count safety limit "
+            f"({_MAX_CHOICES_PER_EVENT})")
+        choices = choices[:_MAX_CHOICES_PER_EVENT]
 
     first_content = False
     for position, choice in enumerate(choices):
@@ -559,21 +675,29 @@ def update_state(state: StreamState, event: object) -> bool:
             delta = {}
         visible = delta.get("content")
         reasoning = delta.get("reasoning_content")
+        refusal = delta.get("refusal")
         tool_call = delta.get("tool_calls") or delta.get("function_call")
         has_visible_delta = _nonempty_delta(visible)
         has_reasoning_delta = _nonempty_delta(reasoning)
+        has_refusal_delta = _nonempty_delta(refusal)
         has_tool_call_delta = (
             _update_tool_calls(state, tool_call, choice_index)
             if tool_call is not None else False)
-        if has_visible_delta or has_reasoning_delta:
+        if has_visible_delta or has_reasoning_delta or has_refusal_delta:
             state.content_chunks += 1
             if not state.saw_first_content:
                 state.saw_first_content = True
                 first_content = True
         if has_reasoning_delta:
             state.reasoning_chunks += 1
+        if has_refusal_delta:
+            state.refusal_chunks += 1
+            state.saw_refusal = True
         if has_reasoning_delta and not state.saw_first_reasoning:
             state.saw_first_reasoning = True
+        # A model refusal is an observable response onset, but it is not
+        # visible assistant answer content. Keep it in first-content/refusal
+        # evidence without letting it satisfy TTFV or answer visibility.
         if _meaningful_text(visible) and not state.saw_first_visible:
             state.saw_first_visible = True
         if has_tool_call_delta:
@@ -581,13 +705,25 @@ def update_state(state: StreamState, event: object) -> bool:
             state.saw_first_tool_call = True
         fr = choice.get("finish_reason")
         if isinstance(fr, str) and fr:
-            if state.finish_reason is None:
-                state.finish_reason = fr
-            elif fr != state.finish_reason \
-                    and not state._conflicting_finish_reported:
+            if len(fr) > _MAX_IDENTITY_FIELD_CHARS:
                 state.errors.append(
-                    "stream reported conflicting finish_reason values")
-                state._conflicting_finish_reported = True
+                    f"stream choice {choice_index} finish_reason exceeded "
+                    f"the {_MAX_IDENTITY_FIELD_CHARS}-character safety limit")
+            else:
+                try:
+                    fr.encode("utf-8", errors="strict")
+                except UnicodeEncodeError:
+                    state.errors.append(
+                        f"stream choice {choice_index} finish_reason "
+                        "contained a lone Unicode surrogate")
+                else:
+                    if state.finish_reason is None:
+                        state.finish_reason = fr
+                    elif fr != state.finish_reason \
+                            and not state._conflicting_finish_reported:
+                        state.errors.append(
+                            "stream reported conflicting finish_reason values")
+                        state._conflicting_finish_reported = True
         elif fr is not None:
             state.errors.append(
                 f"stream choice {choice_index} finish_reason must be a string")

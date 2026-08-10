@@ -83,6 +83,12 @@ def validate_acceptance_targets(value: Any, where: str =
     if "success_rate" in value:
         _number(value["success_rate"], f"{where}.success_rate",
                 positive=True, maximum=1.0)
+        if float(value["success_rate"]) >= 1.0:
+            raise ValueError(
+                f"{where}.success_rate must be less than 1.0; a finite "
+                "sample can demonstrate a high reliability target with a "
+                "one-sided confidence bound, but can never prove a true "
+                "100% success probability")
     if "interchunk_ms" in value:
         _number(value["interchunk_ms"], f"{where}.interchunk_ms",
                 positive=True)
@@ -132,7 +138,8 @@ def validate_rate_limits(value: Any, where: str = "rate_limits") -> None:
         raise ValueError(f"{where} must be an object")
     allowed = {
         "input_tokens_per_minute", "output_tokens_per_minute",
-        "queries_per_hour", "warning_utilization", "source", "as_of",
+        "queries_per_hour", "queries_per_second", "request_bytes_max",
+        "warning_utilization", "source", "as_of",
         "scope", "note", "provider", "deployment_mode", "workspace_tier",
         "model", "accounting_model", "verified_at", "max_age_days",
     }
@@ -140,15 +147,23 @@ def validate_rate_limits(value: Any, where: str = "rate_limits") -> None:
     limits = {
         name: value[name]
         for name in ("input_tokens_per_minute", "output_tokens_per_minute",
-                     "queries_per_hour")
+                     "queries_per_hour", "queries_per_second",
+                     "request_bytes_max")
         if name in value
     }
     if not limits:
         raise ValueError(
             f"{where} needs input_tokens_per_minute, "
-            "output_tokens_per_minute, or queries_per_hour")
+            "output_tokens_per_minute, queries_per_hour, "
+            "queries_per_second, or request_bytes_max")
     for name, limit in limits.items():
         _number(limit, f"{where}.{name}", positive=True)
+    if "request_bytes_max" in value and (
+            isinstance(value["request_bytes_max"], bool)
+            or not isinstance(value["request_bytes_max"], int)):
+        raise ValueError(
+            f"{where}.request_bytes_max must be a positive integer byte "
+            "count")
     if "warning_utilization" not in value:
         raise ValueError(f"{where}.warning_utilization is required")
     _number(value["warning_utilization"],
@@ -199,6 +214,9 @@ def validate_rate_limits(value: Any, where: str = "rate_limits") -> None:
             raise ValueError(f"{where}.verified_at must be YYYY-MM-DD")
         if verified_date > date.today():
             raise ValueError(f"{where}.verified_at cannot be in the future")
+        if verified_date < parsed:
+            raise ValueError(
+                f"{where}.verified_at cannot be earlier than as_of")
         max_age = value["max_age_days"]
         if isinstance(max_age, bool) or not isinstance(max_age, int) \
                 or max_age <= 0:

@@ -21,7 +21,6 @@ import json
 import os
 import re
 import stat
-import subprocess
 import threading
 import time
 import urllib.parse
@@ -29,6 +28,10 @@ import uuid
 from pathlib import Path
 from typing import Iterator
 
+from ._build_provenance import (
+    build_provenance_for_source,
+    source_inventory,
+)
 from .json_input import json_error_detail, loads_strict
 
 
@@ -43,8 +46,9 @@ class ArtifactError(RuntimeError):
 
 
 _SECRET_EXACT = {
-    "authorization", "proxyauthorization", "apikey", "xapikey",
+    "authorization", "proxyauthorization", "auth", "apikey", "xapikey",
     "accesskey", "secretkey", "clientsecret", "password", "passwd",
+    "secret",
     "credential", "credentials", "cookie", "setcookie", "token",
     "accesstoken", "authtoken", "bearertoken", "refreshtoken", "idtoken",
     "jwt", "assertion", "clientassertion", "signature", "sig", "sas",
@@ -53,6 +57,7 @@ _SECRET_EXACT = {
 }
 _SECRET_SUFFIXES = (
     "apikey", "accesskey", "secretkey", "clientsecret", "password",
+    "secret",
     "credential", "credentials", "accesstoken", "authtoken",
     "bearertoken", "refreshtoken", "idtoken", "clientassertion",
     "privatekey", "sharedaccesssignature", "signature", "sastoken",
@@ -364,34 +369,21 @@ def _regular_metadata(path: Path, *, row_count: int | None = None) -> dict:
 def snapshot_source_state(package_dir: str | Path) -> dict:
     """Snapshot source bytes and Git identity before the output tree exists."""
     root = Path(package_dir).resolve()
-    digest = hashlib.sha256()
-    files = []
-    for path in sorted(root.rglob("*.py")):
-        if not path.is_file() or path.is_symlink():
-            continue
-        raw = path.read_bytes()
-        rel = path.relative_to(root).as_posix()
-        digest.update(rel.encode("utf-8") + b"\0" + raw + b"\0")
-        files.append({"path": rel, "sha256": sha256_bytes(raw), "bytes": len(raw)})
-
-    def git(*args):
-        try:
-            result = subprocess.run(
-                ["git", *args], cwd=root, capture_output=True, timeout=10)
-        except Exception:
-            return None
-        return (result.stdout.decode("utf-8", "replace").strip()
-                if result.returncode == 0 else None)
-
-    status = git("status", "--porcelain=v1", "--untracked-files=all")
+    tree, files = source_inventory(root)
+    provenance, origin, error = build_provenance_for_source(root, root)
+    trusted = origin in {"git", "embedded_build"}
     return {
         "captured_at_unix": time.time(),
-        "git_commit": git("rev-parse", "HEAD"),
-        "git_dirty": bool(status) if status is not None else None,
-        "git_status_sha256": (sha256_bytes(status.encode("utf-8"))
-                               if status is not None else None),
-        "source_tree_sha256": digest.hexdigest(),
+        "git_commit": provenance.get("git_commit") if trusted else None,
+        "git_dirty": provenance.get("git_dirty") if trusted else None,
+        "git_status_sha256": (
+            provenance.get("git_status_sha256") if trusted else None),
+        "source_tree_sha256": tree,
         "source_files": files,
+        "package_version": provenance.get("package_version"),
+        "build_id": provenance.get("build_id") if trusted else None,
+        "source_identity_origin": origin,
+        "embedded_provenance_error": error,
     }
 
 

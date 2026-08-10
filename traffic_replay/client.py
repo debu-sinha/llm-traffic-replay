@@ -8,8 +8,9 @@ the client kept up (see runner.py / metrics.py).
 
 Timing definitions, used consistently everywhere:
   t_send           immediately before ``conn.request``; includes upload
-  ttfb_ms          first iterated response-body/SSE line (not first byte)
-  ttft_ms          first visible or reasoning content delta; excludes tools
+  ttfb_ms          first bounded response-body chunk returned by read1
+                    (not necessarily the first response byte)
+  ttft_ms          first visible, reasoning, or refusal delta; excludes tools
   e2e_ms           stream finished ([DONE] or final chunk)
 
 Usage (prompt/completion/cached token counts) is read from the endpoint's
@@ -24,6 +25,7 @@ import http.client
 import ipaddress
 import json
 import math
+import copy
 import socket
 import ssl
 import threading
@@ -35,11 +37,19 @@ from dataclasses import dataclass, asdict, field
 
 from .sse import (StreamState, extract_usage, finalize_tool_calls,
                   iter_sse_events, update_state)
+from .network import bind_deadline_bounded_dns
 
 
 _MAX_PHYSICAL_RETRIES = 2
 _OUTPUT_BUDGET_ALIASES = (
     "max_completion_tokens", "max_output_tokens", "max_new_tokens")
+_BEARER_TOKEN_MAX_BYTES = 64 * 1024
+_STREAM_READ_CHUNK_BYTES = 64 * 1024
+_MAX_STREAM_BYTES = 16 * 1024 * 1024
+_MAX_STREAM_EVENTS = 100_000
+_MAX_STREAM_ERRORS = 64
+_MAX_RESPONSE_IDENTITY_FIELD_CHARS = 512
+_FRESH_HTTP1_CONNECTION_POLICY = "fresh_http1_per_physical_attempt"
 
 
 def validate_extra_body_safety(value: dict | None) -> None:
@@ -87,14 +97,21 @@ class EndpointConfig:
     max_retries: int = 0             # physical inference retries; 0-2 only
     include_usage: bool = True       # request streamed usage when supported
     extra_body: dict | None = None   # passthrough request params (see _body)
+    # Optional declaration of the real application's connection behavior.
+    # Capacity conclusions are qualified unless production uses this tool's
+    # exact transport contract. A closed enum prevents a vague "equivalent"
+    # assertion from silently clearing that gate.
+    production_connection_policy: str | None = None
 
     def __post_init__(self) -> None:
         normalized_origin(self.base_url)
         if not isinstance(self.path, str) or not self.path.startswith("/") \
                 or self.path.startswith("//"):
             raise ValueError("endpoint path must start with one / character")
-        if any(char in self.path for char in ("\r", "\n", "\x00")):
-            raise ValueError("endpoint path must not contain control characters")
+        if any(ord(char) < 0x21 or ord(char) > 0x7e for char in self.path):
+            raise ValueError(
+                "endpoint path must contain printable ASCII without spaces "
+                "or control characters")
         if urllib.parse.urlsplit(self.path).fragment:
             raise ValueError("endpoint path must not contain a URL fragment")
         from .artifacts import redact_secrets
@@ -105,6 +122,24 @@ class EndpointConfig:
         if self.model is not None \
                 and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("endpoint model must be a non-empty string")
+        if not isinstance(self.auth_token_env, str) \
+                or not self.auth_token_env \
+                or not (self.auth_token_env[0].isalpha()
+                        or self.auth_token_env[0] == "_") \
+                or not all(char.isascii() and (char.isalnum() or char == "_")
+                           for char in self.auth_token_env):
+            raise ValueError(
+                "endpoint auth_token_env must be a valid environment "
+                "variable name")
+        if self.auth_profile is not None and (
+                not isinstance(self.auth_profile, str)
+                or not self.auth_profile.strip()
+                or self.auth_profile != self.auth_profile.strip()
+                or any(ord(char) < 0x21 or ord(char) > 0x7e
+                       for char in self.auth_profile)):
+            raise ValueError(
+                "endpoint auth_profile must be non-empty printable ASCII "
+                "without surrounding whitespace")
         for name, value in (("connect_timeout_s", self.connect_timeout_s),
                             ("read_timeout_s", self.read_timeout_s),
                             ("total_timeout_s", self.total_timeout_s)):
@@ -124,6 +159,11 @@ class EndpointConfig:
                 "quota, and can bias a load test")
         if not isinstance(self.include_usage, bool):
             raise ValueError("endpoint include_usage must be boolean")
+        if self.production_connection_policy not in (
+                None, _FRESH_HTTP1_CONNECTION_POLICY):
+            raise ValueError(
+                "endpoint production_connection_policy must be null or "
+                f"{_FRESH_HTTP1_CONNECTION_POLICY!r}")
         validate_extra_body_safety(self.extra_body)
         if self.extra_body is not None:
             aliases = [
@@ -187,7 +227,10 @@ class RequestResult:
     ok: bool
     error: str | None
     content_chunks: int
-    interchunk_max_ms: float | None   # widest gap between content chunks
+    # Widest gap between SSE content-delta events (visible, reasoning, or
+    # refusal). This is chunk pacing, not token-level inter-token latency;
+    # tool-call-only fragments are excluded.
+    interchunk_max_ms: float | None
     finish_reason: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
@@ -232,6 +275,17 @@ class RequestResult:
     tool_call_chunks: int = 0
     ttf_tool_call_ms: float | None = None
     valid_tool_calls: int = 0
+    refusal_seen: bool = False
+    refusal_chunks: int = 0
+    response_content_type: str | None = None
+    served_model_name: str | None = None
+    response_model: str | None = None
+    response_object: str | None = None
+    response_id_sha256: str | None = None
+    system_fingerprint: str | None = None
+    quota_guard_id: str | None = None
+    quota_guard_denied: bool = False
+    quota_guard_events: list[dict] = field(default_factory=list)
     # Exact caller-experienced clocks, measured from the runner's monotonic
     # scheduled target. These include pool wait, connection setup, and every
     # automatic retry/fallback. They are intentionally separate from the
@@ -242,6 +296,9 @@ class RequestResult:
     caller_ttfr_ms: float | None = None
     caller_ttfv_ms: float | None = None
     caller_ttf_tool_call_ms: float | None = None
+    # Scheduled target to the first conn.request invocation. Request-body
+    # upload completion and endpoint receipt are not observed.
+    caller_send_ms: float | None = None
     caller_e2e_ms: float | None = None
     # Exact wall-clock completion for every worker result, including HTTP and
     # transport failures. This closes the interval started by first_send_unix
@@ -256,6 +313,27 @@ class UnsafeBearerTransport(ValueError):
     """A bearer credential would cross an untrusted cleartext transport."""
 
 
+def validate_bearer_token(value: object, *, source: str) -> str:
+    """Return one header-safe bearer token without echoing credential bytes."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{source} did not provide a non-empty access token")
+    try:
+        encoded = value.encode("ascii", errors="strict")
+    except UnicodeEncodeError:
+        raise ValueError(
+            f"{source} returned a bearer token with non-ASCII characters") \
+            from None
+    if len(encoded) > _BEARER_TOKEN_MAX_BYTES:
+        raise ValueError(
+            f"{source} returned an oversized bearer token "
+            f"(bytes={len(encoded)})")
+    if any(byte < 0x21 or byte > 0x7e for byte in encoded):
+        raise ValueError(
+            f"{source} returned a bearer token with unsafe whitespace or "
+            "control characters")
+    return value
+
+
 class _RequestDeadlineExceeded(TimeoutError):
     """The absolute per-request deadline expired."""
 
@@ -268,9 +346,14 @@ def normalized_origin(value: str) -> tuple[str, str, int]:
     rejected because it makes security-sensitive URL review needlessly
     ambiguous (and is never needed for a serving endpoint).
     """
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         raise ValueError("endpoint base_url must be a non-empty URL")
-    u = urllib.parse.urlsplit(value.strip())
+    if value != value.strip() or any(
+            ord(char) < 0x21 or ord(char) > 0x7e for char in value):
+        raise ValueError(
+            "endpoint base_url must contain printable ASCII without spaces "
+            "or control characters")
+    u = urllib.parse.urlsplit(value)
     scheme = u.scheme.lower()
     if scheme not in ("http", "https"):
         raise ValueError("endpoint base_url must use an explicit http or https scheme")
@@ -357,7 +440,8 @@ def _credential_may_be_expired(status: int, body: bytes) -> bool:
 
 class EndpointClient:
     def __init__(self, cfg: EndpointConfig, token: str | None,
-                 refresh: Callable[[], str | None] | None = None):
+                 refresh: Callable[[], str | None] | None = None,
+                 runtime_quota_guard=None):
         """`refresh` returns a fresh token, or None if it cannot.
 
         An OAuth token is minted once and a load test can outlive it. When
@@ -366,14 +450,33 @@ class EndpointClient:
         misleading one. Measured for real: a 90 second run lost 171 of 281
         requests to `http 403: Invalid Token`.
         """
-        if token is not None and (not isinstance(token, str) or not token):
-            raise ValueError("bearer token must be a non-empty string")
+        if token is not None:
+            token = validate_bearer_token(token, source="initial credential")
         self.cfg = cfg
         self.token = token
         self._refresh = refresh
+        if runtime_quota_guard is not None:
+            required = (
+                "reserve", "mark_post_may_have_started", "commit",
+                "cancel_before_post", "snapshot")
+            missing = [name for name in required
+                       if not callable(getattr(runtime_quota_guard, name, None))]
+            if missing:
+                raise TypeError(
+                    "runtime_quota_guard is missing method(s): "
+                    + ", ".join(missing))
+        self.runtime_quota_guard = runtime_quota_guard
         self._lock = threading.Lock()
+        self._refresh_condition = threading.Condition(self._lock)
+        self._refresh_inflight_for: str | None = None
+        self._refresh_failed_for: str | None = None
+        self._refresh_failure_error: str | None = None
         self._active_connections_lock = threading.Lock()
-        self._active_connections: dict[int, object] = {}
+        self._deadline_condition = threading.Condition(
+            self._active_connections_lock)
+        self._active_connections: dict[
+            int, tuple[object, float | None, threading.Event | None]] = {}
+        self._deadline_thread_started = False
         self.scheme, self.host, self.port = normalized_origin(cfg.base_url)
         # A refresh callback means this is a bearer-auth flow even when the
         # initial token is absent or expired. Reject its transport before the
@@ -384,6 +487,105 @@ class EndpointClient:
         self._include_usage_supported: bool | None = (
             None if cfg.include_usage else False)  # learned or explicitly off
 
+    def transport_contract(self) -> dict:
+        """Public, artifact-safe description of this client's wire behavior."""
+        with self._lock:
+            include_usage_state = self._include_usage_supported
+        actual_policy = _FRESH_HTTP1_CONNECTION_POLICY
+        declared_policy = self.cfg.production_connection_policy
+        production_match = declared_policy == actual_policy
+        warning = None if production_match else (
+            "production connection behavior was not declared to match this "
+            "fresh-connection HTTP/1.1 client. Fresh connections add "
+            "DNS/TCP/TLS pressure and do not reproduce a pooled keep-alive "
+            "or HTTP/2 client; transport-limited capacity is inconclusive")
+        return {
+            "implementation": "python_stdlib_http_client",
+            "http_protocol": "HTTP/1.1",
+            "connection_reuse": False,
+            "connection_policy": "fresh connection per physical attempt",
+            "connection_policy_id": actual_policy,
+            "http2": False,
+            "production_connection_policy_declared": declared_policy,
+            "production_connection_policy_match": production_match,
+            "production_connection_policy_assurance": (
+                "operator asserted that the production application opens a "
+                "fresh HTTP/1.1 connection for every physical attempt; the "
+                "harness recorded the assertion but did not observe the "
+                "production client"
+                if production_match else None),
+            "production_comparability_warning": warning,
+            "connect_timeout_s": float(self.cfg.connect_timeout_s),
+            "read_idle_timeout_s": float(self.cfg.read_timeout_s),
+            "absolute_request_timeout_s": float(self.cfg.total_timeout_s),
+            "stream_read_chunk_bytes": _STREAM_READ_CHUNK_BYTES,
+            "max_stream_bytes": _MAX_STREAM_BYTES,
+            "max_stream_events": _MAX_STREAM_EVENTS,
+            "max_stream_validation_errors": _MAX_STREAM_ERRORS,
+            "required_success_content_type": "text/event-stream",
+            "include_usage_configured": self.cfg.include_usage,
+            "include_usage_support_state": include_usage_state,
+        }
+
+    def _refresh_after_rejection(
+            self, rejected_token: str | None,
+            deadline_monotonic: float) -> tuple[bool, str | None]:
+        """Single-flight a refresh and wait no longer than this request.
+
+        The refresh provider may itself be a blocking CLI or HTTP operation.
+        It therefore runs in one daemon thread while request workers wait on a
+        condition bounded by their own absolute deadlines. A failed refresh is
+        cached for the rejected token generation so a burst of 401s cannot
+        serialize the same doomed operation hundreds of times.
+        """
+        if self._refresh is None:
+            return False, None
+
+        def refresh_worker() -> None:
+            fresh = None
+            error = None
+            try:
+                fresh = self._refresh()
+                if fresh is not None:
+                    fresh = validate_bearer_token(
+                        fresh, source="credential refresh")
+                    validate_bearer_transport(self.cfg.base_url)
+                if not fresh or fresh == rejected_token:
+                    error = "credential refresh did not replace rejected token"
+            except Exception as exc:
+                error = f"credential refresh failed: {type(exc).__name__}"
+                fresh = None
+            with self._refresh_condition:
+                if (fresh and self.token == rejected_token
+                        and self._refresh_inflight_for == rejected_token):
+                    self.token = fresh
+                    self._refresh_failed_for = None
+                    self._refresh_failure_error = None
+                elif self.token == rejected_token:
+                    self._refresh_failed_for = rejected_token
+                    self._refresh_failure_error = error or \
+                        "credential refresh failed"
+                self._refresh_inflight_for = None
+                self._refresh_condition.notify_all()
+
+        with self._refresh_condition:
+            while True:
+                if self.token != rejected_token:
+                    return True, None
+                if self._refresh_failed_for == rejected_token:
+                    return False, self._refresh_failure_error
+                if self._refresh_inflight_for is None:
+                    self._refresh_inflight_for = rejected_token
+                    threading.Thread(
+                        target=refresh_worker,
+                        name="traffic-replay-auth-refresh",
+                        daemon=True,
+                    ).start()
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise _RequestDeadlineExceeded
+                self._refresh_condition.wait(timeout=remaining)
+
     def _connect(self) -> http.client.HTTPConnection:
         if self.scheme == "https":
             return http.client.HTTPSConnection(
@@ -392,13 +594,76 @@ class EndpointClient:
         return http.client.HTTPConnection(
             self.host, self.port, timeout=self.cfg.connect_timeout_s)
 
-    def _register_connection(self, conn) -> None:
-        with self._active_connections_lock:
-            self._active_connections[id(conn)] = conn
+    def _deadline_loop(self) -> None:
+        """One watchdog interrupts every connection at its wall deadline."""
+        while True:
+            expired = []
+            with self._deadline_condition:
+                timed = [
+                    item for item in self._active_connections.values()
+                    if item[1] is not None]
+                if not timed:
+                    # Do not retain every short-lived EndpointClient forever
+                    # through an idle bound-method daemon. Registration and
+                    # this transition share the same lock, so a later lease
+                    # reliably starts a fresh monitor.
+                    self._deadline_thread_started = False
+                    return
+                now = time.monotonic()
+                next_deadline = min(float(item[1]) for item in timed)
+                if next_deadline > now:
+                    self._deadline_condition.wait(next_deadline - now)
+                    continue
+                for key, (conn, deadline, expired_event) in list(
+                        self._active_connections.items()):
+                    if deadline is not None and deadline <= now:
+                        if expired_event is not None:
+                            expired_event.set()
+                        # Revisit until shutdown actually succeeds. A socket
+                        # may exist while connect/TLS is still in a state where
+                        # shutdown returns ENOTCONN; swallowing that once and
+                        # clearing the deadline would strand the worker.
+                        self._active_connections[key] = (
+                            conn, now + 0.01, expired_event)
+                        if getattr(conn, "sock", None) is not None:
+                            expired.append((key, conn))
+            for key, conn in expired:
+                sock = getattr(conn, "sock", None)
+                interrupted = False
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                        interrupted = True
+                    except (AttributeError, OSError, ValueError):
+                        pass
+                if interrupted:
+                    with self._deadline_condition:
+                        current = self._active_connections.get(key)
+                        if current is not None and current[0] is conn:
+                            self._active_connections[key] = (
+                                conn, None, current[2])
+                            self._deadline_condition.notify_all()
+
+    def _register_connection(
+            self, conn, deadline_monotonic: float | None = None,
+            expired_event: threading.Event | None = None) -> None:
+        with self._deadline_condition:
+            self._active_connections[id(conn)] = (
+                conn, deadline_monotonic, expired_event)
+            if deadline_monotonic is not None \
+                    and not self._deadline_thread_started:
+                self._deadline_thread_started = True
+                threading.Thread(
+                    target=self._deadline_loop,
+                    name="traffic-replay-deadline-watchdog",
+                    daemon=True,
+                ).start()
+            self._deadline_condition.notify_all()
 
     def _discard_connection(self, conn) -> None:
-        with self._active_connections_lock:
+        with self._deadline_condition:
             self._active_connections.pop(id(conn), None)
+            self._deadline_condition.notify_all()
 
     def cancel_active_requests(self) -> int:
         """Best-effort interruption of sockets already blocked in I/O.
@@ -417,7 +682,7 @@ class EndpointClient:
         ``finally`` block.
         """
         with self._active_connections_lock:
-            active = list(self._active_connections.values())
+            active = [item[0] for item in self._active_connections.values()]
         for conn in active:
             sock = getattr(conn, "sock", None)
             if sock is not None:
@@ -447,7 +712,8 @@ class EndpointClient:
             -> RequestResult:
         """One request, fully measured. Never raises; errors land in result."""
         attempt = 0
-        include_usage = self._include_usage_supported is not False
+        with self._lock:
+            include_usage = self._include_usage_supported is not False
         last_err: str | None = None
         # Connection start and HTTP send are different events. In particular,
         # a DNS/TCP/TLS failure did not put a request on the wire and must not
@@ -463,12 +729,25 @@ class EndpointClient:
         caller_ttfb_ms = caller_ttft_ms = None
         caller_ttfr_ms = caller_ttfv_ms = None
         caller_ttf_tool_call_ms = None
+        caller_send_ms = None
+        quota_guard_events: list[dict] = []
+        quota_guard_denied = False
+        # These live outside the retry body so result construction can settle
+        # the current physical-attempt reservation before copying its event
+        # evidence.  Python evaluates a return value before running ``finally``;
+        # relying on the attempt's finally block alone would persist an event
+        # as provisional even though the guard committed it moments later.
+        quota_handle = None
+        quota_post_marked = False
         worker_started_unix = time.time()
         worker_started_monotonic = time.monotonic()
         deadline_monotonic = (
             worker_started_monotonic + float(self.cfg.total_timeout_s))
+        deadline_expired = threading.Event()
 
         def remaining_s(now: float | None = None) -> float:
+            if deadline_expired.is_set():
+                raise _RequestDeadlineExceeded
             if now is None:
                 now = time.monotonic()
             remaining = deadline_monotonic - now
@@ -505,7 +784,30 @@ class EndpointClient:
                 now = time.monotonic()
             return max((now - scheduled_monotonic) * 1000.0, 0.0)
 
+        def settle_quota_attempt() -> None:
+            if quota_handle is None:
+                return
+            try:
+                if quota_post_marked:
+                    # Idempotent after a response-header commit.  Otherwise
+                    # conn.request may have reached the provider, so retain
+                    # the reservation rather than manufacture quota headroom.
+                    self.runtime_quota_guard.commit(
+                        quota_handle,
+                        reason="attempt_ended_without_receipt_proof")
+                else:
+                    self.runtime_quota_guard.cancel_before_post(
+                        quota_handle, reason="attempt_ended_before_post")
+            except Exception:
+                # The guard records/trips on internal transition failures.
+                # Preserve the transport result; report validation will reject
+                # any nonterminal or otherwise inconsistent guard evidence.
+                pass
+
         def caller_kwargs() -> dict:
+            # Must precede the deep copy in _finish().  A return expression is
+            # evaluated before the surrounding attempt finally block runs.
+            settle_quota_attempt()
             return {
                 "scheduled_monotonic": scheduled_monotonic,
                 "queue_wait_ms": queue_wait_ms,
@@ -514,6 +816,12 @@ class EndpointClient:
                 "caller_ttfr_ms": caller_ttfr_ms,
                 "caller_ttfv_ms": caller_ttfv_ms,
                 "caller_ttf_tool_call_ms": caller_ttf_tool_call_ms,
+                "caller_send_ms": caller_send_ms,
+                "quota_guard_id": (
+                    getattr(self.runtime_quota_guard, "guard_id", None)
+                    if self.runtime_quota_guard is not None else None),
+                "quota_guard_denied": quota_guard_denied,
+                "quota_guard_events": quota_guard_events,
                 "worker_started_unix": worker_started_unix,
                 "worker_started_monotonic": worker_started_monotonic,
             }
@@ -560,7 +868,17 @@ class EndpointClient:
             response_status = None
             ttfb_ms = ttft_ms = ttfr_ms = ttfv_ms = None
             ttf_tool_call_ms = None
+            # These are caller-experienced clocks for the response produced
+            # by this physical attempt. Their origin stays the logical
+            # request's scheduled target, so retry delay is still included,
+            # but an event observed on a failed earlier stream must not be
+            # attached to the final response.
+            caller_ttfb_ms = caller_ttft_ms = None
+            caller_ttfr_ms = caller_ttfv_ms = None
+            caller_ttf_tool_call_ms = None
             interchunk_max = None
+            quota_handle = None
+            quota_post_marked = False
             try:
                 remaining_s()
                 try:
@@ -579,7 +897,16 @@ class EndpointClient:
                         retry_reasons=retry_reasons,
                         **caller_kwargs())
                 conn = self._connect()
-                self._register_connection(conn)
+                # ``socket`` timeouts begin only after DNS. Replace
+                # http.client's socket factory so resolution and TCP setup
+                # share the capped connect budget. The resolver helper is
+                # daemon-only and DNS-only: cancellation/deadline expiry can
+                # return this worker without permitting a late connection or
+                # POST when a blocked lookup eventually finishes.
+                bind_deadline_bounded_dns(
+                    conn, cancel_event=cancellation_event)
+                self._register_connection(
+                    conn, deadline_monotonic, deadline_expired)
                 connection_attempts += 1
                 if first_attempt_unix is None:
                     first_attempt_unix = time.time()
@@ -597,6 +924,8 @@ class EndpointClient:
                 if tok_used:
                     # Constructor validation covers the normal path. Recheck
                     # here as a defense against a caller mutating client.token.
+                    tok_used = validate_bearer_token(
+                        tok_used, source="active credential")
                     validate_bearer_transport(self.cfg.base_url)
                     headers["Authorization"] = f"Bearer {tok_used}"
 
@@ -610,6 +939,108 @@ class EndpointClient:
                 if is_cancelled():
                     return cancelled_result()
 
+                if self.runtime_quota_guard is not None:
+                    try:
+                        quota_handle = self.runtime_quota_guard.reserve(
+                            body=body,
+                            message_count=len(messages),
+                            max_tokens=int(max_tokens),
+                            request_id=request_id,
+                            attempt_ordinal=request_attempts + 1,
+                            retry_trigger=(retry_reasons[-1]
+                                           if retry_reasons else None),
+                        )
+                        quota_event = getattr(quota_handle, "event", None)
+                        if not isinstance(quota_event, dict):
+                            raise TypeError(
+                                "quota admission handle has no event object")
+                        quota_guard_events.append(quota_event)
+                    except Exception as exc:
+                        quota_guard_denied = True
+                        return self._finish(
+                            request_id, scheduled_s, dispatch_lag_ms,
+                            last_send_unix, None, None, None, None, False,
+                            "runtime quota admission failed closed before "
+                            f"HTTP POST ({type(exc).__name__})",
+                            StreamState(), intended, chars_sent,
+                            len(retry_reasons), None, None, None, connect_ms,
+                            first_send_unix, max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons,
+                            **caller_kwargs())
+                    if quota_event.get("decision") != "admitted":
+                        quota_guard_denied = True
+                        # A denial created no provisional reservation. Keep
+                        # its event evidence, but do not ask the attempt
+                        # cleanup path to cancel a nonexistent admission.
+                        quota_handle = None
+                        stage = (
+                            "before first HTTP POST" if request_attempts == 0
+                            else "before retry; an earlier POST may have "
+                                 "reached the provider")
+                        return self._finish(
+                            request_id, scheduled_s, dispatch_lag_ms,
+                            last_send_unix, None, None, None, None, False,
+                            f"runtime quota admission refused {stage}",
+                            StreamState(), intended, chars_sent,
+                            len(retry_reasons), None, None, None, connect_ms,
+                            first_send_unix, max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons,
+                            **caller_kwargs())
+                    if is_cancelled():
+                        try:
+                            self.runtime_quota_guard.cancel_before_post(
+                                quota_handle, reason="request_cancelled")
+                        except Exception:
+                            # Keep the rich provisional event and exact zero
+                            # POST count.  The guard has failed closed and its
+                            # snapshot/invariant validation will make this run
+                            # non-publishable.
+                            quota_guard_denied = True
+                        return cancelled_result()
+                    try:
+                        self.runtime_quota_guard.mark_post_may_have_started(
+                            quota_handle)
+                    except Exception as exc:
+                        quota_guard_denied = True
+                        return self._finish(
+                            request_id, scheduled_s, dispatch_lag_ms,
+                            last_send_unix, None, None, None, None, False,
+                            "runtime quota guard failed closed before HTTP "
+                            f"POST ({type(exc).__name__})",
+                            StreamState(), intended, chars_sent,
+                            len(retry_reasons), None, None, None, connect_ms,
+                            first_send_unix, max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons,
+                            **caller_kwargs())
+                    quota_post_marked = True
+                    # Admission marking takes the guard lock and can briefly
+                    # wait behind other workers.  Cancellation may become
+                    # visible during that transition, after the earlier check
+                    # but before this worker has invoked conn.request.  Recheck
+                    # at the returned boundary so an operator stop cannot turn
+                    # that lock wait into a late physical POST.  The marked
+                    # reservation is retained conservatively by
+                    # cancelled_result(): at this point the provider outcome is
+                    # known to be unsent locally, but releasing after the guard's
+                    # explicit may-have-started transition would weaken its
+                    # fail-closed state machine.
+                    if is_cancelled():
+                        return cancelled_result()
+                    # The same guard-lock interval is inside this worker's
+                    # absolute deadline.  Do not start a POST after that budget
+                    # elapsed merely because the socket watchdog raced while
+                    # admission was being marked.
+                    remaining_s()
+
                 # The final-attempt clock begins immediately before the
                 # blocking conn.request call. It therefore includes request
                 # upload; it does not claim to begin when the last request
@@ -619,6 +1050,7 @@ class EndpointClient:
                 last_send_unix = t_send_unix
                 if first_send_unix is None:
                     first_send_unix = t_send_unix
+                    caller_send_ms = caller_elapsed(t_send)
                 request_attempts += 1
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
                 remaining_s()
@@ -626,15 +1058,81 @@ class EndpointClient:
                 resp = conn.getresponse()
                 remaining_s()
                 response_status = resp.status
+                if quota_handle is not None:
+                    try:
+                        self.runtime_quota_guard.commit(
+                            quota_handle, reason="response_headers_received")
+                    except Exception as exc:
+                        quota_guard_denied = True
+                        failed_at = time.monotonic()
+                        return self._finish(
+                            request_id, scheduled_s, dispatch_lag_ms,
+                            t_send_unix, None, None,
+                            max((failed_at - t_send) * 1000.0, 0.0),
+                            response_status, False,
+                            "runtime quota guard failed closed after HTTP "
+                            f"response headers ({type(exc).__name__})",
+                            state, intended, chars_sent, len(retry_reasons),
+                            None, None, None, connect_ms, first_send_unix,
+                            max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons,
+                            **caller_kwargs())
 
-                if resp.status == 400 and include_usage \
-                        and self._include_usage_supported is None:
+                # A real HTTPResponse always exposes getheader(). Test
+                # adapters without it remain usable, but a production 200
+                # must prove that the body is an SSE stream before it can be
+                # accepted as benchmark evidence.
+                get_header = getattr(resp, "getheader", None)
+                if resp.status == 200 and callable(get_header):
+                    served_model_name = get_header("served-model-name")
+                    if served_model_name is not None:
+                        if not isinstance(served_model_name, str) \
+                                or not served_model_name.strip():
+                            state.errors.append(
+                                "HTTP served-model-name response header must "
+                                "be a non-empty string")
+                        elif len(served_model_name) > \
+                                _MAX_RESPONSE_IDENTITY_FIELD_CHARS:
+                            state.errors.append(
+                                "HTTP served-model-name response header "
+                                "exceeded the 512-character safety limit")
+                        else:
+                            state.served_model_name = served_model_name.strip()
+                    content_type = get_header("Content-Type")
+                    media_type = (
+                        content_type.split(";", 1)[0].strip().lower()
+                        if isinstance(content_type, str) else "")
+                    if media_type != "text/event-stream":
+                        state.errors.append(
+                            "HTTP 200 response Content-Type was not "
+                            "text/event-stream")
+                        failed_at = time.monotonic()
+                        return self._finish(
+                            request_id, scheduled_s, dispatch_lag_ms,
+                            t_send_unix, None, None,
+                            (failed_at - t_send) * 1000.0,
+                            200, False, "stream protocol validation failed",
+                            state, intended, chars_sent, len(retry_reasons),
+                            None, None, None, connect_ms, first_send_unix,
+                            max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons,
+                            **caller_kwargs())
+                    state.response_content_type = media_type
+
+                if resp.status == 400 and include_usage:
                     cap_socket_timeout(conn)
                     detail = resp.read(64 * 1024)
                     remaining_s()
                     if _stream_options_rejected(detail):
                         # This is a real second POST and is recorded as such.
-                        self._include_usage_supported = False
+                        with self._lock:
+                            self._include_usage_supported = False
                         include_usage = False
                         retry_reasons.append("stream_options_rejected")
                         attempt -= 1
@@ -673,34 +1171,11 @@ class EndpointClient:
                     retry_auth = False
                     if not auth_retried and _credential_may_be_expired(
                             resp.status, detail):
-                        with self._lock:
-                            if self.token != tok_used:
-                                retry_auth = True      # someone refreshed
-                            else:
-                                try:
-                                    fresh = self._refresh()
-                                except Exception as exc:
-                                    last_err = (
-                                        "credential refresh failed: "
-                                        f"{type(exc).__name__}")
-                                    fresh = None
-                                if isinstance(fresh, str) and fresh \
-                                        and fresh != self.token:
-                                    try:
-                                        validate_bearer_transport(
-                                            self.cfg.base_url)
-                                    except UnsafeBearerTransport as exc:
-                                        # Never install a token that would be
-                                        # sent over an unsafe transport.
-                                        last_err = str(exc)
-                                    else:
-                                        self.token = fresh
-                                        retry_auth = True
-                                elif fresh is not None and not isinstance(
-                                        fresh, str):
-                                    last_err = (
-                                        "credential refresh returned an "
-                                        "invalid token type")
+                        retry_auth, refresh_error = \
+                            self._refresh_after_rejection(
+                                tok_used, deadline_monotonic)
+                        if refresh_error:
+                            last_err = refresh_error
                     if retry_auth:
                         auth_retried = True
                         retry_reasons.append("auth_token_refreshed")
@@ -736,34 +1211,73 @@ class EndpointClient:
                                         retry_reasons=retry_reasons,
                                         **caller_kwargs())
 
-                if include_usage and self._include_usage_supported is None:
-                    self._include_usage_supported = True
+                if include_usage:
+                    with self._lock:
+                        if self._include_usage_supported is None:
+                            self._include_usage_supported = True
 
                 last_content_t = None
 
                 def timed_lines():
                     nonlocal ttfb_ms, caller_ttfb_ms
-                    response_lines = iter(resp)
+                    read1 = getattr(resp, "read1", None)
+                    response_lines = None if callable(read1) else iter(resp)
+                    stream_bytes = 0
                     while True:
                         cap_socket_timeout(conn)
-                        try:
-                            raw = next(response_lines)
-                        except StopIteration:
-                            return
+                        if read1 is not None and callable(read1):
+                            raw = read1(_STREAM_READ_CHUNK_BYTES)
+                            if not raw:
+                                return
+                        else:
+                            try:
+                                raw = next(response_lines)
+                            except StopIteration:
+                                return
                         now = time.monotonic()
                         remaining_s(now)
+                        if not isinstance(raw, (bytes, str)):
+                            raise http.client.HTTPException(
+                                "response stream yielded a non-byte chunk")
+                        raw_size = (len(raw) if isinstance(raw, bytes)
+                                    else len(raw.encode(
+                                        "utf-8", errors="surrogatepass")))
+                        stream_bytes += raw_size
+                        if stream_bytes > _MAX_STREAM_BYTES:
+                            state.errors.append(
+                                "response stream exceeded the cumulative "
+                                f"{_MAX_STREAM_BYTES}-byte safety limit")
+                            return
                         if ttfb_ms is None:
                             ttfb_ms = (now - t_send) * 1000.0
                             caller_ttfb_ms = caller_elapsed(now)
-                        yield raw
+                        # Iterator-only test adapters may return a large raw
+                        # line. Slice it before the SSE parser sees it so its
+                        # own physical-line cap applies incrementally too.
+                        for start in range(0, len(raw),
+                                           _STREAM_READ_CHUNK_BYTES):
+                            yield raw[start:start + _STREAM_READ_CHUNK_BYTES]
 
+                event_count = 0
                 for event in iter_sse_events(timed_lines()):
+                    event_count += 1
+                    if event_count > _MAX_STREAM_EVENTS:
+                        state.errors.append(
+                            "response stream exceeded the cumulative "
+                            f"{_MAX_STREAM_EVENTS}-event safety limit")
+                        break
                     now = time.monotonic()
                     chunks_before = state.content_chunks
                     reasoning_before = state.saw_first_reasoning
                     visible_before = state.saw_first_visible
                     tool_before = state.saw_first_tool_call
                     first = update_state(state, event)
+                    if len(state.errors) >= _MAX_STREAM_ERRORS:
+                        state.errors[:] = state.errors[:_MAX_STREAM_ERRORS]
+                        state.errors.append(
+                            "additional stream validation errors omitted after "
+                            f"the {_MAX_STREAM_ERRORS}-error safety limit")
+                        break
                     if first and ttft_ms is None:
                         ttft_ms = (now - t_send) * 1000.0
                         caller_ttft_ms = caller_elapsed(now)
@@ -838,7 +1352,8 @@ class EndpointClient:
             except (OSError, http.client.HTTPException) as exc:
                 if is_cancelled():
                     return cancelled_result()
-                if time.monotonic() >= deadline_monotonic:
+                if deadline_expired.is_set() \
+                        or time.monotonic() >= deadline_monotonic:
                     finished_at = time.monotonic()
                     e2e_ms = (
                         max((finished_at - t_send) * 1000.0, 0.0)
@@ -862,8 +1377,30 @@ class EndpointClient:
                         "transport_error_after_post"
                         if request_attempts > posts_before_attempt else
                         "connection_error_before_post")
-                continue
+                    continue
+                # The final failed physical attempt may already have returned
+                # HTTP headers and partial SSE output. Preserve those facts;
+                # replacing them with a blank state corrupts failure analysis.
+                failed_at = time.monotonic()
+                e2e_ms = (
+                    max((failed_at - t_send) * 1000.0, 0.0)
+                    if t_send is not None else None)
+                finalize_tool_calls(state)
+                return self._finish(
+                    request_id, scheduled_s, dispatch_lag_ms,
+                    t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
+                    response_status, False, last_err, state, intended,
+                    chars_sent, len(retry_reasons), interchunk_max,
+                    ttfr_ms, ttfv_ms, connect_ms, first_send_unix,
+                    max_tokens,
+                    first_attempt_unix=first_attempt_unix,
+                    connection_attempts=connection_attempts,
+                    request_attempts=request_attempts,
+                    retry_reasons=retry_reasons,
+                    ttf_tool_call_ms=ttf_tool_call_ms,
+                    **caller_kwargs())
             finally:
+                settle_quota_attempt()
                 if conn is not None:
                     self._discard_connection(conn)
                     try:
@@ -897,6 +1434,9 @@ class EndpointClient:
                 queue_wait_ms=None, caller_ttfb_ms=None,
                 caller_ttft_ms=None, caller_ttfr_ms=None,
                 caller_ttfv_ms=None, caller_ttf_tool_call_ms=None,
+                caller_send_ms=None,
+                quota_guard_id=None, quota_guard_denied=False,
+                quota_guard_events=None,
                 worker_started_unix=None, worker_started_monotonic=None
                 ) -> RequestResult:
         finished_monotonic = time.monotonic()
@@ -921,7 +1461,7 @@ class EndpointClient:
         if len(distinct_parse_errors) > 16:
             parse_error_details.append(
                 f"{len(distinct_parse_errors) - 16} additional distinct "
-                "parser error(s) omitted")
+                "stream validation error(s) omitted")
         return RequestResult(
             request_id=request_id, scheduled_s=scheduled_s,
             dispatch_lag_ms=dispatch_lag_ms, t_send_unix=t_send_unix,
@@ -960,12 +1500,26 @@ class EndpointClient:
             tool_call_chunks=state.tool_call_chunks,
             ttf_tool_call_ms=ttf_tool_call_ms,
             valid_tool_calls=state.valid_tool_calls,
+            refusal_seen=state.saw_refusal,
+            refusal_chunks=state.refusal_chunks,
+            response_content_type=state.response_content_type,
+            served_model_name=state.served_model_name,
+            response_model=state.response_model,
+            response_object=state.response_object,
+            response_id_sha256=(
+                hashlib.sha256(state.response_id.encode("utf-8")).hexdigest()
+                if state.response_id is not None else None),
+            system_fingerprint=state.system_fingerprint,
+            quota_guard_id=quota_guard_id,
+            quota_guard_denied=bool(quota_guard_denied),
+            quota_guard_events=copy.deepcopy(quota_guard_events or []),
             queue_wait_ms=queue_wait_ms,
             caller_ttfb_ms=caller_ttfb_ms,
             caller_ttft_ms=caller_ttft_ms,
             caller_ttfr_ms=caller_ttfr_ms,
             caller_ttfv_ms=caller_ttfv_ms,
             caller_ttf_tool_call_ms=caller_ttf_tool_call_ms,
+            caller_send_ms=caller_send_ms,
             caller_e2e_ms=(
                 max((finished_monotonic - scheduled_monotonic) * 1000.0, 0.0)
                 if scheduled_monotonic is not None else None),

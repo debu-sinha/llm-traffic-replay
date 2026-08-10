@@ -1,5 +1,8 @@
 name: tests
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -23,10 +26,11 @@ jobs:
           - python-version: "3.12"
             dependency-set: latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: install minimum supported dependencies
@@ -65,10 +69,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
       - name: install build tooling
@@ -77,6 +82,24 @@ jobs:
         run: python -m build
       - name: validate distribution metadata
         run: python -m twine check dist/*
+      - name: verify sdist and wheel carry identical clean provenance
+        run: >-
+          python -c 'import json, subprocess, tarfile, zipfile;
+          from pathlib import Path;
+          sdist, = Path("dist").glob("*.tar.gz");
+          wheel, = Path("dist").glob("*.whl");
+          archive = tarfile.open(sdist);
+          member, = (item for item in archive.getmembers()
+          if item.name.endswith("/traffic_replay/_build_provenance.json"));
+          sdist_record = json.load(archive.extractfile(member));
+          wheel_record = json.loads(zipfile.ZipFile(wheel).read(
+          "traffic_replay/_build_provenance.json"));
+          assert sdist_record == wheel_record;
+          head = subprocess.check_output(
+          ["git", "rev-parse", "HEAD"], text=True).strip();
+          assert sdist_record["git_commit"] == head;
+          assert sdist_record["git_dirty"] is False;
+          assert sdist_record["provenance_schema_version"] == 2'
       - name: install and validate the wheel outside the source tree
         shell: bash
         run: |
@@ -86,4 +109,23 @@ jobs:
           "${RUNNER_TEMP}/wheel-venv/bin/python" -m pip check
           cd "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/wheel-venv/bin/python" -c 'import json; from importlib.metadata import version; from importlib.resources import files; from traffic_replay import __version__; assert version("llm-traffic-replay") == __version__; data = files("traffic_replay").joinpath("data/profile_validation_small.json").read_text(encoding="utf-8"); assert json.loads(data)["name"] == "validation_small"'
-          "${RUNNER_TEMP}/wheel-venv/bin/python" -m traffic_replay validate --port 0 --duration 5 --tolerance-ms 120 --quiet --workdir "${RUNNER_TEMP}/wheel-validation"
+          "${RUNNER_TEMP}/wheel-venv/bin/traffic-replay" --version
+          "${RUNNER_TEMP}/wheel-venv/bin/python" -c 'import re; from pathlib import Path; import traffic_replay; from traffic_replay.artifacts import snapshot_source_state; state = snapshot_source_state(Path(traffic_replay.__file__).parent); paths = {item["path"] for item in state["source_files"]}; assert state["source_identity_origin"] == "embedded_build", state; assert state["git_dirty"] is False, state; assert re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", state["git_commit"]), state; assert re.fullmatch(r"[0-9a-f]{64}", state["source_tree_sha256"]), state; assert re.fullmatch(r"[0-9a-f]{64}", state["build_id"]), state; assert "data/profile_validation_small.json" in paths, paths; assert state["embedded_provenance_error"] is None, state'
+          "${RUNNER_TEMP}/wheel-venv/bin/traffic-replay" validate --port 0 --duration 5 --tolerance-ms 120 --quiet --workdir "${RUNNER_TEMP}/wheel-validation"
+      - name: install and test the source distribution outside the checkout
+        shell: bash
+        run: |
+          python -m venv "${RUNNER_TEMP}/sdist-venv"
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install numpy pytest
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pip install --no-deps dist/*.tar.gz
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/sdist-venv/bin/traffic-replay" validate --port 0 --duration 5 --tolerance-ms 120 --quiet --workdir "${RUNNER_TEMP}/sdist-validation"
+          mkdir "${RUNNER_TEMP}/sdist-source"
+          tar -xzf "${GITHUB_WORKSPACE}"/dist/*.tar.gz -C "${RUNNER_TEMP}/sdist-source"
+          sdist_roots=("${RUNNER_TEMP}/sdist-source"/*)
+          test "${#sdist_roots[@]}" -eq 1
+          cd "${sdist_roots[0]}"
+          unset PYTHONPATH
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -c 'from pathlib import Path; import scripts.pack_notebook as packer; import traffic_replay; root = Path.cwd().resolve(); assert Path(traffic_replay.__file__).resolve().is_relative_to(root); assert packer.ROOT.resolve() == root'
+          "${RUNNER_TEMP}/sdist-venv/bin/python" scripts/pack_notebook.py --check
+          "${RUNNER_TEMP}/sdist-venv/bin/python" -m pytest -q -p no:cacheprovider --basetemp "${RUNNER_TEMP}/sdist-pytest"

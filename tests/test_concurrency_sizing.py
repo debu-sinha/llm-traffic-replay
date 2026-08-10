@@ -94,6 +94,48 @@ def test_sizing_honors_explicit_and_default_worker_caps(monkeypatch):
     assert size(17).max_concurrency == 17
 
 
+def test_sizing_rate_uses_mean_service_time_for_skewed_latency(monkeypatch):
+    from traffic_replay import runner
+
+    class Workload:
+        def __init__(self, _rc, _n):
+            pass
+
+        def plan(self, i, request_id):
+            return {
+                "messages": [], "max_output": 1,
+                "intended": (1, 1, 0.0, i), "chars": 1,
+                "global_index": i, "sample_index": i,
+                "prompt_index": None, "construction": None,
+                "body_request_id": request_id,
+            }
+
+    latencies_ms = iter([100.0, 100.0, 100.0, 1000.0])
+    monkeypatch.setattr(runner, "_PreparedWorkload", Workload)
+    monkeypatch.setattr(runner, "_payload_hash", lambda *_args: "0" * 64)
+    monkeypatch.setattr(
+        runner, "_send_request", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        runner, "_annotate_result",
+        lambda *_args: {
+            "ok": True, "e2e_ms": next(latencies_ms),
+            "stream_complete": True, "parse_errors": 0,
+        })
+    rc = _cfg(1, sizing_concurrency=4, calibrate_n=4,
+              max_concurrency=None)
+
+    sized = runner._size_for_concurrency(
+        rc, object(), object(), lambda _row: None, True,
+        "workload-test", "execution-test")
+
+    # Little's Law: lambda = L / mean(W) = 4 / 0.325 seconds. The former
+    # median-based calculation offered 40 rps and implied 13 mean in flight.
+    assert abs(sized.qps_base - (4 / 0.325)) < 1e-12
+    assert sized.qps_base == sized.qps_burst == sized.qps_min == sized.qps_max
+    # p95 remains the conservative worker-headroom input.
+    assert sized.max_concurrency == 16
+
+
 def test_sizing_refuses_survivor_biased_partial_probe(monkeypatch):
     from traffic_replay import runner
 

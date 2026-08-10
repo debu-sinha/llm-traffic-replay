@@ -8,7 +8,8 @@ import http.client
 import pytest
 
 from traffic_replay.endpoint_meta import (
-    endpoint_name_from_path, fetch_endpoint_metadata, _summarize)
+    endpoint_name_from_path, fetch_endpoint_metadata,
+    invocation_endpoint_binding, _summarize)
 
 
 def test_name_extraction_handles_custom_names():
@@ -32,6 +33,30 @@ def test_name_extraction_requires_the_real_route_prefix_and_is_canonical():
         "/serving-endpoints/%2e%2e/invocations") is None
     assert endpoint_name_from_path(
         "/serving-endpoints/a%2Fb/invocations") is None
+
+
+def test_generic_invocation_binding_is_deployment_mode_neutral():
+    metadata = {
+        "name": "custom-pt-endpoint",
+        "ready": "READY",
+        "route_optimized": True,
+        "served_entities": [{"name": "weighted-a"}],
+    }
+    binding = invocation_endpoint_binding(
+        "/serving-endpoints/custom-pt-endpoint/invocations", metadata)
+
+    assert binding["binding_complete"] is True
+    assert binding["binding_kind"] == "direct_invocation_endpoint"
+    assert "deployment mode" in binding["note"]
+
+
+def test_generic_invocation_binding_fails_closed_on_route_mismatch():
+    binding = invocation_endpoint_binding(
+        "/serving-endpoints/requested/invocations",
+        {"name": "other", "ready": "READY",
+         "served_entities": [{"name": "entity"}]})
+    assert binding["binding_complete"] is False
+    assert any("does not match" in reason for reason in binding["reasons"])
 
 
 @pytest.mark.parametrize("path", [

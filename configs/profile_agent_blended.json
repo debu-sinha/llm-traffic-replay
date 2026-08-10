@@ -20,9 +20,10 @@
     "output_tokens": [40, 70, 90, 165],
     "cache_fraction": [0.6, 0.75, 0.87, 0.98]
   },
-  "provenance": "Quantile-CDF representation of the full documented P50/P90/P95/P99 ladder for two blended workload classes. No joint request-level dataset was available, so input, output, and cache are sampled as independent marginals and must not be interpreted as measured cross-field correlation.",
-  "label": "Blended quantile marginals, not joint observations. Run empirical-joint or per-class profiles when request-level or per-class data is available.",
+  "provenance": "UNVERIFIED ILLUSTRATIVE values assembled without a retained customer log export or other auditable source dataset. The P50/P90/P95/P99 ladders are examples only. Input, output, and cache are sampled as independent marginals and must not be interpreted as measured cross-field correlation or customer demand.",
+  "label": "UNVERIFIED ILLUSTRATIVE PROFILE: every numeric workload value and acceptance target is a placeholder. Replace this file with a log-derived empirical-joint profile or an explicitly sourced customer-owned quantile profile before performance or capacity use.",
   "acceptance_targets": {
+    "targets_are": "UNVERIFIED ILLUSTRATIVE placeholders; not customer-owned requirements",
     "ttft_ms": {
       "p50": 600,
       "p90": 1000,
@@ -41,7 +42,7 @@
       "note": "requests over budget count as failures against these illustrative acceptance targets"
     },
     "success_rate": 0.999,
-    "priority": "TTFT and throughput, sensitive to interchunk stalls and timeouts",
-    "note": "illustrative targets. replace with the ones you agreed in writing."
+    "priority": "illustrative example only: configured TTFT latency, full-generation latency, hard TTFT/TTFG timeouts, and success rate",
+    "note": "UNVERIFIED ILLUSTRATIVE targets. Replace every value with customer-owned requirements agreed in writing."
   }
 }

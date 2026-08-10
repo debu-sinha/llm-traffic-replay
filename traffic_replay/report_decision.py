@@ -69,13 +69,54 @@ def _nonnegative_int(value: object) -> int | None:
 
 
 def _state(code: str, label: str, reason: str,
-           reason_codes: list[str], *, severity: str) -> dict:
+           reason_codes: list[str], *, severity: str,
+           reason_details: list[tuple[str, str]] | None = None) -> dict:
+    """Build one decision state without losing its individual gate reasons.
+
+    ``reason`` remains the compact compatibility summary used by existing
+    automation. ``reason_details`` is the presentation-independent, ordered
+    code/message list.  Reports render that list above every metric so a third
+    or later caution cannot disappear behind a ``plus N more`` summary.
+    """
+    unique_codes = list(dict.fromkeys(reason_codes))
+    if reason_details is None:
+        normalized_details = [
+            {"code": item, "message": _one_line(reason, limit=1_000)}
+            for item in unique_codes
+        ]
+    else:
+        normalized_details = []
+        seen: set[tuple[str, str]] = set()
+        for detail_code, detail_message in reason_details:
+            item = (
+                _one_line(detail_code, limit=160),
+                _one_line(detail_message, limit=1_000),
+            )
+            if item in seen:
+                continue
+            seen.add(item)
+            normalized_details.append({
+                "code": item[0],
+                "message": item[1],
+            })
+        detail_codes = {item["code"] for item in normalized_details}
+        for item in unique_codes:
+            if item not in detail_codes:
+                normalized_details.append({
+                    "code": item,
+                    "message": _one_line(reason, limit=1_000),
+                })
+        unique_codes = list(dict.fromkeys([
+            *unique_codes,
+            *(item["code"] for item in normalized_details),
+        ]))
     return {
         "code": code,
         "label": label,
         "severity": severity,
         "reason": _one_line(reason),
-        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "reason_codes": unique_codes,
+        "reason_details": normalized_details,
     }
 
 
@@ -166,6 +207,22 @@ def _quota_facts(summary: Mapping) -> dict:
     if count and (not phase_evidence_valid or sum(phases.values()) != count):
         inconsistent = True
 
+    local = summary.get("runtime_quota_admission")
+    local = local if isinstance(local, Mapping) else {}
+    local_denied_rows = _nonnegative_int(local.get("denied_rows")) or 0
+    local_denied_attempts = _nonnegative_int(
+        local.get("denied_attempts_in_captured_rows"))
+    if local_denied_attempts is None:
+        # Compatibility with short-lived development artifacts from before
+        # preflight/probe/sizing rows were included in this evidence block.
+        local_denied_attempts = _nonnegative_int(
+            local.get("denied_attempts_in_replay_rows"))
+    local_denied_attempts = local_denied_attempts or 0
+    local_status = (local.get("status")
+                    if isinstance(local.get("status"), str) else None)
+    local_invariant_errors = local.get("invariant_errors")
+    if not isinstance(local_invariant_errors, list):
+        local_invariant_errors = []
     return {
         "count": count,
         "request_rows_examined": rows,
@@ -174,6 +231,11 @@ def _quota_facts(summary: Mapping) -> dict:
         "evidence_inconsistent": inconsistent,
         "scope": (_one_line(block["scope"])
                   if isinstance(block.get("scope"), str) else None),
+        "local_guard_status": local_status,
+        "local_guard_denied_rows": local_denied_rows,
+        "local_guard_denied_attempts": local_denied_attempts,
+        "local_guard_invariant_errors": [
+            _one_line(item) for item in local_invariant_errors],
     }
 
 
@@ -189,6 +251,13 @@ def _quota_state(facts: dict) -> dict:
         "phases": phases,
         "scope": facts["scope"],
         "evidence_inconsistent": facts["evidence_inconsistent"],
+    }
+    local_evidence = {
+        "status": facts["local_guard_status"],
+        "denied_rows": facts["local_guard_denied_rows"],
+        "denied_attempts_in_captured_rows": facts[
+            "local_guard_denied_attempts"],
+        "invariant_errors": facts["local_guard_invariant_errors"],
     }
 
     if count:
@@ -206,6 +275,21 @@ def _quota_state(facts: dict) -> dict:
                 ["HTTP_429_EVIDENCE_INCONSISTENT"]
                 if facts["evidence_inconsistent"] else []),
             severity="fail")
+    elif (facts["local_guard_denied_rows"]
+          or facts["local_guard_denied_attempts"]
+          or facts["local_guard_status"] == "denied"):
+        out = _state(
+            "LOCAL_GUARD_REFUSED", "Runtime quota admission refused",
+            "The command-local guard refused at least one physical POST "
+            "before send. The requested load was not delivered; this is a "
+            "harness quota-safety stop, not endpoint-capacity evidence.",
+            ["RUNTIME_QUOTA_ADMISSION_REFUSED"], severity="fail")
+    elif (facts["local_guard_status"] == "invalid_evidence"
+          or facts["local_guard_invariant_errors"]):
+        out = _state(
+            "UNKNOWN", "Quota state unknown",
+            "Runtime quota-guard evidence failed its internal invariants.",
+            ["RUNTIME_QUOTA_EVIDENCE_INVALID"], severity="warning")
     elif facts["evidence_inconsistent"]:
         out = _state(
             "UNKNOWN", "Quota state unknown",
@@ -237,6 +321,7 @@ def _quota_state(facts: dict) -> dict:
             "rows. This does not establish provider quota headroom.",
             ["HTTP_429_NOT_OBSERVED"], severity="pass")
     out["http_429"] = evidence
+    out["runtime_quota_admission"] = local_evidence
     out["provider_headroom_established"] = False
     return out
 
@@ -277,8 +362,32 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
         invalid_codes.append("NO_ACCEPTABLE_OUTCOME")
         invalid_reasons.append(_one_line(answers["invalid"]))
 
+    response_identity = summary.get("response_identity")
+    response_identity = (response_identity
+                         if isinstance(response_identity, Mapping) else {})
+    identity_invalid = response_identity.get("invalid")
+    if (response_identity.get("status") == "invalid"
+            or (isinstance(identity_invalid, str)
+                and identity_invalid.strip())):
+        invalid_codes.append("RESPONSE_MODEL_IDENTITY_INVALID")
+        invalid_reasons.append(_one_line(
+            identity_invalid or "response model identity was inconsistent"))
+
     run = summary.get("run")
     run = run if isinstance(run, Mapping) else {}
+    preflight_gate = run.get("preflight_gate")
+    if isinstance(preflight_gate, Mapping) \
+            and preflight_gate.get("outcome") == \
+            "preflight_forced_unreadable":
+        invalid_codes.append("FORCED_UNREADABLE_PREFLIGHT")
+        invalid_reasons.append(
+            "measured load was explicitly forced after the representative "
+            "preflight produced an incomplete answer")
+    if run.get("endpoint_metadata_stability") == "changed":
+        invalid_codes.append("ENDPOINT_METADATA_CHANGED_DURING_RUN")
+        invalid_reasons.append(
+            "serving endpoint metadata changed between the pre-run and "
+            "post-drain snapshots")
     if run.get("aggregation_valid") is False:
         invalid_codes.append("INCOMPATIBLE_AGGREGATE")
         issues = run.get("compatibility_issues")
@@ -297,14 +406,24 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
     elif quota_facts["evidence_inconsistent"]:
         invalid_codes.append("HTTP_429_EVIDENCE_INCONSISTENT")
         invalid_reasons.append("HTTP-429 evidence is internally inconsistent")
+    if (quota_facts["local_guard_denied_rows"]
+            or quota_facts["local_guard_denied_attempts"]
+            or quota_facts["local_guard_status"] == "denied"):
+        invalid_codes.append("RUNTIME_QUOTA_ADMISSION_REFUSED")
+        invalid_reasons.append(
+            "the runtime quota guard refused physical POST admission")
+    if (quota_facts["local_guard_status"] == "invalid_evidence"
+            or quota_facts["local_guard_invariant_errors"]):
+        invalid_codes.append("RUNTIME_QUOTA_EVIDENCE_INVALID")
+        invalid_reasons.append(
+            "runtime quota guard evidence failed internal invariants")
 
     if invalid_codes:
-        reason = "; ".join(invalid_reasons[:2])
-        if len(invalid_reasons) > 2:
-            reason += f"; plus {len(invalid_reasons) - 2} more invalidity gate(s)"
+        reason = "; ".join(invalid_reasons)
         return _state(
             "INVALID", "Measurement invalid", reason, invalid_codes,
-            severity="fail")
+            severity="fail",
+            reason_details=list(zip(invalid_codes, invalid_reasons)))
 
     cautions: list[tuple[str, str]] = []
     quota_rows = quota_facts["request_rows_examined"]
@@ -321,6 +440,8 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
             f"HTTP status was retained for only {shown}/{quota_rows} "
             "captured request rows"))
     warning_paths = (
+        ("RESPONSE_MODEL_IDENTITY_UNVERIFIED",
+         ("response_identity", "warning")),
         ("SLA_TARGET_PROVENANCE_WARNING", ("sla", "targets_warning")),
         ("SLA_COVERAGE_INCOMPLETE", ("sla", "coverage_warning")),
         ("CALLER_LATENCY_COVERAGE_INCOMPLETE",
@@ -338,11 +459,32 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
         ("CONCURRENCY_FIDELITY_UNVERIFIED", ("concurrency", "warning")),
         ("RATE_LIMIT_EVIDENCE_INCOMPLETE", ("rate_limits", "warning")),
         ("NETWORK_PATH_CAUTION", ("network_path", "warning")),
+        ("ENDPOINT_METADATA_STABILITY_UNVERIFIED",
+         ("run", "endpoint_metadata_warning")),
     )
     for code, path in warning_paths:
         message = _warning(summary, path)
         if message:
             cautions.append((code, message))
+
+    transport = run.get("transport")
+    if not isinstance(transport, Mapping):
+        cautions.append((
+            "PRODUCTION_TRANSPORT_EVIDENCE_MISSING",
+            "the benchmark transport contract was not recorded, so its "
+            "connection behavior cannot be compared with production"))
+    else:
+        transport_warning = transport.get(
+            "production_comparability_warning")
+        if isinstance(transport_warning, str) and transport_warning.strip():
+            cautions.append((
+                "PRODUCTION_TRANSPORT_UNVERIFIED",
+                _one_line(transport_warning)))
+        elif transport.get("production_connection_policy_match") is not True:
+            cautions.append((
+                "PRODUCTION_TRANSPORT_EVIDENCE_INCONSISTENT",
+                "the transport artifact did not contain an explicit exact "
+                "production-policy match"))
 
     sample = summary.get("sample")
     sample = sample if isinstance(sample, Mapping) else {}
@@ -378,12 +520,10 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
     if cautions:
         codes = [code for code, _message in cautions]
         reasons = [message for _code, message in cautions]
-        reason = "; ".join(reasons[:2])
-        if len(reasons) > 2:
-            reason += f"; plus {len(reasons) - 2} more caution gate(s)"
+        reason = "; ".join(reasons)
         return _state(
             "CAUTION", "Use with caution", reason, codes,
-            severity="warning")
+            severity="warning", reason_details=cautions)
 
     return _state(
         "VALID", "Measurement valid",
@@ -437,10 +577,14 @@ def _sla_state(summary: Mapping) -> dict:
     if hard_configured:
         checks += 1
         breaches = _nonnegative_int(sla.get("hard_timeout_breaches"))
+        hard_unmeasured = _nonnegative_int(
+            sla.get("hard_timeout_unmeasured"))
         if breaches is None:
             unmeasured += 1
         elif breaches:
             misses += 1
+        elif hard_unmeasured is None or hard_unmeasured:
+            unmeasured += 1
 
     inter_configured = (
         acceptance.get("interchunk_ms") is not None
@@ -448,10 +592,14 @@ def _sla_state(summary: Mapping) -> dict:
     if inter_configured:
         checks += 1
         breaches = _nonnegative_int(sla.get("interchunk_breaches"))
+        inter_unmeasured = _nonnegative_int(
+            sla.get("interchunk_unmeasured"))
         if breaches is None:
             unmeasured += 1
         elif breaches:
             misses += 1
+        elif inter_unmeasured is None or inter_unmeasured:
+            unmeasured += 1
 
     success = sla.get("success_rate")
     success = success if isinstance(success, Mapping) else {}
@@ -584,21 +732,36 @@ def _capacity_state(summary: Mapping, integrity: dict, measurement: dict,
             "The measured replay contains no request, so there is no "
             "tested-load capacity observation.",
             ["NO_MEASURED_REQUESTS"], severity="neutral")
-    elif quota["code"] == "EXCEEDED":
+    elif quota["code"] in {"EXCEEDED", "LOCAL_GUARD_REFUSED"}:
         evidence = quota["http_429"]
         count = evidence["http_429_count"]
         rows = evidence["request_rows_examined"]
         denominator = rows if rows is not None and rows >= count else "unknown"
+        if quota["code"] == "LOCAL_GUARD_REFUSED":
+            reason = (
+                "The runtime quota guard refused new physical POSTs before "
+                "send, so the requested load was not delivered. That is a "
+                "local quota-safety stop, not an endpoint-capacity ceiling.")
+            reason_codes = ["QUOTA_LIMITED_CAPACITY_INCONCLUSIVE"]
+        else:
+            reason = (
+                f"HTTP 429 occurred in {count}/{denominator} captured request "
+                "rows. That is quota-limited evidence, not an endpoint-capacity "
+                "ceiling.")
+            reason_codes = ["QUOTA_LIMITED_CAPACITY_INCONCLUSIVE"]
         out = _state(
             "INCONCLUSIVE", "Endpoint capacity inconclusive",
-            f"HTTP 429 occurred in {count}/{denominator} captured request "
-            "rows. That is quota-limited evidence, not an endpoint-capacity "
-            "ceiling.",
-            ["QUOTA_LIMITED_CAPACITY_INCONCLUSIVE"], severity="warning")
+            reason, reason_codes, severity="warning")
     else:
-        rate_limits = summary.get("rate_limits")
-        binding = (rate_limits.get("binding")
-                   if isinstance(rate_limits, Mapping) else None)
+        run = summary.get("run")
+        run = run if isinstance(run, Mapping) else {}
+        binding = run.get("invocation_binding")
+        if not isinstance(binding, Mapping):
+            # Compatibility fallback for older quota-aware artifacts, whose
+            # only route/control-plane binding lived under rate_limits.
+            rate_limits = summary.get("rate_limits")
+            binding = (rate_limits.get("binding")
+                       if isinstance(rate_limits, Mapping) else None)
         binding_complete = bool(
             isinstance(binding, Mapping)
             and binding.get("binding_complete") is True)
@@ -621,13 +784,12 @@ def _capacity_state(summary: Mapping, integrity: dict, measurement: dict,
                 "endpoint identity and deployment-mode binding is not verified"))
 
         if blockers:
-            reason = "; ".join(message for _code, message in blockers[:2])
-            if len(blockers) > 2:
-                reason += f"; plus {len(blockers) - 2} more capacity gate(s)"
+            reason = "; ".join(message for _code, message in blockers)
             reason += ". Tested-load facts remain observations, not a ceiling."
             out = _state(
                 "INCONCLUSIVE", "Endpoint capacity inconclusive", reason,
-                [code for code, _message in blockers], severity="warning")
+                [code for code, _message in blockers], severity="warning",
+                reason_details=blockers)
         else:
             failed = tested_load["measured_replay_failed"]
             judged = tested_load["answer_rows_judged"]
@@ -694,6 +856,17 @@ def build_report_decision(
         sla["reason_codes"] = list(dict.fromkeys([
             *sla["reason_codes"], "MEASUREMENT_BLOCKS_CLEAN_SLA_PASS",
         ]))
+        sla["reason_details"] = [
+            *list(sla.get("reason_details") or []),
+            {
+                "code": "MEASUREMENT_BLOCKS_CLEAN_SLA_PASS",
+                "message": (
+                    "The independently observed acceptance outcome is retained, "
+                    f"but the measurement state is {measurement['code'].lower()}, "
+                    "so this is not a clean acceptance pass."
+                ),
+            },
+        ]
     tested_load = _tested_load(summary, quota_facts)
     capacity = _capacity_state(
         summary, evidence, measurement, sla, quota, tested_load)

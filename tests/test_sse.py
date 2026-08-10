@@ -179,6 +179,60 @@ def test_tool_call_only_response_is_classified_separately():
     assert st.valid_tool_calls == 1
 
 
+def test_refusal_delta_is_content_onset_but_not_visible_answer_content():
+    st = StreamState()
+    event = {"model": "glm", "object": "chat.completion.chunk",
+             "choices": [{"delta": {"refusal": "blocked"},
+                           "finish_reason": "stop"}]}
+
+    assert update_state(st, event) is True
+    assert st.saw_refusal is True
+    assert st.refusal_chunks == 1
+    assert st.saw_first_content is True
+    assert st.saw_first_visible is False
+    assert st.response_model == "glm"
+    assert st.response_object == "chat.completion.chunk"
+    assert st.errors == []
+
+
+def test_conflicting_response_identity_is_a_protocol_error():
+    st = StreamState()
+    update_state(st, {"model": "glm-a", "id": "one", "choices": []})
+    update_state(st, {"model": "glm-b", "id": "two", "choices": []})
+
+    assert "stream reported conflicting model values" in st.errors
+    assert "stream reported conflicting id values" in st.errors
+
+
+def test_lone_surrogate_response_identity_is_a_protocol_error_not_state():
+    st = StreamState()
+
+    update_state(st, {"id": "\ud800", "model": "glm", "choices": []})
+
+    assert st.response_id is None
+    assert st.response_model == "glm"
+    assert st.errors == [
+        "stream event id contained a lone Unicode surrogate"]
+
+
+def test_tool_fragment_state_has_a_cumulative_memory_bound():
+    st = StreamState()
+    fragment = "x" * 200_000
+    for _ in range(10):
+        update_state(st, {"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "function": {"name": fragment, "arguments": fragment},
+        }]}}]})
+
+    retained = sum(len(value) for pieces in st._tool_names.values()
+                   for value in pieces)
+    retained += sum(len(value) for pieces in st._tool_arguments.values()
+                    for value in pieces)
+    assert retained <= 1024 * 1024
+    assert any("cumulative tool fragment safety limit" in error
+               for error in st.errors)
+
+
 def test_fragmented_tool_call_is_validated_only_after_complete_json():
     st = StreamState()
     update_state(st, {"choices": [{"delta": {"tool_calls": [{
@@ -469,6 +523,37 @@ def test_invalid_service_tier_values_are_protocol_errors():
         assert st.service_tier is None
         assert st.errors == [
             "stream event service_tier must be a non-empty string"]
+
+
+def test_service_tier_is_bounded_and_rejects_lone_surrogates():
+    cases = (
+        ("x" * 513,
+         "stream event service_tier exceeded the 512-character safety limit"),
+        ("default\ud800",
+         "stream event service_tier contained a lone Unicode surrogate"),
+    )
+    for value, expected in cases:
+        st = StreamState()
+        update_state(st, {"service_tier": value, "choices": []})
+        assert st.service_tier is None
+        assert st.errors == [expected]
+
+
+def test_finish_reason_is_bounded_and_rejects_lone_surrogates():
+    cases = (
+        ("x" * 513,
+         "stream choice 0 finish_reason exceeded the 512-character "
+         "safety limit"),
+        ("stop\ud800",
+         "stream choice 0 finish_reason contained a lone Unicode surrogate"),
+    )
+    for value, expected in cases:
+        st = StreamState()
+        update_state(st, {"choices": [{
+            "delta": {}, "finish_reason": value,
+        }]})
+        assert st.finish_reason is None
+        assert st.errors == [expected]
 
 
 def test_usage_arithmetic_invariants_fail_closed():

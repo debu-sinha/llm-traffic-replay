@@ -63,6 +63,37 @@ def test_drift_needs_two_windows():
     assert "two" in d["note"]
 
 
+def test_drift_uses_one_logical_schedule_clock_not_final_retry_send_time():
+    """A retry may finish its final POST in a later minute. Stability cohorts
+    belong to when the logical request was scheduled, not whichever physical
+    retry produced the terminal result."""
+    rows = []
+    for i in range(25):
+        row = _rows(1, base_ttft=100.0)[0]
+        row.update({
+            "scheduled_s": float(i),
+            "first_send_unix": 1_000_000.0 + i,
+            "t_send_unix": 1_000_061.0 + i,
+            "retries": 1,
+        })
+        rows.append(row)
+    for i in range(25):
+        row = _rows(1, base_ttft=400.0)[0]
+        row.update({
+            "scheduled_s": 70.0 + i,
+            "first_send_unix": 1_000_070.0 + i,
+            "t_send_unix": 1_000_070.0 + i,
+        })
+        rows.append(row)
+
+    drift = _drift_block(rows)
+
+    assert drift["window_clock"] == "scheduled_s"
+    assert drift["window_clock_n"] == drift["window_clock_of"] == 50
+    assert [window["n"] for window in drift["windows"]] == [25, 25]
+    assert drift["drift_kind"] == "variable"
+
+
 def test_connect_and_endpoint_render_in_html():
     s = summarize(_rows(120), run_meta={
         "input_mode": "profile", "endpoint_path": "/e",
@@ -74,9 +105,86 @@ def test_connect_and_endpoint_render_in_html():
     assert "Connection setup" in h              # connect line
     assert "excluded" in h                      # states it is not in TTFT
     assert "8" in h                             # connect ms value
+    assert "fresh-connection setup diagnostic" in h
+    assert "upper bound on network distance" not in h
     assert "Endpoint under test" in h           # endpoint metadata card
     assert "acme-glm-prod-42" in h            # custom name shown
     assert "GPU_LARGE" in h                     # served entity workload
+
+
+def test_report_distinguishes_physical_post_attempts_from_retry_markers():
+    rows = _rows(3)
+    rows[0].update({
+        "request_attempts": 3,
+        "connection_attempts": 3,
+        "retries": 2,
+        "retry_reasons": [
+            "stream_options_rejected", "transport_error_after_post"],
+    })
+    rows[1].update({
+        "request_attempts": 1,
+        "connection_attempts": 1,
+        "retries": 0,
+        "retry_reasons": [],
+    })
+    rows[2].update({"retries": 1})  # legacy row: physical count unknown
+
+    summary = summarize(rows)
+    evidence = summary["physical_post_attempts"]
+    assert evidence["logical_rows_with_additional_attempts"] == 1
+    assert evidence["additional_attempts"] == 2
+    assert evidence["recorded_retry_triggers"] == {
+        "stream_options_rejected": 1,
+        "transport_error_after_post": 1,
+    }
+    assert evidence["legacy_retry_marked_rows_without_attempt_count"] == 1
+
+    markdown = render_markdown(summary, "attempt evidence")
+    report_html = render_html(summary, "attempt evidence")
+    for rendered in (markdown, report_html):
+        assert "logical rows with additional physical post attempts" \
+            in rendered.lower()
+        assert "stream_options_rejected" in rendered
+        assert "transport_error_after_post" in rendered
+        assert "connection retry" not in rendered.lower()
+
+
+def test_report_does_not_project_unobserved_answer_length_from_percentiles():
+    summary = summarize(_rows(30))
+    markdown = render_markdown(summary, "observed TPOT")
+
+    assert summary["tpot_ms"]["n"] == 30
+    assert "(e2e - ttft) / (completion_tokens - 1)" in markdown
+    assert "500-token" not in markdown
+    assert "unobserved answer length" in markdown
+
+
+def test_missing_visible_content_does_not_invent_a_finish_reason():
+    rows = _rows(3)
+    for row in rows:
+        row["ttfr_ms"] = 80.0
+    rows[0]["ttfv_ms"] = 150.0
+
+    markdown = render_markdown(summarize(rows), "reasoning visibility")
+
+    assert "remaining requests had no observed visible-content event" \
+        in markdown
+    assert "artifact does not establish why" in markdown
+    assert "ran out of output tokens still reasoning" not in markdown
+
+
+def test_exact_caller_display_is_not_labeled_as_a_correction():
+    rows = _rows(30)
+    for row in rows:
+        row["caller_ttft_ms"] = 125.0
+        row["caller_e2e_ms"] = 225.0
+    summary = summarize(rows)
+
+    markdown = render_markdown(summary, "exact caller")
+    report_html = render_html(summary, "exact caller")
+    for rendered in (markdown, report_html):
+        assert "Exact caller TTFT" in rendered
+        assert "corrected (configured" not in rendered
 
 
 def test_stability_card_present_for_long_run():
@@ -131,6 +239,91 @@ def test_degrading_run_is_labeled_degrading():
     d = _drift_block(early + mid + late)
     assert d["drift_kind"] == "degrading"
     assert "slower" in d["drift_headline"]
+
+
+def test_first_visible_stability_scores_visible_latency_not_reasoning_start():
+    rows = []
+    for window, visible_ms in enumerate((400.0, 1200.0, 4000.0)):
+        for row in _rows(25, base_ttft=100.0, t0=window * 70.0, dt=1.0):
+            row.update({
+                "ttfv_ms": visible_ms,
+                "caller_ttft_ms": 100.0,
+                "caller_ttfv_ms": visible_ms,
+                "visible_content_seen": True,
+                "stream_complete": True,
+                "parse_errors": 0,
+            })
+            rows.append(row)
+
+    visible = summarize(rows, ttft_definition="first_visible")["drift"]
+    content = summarize(rows, ttft_definition="first_content")["drift"]
+
+    assert visible["latency_metric"] == "caller_ttfv_ms"
+    assert visible["latency_event"] == "ttfv"
+    assert visible["ttfv_p95_spread_ratio"] == 10.0
+    assert visible["drift_kind"] == "degrading"
+    assert "TTFV (first visible content)" in visible["drift_headline"]
+    assert all("ttfv_p95" in window for window in visible["windows"])
+    assert all("ttft_p95" not in window for window in visible["windows"])
+
+    assert content["latency_metric"] == "caller_ttft_ms"
+    assert content["ttft_p95_spread_ratio"] == 1.0
+    assert content["drift_kind"] == "stable"
+
+
+def test_first_visible_stability_rejects_event_survivor_percentiles():
+    rows = []
+    for window in range(3):
+        for i, row in enumerate(
+                _rows(40, base_ttft=100.0, t0=window * 70.0, dt=1.0)):
+            visible = i < 20
+            row.update({
+                "ttfv_ms": 400.0 if visible else None,
+                "caller_ttfv_ms": 400.0 if visible else None,
+                "visible_content_seen": visible,
+                "valid_tool_calls": 0 if visible else 1,
+                "stream_complete": True,
+                "parse_errors": 0,
+            })
+            rows.append(row)
+
+    drift = summarize(rows, ttft_definition="first_visible")["drift"]
+
+    assert "drift_kind" not in drift
+    assert drift["counted_windows"] == 0
+    assert all(window["latency_coverage"] == 0.5
+               for window in drift["windows"])
+    assert all(window["event_survivorship"] is True
+               for window in drift["windows"])
+
+
+def test_first_visible_stability_keeps_reasoning_only_second_half():
+    rows = []
+    for i in range(240):
+        visible = i < 120
+        rows.append({
+            "ok": True,
+            "scheduled_s": i * 0.5,
+            "first_send_unix": 1_700_000_000.0 + i * 0.5,
+            "t_send_unix": 1_700_000_000.0 + i * 0.5,
+            "ttft_ms": 10.0,
+            "ttfv_ms": 100.0 if visible else None,
+            "e2e_ms": 200.0,
+            "visible_content_seen": visible,
+            "reasoning_seen": not visible,
+            "valid_tool_calls": 0,
+            "stream_complete": True,
+            "parse_errors": 0,
+        })
+
+    drift = summarize(rows, ttft_definition="first_visible")["drift"]
+
+    assert drift["window_clock_n"] == drift["window_clock_of"] == 240
+    assert len(drift["windows"]) == 2
+    assert drift["windows"][0]["latency_coverage"] == 1.0
+    assert drift["windows"][1]["latency_coverage"] == 0.0
+    assert drift["windows"][1]["event_survivorship"] is False
+    assert drift["windows"][1]["counted"] is False
 
 
 def test_unstable_run_says_so_in_html():
@@ -254,19 +447,137 @@ def test_report_states_which_harness_version_and_latency_basis():
     assert "NOT included" in s["latency_basis"]
     assert "immediately before conn.request" in s["latency_basis"]
     assert "include request upload" in s["latency_basis"]
-    assert "first iterated response-body line" in s["latency_basis"]
+    assert "first bounded response-body chunk" in s["latency_basis"]
+    assert "HTTPResponse.read1" in s["latency_basis"]
     assert "not necessarily the first response byte" in s["latency_basis"]
-    assert "visible or reasoning content delta" in s["latency_basis"]
+    assert "visible, reasoning, or refusal delta" in s["latency_basis"]
     assert "excludes tool-call fragments" in s["latency_basis"]
     assert "first visible content and first tool-call fragment remain separate" \
         in s["latency_basis"]
     assert "latency basis" in render_markdown(s, "v")
     html = render_html(s, "v")
     assert "Latency basis" in html
-    assert "TTFB (first response-body line)" in html
+    assert "TTFB (first bounded response-body chunk)" in html
     assert "TTFB (first byte)" not in html
-    assert "TTFT (first content delta)" in html
+    assert "TTFT (configured first content)" in html
     assert "TTFT (first token)" not in html
+
+
+def test_first_visible_is_primary_in_both_customer_reports():
+    rows = _rows(120)
+    for row in rows:
+        row["ttfv_ms"] = row["ttft_ms"] + 800.0
+        row["caller_ttfv_ms"] = row["ttfv_ms"] + 20.0
+        row["caller_ttft_ms"] = row["ttft_ms"] + 20.0
+    summary = summarize(rows, ttft_definition="first_visible")
+
+    markdown = render_markdown(summary, "visible")
+    html = render_html(summary, "visible")
+
+    assert "TTFV (configured first visible content)" in markdown
+    assert "TTFT (first content; diagnostic)" in markdown
+    assert markdown.index("TTFV (configured") < markdown.index(
+        "TTFT (first content; diagnostic)")
+    assert "Exact caller TTFV p50" in html
+    assert "Exact caller TTFT p50" not in html
+    assert html.index("TTFV (configured") < html.index(
+        "TTFT (first content; diagnostic)")
+
+
+def test_mixed_response_models_invalidate_single_model_benchmark():
+    rows = _rows(600, dt=0.25)
+    for i, row in enumerate(rows):
+        row.update({
+            "status": 200,
+            "response_model": (
+                "databricks-glm-5-2" if i < 300 else "wrong-model"),
+            "response_object": "chat.completion.chunk",
+            "system_fingerprint": "fp-a" if i < 300 else "fp-b",
+        })
+    summary = summarize(
+        rows,
+        run_meta={"endpoint_model": "databricks-glm-5-2"},
+        acceptance={
+            "ttft_ms": {"p95": 500.0},
+            "success_rate": 0.99,
+        },
+    )
+
+    identity = summary["response_identity"]
+    assert identity["status"] == "invalid"
+    assert identity["models"]["counts"] == {
+        "databricks-glm-5-2": 300,
+        "wrong-model": 300,
+    }
+    assert identity["unexpected_models"] == ["wrong-model"]
+    html = render_html(summary, "mixed model")
+    assert "Measurement invalid" in html
+    assert "multiple response model values" in html
+
+
+def test_consistent_response_model_is_bound_and_fingerprint_rotation_is_context():
+    rows = _rows(120)
+    for i, row in enumerate(rows):
+        row.update({
+            "status": 200,
+            "response_model": "databricks-glm-5-2",
+            "response_object": "chat.completion.chunk",
+            "system_fingerprint": "fp-a" if i < 60 else "fp-b",
+        })
+    summary = summarize(
+        rows,
+        run_meta={"endpoint_model": "databricks-glm-5-2"},
+    )
+
+    identity = summary["response_identity"]
+    assert identity["status"] == "bound"
+    assert identity["invalid"] is None
+    assert identity["system_fingerprints"]["distinct_values_at_least"] == 2
+
+
+def test_custom_endpoint_name_is_not_mistaken_for_response_model_identity():
+    rows = _rows(12)
+    for row in rows:
+        row.update({
+            "status": 200,
+            "response_model": "qwen-underlying-model",
+            "served_model_name": "production-route-a",
+            "response_object": "chat.completion.chunk",
+        })
+    summary = summarize(rows, run_meta={
+        "endpoint_model": None,
+        "endpoint_metadata": {
+            "name": "customer-pt-endpoint",
+            "served_entities": [{"name": "production-route-a"}],
+        },
+    })
+
+    identity = summary["response_identity"]
+    assert identity["status"] == "bound"
+    assert identity["invalid"] is None
+    assert identity["expected_models"] == []
+    assert identity["expected_served_model_names"] == ["production-route-a"]
+
+
+def test_served_model_header_must_match_an_active_control_plane_entity():
+    rows = _rows(12)
+    for row in rows:
+        row.update({
+            "status": 200,
+            "response_model": "qwen-underlying-model",
+            "served_model_name": "stale-route",
+            "response_object": "chat.completion.chunk",
+        })
+    summary = summarize(rows, run_meta={
+        "endpoint_metadata": {
+            "name": "customer-pt-endpoint",
+            "served_entities": [{"name": "production-route-a"}],
+        },
+    })
+
+    identity = summary["response_identity"]
+    assert identity["status"] == "invalid"
+    assert identity["unexpected_served_model_names"] == ["stale-route"]
 
 
 def _fail(n, t0=0.0, dt=1.0):
@@ -412,7 +723,8 @@ def test_a_run_where_everything_failed_says_so():
     established'. It is the most complete failure there is."""
     d = _drift_block([], _fail(50, t0=0.0) + _fail(50, t0=70.0))
     assert d["drift_kind"] == "failing"
-    assert "every request failed" in d["drift_headline"]
+    assert "no request belonged to the scored latency-outcome population" in \
+        d["drift_headline"]
 
 
 def test_the_named_window_is_the_largest_failure_not_the_highest_rate():
@@ -488,7 +800,7 @@ def test_a_total_outage_actually_renders_its_verdict():
     h = render_html(s, "outage")
     assert "failing" in md.lower()
     assert "unstable: failing" in h
-    assert "every request failed" in md
+    assert "no request belonged to the scored latency-outcome population" in md
 
 
 def test_one_stray_failure_does_not_flip_a_healthy_run():
@@ -583,7 +895,8 @@ def test_a_saturated_pool_shows_up_as_wire_lateness_not_dispatch_lag():
     assert arr["wire_lateness_ms"]["p95"] > 10_000      # reality
     assert s["client"]["warning"] is not None
     # states the observation, not a cause it cannot know
-    assert "did not reach the endpoint on schedule" in s["client"]["warning"]
+    assert "did not start HTTP requests on schedule" in s["client"]["warning"]
+    assert "endpoint receipt were not observed" in s["client"]["warning"]
     assert "read the stability card to tell them apart" in s["client"]["warning"]
 
 
@@ -592,7 +905,8 @@ def test_the_caution_is_above_the_tables_in_both_formats():
     s = summarize(rows)
     md = render_markdown(s, "sat")
     assert md.index("CAUTION (client saturation)") < md.index(
-        "| endpoint service metric (ms, from send) |")
+        "| final-attempt request-path metric (ms; clock starts immediately "
+        "before conn.request; connection setup excluded) |")
     assert "banner warn" in render_html(s, "sat")
 
 
@@ -609,7 +923,7 @@ def test_wire_lateness_is_reported_even_when_nothing_is_wrong():
     rows = _paced(600, offered_qps=20.0, service_s=0.06, pool=64)
     s = summarize(rows)
     md = render_markdown(s, "ok")
-    assert "wire lateness p95" in md
+    assert "HTTP request-start lateness p95" in md
     assert s["arrivals"]["wire_lateness_ms"]["n"] == 600
 
 
@@ -838,7 +1152,8 @@ def test_concurrency_caution_renders_above_the_tables():
     s = summarize(rows, concurrency_target=30)
     md = render_markdown(s, "conc")
     assert md.index("CAUTION (concurrency not reached)") < md.index(
-        "| endpoint service metric (ms, from send) |")
+        "| final-attempt request-path metric (ms; clock starts immediately "
+        "before conn.request; connection setup excluded) |")
     assert "banner warn" in render_html(s, "conc")
 
 
@@ -923,7 +1238,8 @@ def test_ttfv_percentiles_say_how_many_requests_they_leave_out():
     assert s["ttfv_ms"]["of"] == 187
     note = render_markdown(s, "note")
     assert "55 of 187" in note
-    assert "fastest subset" in note
+    assert "visible-content subset" in note
+    assert "artifact does not establish why" in note
     assert "first visible-or-reasoning content delta" in note
     assert "first visible content" in note
     assert "first token of" not in note
@@ -991,7 +1307,7 @@ def test_a_200_with_no_visible_content_is_not_a_successful_answer():
     assert a["transport_ok"] == 187
     assert a["answered"] == 55
     assert a["no_visible_content"] == 132
-    assert a["answer_rate"] == round(55 / 187, 6)
+    assert a["answer_rate"] == 55 / 187
     assert s["ttft_ms"]["n"] == 55
     assert s["latency_population"]["kind"] == "readable_answers"
     md = render_markdown(s, "answers")
@@ -1182,6 +1498,39 @@ def test_concurrency_percentiles_are_time_weighted():
     assert c["in_flight_max"] >= 24, c
 
 
+def test_empty_middle_load_window_reports_zero_occupancy_and_sizing_warning():
+    base = 1_700_000_000.0
+    rows = [
+        {"ok": True, "phase": "replay", "first_send_unix": base,
+         "t_send_unix": base, "finished_unix": base + 1.0},
+        {"ok": True, "phase": "replay", "first_send_unix": base + 10.0,
+         "t_send_unix": base + 10.0, "finished_unix": base + 11.0},
+    ]
+
+    concurrency = _concurrency_block(rows, asked=30)
+
+    assert concurrency["in_flight_p50"] == 0.0
+    assert concurrency["in_flight_p95"] == 0.0
+    assert concurrency["in_flight_max"] == 1.0
+    assert "observed in-flight p50 was 0" in concurrency["warning"]
+
+
+def test_equal_send_timestamp_burst_retains_peak_and_explicit_window_caution():
+    base = 1_700_000_000.0
+    rows = [
+        {"ok": True, "phase": "replay", "first_send_unix": base,
+         "t_send_unix": base, "finished_unix": base + 1.0}
+        for _ in range(7)
+    ]
+
+    concurrency = _concurrency_block(rows, asked=None)
+
+    assert concurrency["in_flight_max"] == 7.0
+    assert concurrency["in_flight_p50"] == 7.0
+    assert "same timestamp" in concurrency["warning"]
+    assert "response-drain interval" in concurrency["method"]
+
+
 # ---- rate conventions and observation windows ---------------------------
 
 def test_the_arrival_rate_uses_the_send_span_not_the_drain():
@@ -1200,6 +1549,130 @@ def test_the_arrival_rate_uses_the_send_span_not_the_drain():
     # 1000 output tokens over a 14.9s observation interval, not 9.9s
     expected = 1000 / (14.9 / 60.0)
     assert abs(s["throughput"]["output_tokens_per_min"] - expected) < 1.0
+
+
+def test_sparse_shard_arrivals_use_the_complete_logical_schedule_window():
+    base = 1_700_000_000.0
+    rows = [
+        {"ok": True, "phase": "replay", "ttft_ms": 50.0,
+         "e2e_ms": 100.0, "prompt_tokens": 100,
+         "completion_tokens": 10, "scheduled_s": stamp,
+         "caller_send_ms": 0.0, "t_send_unix": base + stamp,
+         "first_send_unix": base + stamp, "request_attempts": 1}
+        for stamp in (30.0, 30.1)
+    ]
+
+    summary = summarize(rows, schedule_meta={
+        "seconds": 60, "requests": 2, "shard": "2/4",
+        "rates_describe": "the whole run, not this shard",
+    })
+    arrivals = summary["arrivals"]
+
+    assert abs(arrivals["on_wire_qps_active_span"] - 10.0) < 1e-4
+    assert arrivals["scheduled_qps"] == 2 / 60
+    assert arrivals["achieved_qps_overall"] == 2 / 60
+    assert arrivals["logical_schedule_seconds"] == 60.0
+    assert arrivals["scheduled_qps_basis"] == \
+        "scheduled requests / logical schedule seconds"
+
+
+def test_sparse_schedule_token_throughput_and_cost_share_full_window():
+    base = 1_700_000_000.0
+    rows = [
+        {"ok": True, "phase": "replay", "ttft_ms": 50.0,
+         "e2e_ms": 100.0, "prompt_tokens": 100,
+         "completion_tokens": 10, "scheduled_s": stamp,
+         "caller_send_ms": 0.0, "t_send_unix": base + stamp,
+         "first_send_unix": base + stamp,
+         "finished_unix": base + stamp + 0.1,
+         "request_attempts": 1, "retries": 0, "retry_reasons": []}
+        for stamp in (30.0, 30.1)
+    ]
+
+    summary = summarize(
+        rows,
+        schedule_meta={"seconds": 60, "requests": 2},
+        pricing={"mode": "provisioned", "dbu_per_hour": 10.0})
+
+    throughput = summary["throughput"]
+    assert throughput["input_tokens_per_min"] == 200.0
+    assert throughput["output_tokens_per_min"] == 20.0
+    assert throughput["observation_seconds"] == 60.0
+    assert throughput["duration_basis"] == \
+        "max(logical_schedule_seconds,response_drain)"
+    assert summary["cost"]["observation_seconds"] == \
+        throughput["observation_seconds"]
+
+
+def _partially_delivered_schedule(sent_indexes: set[int]) -> list[dict]:
+    base = 1_700_000_000.0
+    rows = []
+    for i in range(100):
+        common = {
+            "scheduled_s": i * 0.1,
+            "dispatch_lag_ms": 0.0,
+            # Presence of this exact field distinguishes current rows from
+            # legacy evidence; None is proof that no POST began.
+            "caller_send_ms": 0.0 if i in sent_indexes else None,
+        }
+        if i in sent_indexes:
+            rows.append({
+                **common, "ok": True, "phase": "replay",
+                "ttft_ms": 50.0, "e2e_ms": 100.0,
+                "t_send_unix": base + i * 0.1,
+                "first_send_unix": base + i * 0.1,
+                "prompt_tokens": 100, "completion_tokens": 10,
+                "request_attempts": 1,
+            })
+        else:
+            rows.append({
+                **common, "ok": False, "phase": "replay",
+                "error": "pending limit reached before worker start",
+                "request_attempts": 0,
+            })
+    return rows
+
+
+def test_unsent_tail_cannot_report_full_scheduled_qps():
+    summary = summarize(_partially_delivered_schedule(set(range(50))))
+    arrivals = summary["arrivals"]
+
+    assert arrivals["scheduled_qps"] == 10.0
+    assert abs(arrivals["on_wire_qps_active_span"] - 10.0) < 1e-6
+    assert abs(arrivals["achieved_qps_overall"] - 5.0) < 1e-6
+    assert arrivals["schedule_delivery_fraction"] == 0.5
+    assert arrivals["scheduled_requests_not_sent"] == 50
+    assert summary["client"]["scheduled_requests_not_sent"] == 50
+    assert "never reached an HTTP POST" in summary["client"]["warning"]
+
+
+def test_interleaved_unsent_requests_reduce_delivery_rate_too():
+    summary = summarize(
+        _partially_delivered_schedule(set(range(0, 100, 2))))
+    arrivals = summary["arrivals"]
+
+    assert arrivals["schedule_delivery_fraction"] == 0.5
+    assert abs(arrivals["achieved_qps_overall"] - 5.0) < 0.1
+    assert arrivals["on_wire_qps_active_span"] < 6.0
+    assert "client" in summary
+
+
+def test_unsent_tail_and_stretched_sent_prefix_are_not_double_penalized():
+    rows = _partially_delivered_schedule(set(range(50)))
+    base = 1_700_000_000.0
+    for i, row in enumerate(rows[:50]):
+        # Sent prefix arrives at 5 rps across almost the entire 10-second
+        # logical window. The other half is unsent. That is 5 delivered rps,
+        # not 2.5 from multiplying the same shortfall twice.
+        row["caller_send_ms"] = i * 100.0
+        row["first_send_unix"] = base + i * 0.2
+        row["t_send_unix"] = base + i * 0.2
+
+    arrivals = summarize(rows)["arrivals"]
+
+    assert abs(arrivals["on_wire_qps_active_span"] - 5.0) < 1e-6
+    assert abs(arrivals["achieved_qps_overall"] - 5.0) < 0.1
+    assert arrivals["schedule_delivery_fraction"] == 0.5
 
 
 def test_failed_tail_extends_the_observation_window_instead_of_zero_duration():

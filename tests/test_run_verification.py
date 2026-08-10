@@ -16,10 +16,34 @@ from traffic_replay.artifacts import strict_json_dumps
 from traffic_replay.cli import main
 from traffic_replay.metrics import render_html, render_markdown, summarize
 from traffic_replay.run_verification import (
+    _validate_preflight_gate_consistency,
     create_run_verification_receipt,
     verify_run_output,
     verify_run_receipt,
 )
+
+
+def test_preflight_pass_cannot_be_bound_to_non_200_response_rows(tmp_path):
+    gate = {
+        "skipped": False, "attempted": 2, "reachable": 2,
+        "readable": 2, "reasoning_probe_requests": 0,
+        "outcome": "preflight_passed", "force_requested": False,
+        "gate_satisfied": True,
+    }
+    summary = {"run": {"preflight_gate": gate}}
+    start = {"preflight_gate": gate}
+    evidence = {
+        "phases": {"preflight": 2},
+        "preflight_rows_judged": 2,
+        "preflight_acceptable_outcomes": 0,
+        # Both adversarial rows can claim visible, complete answers, but HTTP
+        # 503 is never a reachable/passing production preflight response.
+        "preflight_http_200": 0,
+    }
+
+    with pytest.raises(ValueError, match="preflight gate counts disagree"):
+        _validate_preflight_gate_consistency(
+            tmp_path, summary, start, evidence)
 
 
 @pytest.fixture(autouse=True)
@@ -77,11 +101,15 @@ def _request_row() -> dict:
         "intended_cache_fraction": 0.0,
         "finish_reason": "stop",
         "retries": 0,
+        "response_model": "fixture-model",
+        "response_object": "chat.completion.chunk",
+        "response_id_sha256": "e" * 64,
+        "system_fingerprint": "fixture-fingerprint",
     }
 
 
-def _summary() -> dict:
-    row = _request_row()
+def _summary(row=None) -> dict:
+    row = _request_row() if row is None else row
     summary = summarize(
         [row],
         schedule_meta={
@@ -93,8 +121,19 @@ def _summary() -> dict:
             "title": "verified fixture",
             "input_mode": "profile",
             "endpoint_path": "/serving-endpoints/fixture/invocations",
+            "endpoint_model": "fixture-model",
             "artifact_id": "artifact-fixture",
             "aggregation_valid": True,
+            "transport": {
+                "connection_policy_id":
+                    "fresh_http1_per_physical_attempt",
+                "production_connection_policy_declared":
+                    "fresh_http1_per_physical_attempt",
+                "production_connection_policy_match": True,
+                "production_connection_policy_assurance":
+                    "operator asserted an exact production policy match",
+                "production_comparability_warning": None,
+            },
         },
         rate_limit_results=[row],
     )
@@ -130,17 +169,17 @@ def _file_metadata(raw: bytes, *, rows: int | None = None) -> dict:
     return value
 
 
-def _seal_run(base: Path, *, source=None, summary=None) -> Path:
+def _seal_run(base: Path, *, source=None, summary=None, row=None) -> Path:
     d = base
     d.mkdir()
     source = _source_state() if source is None else source
-    summary = _summary() if summary is None else summary
+    row = _request_row() if row is None else row
+    summary = _summary(row) if summary is None else summary
     start = {
         "run_started_at_unix": 1_800_000_000.0,
         "source": source,
         "effective_config": {"title": "verified fixture"},
     }
-    row = _request_row()
     files = {
         "requests.jsonl": (strict_json_dumps(row) + "\n").encode("utf-8"),
         "summary.json": _json_bytes(summary),
@@ -557,6 +596,34 @@ def test_manifest_bound_summary_and_request_log_must_agree(
     _reseal_manifest(run)
 
     with pytest.raises(ValueError, match=match):
+        verify_run_output(run)
+
+
+def test_external_verifier_rederives_visible_refusal_as_unacceptable(
+        tmp_path):
+    row = _request_row()
+    row["refusal_seen"] = True
+    summary = _summary(row)
+    assert summary["answers"]["judged"] == 1
+    assert summary["answers"]["acceptable_outcomes"] == 0
+
+    verified = verify_run_output(
+        _seal_run(tmp_path / "run", row=row, summary=summary))
+
+    evidence = verified["binding"]["request_evidence"]
+    assert evidence["answer_rows_judged"] == 1
+    assert evidence["acceptable_outcomes"] == 0
+    assert verified["summary"]["answers"]["acceptable_outcomes"] == 0
+
+
+def test_external_verifier_rejects_non_boolean_refusal_evidence(tmp_path):
+    canonical = _request_row()
+    canonical["refusal_seen"] = True
+    malformed = dict(canonical, refusal_seen=1)
+    run = _seal_run(
+        tmp_path / "run", row=malformed, summary=_summary(canonical))
+
+    with pytest.raises(ValueError, match="invalid answer-outcome fields"):
         verify_run_output(run)
 
 

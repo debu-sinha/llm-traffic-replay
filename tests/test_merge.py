@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from traffic_replay.aggregate import merge_runs
+from traffic_replay.aggregate import (
+    _require_run_dir,
+    _verified_comparison_request_evidence,
+    merge_runs,
+)
 
 
 def _tmp() -> Path:
@@ -78,6 +82,9 @@ def _source_manifest(ep: str, *, input_mode="profile", profile_sha="b" * 64,
         "seed": 7,
         "request_params": {"temperature": 0.0,
                            "max_output_tokens_cap": 512},
+        "config_identity": {
+            "sla_definition": {"ttft_definition": "first_content"},
+        },
         "schedule": {"seconds": 120, "requests": local_requests,
                      "total_requests": global_requests, "shard": shard,
                      "rate_min": 5.0, "rate_p50": 5.0,
@@ -178,7 +185,8 @@ def _mkrun(d: Path, ep: str, ttfts, title="run", profile_sha="b" * 64,
     d.mkdir(parents=True, exist_ok=True)
     (d / "summary.json").write_text(json.dumps({
         "run": {"endpoint_path": ep, "title": title,
-                "input_mode": "profile"},
+                "input_mode": "profile",
+                "ttft_definition": "first_content"},
         "harness_version": "0.4.1",
         "latency_basis": "send-to-first-token; connection excluded",
         "schedule": manifest["schedule"],
@@ -235,6 +243,54 @@ def _set_quota_row_evidence(d: Path, prompt_tokens):
     _refresh_artifacts(d)
 
 
+def _set_first_visible_evidence(d: Path, visible_ms: float) -> None:
+    summary_path = d / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["run"]["ttft_definition"] = "first_visible"
+    summary["sla"] = {"ttft_definition": "first_visible"}
+    summary_path.write_text(json.dumps(summary))
+
+    manifest_path = d / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["config_identity"] = {
+        "sla_definition": {"ttft_definition": "first_visible"},
+    }
+    manifest_path.write_text(json.dumps(manifest))
+
+    requests_path = d / "requests.jsonl"
+    rows = [json.loads(line) for line in requests_path.read_text().splitlines()]
+    for row in rows:
+        if row.get("phase") != "replay":
+            continue
+        row.update({
+            "ttfv_ms": visible_ms,
+            "caller_ttfv_ms": visible_ms,
+            "visible_content_seen": True,
+            "stream_complete": True,
+            "parse_errors": 0,
+        })
+    requests_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows))
+    _refresh_artifacts(d)
+
+
+def _set_acceptance_policy(d: Path, policy: dict) -> None:
+    summary_path = d / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["sla"] = {
+        "ttft_definition": "first_content",
+        "acceptance_config": {**policy, "targets_are": "source fixture"},
+    }
+    summary_path.write_text(json.dumps(summary))
+
+    manifest_path = d / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["config_identity"]["sla_definition"][
+        "acceptance_config"] = policy
+    manifest_path.write_text(json.dumps(manifest))
+    _refresh_artifacts(d)
+
+
 def test_merge_pools_and_percentiles_from_union():
     base = _tmp()
     _mkrun(base / "a", "/serving-endpoints/pt/invocations", [100] * 5)
@@ -263,6 +319,91 @@ def test_merge_pools_and_percentiles_from_union():
         manifest["artifacts"])
     assert (out / ".traffic-replay-complete").is_file()
     assert not (out / ".traffic-replay-writing").exists()
+
+
+def test_merge_preserves_first_visible_scoring_and_global_schedule():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [10] * 5)
+    _mkrun(base / "b", endpoint, [10] * 5)
+    _set_first_visible_evidence(base / "a", 500.0)
+    _set_first_visible_evidence(base / "b", 500.0)
+
+    out = merge_runs(
+        base / "out", [base / "a", base / "b"],
+        acceptance={"ttft_ms": {"p95": 120.0}},
+    )
+    summary = json.loads((out / "summary.json").read_text())
+
+    assert summary["run"]["ttft_definition"] == "first_visible"
+    assert summary["sla"]["ttft_definition"] == "first_visible"
+    assert summary["sla"]["ttft_vs_target"][0]["actual_ms"] == 500.0
+    assert summary["sla"]["ttft_vs_target"][0]["met"] is False
+    assert summary["schedule"]["requests"] == 10
+    assert summary["schedule"]["total_requests"] == 10
+    assert summary["schedule"]["seconds"] == 120
+    assert summary["schedule"]["source"] == "synthetic"
+
+
+def test_merge_rejects_conflicting_first_event_declarations():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    summary_path = base / "b" / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary["run"]["ttft_definition"] = "first_visible"
+    summary_path.write_text(json.dumps(summary))
+    _refresh_artifacts(base / "b")
+
+    with pytest.raises(ValueError, match="conflicting TTFT definition"):
+        merge_runs(base / "out", [base / "a", base / "b"])
+
+
+def test_merge_propagates_source_acceptance_and_labels_post_hoc_override():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    source_policy = {"ttft_ms": {"p95": 200.0}, "success_rate": 0.95}
+    for name in ("a", "b"):
+        _mkrun(base / name, endpoint, [100] * 2)
+        _set_acceptance_policy(base / name, source_policy)
+
+    propagated = merge_runs(
+        base / "propagated", [base / "a", base / "b"])
+    propagated_summary = json.loads(
+        (propagated / "summary.json").read_text())
+    provenance = propagated_summary["run"]["aggregation"][
+        "acceptance_policy_provenance"]
+    assert propagated_summary["sla"]["acceptance_config"]["ttft_ms"] == {
+        "p95": 200.0}
+    assert provenance["mode"] == "source_policy_propagated"
+    assert provenance["post_hoc"] is False
+
+    override = {"ttft_ms": {"p95": 150.0}, "success_rate": 0.90}
+    rescored = merge_runs(
+        base / "rescored", [base / "a", base / "b"],
+        acceptance=override)
+    rescored_summary = json.loads((rescored / "summary.json").read_text())
+    provenance = rescored_summary["run"]["aggregation"][
+        "acceptance_policy_provenance"]
+    assert rescored_summary["sla"]["acceptance_config"] == override
+    assert provenance["mode"] == "post_hoc_override"
+    assert provenance["post_hoc"] is True
+    manifest = json.loads((rescored / "manifest.json").read_text())
+    assert manifest["effective_config"]["acceptance_policy_provenance"][
+        "post_hoc"] is True
+
+
+def test_merge_rejects_different_source_acceptance_policies():
+    base = _tmp()
+    endpoint = "/serving-endpoints/pt/invocations"
+    _mkrun(base / "a", endpoint, [100] * 2)
+    _mkrun(base / "b", endpoint, [100] * 2)
+    _set_acceptance_policy(base / "a", {"ttft_ms": {"p95": 200.0}})
+    _set_acceptance_policy(base / "b", {"ttft_ms": {"p95": 300.0}})
+
+    with pytest.raises(ValueError, match="different acceptance policies"):
+        merge_runs(base / "out", [base / "a", base / "b"])
 
 
 def test_merge_pools_every_sealed_traffic_phase_for_quota_only():
@@ -854,6 +995,14 @@ def test_missing_index_coverage_is_never_marked_valid():
     assert summary["run"]["aggregation_valid"] is False
     issues = " ".join(summary["run"]["compatibility_issues"])
     assert "global_index coverage" in issues
+    manifest = _require_run_dir(out, "summary.json")
+    assert manifest["schedule_identity"]["global_count"] == 5
+    assert manifest["index_identity"]["global_count"] == 5
+    assert manifest["index_identity"]["partition"] == \
+        "diagnostic_observed_subset"
+    assert manifest["schedule"]["source_expected_total_requests"] == 6
+    evidence = _verified_comparison_request_evidence(out, manifest)
+    assert evidence["phase_totals"]["replay"] == 5
 
 
 def test_missing_expected_shard_is_never_marked_valid():
@@ -869,3 +1018,6 @@ def test_missing_expected_shard_is_never_marked_valid():
                      force=True)
     summary = json.loads((out / "summary.json").read_text())
     assert summary["run"]["aggregation_valid"] is False
+    manifest = _require_run_dir(out, "summary.json")
+    assert manifest["schedule_identity"]["global_count"] == 4
+    assert manifest["schedule"]["source_expected_total_requests"] == 6

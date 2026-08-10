@@ -5,14 +5,16 @@ import base64
 import hashlib
 import json
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from traffic_replay.client import (EndpointClient, EndpointConfig,
                                    UnsafeBearerTransport, normalized_origin)
+from traffic_replay.quota_planner import RuntimeQuotaGuard
 from traffic_replay.runner import AuthProfileError, _token, _token_from_profile
 
 
@@ -153,9 +155,8 @@ def test_oauth_profile_accepts_one_strict_cli_token_envelope(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
     monkeypatch.setattr(
-        "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=b'{"access_token":"minted"}'),
+        "traffic_replay.runner._run_cli_bounded",
+        lambda *args, **kwargs: (0, b'{"access_token":"minted"}'),
     )
 
     assert _token_from_profile(
@@ -177,9 +178,8 @@ def test_oauth_profile_rejects_ambiguous_cli_token_envelope(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
     monkeypatch.setattr(
-        "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=payload),
+        "traffic_replay.runner._run_cli_bounded",
+        lambda *args, **kwargs: (0, payload),
     )
 
     with pytest.raises(AuthProfileError, match="token JSON|access token"):
@@ -201,17 +201,16 @@ def test_u2m_cli_is_explicit_and_environment_auth_is_scrubbed(
     def fake_run(command, **kwargs):
         captured["command"] = command
         captured.update(kwargs)
-        return SimpleNamespace(
-            returncode=0, stdout=b'{"access_token":"minted"}')
+        return 0, b'{"access_token":"minted"}'
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "traffic_replay.runner._run_cli_bounded", fake_run)
     assert _token_from_profile("u2m", "https://workspace.example") == \
         "minted"
     assert captured["command"] == [
         "databricks", "auth", "token", "-p", "u2m"]
-    assert captured["timeout"] == 30.0
-    assert captured["stderr"] is subprocess.DEVNULL
-    assert captured["check"] is False
+    assert captured["timeout_s"] == 30.0
+    assert captured["max_stdout_bytes"] == 64 * 1024
     assert captured["env"]["DATABRICKS_CONFIG_FILE"] == cfg
     assert "DATABRICKS_TOKEN" not in captured["env"]
     assert "DATABRICKS_HOST" not in captured["env"]
@@ -494,9 +493,8 @@ def test_u2m_cli_failures_never_echo_stdout_stderr_or_exception_payload(
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", cfg)
     secret = "cli-secret-never-print"
     monkeypatch.setattr(
-        "subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=17, stdout=secret.encode(), stderr=secret.encode()),
+        "traffic_replay.runner._run_cli_bounded",
+        lambda *args, **kwargs: (17, secret.encode()),
     )
 
     with pytest.raises(AuthProfileError, match="status 17") as err:
@@ -507,7 +505,8 @@ def test_u2m_cli_failures_never_echo_stdout_stderr_or_exception_payload(
         raise subprocess.TimeoutExpired(
             args[0], 30, output=secret.encode(), stderr=secret.encode())
 
-    monkeypatch.setattr("subprocess.run", timeout)
+    monkeypatch.setattr(
+        "traffic_replay.runner._run_cli_bounded", timeout)
     with pytest.raises(AuthProfileError, match="timed out") as err:
         _token_from_profile("u2m", "https://workspace.example")
     assert secret not in str(err.value)
@@ -556,6 +555,43 @@ def test_total_timeout_must_be_positive_and_finite(value):
             base_url="http://127.0.0.1:1", path="/p",
             total_timeout_s=value,
         )
+
+
+@pytest.mark.parametrize("value", ["", "pooled", True, 7, {}])
+def test_production_connection_policy_is_a_closed_exact_contract(value):
+    with pytest.raises(ValueError, match="production_connection_policy"):
+        EndpointConfig(
+            base_url="https://workspace.example", path="/p",
+            production_connection_policy=value,
+        )
+
+
+def test_transport_contract_qualifies_unknown_production_behavior():
+    client = EndpointClient(EndpointConfig(
+        base_url="http://127.0.0.1:1", path="/p"), None)
+
+    contract = client.transport_contract()
+
+    assert contract["connection_policy_id"] == \
+        "fresh_http1_per_physical_attempt"
+    assert contract["production_connection_policy_declared"] is None
+    assert contract["production_connection_policy_match"] is False
+    assert contract["production_comparability_warning"]
+    assert contract["production_connection_policy_assurance"] is None
+
+
+def test_transport_contract_records_an_exact_operator_assertion():
+    client = EndpointClient(EndpointConfig(
+        base_url="http://127.0.0.1:1", path="/p",
+        production_connection_policy="fresh_http1_per_physical_attempt",
+    ), None)
+
+    contract = client.transport_contract()
+
+    assert contract["production_connection_policy_match"] is True
+    assert contract["production_comparability_warning"] is None
+    assert "operator asserted" in \
+        contract["production_connection_policy_assurance"]
 
 
 @pytest.mark.parametrize("value", [-1, True, 3, 10 ** 400])
@@ -670,6 +706,7 @@ def test_sweep_auth_failure_is_concise_stderr_without_traceback(
         "sweep", "--host", "https://workspace.example",
         "--endpoint", "model", "--auth-profile", "bad",
         "--rate", "1,2", "--duration", "1", "--cooldown", "0",
+        "--diagnostic-only",
         "--out-dir", str(tmp_path / "sweep"),
     ])
     captured = capsys.readouterr()
@@ -697,6 +734,47 @@ class _Response:
 
     def __iter__(self):
         return iter(self._events)
+
+
+def test_client_persists_databricks_served_model_response_header():
+    events = (
+        b'data: {"model":"underlying-model","choices":[{"delta":'
+        b'{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    class Response(_Response):
+        def getheader(self, name):
+            return {
+                "content-type": "text/event-stream; charset=utf-8",
+                "served-model-name": "active-served-entity",
+            }.get(name.casefold())
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return Response(200, events=events)
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+    client._connect = Connection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "served-header",
+        0.0, 0.0, (0, 0, None, 0), 2)
+
+    assert result.ok is True
+    assert result.response_model == "underlying-model"
+    assert result.served_model_name == "active-served-entity"
 
 
 class _TimedFailure:
@@ -827,6 +905,52 @@ def test_absolute_deadline_also_covers_connection_setup():
     assert conn.closed is True
 
 
+def test_absolute_deadline_expiring_during_quota_mark_never_posts():
+    request_calls = []
+
+    class SlowMarkGuard(RuntimeQuotaGuard):
+        def mark_post_may_have_started(self, handle):
+            evidence = super().mark_post_may_have_started(handle)
+            time.sleep(0.03)
+            return evidence
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            request_calls.append(True)
+
+        def close(self):
+            pass
+
+    guard = SlowMarkGuard({
+        "queries_per_hour": 100,
+        "warning_utilization": 1.0,
+    })
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       include_usage=False, total_timeout_s=0.01),
+        None, runtime_quota_guard=guard)
+    client._connect = Connection
+
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "deadline-quota-mark",
+        0.0, 0.0, (0, 0, None, 0), 2)
+
+    assert request_calls == []
+    assert result.request_attempts == 0
+    assert result.error == (
+        "request exceeded total timeout (total_timeout_s=0.01)")
+    assert result.quota_guard_events[0]["post_may_have_started"] is True
+    assert result.quota_guard_events[0]["state"] == "committed"
+    assert result.first_attempt_unix is not None
+    assert result.first_send_unix is None
+    assert result.finished_unix is not None
+
+
 def test_send_timestamp_excludes_connection_setup_and_attempts_are_explicit():
     conn = _TimedFailure()
     client = EndpointClient(
@@ -881,6 +1005,7 @@ def test_exact_caller_clocks_preserve_uniform_schedule_delay():
         (0, 0, None, 0), 2, scheduled_monotonic=scheduled,
     )
     assert 1900 <= result.queue_wait_ms <= 2300
+    assert 1900 <= result.caller_send_ms <= 2300
     assert 1900 <= result.caller_ttfb_ms <= 2300
     assert 1900 <= result.caller_ttft_ms <= 2300
     assert 1900 <= result.caller_ttfv_ms <= 2300
@@ -919,6 +1044,7 @@ def test_queue_wait_excludes_connection_setup_but_caller_latency_includes_it():
     )
     assert result.connect_ms >= 40
     assert result.queue_wait_ms < result.connect_ms
+    assert result.caller_send_ms >= result.connect_ms
     assert result.caller_ttft_ms >= result.connect_ms
 
 
@@ -1006,6 +1132,419 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     assert result.retry_reasons == ["stream_options_rejected"]
 
 
+def test_runtime_quota_denial_occurs_before_the_physical_post():
+    requests = []
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            requests.append((args, kwargs))
+
+        def close(self):
+            pass
+
+    # Strict threshold contact is refused: limit=1 at 100% has no safe
+    # positive integer below the threshold.
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 1,
+    })
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None,
+        runtime_quota_guard=guard)
+    client._connect = Connection
+
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "quota-denied",
+        0.0, 0.0, (0, 0, None, 0), 2)
+
+    assert requests == []
+    assert result.request_attempts == 0
+    assert result.connection_attempts == 1
+    assert result.quota_guard_denied is True
+    assert len(result.quota_guard_events) == 1
+    assert result.quota_guard_events[0]["decision"] == "denied"
+    assert guard.tripped is True
+
+
+def test_runtime_quota_can_refuse_a_fallback_retry_after_one_real_post():
+    requests = []
+
+    class Connection:
+        sock = _Sock()
+
+        def __init__(self, response):
+            self.response = response
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            requests.append((args, kwargs))
+
+        def getresponse(self):
+            return self.response
+
+        def close(self):
+            pass
+
+    connections = iter([
+        Connection(_Response(
+            400, b'{"error":"stream_options include_usage unsupported"}')),
+        # The guard must refuse before this response can be reached.
+        Connection(_Response(200)),
+    ])
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 2,
+    })
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None,
+        runtime_quota_guard=guard)
+    client._connect = lambda: next(connections)
+
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "quota-retry-denied",
+        0.0, 0.0, (0, 0, None, 0), 2)
+
+    assert len(requests) == 1
+    assert result.request_attempts == 1
+    assert result.connection_attempts == 2
+    assert result.retries == 1
+    assert result.retry_reasons == ["stream_options_rejected"]
+    assert result.quota_guard_denied is True
+    assert [event["decision"] for event in result.quota_guard_events] == [
+        "admitted", "denied"]
+    assert result.quota_guard_events[0]["state"] == "committed"
+    assert guard.snapshot()["counts"]["committed"] == 1
+
+
+def test_transport_failure_row_captures_terminal_quota_event():
+    """The result is evaluated before an attempt's finally block runs.
+
+    An ambiguous failure after conn.request must therefore settle the guard
+    before RequestResult deep-copies event evidence; otherwise the sealed row
+    says ``provisional`` while the command snapshot says ``committed``.
+    """
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            raise OSError("ambiguous failure after POST start")
+
+        def close(self):
+            pass
+
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0,
+        "queries_per_hour": 100,
+    })
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       include_usage=False, max_retries=0), None,
+        runtime_quota_guard=guard)
+    client._connect = Connection
+
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8,
+        "quota-ambiguous-transport", 0.0, 0.0,
+        (0, 0, None, 0), 2)
+
+    assert result.request_attempts == 1
+    assert result.quota_guard_denied is False
+    assert len(result.quota_guard_events) == 1
+    assert result.quota_guard_events[0]["state"] == "committed"
+    assert result.quota_guard_events[0]["post_may_have_started"] is True
+    snapshot = guard.snapshot()
+    assert snapshot["counts"]["committed"] == 1
+    assert snapshot["provisional_reservations"] == 0
+
+
+def test_guard_mark_failure_returns_exact_zero_post_evidence():
+    ticks = iter((10, 11, 9))
+    last = [9]
+
+    def clock_ns():
+        try:
+            last[0] = next(ticks)
+        except StopIteration:
+            pass
+        return last[0]
+
+    requests = []
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            requests.append((args, kwargs))
+
+        def close(self):
+            pass
+
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0, "queries_per_hour": 100,
+    }, clock_ns=clock_ns, wall_clock=lambda: 1_700_000_000.0)
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       include_usage=False, max_retries=0), None,
+        runtime_quota_guard=guard)
+    client._connect = Connection
+
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "mark-failure",
+        0.0, 0.0, (0, 0, None, 0), 2)
+
+    assert requests == []
+    assert result.request_attempts == 0
+    assert result.quota_guard_denied is True
+    assert len(result.quota_guard_events) == 1
+    assert result.quota_guard_events[0]["state"] == "provisional"
+    assert result.quota_guard_events[0]["post_may_have_started"] is False
+    assert guard.snapshot()["tripped"] is True
+
+
+def test_guard_commit_failure_returns_exact_ambiguous_post_evidence():
+    ticks = iter((10, 11, 12, 9))
+    last = [9]
+
+    def clock_ns():
+        try:
+            last[0] = next(ticks)
+        except StopIteration:
+            pass
+        return last[0]
+
+    requests = []
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            requests.append((args, kwargs))
+
+        def getresponse(self):
+            return _Response(503, b'{"error":"busy"}')
+
+        def close(self):
+            pass
+
+    guard = RuntimeQuotaGuard({
+        "warning_utilization": 1.0, "queries_per_hour": 100,
+    }, clock_ns=clock_ns, wall_clock=lambda: 1_700_000_000.0)
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       include_usage=False, max_retries=0), None,
+        runtime_quota_guard=guard)
+    client._connect = Connection
+
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "commit-failure",
+        0.0, 0.0, (0, 0, None, 0), 2)
+
+    assert len(requests) == 1
+    assert result.request_attempts == 1
+    assert result.status == 503
+    assert result.quota_guard_denied is True
+    assert len(result.quota_guard_events) == 1
+    assert result.quota_guard_events[0]["state"] == "provisional"
+    assert result.quota_guard_events[0]["post_may_have_started"] is True
+    snapshot = guard.snapshot()
+    assert snapshot["tripped"] is True
+    assert snapshot["provisional_reservations"] == 1
+
+
+def test_concurrent_stream_options_rejections_each_fallback_once():
+    delayed_started = threading.Event()
+    release_delayed = threading.Event()
+    connection_count = 0
+    count_lock = threading.Lock()
+    events = (
+        b'data: {"choices":[{"delta":{"content":"ok"},'
+        b'"finish_reason":"stop"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    class Connection:
+        sock = _Sock()
+
+        def __init__(self, role):
+            self.role = role
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            if self.role == "delayed-400":
+                delayed_started.set()
+                assert release_delayed.wait(timeout=2.0)
+                return _Response(
+                    400,
+                    b'{"error":"stream_options include_usage unsupported"}',
+                )
+            if self.role == "learning-400":
+                return _Response(
+                    400,
+                    b'{"error":"stream_options include_usage unsupported"}',
+                )
+            return _Response(200, events=events)
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p"), None)
+
+    def connect():
+        nonlocal connection_count
+        with count_lock:
+            connection_count += 1
+            number = connection_count
+        return Connection(
+            {1: "delayed-400", 2: "learning-400"}.get(number, "success"))
+
+    client._connect = connect
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        delayed = pool.submit(
+            client.send, [{"role": "user", "content": "hi"}], 8,
+            "delayed", 0.0, 0.0, (0, 0, None, 0), 2)
+        assert delayed_started.wait(timeout=1.0)
+        learner = pool.submit(
+            client.send, [{"role": "user", "content": "hi"}], 8,
+            "learner", 0.0, 0.0, (0, 0, None, 0), 2)
+        learned = learner.result(timeout=2.0)
+        release_delayed.set()
+        raced = delayed.result(timeout=2.0)
+
+    assert learned.ok is True and raced.ok is True
+    assert learned.request_attempts == raced.request_attempts == 2
+    assert learned.retry_reasons == ["stream_options_rejected"]
+    assert raced.retry_reasons == ["stream_options_rejected"]
+    assert client._include_usage_supported is False
+
+
+def test_exhausted_midstream_reset_preserves_observed_evidence():
+    class BrokenResponse:
+        status = 200
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise OSError("reset after content")
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return BrokenResponse()
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       include_usage=False), None)
+    client._connect = Connection
+    result = client.send(
+        [{"role": "user", "content": "hi"}], 8, "partial-reset",
+        0.0, 0.0, (0, 0, None, 0), 2,
+        scheduled_monotonic=time.monotonic())
+
+    assert result.ok is False
+    assert result.status == 200
+    assert result.ttfb_ms is not None
+    assert result.ttft_ms is not None
+    assert result.caller_ttft_ms is not None
+    assert result.e2e_ms is not None
+    assert result.content_chunks == 1
+    assert result.visible_content_seen is True
+    assert result.stream_complete is False
+    assert result.request_attempts == 1
+    assert result.error == "transport failed: OSError"
+
+
+def test_failed_refresh_is_single_flight_and_respects_each_deadline():
+    workers = 3
+    response_barrier = threading.Barrier(workers)
+    refresh_calls = 0
+    refresh_lock = threading.Lock()
+
+    class Connection:
+        sock = _Sock()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            response_barrier.wait(timeout=1.0)
+            return _Response(401, b'expired token')
+
+        def close(self):
+            pass
+
+    def refresh():
+        nonlocal refresh_calls
+        with refresh_lock:
+            refresh_calls += 1
+        time.sleep(0.05)
+        return None
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       include_usage=False, total_timeout_s=0.02),
+        "stale-token", refresh=refresh)
+    client._connect = Connection
+
+    def invoke(index):
+        started = time.monotonic()
+        result = client.send(
+            [{"role": "user", "content": "hi"}], 8, f"auth-{index}",
+            0.0, 0.0, (0, 0, None, 0), 2)
+        return time.monotonic() - started, result
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        outcomes = list(pool.map(invoke, range(workers)))
+
+    assert refresh_calls == 1
+    assert max(elapsed for elapsed, _result in outcomes) < 0.15
+    assert all(result.error ==
+               "request exceeded total timeout (total_timeout_s=0.02)"
+               for _elapsed, result in outcomes)
+
+
+@pytest.mark.parametrize("token", ["bad\r\ntoken", "bad token", "tökén"])
+def test_endpoint_client_rejects_header_unsafe_tokens_without_echo(token):
+    with pytest.raises(ValueError) as raised:
+        EndpointClient(
+            EndpointConfig(base_url="http://127.0.0.1:1", path="/p"),
+            token)
+    assert token not in str(raised.value)
+
+
 def test_exact_caller_clock_includes_automatic_fallback_elapsed_time():
     events = (
         b'data: {"choices":[{"delta":{"content":"ok"},'
@@ -1053,6 +1592,84 @@ def test_exact_caller_clock_includes_automatic_fallback_elapsed_time():
     assert result.caller_ttft_ms >= 35
     assert result.caller_e2e_ms >= 35
     assert result.ttft_ms < result.caller_ttft_ms
+
+
+def test_retry_cannot_reuse_caller_milestones_from_a_failed_stream():
+    class BrokenContentResponse:
+        status = 200
+
+        def __iter__(self):
+            yield (b'data: {"choices":[{"delta":{"content":"stale"}}]}'
+                   b'\n\n')
+            raise OSError("stream reset after content")
+
+    tool_events = (
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"function":{"name":"lookup","arguments":"{}"}}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{},'
+        b'"finish_reason":"tool_calls"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    class Connection:
+        sock = _Sock()
+
+        def __init__(self, response):
+            self.response = response
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return self.response
+
+        def close(self):
+            pass
+
+    connections = iter([
+        Connection(BrokenContentResponse()),
+        Connection(_Response(200, events=tool_events)),
+    ])
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/p",
+                       max_retries=1),
+        None,
+    )
+    client._connect = lambda: next(connections)
+    result = client.send(
+        [{"role": "user", "content": "look it up"}], 20, "retry-tool",
+        0.0, 0.0, (3, 20, None, -1), 10,
+        scheduled_monotonic=time.monotonic(),
+    )
+
+    assert result.ok is True
+    assert result.request_attempts == 2
+    assert result.retry_reasons == ["transport_error_after_post"]
+    assert result.valid_tool_calls == 1
+    assert result.ttft_ms is None
+    assert result.ttfv_ms is None
+    assert result.caller_ttft_ms is None
+    assert result.caller_ttfv_ms is None
+    assert result.ttf_tool_call_ms is not None
+    assert result.caller_ttf_tool_call_ms is not None
+
+    from traffic_replay.metrics import summarize
+    summary = summarize(
+        [json.loads(result.to_json())],
+        acceptance={"ttft_ms": {"p50": 1}},
+    )
+    assert "ttft_corrected_ms" not in summary
+    assert summary["sla"]["ttft_vs_target"][0]["met"] is False
+    from traffic_replay.report_decision import (
+        IntegrityContext,
+        build_report_decision,
+    )
+    decision = build_report_decision(
+        summary, IntegrityContext(status="verified", reason="test evidence"))
+    assert decision["customer_sla"]["code"] == "MISS"
 
 
 def test_generic_400_is_not_retried_or_persisted_verbatim():

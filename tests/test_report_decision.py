@@ -40,7 +40,17 @@ def _summary(*, with_sla: bool = True) -> dict:
             "seconds": 120,
             "source": "customer trace",
         },
-        "run": {"aggregation_valid": True},
+        "run": {
+            "aggregation_valid": True,
+            "transport": {
+                "connection_policy_id":
+                    "fresh_http1_per_physical_attempt",
+                "production_connection_policy_declared":
+                    "fresh_http1_per_physical_attempt",
+                "production_connection_policy_match": True,
+                "production_comparability_warning": None,
+            },
+        },
         "http_429_count": 0,
         "http_429": {
             "count": 0,
@@ -73,12 +83,14 @@ def _summary(*, with_sla: bool = True) -> dict:
                 "actual_ms": 1_500, "met": True,
             }],
             "hard_timeout_breaches": 0,
+            "hard_timeout_unmeasured": 0,
             "hard_timeout_basis": {
                 "ttft_cap_ms": 15_000,
                 "ttfg_cap_ms": 45_000,
                 "interchunk_cap_ms": 2_000,
             },
             "interchunk_breaches": 0,
+            "interchunk_unmeasured": 0,
             "success_rate": {
                 "target": 0.99,
                 "actual": 1.0,
@@ -112,6 +124,174 @@ def test_clean_verified_run_keeps_all_five_decisions_separate():
         decision["endpoint_capacity"]["reason"]
 
 
+@pytest.mark.parametrize("transport,reason_code", [
+    (None, "PRODUCTION_TRANSPORT_EVIDENCE_MISSING"),
+    ({
+        "production_connection_policy_match": False,
+        "production_comparability_warning": "production policy is unknown",
+     }, "PRODUCTION_TRANSPORT_UNVERIFIED"),
+    ({
+        "production_connection_policy_match": False,
+        "production_comparability_warning": None,
+     }, "PRODUCTION_TRANSPORT_EVIDENCE_INCONSISTENT"),
+])
+def test_unmatched_or_missing_production_transport_qualifies_capacity(
+        transport, reason_code):
+    summary = _summary()
+    if transport is None:
+        summary["run"].pop("transport")
+    else:
+        summary["run"]["transport"] = transport
+
+    decision = build_report_decision(summary, VERIFIED)
+
+    assert decision["measurement_validity"]["code"] == "CAUTION"
+    assert reason_code in \
+        decision["measurement_validity"]["reason_codes"]
+    assert decision["endpoint_capacity"]["code"] == "INCONCLUSIVE"
+
+
+def test_every_measurement_gate_retains_its_ordered_code_and_message():
+    summary = _summary()
+    summary["cache_fidelity"] = {
+        "warning": "cache usage was not reported by the endpoint",
+    }
+    summary["network_path"] = {
+        "warning": "the generator was outside the production network path",
+    }
+    summary["run"].update({
+        "endpoint_metadata_warning": (
+            "post-drain endpoint metadata could not be captured"),
+        "transport": {
+            "production_connection_policy_match": False,
+            "production_comparability_warning": (
+                "production connection behavior was not declared"),
+        },
+    })
+
+    measurement = build_report_decision(
+        summary, VERIFIED)["measurement_validity"]
+
+    expected = [
+        ("CACHE_FIDELITY_UNVERIFIED",
+         "cache usage was not reported by the endpoint"),
+        ("NETWORK_PATH_CAUTION",
+         "the generator was outside the production network path"),
+        ("ENDPOINT_METADATA_STABILITY_UNVERIFIED",
+         "post-drain endpoint metadata could not be captured"),
+        ("PRODUCTION_TRANSPORT_UNVERIFIED",
+         "production connection behavior was not declared"),
+    ]
+    assert measurement["code"] == "CAUTION"
+    assert [
+        (item["code"], item["message"])
+        for item in measurement["reason_details"]
+    ] == expected
+    assert measurement["reason_codes"] == [code for code, _ in expected]
+    assert "plus " not in measurement["reason"]
+
+
+@pytest.mark.parametrize("invalidity,reason_code", [
+    ("response_identity", "RESPONSE_MODEL_IDENTITY_INVALID"),
+    ("endpoint_stability", "ENDPOINT_METADATA_CHANGED_DURING_RUN"),
+    ("forced_preflight", "FORCED_UNREADABLE_PREFLIGHT"),
+])
+def test_cli_exit_and_sweep_rung_follow_canonical_measurement_invalidity(
+        tmp_path, capsys, invalidity, reason_code):
+    from traffic_replay.cli import _finish
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    summary = _summary()
+    summary["sla"]["acceptance_config"]["targets_are"] = \
+        "customer requirements"
+    if invalidity == "response_identity":
+        summary["response_identity"] = {
+            "status": "invalid",
+            "invalid": "response model identity changed across requests",
+        }
+    elif invalidity == "endpoint_stability":
+        summary["run"]["endpoint_metadata_stability"] = "changed"
+    else:
+        summary["run"]["preflight_gate"] = {
+            "skipped": False, "attempted": 2, "reachable": 2,
+            "readable": 0, "reasoning_probe_requests": 0,
+            "outcome": "preflight_forced_unreadable",
+            "force_requested": True, "gate_satisfied": False,
+        }
+
+    decision = build_report_decision(summary)
+    assert decision["measurement_validity"]["code"] == "INVALID"
+    assert reason_code in decision["measurement_validity"]["reason_codes"]
+    assert _finish(
+        {"summary": summary, "out_dir": str(tmp_path)},
+        fmt="json") == 2
+    assert json.loads(capsys.readouterr().out)["requests_total"] == 1_000
+    rung = classify_sweep_rung(summary)
+    assert rung["state"] == "INVALID"
+    assert rung["kind"] == "invalid"
+
+
+@pytest.mark.parametrize("caution,reason_code", [
+    ("response_identity", "RESPONSE_MODEL_IDENTITY_UNVERIFIED"),
+    ("endpoint_stability", "ENDPOINT_METADATA_STABILITY_UNVERIFIED"),
+])
+def test_cli_and_sweep_never_promote_canonical_measurement_caution_to_pass(
+        tmp_path, capsys, caution, reason_code):
+    from traffic_replay.cli import _finish
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    summary = _summary()
+    summary["sla"]["acceptance_config"]["targets_are"] = \
+        "customer requirements"
+    if caution == "response_identity":
+        summary["response_identity"] = {
+            "status": "caution",
+            "warning": "response model identity was not reported",
+        }
+    else:
+        summary["run"]["endpoint_metadata_stability"] = "unverified"
+        summary["run"]["endpoint_metadata_warning"] = (
+            "post-run endpoint metadata could not be fetched")
+
+    decision = build_report_decision(summary)
+    assert decision["measurement_validity"]["code"] == "CAUTION"
+    assert reason_code in decision["measurement_validity"]["reason_codes"]
+    assert _finish(
+        {"summary": summary, "out_dir": str(tmp_path)},
+        fmt="text") == 0
+    terminal = capsys.readouterr().out
+    assert "CAUTION:" in terminal
+    assert "OK:" not in terminal
+    rung = classify_sweep_rung(summary)
+    assert rung["kind"] == "caution"
+    assert rung["state"] != "PASS"
+
+
+def test_current_summary_count_contradiction_can_never_be_cli_or_sweep_pass(
+        tmp_path, capsys):
+    from traffic_replay.cli import _finish
+    from traffic_replay.metrics import _verdict
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    summary = _summary()
+    summary["sla"]["acceptance_config"]["targets_are"] = \
+        "customer requirements"
+    summary["requests_total"] = 999
+
+    decision = build_report_decision(summary)
+    assert decision["measurement_validity"]["code"] == "INVALID"
+    assert "SUMMARY_COUNTS_INCONSISTENT" in decision[
+        "measurement_validity"]["reason_codes"]
+    assert _verdict(summary)[0] == "invalid"
+    assert _finish(
+        {"summary": summary, "out_dir": str(tmp_path)},
+        fmt="json") == 2
+    assert json.loads(capsys.readouterr().out)["requests_total"] == 999
+    rung = classify_sweep_rung(summary)
+    assert rung["kind"] == "invalid"
+    assert rung["state"] == "INVALID"
+
+
 def test_sla_miss_is_retained_when_quota_makes_capacity_inconclusive():
     summary = _summary()
     summary["sla"]["ttft_vs_target"][0].update(
@@ -140,6 +320,47 @@ def test_sla_miss_is_retained_when_quota_makes_capacity_inconclusive():
     }
     assert "3/1008" in decision["quota_state"]["reason"]
     assert "preflight=1, replay=2" in decision["quota_state"]["reason"]
+
+
+def test_local_quota_refusal_is_not_mislabeled_as_an_http_429():
+    summary = _summary()
+    summary["runtime_quota_admission"] = {
+        "status": "denied",
+        "denied_rows": 1,
+        "denied_attempts_in_captured_rows": 1,
+        "invariant_errors": [],
+    }
+
+    decision = build_report_decision(summary, VERIFIED)
+
+    assert decision["measurement_validity"]["code"] == "INVALID"
+    assert decision["quota_state"]["code"] == "LOCAL_GUARD_REFUSED"
+    assert decision["endpoint_capacity"]["code"] == "INCONCLUSIVE"
+    assert decision["quota_state"]["http_429"]["http_429_count"] == 0
+    assert decision["quota_state"]["runtime_quota_admission"] == {
+        "status": "denied",
+        "denied_rows": 1,
+        "denied_attempts_in_captured_rows": 1,
+        "invariant_errors": [],
+    }
+    assert "not endpoint-capacity" in decision["quota_state"]["reason"]
+
+
+def test_invalid_runtime_quota_evidence_invalidates_the_measurement():
+    summary = _summary()
+    summary["runtime_quota_admission"] = {
+        "status": "invalid_evidence",
+        "denied_rows": 0,
+        "denied_attempts_in_captured_rows": 0,
+        "invariant_errors": ["attempt count mismatch"],
+    }
+
+    decision = build_report_decision(summary, VERIFIED)
+
+    assert decision["measurement_validity"]["code"] == "INVALID"
+    assert "RUNTIME_QUOTA_EVIDENCE_INVALID" in \
+        decision["measurement_validity"]["reason_codes"]
+    assert decision["quota_state"]["code"] == "UNKNOWN"
 
 
 def test_passing_sla_checks_are_visibly_qualified_on_invalid_measurement():
@@ -364,6 +585,21 @@ def test_unknown_endpoint_binding_blocks_capacity_claim_only():
     assert decision["endpoint_capacity"]["code"] == "INCONCLUSIVE"
     assert "ENDPOINT_BINDING_UNVERIFIED" in \
         decision["endpoint_capacity"]["reason_codes"]
+
+
+def test_generic_invocation_binding_allows_pt_tested_load_claim():
+    summary = _summary()
+    summary.pop("rate_limits")
+    summary["run"]["invocation_binding"] = {
+        "binding_kind": "direct_invocation_endpoint",
+        "binding_complete": True,
+    }
+
+    decision = build_report_decision(
+        summary, IntegrityContext(status="verified"))
+
+    assert decision["measurement_validity"]["code"] == "VALID"
+    assert decision["endpoint_capacity"]["code"] == "HELD_AT_TESTED_LOAD"
 
 
 def test_summary_only_integrity_is_verify_required_and_blocks_capacity_claim():

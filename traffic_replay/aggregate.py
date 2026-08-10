@@ -33,6 +33,7 @@ from .config_validation import validate_rate_limits
 from .json_input import json_error_detail, loads_strict
 from .markdown import markdown_plain_text
 from .metrics import _pct_table, summarize, write_outputs
+from .schedule import MAX_EXACT_ANALYSIS_REQUEST_ROWS
 
 
 _WRITING_MARKER = ".traffic-replay-writing"
@@ -43,48 +44,119 @@ _SHARD_RE = re.compile(r"([1-9][0-9]*)/([1-9][0-9]*)")
 _QUOTA_REQUEST_PHASES = frozenset({
     "preflight", "probe", "sizing", "calibration", "replay",
 })
-def _read_regular_bytes(path: Path) -> bytes:
-    """Read one artifact without following a final-component symlink."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_MAX_METADATA_ARTIFACT_BYTES = 16 * 1024 * 1024
+_MAX_REQUEST_JOURNAL_BYTES = 256 * 1024 * 1024
+_MAX_REQUEST_JSONL_LINE_BYTES = 256 * 1024
+
+
+def _regular_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns,
+    )
+
+
+def _read_regular_bytes(
+        path: Path, *, max_bytes: int = _MAX_METADATA_ARTIFACT_BYTES) -> bytes:
+    """Read one bounded stable artifact without following a symlink."""
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
+            or max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
         raise ValueError(f"cannot read regular artifact {path}: {exc}") from exc
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"artifact is not a regular file: {path}")
+        if before.st_size > max_bytes:
+            raise ValueError(
+                f"artifact {path} declares {before.st_size:,} bytes, above "
+                f"the {max_bytes:,}-byte metadata limit")
         chunks = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
             if not chunk:
-                break
+                raise ValueError(f"artifact was truncated while reading: {path}")
             chunks.append(chunk)
+            remaining -= len(chunk)
+        extra = os.read(fd, 1)
+        after = os.fstat(fd)
+        if extra or _regular_identity(before) != _regular_identity(after):
+            raise ValueError(f"artifact changed while reading: {path}")
         return b"".join(chunks)
     finally:
         os.close(fd)
 
 
-def _measure_regular(path: Path) -> tuple[str, int, int]:
+def _measure_regular(
+        path: Path, *, max_bytes: int = _MAX_METADATA_ARTIFACT_BYTES,
+        max_rows: int | None = None,
+        max_line_bytes: int | None = None) -> tuple[str, int, int]:
     """Return SHA-256, byte count and newline count with bounded memory."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
         raise ValueError(f"cannot read regular artifact {path}: {exc}") from exc
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"artifact is not a regular file: {path}")
+        if before.st_size > max_bytes:
+            raise ValueError(
+                f"artifact {path} declares {before.st_size:,} bytes, above "
+                f"its {max_bytes:,}-byte resource limit")
         digest = hashlib.sha256()
         size = 0
         rows = 0
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
+        current_line_bytes = 0
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
             if not chunk:
-                break
+                raise ValueError(
+                    f"artifact was truncated while measuring: {path}")
             digest.update(chunk)
             size += len(chunk)
-            rows += chunk.count(b"\n")
+            remaining -= len(chunk)
+            parts = chunk.split(b"\n")
+            if len(parts) == 1:
+                current_line_bytes += len(chunk)
+                if max_line_bytes is not None \
+                        and current_line_bytes > max_line_bytes:
+                    raise ValueError(
+                        f"artifact line exceeds {max_line_bytes:,} bytes: "
+                        f"{path}")
+            else:
+                if max_line_bytes is not None and (
+                        current_line_bytes + len(parts[0]) > max_line_bytes
+                        or any(len(part) > max_line_bytes
+                               for part in parts[1:-1])):
+                    raise ValueError(
+                        f"artifact line exceeds {max_line_bytes:,} bytes: "
+                        f"{path}")
+                rows += len(parts) - 1
+                if max_rows is not None and rows > max_rows:
+                    raise ValueError(
+                        f"artifact exceeds the {max_rows:,}-row resource "
+                        f"limit: {path}")
+                current_line_bytes = len(parts[-1])
+                if max_line_bytes is not None \
+                        and current_line_bytes > max_line_bytes:
+                    raise ValueError(
+                        f"artifact line exceeds {max_line_bytes:,} bytes: "
+                        f"{path}")
+        extra = os.read(fd, 1)
+        after = os.fstat(fd)
+        if extra or _regular_identity(before) != _regular_identity(after) \
+                or size != before.st_size:
+            raise ValueError(f"artifact changed while measuring: {path}")
         return digest.hexdigest(), size, rows
     finally:
         os.close(fd)
@@ -137,6 +209,260 @@ def _global_schedule_identity(manifest: dict) -> dict | None:
         for key in ("encoding", "global_timestamps_sha256", "global_count",
                     "global_min_s", "global_max_s")
     }
+
+
+def _local_replay_identity(manifest: dict) -> dict | None:
+    """Exact shard-local schedule/index identity used by comparison.
+
+    Two shards can truthfully share one parent/global schedule while covering
+    disjoint requests.  Comparing only the parent digest would therefore make
+    shard 1 look interchangeable with shard 2.  The values returned here are
+    authenticated against ``requests.jsonl`` before comparison uses them.
+    """
+    schedule = manifest.get("schedule_identity")
+    index = manifest.get("index_identity")
+    if not isinstance(schedule, dict) or not isinstance(index, dict):
+        return None
+    return {
+        "schedule": {
+            key: schedule.get(key)
+            for key in (
+                "encoding", "shard_timestamps_sha256", "shard_count",
+                "shard_min_s", "shard_max_s",
+            )
+        },
+        "index": {
+            key: index.get(key)
+            for key in (
+                "encoding", "global_indices_sha256", "count", "min", "max",
+                "global_count", "shard_index", "shard_total", "partition",
+            )
+        },
+    }
+
+
+def _declared_ttft_definition(
+        title: str, summary: dict, manifest: dict) -> tuple[str | None, list[str]]:
+    """Return one canonical first-event definition or declaration issues.
+
+    Do not use an ``or`` chain here: it hides an internally contradictory
+    artifact by selecting whichever declaration happens to appear first.
+    Current v3 artifacts carry the definition in both measurement output and
+    immutable configuration provenance, and all present declarations must
+    agree.
+    """
+    config_identity = manifest.get("config_identity")
+    config_identity = config_identity if isinstance(config_identity, dict) else {}
+    effective = manifest.get("effective_config")
+    effective = effective if isinstance(effective, dict) else {}
+    identity_effective = config_identity.get("effective_config")
+    identity_effective = (identity_effective
+                          if isinstance(identity_effective, dict) else {})
+    sla_definition = config_identity.get("sla_definition")
+    sla_definition = sla_definition if isinstance(sla_definition, dict) else {}
+    summary_run = summary.get("run")
+    summary_run = summary_run if isinstance(summary_run, dict) else {}
+    summary_sla = summary.get("sla")
+    summary_sla = summary_sla if isinstance(summary_sla, dict) else {}
+    declarations = [
+        ("manifest.config_identity.sla_definition",
+         sla_definition.get("ttft_definition")),
+        ("manifest.config_identity.effective_config",
+         identity_effective.get("ttft_definition")),
+        ("manifest.effective_config", effective.get("ttft_definition")),
+        ("summary.run", summary_run.get("ttft_definition")),
+        ("summary.sla", summary_sla.get("ttft_definition")),
+    ]
+    present = [(location, value) for location, value in declarations
+               if value is not None]
+    issues: list[str] = []
+    invalid = [(location, value) for location, value in present
+               if value not in {"first_content", "first_visible"}]
+    if invalid:
+        detail = ", ".join(
+            f"{location}={value!r}" for location, value in invalid)
+        issues.append(f"invalid TTFT definition declaration for {title}: {detail}")
+        return None, issues
+    groups: dict[str, list[str]] = {}
+    for location, value in present:
+        groups.setdefault(str(value), []).append(location)
+    if len(groups) > 1:
+        detail = "; ".join(
+            f"{value} at {', '.join(locations)}"
+            for value, locations in sorted(groups.items()))
+        issues.append(
+            f"conflicting TTFT definition declarations inside {title}: {detail}")
+        return None, issues
+    if not groups:
+        issues.append(
+            f"missing TTFT definition declaration for {title}; a v3 artifact "
+            "must bind first_content or first_visible")
+        return None, issues
+    return next(iter(groups)), issues
+
+
+def _normalized_acceptance_policy(value: object) -> dict | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    # targets_are says where a policy came from; it does not change a target.
+    return {key: item for key, item in value.items() if key != "targets_are"}
+
+
+def _production_transport_evidence(summary: dict) -> dict:
+    """Normalize the artifact-safe actual-versus-production transport claim."""
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    transport = run.get("transport")
+    transport = transport if isinstance(transport, dict) else {}
+
+    def nonempty_string(value: object) -> str | None:
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    actual = nonempty_string(transport.get("connection_policy_id"))
+    declared = nonempty_string(
+        transport.get("production_connection_policy_declared"))
+    raw_match = transport.get("production_connection_policy_match")
+    match = raw_match if isinstance(raw_match, bool) else None
+    raw_warning = transport.get("production_comparability_warning")
+    warning = nonempty_string(raw_warning)
+    assurance = nonempty_string(
+        transport.get("production_connection_policy_assurance"))
+    exact = bool(
+        actual is not None and declared == actual and match is True
+        and raw_warning is None)
+    if exact:
+        status = "MATCH"
+        note = assurance or "explicit exact connection-policy match recorded"
+    elif match is True or (
+            raw_warning is not None and not isinstance(raw_warning, str)):
+        status = "INCONSISTENT"
+        note = (
+            warning or "transport parity fields are internally inconsistent")
+    else:
+        status = "UNVERIFIED"
+        if warning:
+            note = warning
+        elif actual is None:
+            note = "benchmark connection policy was not recorded"
+        elif declared is None:
+            note = (
+                "production connection behavior was not declared, so it "
+                f"cannot be compared with benchmark policy {actual}")
+        else:
+            note = (
+                f"declared production policy {declared} does not have an "
+                f"explicit exact match to benchmark policy {actual}")
+    return {
+        "status": status,
+        "exact_match": exact,
+        "actual_policy_id": actual,
+        "declared_production_policy": declared,
+        "recorded_match": match,
+        "warning": warning,
+        "assurance": assurance,
+        "note": note,
+    }
+
+
+def _execution_contract(summary: dict, manifest: dict) -> dict | None:
+    """Measurement-affecting client/runtime settings omitted by request body."""
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    transport = run.get("transport")
+    if isinstance(transport, dict):
+        # Production parity is an operator assertion about a different
+        # client, not a behavior of this benchmark process. Compare the
+        # benchmark's actual wire contract here, and qualify production
+        # parity independently in the warning gate/matrix below.
+        transport = {
+            key: value for key, value in transport.items()
+            if key not in {
+                "production_connection_policy_declared",
+                "production_connection_policy_match",
+                "production_connection_policy_assurance",
+                "production_comparability_warning",
+            }
+        }
+    else:
+        transport = None
+    effective = manifest.get("effective_config")
+    if not isinstance(effective, dict):
+        config_identity = manifest.get("config_identity")
+        config_identity = config_identity if isinstance(config_identity, dict) else {}
+        effective = config_identity.get("effective_config")
+    effective = effective if isinstance(effective, dict) else {}
+    endpoint = effective.get("endpoint")
+    endpoint = endpoint if isinstance(endpoint, dict) else {}
+    value = {
+        "transport": transport,
+        "max_concurrency": effective.get("max_concurrency"),
+        "max_pending_requests": (
+            run.get("max_pending_requests")
+            if run.get("max_pending_requests") is not None
+            else effective.get("max_pending_requests")),
+        "endpoint_client": {
+            key: endpoint.get(key)
+            for key in (
+                "connect_timeout_s", "read_timeout_s", "total_timeout_s",
+                "max_retries", "include_usage",
+            )
+            if endpoint.get(key) is not None
+        },
+    }
+    return value if any(item not in (None, {}) for item in value.values()) else None
+
+
+def _declared_acceptance_policy(
+        title: str, summary: dict, manifest: dict) -> tuple[dict | None, list[str]]:
+    """Reconcile every persisted declaration of a source SLA policy."""
+    config_identity = manifest.get("config_identity")
+    config_identity = config_identity if isinstance(config_identity, dict) else {}
+    effective = manifest.get("effective_config")
+    effective = effective if isinstance(effective, dict) else {}
+    identity_effective = config_identity.get("effective_config")
+    identity_effective = (identity_effective
+                          if isinstance(identity_effective, dict) else {})
+    sla_definition = config_identity.get("sla_definition")
+    sla_definition = sla_definition if isinstance(sla_definition, dict) else {}
+    summary_sla = summary.get("sla")
+    summary_sla = summary_sla if isinstance(summary_sla, dict) else {}
+    declarations = [
+        ("manifest.config_identity.sla_definition.acceptance_config",
+         sla_definition.get("acceptance_config")),
+        ("manifest.config_identity.effective_config.acceptance_targets",
+         identity_effective.get("acceptance_targets")),
+        ("manifest.effective_config.acceptance_targets",
+         effective.get("acceptance_targets")),
+        ("summary.sla.acceptance_config",
+         summary_sla.get("acceptance_config")),
+    ]
+    present = [
+        (location, _normalized_acceptance_policy(value))
+        for location, value in declarations
+        if value is not None
+    ]
+    malformed = [location for location, value in present if value is None]
+    if malformed:
+        return None, [
+            f"invalid acceptance policy declaration for {title}: "
+            + ", ".join(malformed) + " must be a non-empty object"
+        ]
+    groups: dict[str, tuple[dict, list[str]]] = {}
+    for location, value in present:
+        assert value is not None
+        key = _stable(value)
+        if key not in groups:
+            groups[key] = (value, [])
+        groups[key][1].append(location)
+    if len(groups) > 1:
+        detail = "; ".join(
+            f"{policy} at {', '.join(locations)}"
+            for policy, (_value, locations) in sorted(groups.items()))
+        return None, [
+            f"conflicting acceptance policy declarations inside {title}: "
+            f"{detail}"
+        ]
+    return (next(iter(groups.values()))[0] if groups else None), []
 
 
 def _compatibility_issues(dirs: list[Path], summaries: list[dict],
@@ -224,10 +550,49 @@ def _compatibility_issues(dirs: list[Path], summaries: list[dict],
                                               merging)
                         or None))
     check("load mode", lambda _s, m: m.get("load_mode"), required=False)
-    check("TTFT definition", lambda s, m: (
-        (((m.get("config_identity") or {}).get("sla_definition") or {}).get(
-            "ttft_definition"))
-        or (s.get("sla") or {}).get("ttft_definition")), required=False)
+    check("client execution contract", _execution_contract, required=False,
+          detail=("different client execution contracts; timeout, retry, "
+                  "stream-usage, transport, or client saturation settings "
+                  "can change measured latency and failure behavior"))
+    definitions: list[tuple[str, str | None]] = []
+    policies: list[tuple[str, dict | None]] = []
+    for title, source_summary, manifest in present:
+        definition, declaration_issues = _declared_ttft_definition(
+            title, source_summary, manifest)
+        definitions.append((title, definition))
+        issues.extend(declaration_issues)
+        policy, policy_issues = _declared_acceptance_policy(
+            title, source_summary, manifest)
+        policies.append((title, policy))
+        issues.extend(policy_issues)
+    definition_groups: dict[str, list[str]] = {}
+    for title, definition in definitions:
+        if definition is not None:
+            definition_groups.setdefault(definition, []).append(title)
+    if len(definition_groups) > 1:
+        detail = "; ".join(
+            f"{', '.join(group_titles)}={definition}"
+            for definition, group_titles in sorted(definition_groups.items()))
+        issues.append("different TTFT definitions: " + detail)
+    if merging:
+        present_policies = [(title, value) for title, value in policies
+                            if value is not None]
+        absent_policies = [title for title, value in policies
+                           if value is None]
+        if present_policies and absent_policies:
+            issues.append(
+                "missing acceptance policy for " + ", ".join(absent_policies))
+        groups: dict[str, list[str]] = {}
+        for title, value in present_policies:
+            groups.setdefault(_stable(value), []).append(title)
+        if len(groups) > 1:
+            detail = "; ".join(
+                f"{', '.join(group_titles)}={value}"
+                for value, group_titles in groups.items())
+            issues.append("different acceptance policies: " + detail)
+    if not merging:
+        check("local replay schedule/index identity",
+              lambda _s, m: _local_replay_identity(m))
     if merging:
         check("endpoint identity", lambda _s, m: ({
             "base_url": m.get("endpoint_base_url"),
@@ -302,6 +667,22 @@ def _artifact_declarations(manifest: dict, d: Path) -> dict[str, dict]:
                     f"invalid row_count for artifact {name!r} in {source} "
                     f"for {d}")
             normalized["row_count"] = rows
+        if name == "requests.jsonl":
+            if size is not None and size > _MAX_REQUEST_JOURNAL_BYTES:
+                raise ValueError(
+                    f"artifact {name!r} in {source} for {d} declares "
+                    f"{size:,} bytes, above the "
+                    f"{_MAX_REQUEST_JOURNAL_BYTES:,}-byte journal limit")
+            if rows is not None and rows > MAX_EXACT_ANALYSIS_REQUEST_ROWS:
+                raise ValueError(
+                    f"artifact {name!r} in {source} for {d} declares "
+                    f"{rows:,} rows, above the exact-analysis limit of "
+                    f"{MAX_EXACT_ANALYSIS_REQUEST_ROWS:,}")
+        elif size is not None and size > _MAX_METADATA_ARTIFACT_BYTES:
+            raise ValueError(
+                f"artifact {name!r} in {source} for {d} declares {size:,} "
+                f"bytes, above the {_MAX_METADATA_ARTIFACT_BYTES:,}-byte "
+                "metadata limit")
         old = declarations.get(name)
         if old is not None and old != normalized:
             raise ValueError(
@@ -350,7 +731,16 @@ def _verify_artifacts(d: Path, manifest: dict,
             + ", ".join(without_sizes))
     for name, expected in declarations.items():
         path = d / name
-        actual, actual_bytes, actual_rows = _measure_regular(path)
+        request_journal = name == "requests.jsonl"
+        actual, actual_bytes, actual_rows = _measure_regular(
+            path,
+            max_bytes=(_MAX_REQUEST_JOURNAL_BYTES if request_journal
+                       else _MAX_METADATA_ARTIFACT_BYTES),
+            max_rows=(MAX_EXACT_ANALYSIS_REQUEST_ROWS
+                      if request_journal else None),
+            max_line_bytes=(_MAX_REQUEST_JSONL_LINE_BYTES
+                            if request_journal else None),
+        )
         if not hmac.compare_digest(actual, expected["sha256"]):
             raise ValueError(
                 f"artifact SHA-256 mismatch for {path}: expected "
@@ -447,7 +837,15 @@ def _validate_identity_shapes(d: Path, manifest: dict) -> None:
         raise ValueError(f"invalid index_identity shard index/total for {d}")
     expected_partition = "unsharded" if shard_total == 1 \
         else "round_robin_modulo"
-    if index.get("partition") != expected_partition:
+    diagnostic_subset = index.get("partition") == "diagnostic_observed_subset"
+    aggregation = manifest.get("aggregation")
+    forced_diagnostic = isinstance(aggregation, dict) \
+        and aggregation.get("forced") is True
+    if diagnostic_subset and not forced_diagnostic:
+        raise ValueError(
+            f"diagnostic_observed_subset is allowed only on an explicitly "
+            f"forced aggregate for {d}")
+    if not diagnostic_subset and index.get("partition") != expected_partition:
         raise ValueError(f"invalid index_identity.partition for {d}")
     low = index.get("min")
     high = index.get("max")
@@ -586,49 +984,112 @@ def _validated_input_dirs(input_dirs, need: str, operation: str) \
     return dirs, manifests
 
 
-def _request_rows(d: Path) -> list[dict]:
-    """Read every manifest-bound row from a sealed request journal.
-
-    Merge latency/SLA integrity is checked against the replay subset, but
-    setup traffic is still real workspace demand.  Keeping the full journal
-    here lets rolling token/query windows union preflight, probe, sizing,
-    calibration, and replay requests by their recorded epoch timestamps.
-    """
-    rows = []
-    path = d / "requests.jsonl"
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _scan_request_journal(path: Path, expected: dict, visitor) -> None:
+    """Strictly stream one bounded manifest-bound JSONL journal."""
+    expected_bytes = expected.get("bytes")
+    expected_rows = expected.get("row_count")
+    if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) \
+            or not 0 <= expected_bytes <= _MAX_REQUEST_JOURNAL_BYTES:
+        raise ValueError(f"invalid bounded request byte declaration for {path}")
+    if isinstance(expected_rows, bool) or not isinstance(expected_rows, int) \
+            or not 0 <= expected_rows <= MAX_EXACT_ANALYSIS_REQUEST_ROWS:
+        raise ValueError(f"invalid bounded request row declaration for {path}")
+    expected_digest = expected.get("sha256")
+    if not isinstance(expected_digest, str) or not _SHA256_RE.fullmatch(
+            expected_digest):
+        raise ValueError(f"invalid request SHA-256 declaration for {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
         raise ValueError(f"cannot read regular artifact {path}: {exc}") from exc
+    digest = hashlib.sha256()
+    size = 0
+    rows = 0
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"artifact is not a regular file: {path}")
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        if before.st_size != expected_bytes:
+            raise ValueError(
+                f"artifact byte count mismatch for {path}: expected "
+                f"{expected_bytes}, got {before.st_size}")
+        with os.fdopen(fd, "rb") as handle:
             fd = -1                 # fdopen owns it from here
-            try:
-                for line_no, line in enumerate(handle, 1):
-                    if not line.strip():
-                        raise ValueError(
-                            f"blank JSONL record in {path} line {line_no}")
-                    try:
-                        r = loads_strict(line)
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"invalid JSON in {path} line {line_no}: "
-                            f"{json_error_detail(exc)}") from exc
-                    if not isinstance(r, dict):
-                        raise ValueError(
-                            f"requests.jsonl line {line_no} is not an object "
-                            f"in {d}")
-                    rows.append(r)
-            except UnicodeDecodeError as exc:
-                raise ValueError(
-                    f"requests.jsonl is not UTF-8 in {d}: "
-                    f"{json_error_detail(exc)}") from exc
+            while True:
+                raw = handle.readline(_MAX_REQUEST_JSONL_LINE_BYTES + 1)
+                if not raw:
+                    break
+                rows += 1
+                if rows > expected_rows \
+                        or rows > MAX_EXACT_ANALYSIS_REQUEST_ROWS:
+                    raise ValueError(
+                        f"request journal exceeds its {expected_rows:,}-row "
+                        f"declaration in {path}")
+                if len(raw) > _MAX_REQUEST_JSONL_LINE_BYTES:
+                    raise ValueError(
+                        f"request journal line {rows} exceeds the "
+                        f"{_MAX_REQUEST_JSONL_LINE_BYTES:,}-byte limit in "
+                        f"{path}")
+                if not raw.endswith(b"\n"):
+                    raise ValueError(
+                        f"request journal line {rows} is not newline "
+                        f"terminated in {path}")
+                digest.update(raw)
+                size += len(raw)
+                if size > expected_bytes:
+                    raise ValueError(
+                        f"request journal exceeds its declared byte count in "
+                        f"{path}")
+                if not raw.strip():
+                    raise ValueError(
+                        f"blank JSONL record in {path} line {rows}")
+                try:
+                    row = loads_strict(raw)
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"invalid JSON in {path} line {rows}: "
+                        f"{json_error_detail(exc)}") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"requests.jsonl line {rows} is not an object in "
+                        f"{path.parent}")
+                visitor(row, rows)
+            after = os.fstat(handle.fileno())
+        if _regular_identity(before) != _regular_identity(after):
+            raise ValueError(f"request journal changed while reading: {path}")
+        if rows != expected_rows:
+            raise ValueError(
+                f"artifact row count mismatch for {path}: expected "
+                f"{expected_rows}, got {rows}")
+        if size != expected_bytes:
+            raise ValueError(
+                f"artifact byte count mismatch for {path}: expected "
+                f"{expected_bytes}, got {size}")
+        actual_digest = digest.hexdigest()
+        if not hmac.compare_digest(actual_digest, expected_digest.lower()):
+            raise ValueError(
+                f"artifact SHA-256 mismatch for {path}: expected "
+                f"{expected_digest}, got {actual_digest}")
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _request_rows(d: Path, manifest: dict) -> list[dict]:
+    """Materialize only a pre-bounded, manifest-bound request journal.
+
+    Merge latency/SLA integrity is checked against the replay subset, but
+    setup traffic is still real workspace demand. Keeping the full journal
+    here lets rolling token/query windows union every phase. The combined
+    input population is rejected before this function is called.
+    """
+    rows: list[dict] = []
+    expected = _artifact_declarations(manifest, d)["requests.jsonl"]
+    _scan_request_journal(
+        d / "requests.jsonl", expected,
+        lambda row, _line_number: rows.append(row))
     return rows
 
 
@@ -1135,8 +1596,20 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     """
     dirs, manifests = _validated_input_dirs(
         input_dirs, "requests.jsonl", "merge")
+    combined_request_rows = sum(
+        _artifact_declarations(manifest, d)["requests.jsonl"]["row_count"]
+        for d, manifest in zip(dirs, manifests))
+    if combined_request_rows > MAX_EXACT_ANALYSIS_REQUEST_ROWS:
+        raise ValueError(
+            f"merge inputs declare {combined_request_rows:,} total request "
+            f"rows, above the exact-analysis resource envelope of "
+            f"{MAX_EXACT_ANALYSIS_REQUEST_ROWS:,}; merge smaller compatible "
+            "sets or implement bounded streaming aggregation")
     summaries = [_load_summary(d) for d in dirs]
-    request_rows_by_dir = [_request_rows(d) for d in dirs]
+    request_rows_by_dir = [
+        _request_rows(d, manifest)
+        for d, manifest in zip(dirs, manifests)
+    ]
     rows_by_dir = [
         [row for row in source_rows if row.get("phase") == "replay"]
         for source_rows in request_rows_by_dir
@@ -1189,8 +1662,55 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     # cache fraction is still replay behavior. carry the fields summarize()
     # needs, otherwise the merged report shows the cache number with no note.
     counts = {(s.get("run") or {}).get("prompts_count") for s in summaries}
+    declared_source_policies = [
+        _declared_acceptance_policy(_run_title(d, summary), summary, manifest)[0]
+        for d, summary, manifest in zip(dirs, summaries, manifests)
+    ]
+    policy_values = {
+        _stable(policy) for policy in declared_source_policies
+        if policy is not None
+    }
+    shared_source_policy = (
+        next(policy for policy in declared_source_policies if policy is not None)
+        if len(policy_values) == 1
+        and all(policy is not None for policy in declared_source_policies)
+        else None
+    )
+    supplied_policy = _normalized_acceptance_policy(acceptance)
+    if acceptance is None:
+        effective_acceptance = shared_source_policy
+        acceptance_mode = (
+            "source_policy_propagated" if shared_source_policy is not None
+            else "not_configured")
+    else:
+        effective_acceptance = acceptance
+        acceptance_mode = (
+            "explicit_policy_matches_sources"
+            if shared_source_policy is not None
+            and supplied_policy == shared_source_policy
+            else "post_hoc_override")
+    acceptance_provenance = {
+        "mode": acceptance_mode,
+        "source_policy_coverage": sum(
+            policy is not None for policy in declared_source_policies),
+        "source_count": len(declared_source_policies),
+        "source_policy": shared_source_policy,
+        "applied_policy": _normalized_acceptance_policy(effective_acceptance),
+        "post_hoc": acceptance_mode == "post_hoc_override",
+        "note": (
+            "acceptance thresholds were supplied at merge time and differ "
+            "from, or were absent from, source-run policy; this is transparent "
+            "post-hoc rescoring of sealed rows"
+            if acceptance_mode == "post_hoc_override" else
+            "the common source-run acceptance policy was retained"
+            if acceptance_mode == "source_policy_propagated" else
+            "the explicit merge policy matches every source-run policy"
+            if acceptance_mode == "explicit_policy_matches_sources" else
+            "no acceptance policy was configured on the source runs or merge"),
+    }
     source_provenance = []
-    for d, manifest in zip(dirs, manifests):
+    for d, manifest, policy in zip(
+            dirs, manifests, declared_source_policies):
         source_provenance.append({
             "run_dir": str(d),
             "logical_run_id": (_logical_run_id(manifest)
@@ -1204,6 +1724,7 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
             "profile_sha256": ((manifest or {}).get("profile_sha256")
                                or (manifest or {}).get("profile_sha256_16")),
             "config_sha256": (manifest or {}).get("config_sha256"),
+            "acceptance_policy": policy,
         })
     workload_ids = {manifest.get("workload_id") for manifest in manifests}
     workload_id = (next(iter(workload_ids)) if len(workload_ids) == 1 else
@@ -1221,38 +1742,87 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
                       if len(request_params_values) == 1 else None)
     seed_values = {manifest.get("seed") for manifest in manifests}
     seed = next(iter(seed_values)) if len(seed_values) == 1 else None
+    load_modes = {manifest.get("load_mode") for manifest in manifests}
+    load_mode = next(iter(load_modes)) if len(load_modes) == 1 else None
+    transport_values = {
+        _stable((summary.get("run") or {}).get("transport"))
+        for summary in summaries
+    }
+    transport = ((summaries[0].get("run") or {}).get("transport")
+                 if len(transport_values) == 1 else None)
     expected_total = _declared_total_requests(manifests[0], dirs[0])
     merged_indices = [row["global_index"] for row in rows]
+    observed_total = len(merged_indices)
+    observed_indices_dense = all(
+        value == position for position, value in enumerate(merged_indices))
     index_identity = {
         "encoding": "int64-le",
         "global_indices_sha256": _packed_sha256(merged_indices, "int64-le"),
         "count": len(merged_indices),
         "min": merged_indices[0] if merged_indices else None,
         "max": merged_indices[-1] if merged_indices else None,
-        "global_count": expected_total,
+        # A forced incomplete merge remains a self-consistent sealed artifact.
+        # The parent expectation is retained separately as diagnostic lineage.
+        "global_count": observed_total,
         "shard_index": 0,
         "shard_total": 1,
-        "partition": "unsharded",
-    }
-    schedule_identities = {
-        _stable(_global_schedule_identity(manifest))
-        for manifest in manifests if manifest.get("schedule_identity") is not None
+        "partition": (
+            "diagnostic_observed_subset"
+            if not observed_indices_dense else "unsharded"),
     }
     source_schedule_identity = manifests[0].get("schedule_identity") or {}
     merged_timestamps = [float(row["scheduled_s"]) for row in rows]
+    observed_schedule_hash = _packed_sha256(
+        merged_timestamps, "float64-le")
     merged_schedule_identity = {
-        "encoding": source_schedule_identity.get("encoding"),
-        "global_timestamps_sha256": source_schedule_identity.get(
-            "global_timestamps_sha256"),
-        "global_count": source_schedule_identity.get("global_count"),
-        "global_min_s": source_schedule_identity.get("global_min_s"),
-        "global_max_s": source_schedule_identity.get("global_max_s"),
-        "shard_timestamps_sha256": _packed_sha256(
-            merged_timestamps, "float64-le"),
-        "shard_count": len(merged_timestamps),
+        "encoding": (source_schedule_identity.get("encoding")
+                     or "float64-le-seconds-from-run-start"),
+        "global_timestamps_sha256": observed_schedule_hash,
+        "global_count": observed_total,
+        "global_min_s": min(merged_timestamps) if merged_timestamps else None,
+        "global_max_s": max(merged_timestamps) if merged_timestamps else None,
+        "shard_timestamps_sha256": observed_schedule_hash,
+        "shard_count": observed_total,
         "shard_min_s": min(merged_timestamps) if merged_timestamps else None,
         "shard_max_s": max(merged_timestamps) if merged_timestamps else None,
     }
+
+    definitions = {
+        definition
+        for d, summary, manifest in zip(dirs, summaries, manifests)
+        for definition in [_declared_ttft_definition(
+            _run_title(d, summary), summary, manifest)[0]]
+        if definition is not None
+    }
+    # A non-forced merge reaches here only with one canonical declaration.
+    # Forced diagnostics use first_content solely to render their withheld
+    # metrics; compatibility_issues remains the authoritative invalid state.
+    ttft_definition = (next(iter(definitions)) if len(definitions) == 1
+                       else "first_content")
+
+    source_schedules = [manifest.get("schedule") or {} for manifest in manifests]
+
+    def common_schedule_value(field: str):
+        values = [schedule.get(field) for schedule in source_schedules]
+        stable = {_stable(value) for value in values if value is not None}
+        return values[0] if len(stable) == 1 and all(
+            value is not None for value in values) else None
+
+    merged_schedule_meta = {
+        "requests": observed_total,
+        "total_requests": observed_total,
+        "source_expected_total_requests": expected_total,
+        "observed_replay_requests": observed_total,
+        "coverage_complete": expected_total == observed_total,
+        "shard": "1/1",
+        "source": common_schedule_value("source") or "merged proven schedule",
+    }
+    for schedule_field in (
+            "seconds", "rate_min", "rate_p50", "rate_p95", "rate_max",
+            "arrival_mode", "trace_sha256"):
+        value = common_schedule_value(schedule_field)
+        if value is not None:
+            merged_schedule_meta[schedule_field] = value
     meta = {
         "merged_from": [str(d) for d in dirs],
         **({"endpoint_base_url": next(iter(endpoints))[0],
@@ -1270,15 +1840,27 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
         "input_mode": input_mode,
         "request_params": request_params,
         "seed": seed,
+        "load_mode": load_mode,
+        **({"transport": transport} if transport is not None else {}),
+        "ttft_definition": ttft_definition,
         "index_identity": index_identity,
-        **({"schedule_identity": merged_schedule_identity}
-           if len(schedule_identities) == 1 else {}),
+        "schedule_identity": merged_schedule_identity,
         "aggregation_valid": not compatibility_issues,
         "compatibility_issues": compatibility_issues,
         "aggregation": {
             "kind": "merge",
             "forced": bool(force),
             "sources": source_provenance,
+            "acceptance_policy_provenance": acceptance_provenance,
+            "source_schedule_expectation": {
+                "expected_total_requests": expected_total,
+                "observed_replay_requests": observed_total,
+                "complete": expected_total == observed_total,
+                "global_schedule_identities": [
+                    _global_schedule_identity(manifest)
+                    for manifest in manifests
+                ],
+            },
         },
         **({"prompts_count": counts.pop()}
            if input_mode == "prompts" and len(counts) == 1
@@ -1310,10 +1892,19 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     # input list. That is invalid when runs began at different wall-clock
     # times. Mark queue wait unavailable before summarize() so a merge pools
     # only exact monotonic caller clocks already recorded on each row.
+    temporary_caller_send_markers: set[int] = set()
     for row in rows:
         row["queue_wait_ms"] = None
+        if "caller_send_ms" not in row:
+            # summarize() reconstructs only legacy rows where this field is
+            # absent. A pooled merge has no valid cross-run epoch offset, so
+            # use an explicit temporary None to suppress reconstruction.
+            row["caller_send_ms"] = None
+            temporary_caller_send_markers.add(id(row))
     summary = summarize(
-        rows, run_meta=meta, acceptance=acceptance,
+        rows, run_meta=meta, acceptance=effective_acceptance,
+        schedule_meta=merged_schedule_meta,
+        ttft_definition=ttft_definition,
         rate_limits=(rate_limits if not compatibility_issues else None),
         rate_limit_results=quota_rows)
     if compatibility_issues:
@@ -1333,9 +1924,11 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     # same hazard as drift below: shards start at different wall-clock times,
     # so a single schedule-vs-send offset across pooled rows reads the gap
     # between shards as lateness.
+    summary["arrivals"]["http_request_start_lateness_ms"] = _pct_table([])
     summary["arrivals"]["wire_lateness_ms"] = _pct_table([])
     summary["arrivals"]["wire_lateness_note"] = (
-        "wire lateness is not computed for a merged run, because pooled rows "
+        "HTTP request-start lateness is not computed for a merged run, "
+        "because pooled rows "
         "come from separate runs and the offset between them would read as "
         "lateness. read each run's own report. dispatch lag below is pooled "
         "and still meaningful, since it is measured within each run.")
@@ -1344,6 +1937,8 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
     # its queue delay. Exact caller clocks remain on their own fields.
     for _r in rows:
         _r.pop("queue_wait_ms", None)
+        if id(_r) in temporary_caller_send_markers:
+            _r.pop("caller_send_ms", None)
     corrected_fields = (
         "ttft_corrected_ms", "ttfv_corrected_ms",
         "ttf_tool_call_corrected_ms", "e2e_corrected_ms")
@@ -1394,6 +1989,10 @@ def merge_runs(out_dir, input_dirs, title=None, acceptance=None,
             "operation": "merge",
             "forced": bool(force),
             "sources": source_provenance,
+            "ttft_definition": ttft_definition,
+            "schedule": merged_schedule_meta,
+            "acceptance_targets": effective_acceptance,
+            "acceptance_policy_provenance": acceptance_provenance,
             **({"rate_limits": rate_limits}
                if rate_limits is not None and not compatibility_issues else {}),
         },
@@ -1555,7 +2154,8 @@ def _verified_comparison_request_evidence(d: Path, manifest: dict) -> dict:
     """
     expected = _artifact_declarations(manifest, d)["requests.jsonl"]
     path = d / "requests.jsonl"
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -1567,14 +2167,42 @@ def _verified_comparison_request_evidence(d: Path, manifest: dict) -> dict:
     phases: dict[str, int] = {}
     phase_totals: dict[str, int] = {}
     http_status_observed_for = 0
+    replay_records: list[tuple[int, float, str]] = []
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError(f"artifact is not a regular file: {path}")
+        if before.st_size != expected["bytes"]:
+            raise ValueError(
+                f"artifact byte count mismatch for {path}: expected "
+                f"{expected['bytes']}, got {before.st_size}")
         with os.fdopen(fd, "rb") as handle:
             fd = -1
-            for line_no, raw in enumerate(handle, 1):
+            line_no = 0
+            while True:
+                raw = handle.readline(_MAX_REQUEST_JSONL_LINE_BYTES + 1)
+                if not raw:
+                    break
+                line_no += 1
+                if line_no > expected["row_count"]:
+                    raise ValueError(
+                        f"request journal exceeds its declared row count in "
+                        f"{path}")
+                if len(raw) > _MAX_REQUEST_JSONL_LINE_BYTES:
+                    raise ValueError(
+                        f"request journal line {line_no} exceeds the "
+                        f"{_MAX_REQUEST_JSONL_LINE_BYTES:,}-byte limit in "
+                        f"{path}")
+                if not raw.endswith(b"\n"):
+                    raise ValueError(
+                        f"request journal line {line_no} is not newline "
+                        f"terminated in {path}")
                 digest.update(raw)
                 size += len(raw)
+                if size > expected["bytes"]:
+                    raise ValueError(
+                        f"request journal exceeds its declared byte count in "
+                        f"{path}")
                 if not raw.strip():
                     raise ValueError(
                         f"blank JSONL record in {path} line {line_no}")
@@ -1590,15 +2218,40 @@ def _verified_comparison_request_evidence(d: Path, manifest: dict) -> dict:
                 total += 1
                 phase = str(row.get("phase") or "unlabeled")
                 phase_totals[phase] = phase_totals.get(phase, 0) + 1
+                if phase == "replay":
+                    global_index = row.get("global_index")
+                    if isinstance(global_index, bool) \
+                            or not isinstance(global_index, int) \
+                            or global_index < 0:
+                        raise ValueError(
+                            f"replay row {line_no} in {path} has no valid "
+                            "non-negative global_index")
+                    scheduled_s = row.get("scheduled_s")
+                    if isinstance(scheduled_s, bool) \
+                            or not isinstance(scheduled_s, (int, float)) \
+                            or not math.isfinite(float(scheduled_s)):
+                        raise ValueError(
+                            f"replay row {line_no} in {path} has no valid "
+                            "scheduled_s")
+                    request_id = row.get("request_id")
+                    if not isinstance(request_id, str) or not request_id:
+                        raise ValueError(
+                            f"replay row {line_no} in {path} has no valid "
+                            "request_id")
+                    replay_records.append((
+                        global_index, float(scheduled_s), request_id))
                 status = row.get("status")
                 if isinstance(status, int) and not isinstance(status, bool):
                     http_status_observed_for += 1
                     if status == 429:
                         count += 1
                         phases[phase] = phases.get(phase, 0) + 1
+            after = os.fstat(handle.fileno())
     finally:
         if fd >= 0:
             os.close(fd)
+    if _regular_identity(before) != _regular_identity(after):
+        raise ValueError(f"request journal changed while reading: {path}")
     actual = digest.hexdigest()
     if not hmac.compare_digest(actual, expected["sha256"]):
         raise ValueError(
@@ -1612,6 +2265,63 @@ def _verified_comparison_request_evidence(d: Path, manifest: dict) -> dict:
         raise ValueError(
             f"artifact row count mismatch for {path}: expected "
             f"{expected['row_count']}, got {total}")
+
+    ordered = sorted(replay_records, key=lambda item: item[0])
+    indices = [item[0] for item in ordered]
+    timestamps = [item[1] for item in ordered]
+    request_ids = [item[2] for item in ordered]
+    if len(indices) != len(set(indices)):
+        raise ValueError(
+            f"duplicate replay global_index values in manifest-bound {path}")
+    if len(request_ids) != len(set(request_ids)):
+        raise ValueError(
+            f"duplicate replay request_id values in manifest-bound {path}")
+
+    index_identity = manifest["index_identity"]
+    schedule_identity = manifest["schedule_identity"]
+    actual_index_hash = _packed_sha256(indices, "int64-le")
+    actual_schedule_hash = _packed_sha256(timestamps, "float64-le")
+    actual_index_min = indices[0] if indices else None
+    actual_index_max = indices[-1] if indices else None
+    actual_schedule_min = min(timestamps) if timestamps else None
+    actual_schedule_max = max(timestamps) if timestamps else None
+    if (not hmac.compare_digest(
+            actual_index_hash,
+            str(index_identity["global_indices_sha256"]).lower())
+            or index_identity["count"] != len(indices)
+            or index_identity.get("min") != actual_index_min
+            or index_identity.get("max") != actual_index_max):
+        raise ValueError(
+            f"index_identity disagrees with replay global_index values in "
+            f"manifest-bound {path}")
+    if (not hmac.compare_digest(
+            actual_schedule_hash,
+            str(schedule_identity["shard_timestamps_sha256"]).lower())
+            or schedule_identity["shard_count"] != len(timestamps)
+            or schedule_identity.get("shard_min_s") != actual_schedule_min
+            or schedule_identity.get("shard_max_s") != actual_schedule_max):
+        raise ValueError(
+            f"schedule_identity disagrees with replay scheduled_s values in "
+            f"manifest-bound {path}")
+    shard_index = index_identity["shard_index"]
+    shard_total = index_identity["shard_total"]
+    misplaced = [index for index in indices
+                 if index % shard_total != shard_index]
+    if misplaced:
+        raise ValueError(
+            f"replay global_index {misplaced[0]} in {path} does not belong "
+            f"to declared shard {shard_index + 1}/{shard_total}")
+    if shard_total == 1 and (
+            not hmac.compare_digest(
+                actual_schedule_hash,
+                str(schedule_identity["global_timestamps_sha256"]).lower())
+            or schedule_identity["global_count"] != len(timestamps)
+            or schedule_identity.get("global_min_s") != actual_schedule_min
+            or schedule_identity.get("global_max_s") != actual_schedule_max
+            or index_identity["global_count"] != len(indices)):
+        raise ValueError(
+            f"global schedule/index identity disagrees with complete unsharded "
+            f"replay evidence in manifest-bound {path}")
     return {
         "count": count,
         "total": total,
@@ -1751,6 +2461,35 @@ def _explicit_measurement_issues(title: str, summary: dict) -> list[str]:
         issues.append(
             f"{title}: source measurement carries explicit invalidity "
             "evidence (" + ", ".join(flags) + ")")
+
+    response_identity = summary.get("response_identity")
+    response_identity = (response_identity
+                         if isinstance(response_identity, dict) else {})
+    if response_identity.get("status") == "invalid":
+        issues.append(
+            f"{title}: response-model identity is invalid: "
+            f"{response_identity.get('invalid') or 'no reason recorded'}")
+
+    runtime_quota = summary.get("runtime_quota_admission")
+    runtime_quota = runtime_quota if isinstance(runtime_quota, dict) else {}
+    runtime_status = runtime_quota.get("status")
+    if runtime_status == "denied":
+        issues.append(
+            f"{title}: the local runtime quota guard denied a physical POST; "
+            "the requested load was not fully delivered")
+    elif runtime_status == "invalid_evidence":
+        details = runtime_quota.get("invariant_errors")
+        rendered = "; ".join(str(item) for item in details) \
+            if isinstance(details, list) and details else "no reason recorded"
+        issues.append(
+            f"{title}: runtime quota-admission evidence is invalid: "
+            f"{rendered}")
+
+    metadata_state = run.get("endpoint_metadata_stability")
+    if metadata_state == "changed":
+        issues.append(
+            f"{title}: serving-endpoint metadata changed between the pre-run "
+            "and post-drain snapshots")
     return issues
 
 
@@ -1785,6 +2524,34 @@ def _explicit_measurement_warnings(title: str, summary: dict) -> list[str]:
             rendered = f"{title}: {label}: {value.strip()}"
             if not any(value.strip() in existing for existing in warnings):
                 warnings.append(rendered)
+
+    response_identity = summary.get("response_identity")
+    response_identity = (response_identity
+                         if isinstance(response_identity, dict) else {})
+    identity_warning = response_identity.get("warning")
+    if isinstance(identity_warning, str) and identity_warning.strip():
+        warnings.append(
+            f"{title}: response-model identity: {identity_warning.strip()}")
+
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    metadata_state = run.get("endpoint_metadata_stability")
+    if metadata_state in {"unverified", "not_requested"}:
+        detail = run.get("endpoint_metadata_warning") or (
+            "pre-run/post-drain endpoint stability was not established")
+        warnings.append(
+            f"{title}: endpoint metadata stability is {metadata_state}: "
+            f"{detail}")
+    transport = _production_transport_evidence(summary)
+    if not transport["exact_match"]:
+        transport_warning = (
+            f"{title}: production transport parity is "
+            f"{str(transport['status']).lower()}: {transport['note']}. "
+            "Connection pooling, HTTP protocol, and fresh-connection "
+            "behavior can change DNS/TCP/TLS pressure; relative production "
+            "performance claims are withheld")
+        if not any(transport["note"] in existing for existing in warnings):
+            warnings.append(transport_warning)
     return warnings
 
 
@@ -2023,20 +2790,89 @@ def _comparison_metric_value(summary: dict, path: tuple[str, ...]):
     return value
 
 
+def _comparison_ttft_definition(summaries: list[dict]) -> str:
+    definitions = {
+        ((summary.get("sla") or {}).get("ttft_definition")
+         or (summary.get("run") or {}).get("ttft_definition"))
+        for summary in summaries
+    }
+    return "first_visible" if definitions == {"first_visible"} \
+        else "first_content"
+
+
+def _comparison_directional_coverage_issues(
+        summaries: list[dict], titles: list[str]) -> list[str]:
+    """Require complete raw-event and caller-event populations for labels.
+
+    Percentile arithmetic remains useful for diagnosis when an event is
+    missing, but calling the surviving subset numerically preferred/adverse is
+    a directional claim.  The comparison may make that claim only when every
+    replay outcome contributed to both the service-time and caller-experienced
+    primary/E2E populations.
+    """
+    first_visible = _comparison_ttft_definition(summaries) == "first_visible"
+    required = (
+        (("service TTFV", "ttfv_ms"),
+         ("caller TTFV", "ttfv_corrected_ms"))
+        if first_visible else
+        (("service TTFT", "ttft_ms"),
+         ("caller TTFT", "ttft_corrected_ms"))
+    ) + (("service E2E", "e2e_ms"),
+         ("caller E2E", "e2e_corrected_ms"))
+    incomplete = []
+    for title, summary in zip(titles, summaries):
+        expected = _nonnegative_int(summary.get("requests_total"))
+        for label, key in required:
+            block = summary.get(key)
+            observed = _nonnegative_int(
+                block.get("n") if isinstance(block, dict) else None)
+            if expected is None or expected == 0 or observed != expected:
+                incomplete.append(
+                    f"{title} {label} "
+                    f"({observed if observed is not None else 'not recorded'}/"
+                    f"{expected if expected is not None else 'not recorded'})")
+    if not incomplete:
+        return []
+    return [
+        "complete caller/event latency coverage is not established: "
+        + ", ".join(incomplete)
+        + ". Arithmetic percentiles remain diagnostic, but directional "
+          "preference labels are withheld because event survivorship could "
+          "change the ordering."
+    ]
+
+
 def _comparison_metric_table(
         summaries: list[dict], titles: list[str], valid: bool) -> str:
     """Render arithmetic deltas without claiming statistical improvement."""
+    first_visible = _comparison_ttft_definition(summaries) == "first_visible"
+    caller_first_metrics = (
+        (("Caller TTFV p50", ("ttfv_corrected_ms", "p50"),
+          "lower", "ms", 1.0, 1, "ms"),
+         ("Caller TTFV p95", ("ttfv_corrected_ms", "p95"),
+          "lower", "ms", 1.0, 1, "ms"))
+        if first_visible else
+        (("Caller TTFT p50", ("ttft_corrected_ms", "p50"),
+          "lower", "ms", 1.0, 1, "ms"),
+         ("Caller TTFT p95", ("ttft_corrected_ms", "p95"),
+          "lower", "ms", 1.0, 1, "ms"))
+    )
+    service_first_metrics = (
+        (("TTFV p50", ("ttfv_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
+         ("TTFV p95", ("ttfv_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
+         ("TTFV p99", ("ttfv_ms", "p99"), "lower", "ms", 1.0, 1, "ms"),
+         ("TTFT (reasoning/visible/refusal onset) p95",
+          ("ttft_ms", "p95"), "context", "ms", 1.0, 1, "ms"))
+        if first_visible else
+        (("TTFT p50", ("ttft_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
+         ("TTFT p95", ("ttft_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
+         ("TTFT p99", ("ttft_ms", "p99"), "lower", "ms", 1.0, 1, "ms"))
+    )
     # label, path, direction, value unit, scale, decimals, delta unit
-    metrics = (
-        ("Caller TTFT p50", ("ttft_corrected_ms", "p50"),
-         "lower", "ms", 1.0, 1, "ms"),
-        ("Caller TTFT p95", ("ttft_corrected_ms", "p95"),
-         "lower", "ms", 1.0, 1, "ms"),
+    metrics = caller_first_metrics + (
         ("Caller E2E p95", ("e2e_corrected_ms", "p95"),
          "lower", "ms", 1.0, 1, "ms"),
-        ("TTFT p50", ("ttft_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
-        ("TTFT p95", ("ttft_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
-        ("TTFT p99", ("ttft_ms", "p99"), "lower", "ms", 1.0, 1, "ms"),
+    ) + service_first_metrics + (
         ("TTFB p50", ("ttfb_ms", "p50"), "lower", "ms", 1.0, 1, "ms"),
         ("TTFB p95", ("ttfb_ms", "p95"), "lower", "ms", 1.0, 1, "ms"),
         ("TTFB p99", ("ttfb_ms", "p99"), "lower", "ms", 1.0, 1, "ms"),
@@ -2054,7 +2890,9 @@ def _comparison_metric_table(
          "context", "", 1.0, 0, ""),
         ("Dispatch lag p95", ("arrivals", "dispatch_lag_ms", "p95"),
          "lower", "ms", 1.0, 1, "ms"),
-        ("Wire lateness p95", ("arrivals", "wire_lateness_ms", "p95"),
+        ("HTTP request-start lateness p95",
+         # Compatibility alias exists in both old and new summaries.
+         ("arrivals", "wire_lateness_ms", "p95"),
          "lower", "ms", 1.0, 1, "ms"),
     )
     candidate_count = len(summaries) - 1
@@ -2181,6 +3019,7 @@ def _render_comparison_html(
         endpoint = _comparison_endpoint_value(summary, manifest)
         deployment = _comparison_deployment_value(summary, manifest)
         workload_digest = _comparison_workload_digest(manifest)
+        transport = _production_transport_evidence(summary)
         source_cards.append(
             "<article class='source-card'>"
             f"<div class='eyebrow'>{_html_text(role)}</div>"
@@ -2197,6 +3036,9 @@ def _render_comparison_html(
             f"{_html_code(workload_digest)}</dd>"
             f"<dt>Sample count</dt><dd>"
             f"{_html_text(_comparison_sample_count(summary))}</dd>"
+            f"<dt>Transport parity</dt><dd>"
+            f"{_html_text(transport['status'])} · "
+            f"{_html_text(transport['note'])}</dd>"
             "</dl>"
             f"<div class='source-link'>{_comparison_relative_report_link(source_dir, out_dir, manifest)}</div>"
             "</article>"
@@ -2246,9 +3088,15 @@ def _render_comparison_html(
         and (summary.get("drift") or {}).get("drift_kind") == "stable"
         for summary in summaries
     )
+
+    def runtime_quota_status(summary: dict) -> str | None:
+        block = summary.get("runtime_quota_admission")
+        return block.get("status") if isinstance(block, dict) else None
+
     any_quota_issue = any(
         journal["count"] > 0 or summary.get("quota_limited") is True
         or _comparison_summary_429_count(summary) > 0
+        or runtime_quota_status(summary) in {"denied", "invalid_evidence"}
         for summary, journal in zip(summaries, request_evidence)
     )
     any_request_rows = any(journal["total"] > 0 for journal in request_evidence)
@@ -2267,6 +3115,29 @@ def _render_comparison_html(
         "Match" if same(harness_values) else "Invalid",
         [f"harness {_html_code(value[0])}<br>{_html_text(value[1] or 'not recorded')}"
          for value in harness_values],
+    ))
+    transport_values = [
+        _production_transport_evidence(summary) for summary in summaries]
+    transport_state = (
+        "Match" if all(value["exact_match"] for value in transport_values)
+        else "Review")
+    transport_cells = []
+    for value in transport_values:
+        exact = "yes" if value["exact_match"] else "no"
+        recorded = value["recorded_match"]
+        recorded_text = (
+            "true" if recorded is True else "false" if recorded is False
+            else "not recorded")
+        transport_cells.append(
+            f"benchmark policy: "
+            f"{_html_code(value['actual_policy_id'] or 'not recorded')}"
+            f"<br>declared production policy: "
+            f"{_html_code(value['declared_production_policy'] or 'not recorded')}"
+            f"<br>recorded match: {_html_text(recorded_text)}"
+            f"<br>exact match: {_html_text(exact)}"
+            f"<br>{_html_text(value['note'])}")
+    matrix_rows.append((
+        "Production transport parity", transport_state, transport_cells,
     ))
     matrix_rows.append((
         "Workload / profile hash",
@@ -2287,6 +3158,58 @@ def _render_comparison_html(
         [_html_code(_comparison_endpoint_value(summary, manifest))
          for summary, manifest in zip(summaries, manifests)],
     ))
+
+    response_identity_cells = []
+    response_identity_statuses = []
+    for summary in summaries:
+        identity = summary.get("response_identity")
+        identity = identity if isinstance(identity, dict) else {}
+        identity_status = identity.get("status") or "not recorded"
+        response_identity_statuses.append(identity_status)
+        models = identity.get("models")
+        models = models if isinstance(models, dict) else {}
+        expected = identity.get("expected_models")
+        expected = expected if isinstance(expected, list) else []
+        response_identity_cells.append(
+            f"status: {_html_text(identity_status)}"
+            f"<br>observed: {_html_code(_stable(models.get('counts') or {}))}"
+            f"<br>expected: {_html_code(_stable(expected))}"
+        )
+    if any(status == "invalid" for status in response_identity_statuses):
+        response_identity_state = "Invalid"
+    elif response_identity_statuses and all(
+            status == "bound" for status in response_identity_statuses):
+        response_identity_state = "Bound"
+    else:
+        response_identity_state = "Review"
+    matrix_rows.append((
+        "Response-model identity", response_identity_state,
+        response_identity_cells,
+    ))
+
+    endpoint_stability_cells = []
+    endpoint_stability_states = []
+    for summary in summaries:
+        run = summary.get("run")
+        run = run if isinstance(run, dict) else {}
+        state = run.get("endpoint_metadata_stability") or "not recorded"
+        endpoint_stability_states.append(state)
+        warning = run.get("endpoint_metadata_warning")
+        endpoint_stability_cells.append(
+            _html_text(state)
+            + (f"<br>{_html_text(warning)}" if warning else ""))
+    if any(state == "changed" for state in endpoint_stability_states):
+        endpoint_stability_state = "Invalid"
+    elif endpoint_stability_states and all(
+            state == "stable" for state in endpoint_stability_states):
+        endpoint_stability_state = "Ready"
+    else:
+        endpoint_stability_state = "Review"
+    matrix_rows.append((
+        "Endpoint metadata: pre-run vs post-drain",
+        endpoint_stability_state, endpoint_stability_cells,
+    ))
+
     sample_cells = []
     for summary in summaries:
         sample = summary.get("sample")
@@ -2311,14 +3234,27 @@ def _render_comparison_html(
         quota_flag = summary.get("quota_limited")
         quota_label = "yes" if quota_flag is True else \
             "no" if quota_flag is False else "not recorded"
+        runtime_quota = summary.get("runtime_quota_admission")
+        runtime_quota = runtime_quota \
+            if isinstance(runtime_quota, dict) else {}
+        guard_status = runtime_quota.get("status") or "not recorded"
+        guard_id = runtime_quota.get("guard_id") or "not recorded"
+        denied_attempts = runtime_quota.get(
+            "denied_attempts_in_captured_rows", "not recorded")
         quota_cells.append(
             f"HTTP 429: <strong>{journal['count']}/{journal['total']}</strong>"
             f"<br>phases: {_html_text(phases)}"
             f"<br>summary quota-limited: {_html_text(quota_label)}"
+            f"<br>local guard: {_html_text(guard_status)}"
+            f"<br>guard id: {_html_code(guard_id)}"
+            f"<br>locally denied attempts: {_html_text(denied_attempts)}"
         )
     quota_status = "Invalid" if any_quota_issue else \
         "Clear" if any_request_rows else "No request rows"
-    matrix_rows.append(("HTTP 429 / quota state", quota_status, quota_cells))
+    matrix_rows.append((
+        "Provider HTTP 429 / local quota admission", quota_status,
+        quota_cells,
+    ))
 
     matrix_head = "".join(
         f"<th scope='col'>{_html_text(title)}</th>" for title in titles)
@@ -2392,7 +3328,7 @@ footer{{padding:22px 42px;background:var(--navy);color:#dce7f8}}footer code{{col
 <div class='scroll-hint' id='compatibility-scroll-hint' role='note'><span aria-hidden='true'>↔</span> Scroll horizontally; the Dimension column stays visible.</div>
 <div class='table-wrap' tabindex='0' role='region' aria-labelledby='compatibility-heading' aria-describedby='compatibility-scroll-hint'><table class='compat'><caption>Each cell comes from a manifest-bound source manifest, summary, or request journal. Internal hashes are not a digital signature.</caption><thead><tr><th scope='col' class='sticky-col'>Dimension</th><th scope='col'>State</th>{matrix_head}</tr></thead><tbody>{''.join(matrix_body)}</tbody></table></div>
 </section>
-<section id='method' class='method-card' aria-labelledby='method-heading'><div class='eyebrow'>Interpretation contract</div><h2 id='method-heading'>How to read this report</h2><p class='method-note'>Latency percentiles describe successful requests and can be biased when errors occur. Throughput and token counts are context, not an automatic quality ranking. HTTP 429 evidence includes setup and replay phases from each sealed journal. This file contains no scripts, remote assets, remote fonts, or network requests.</p></section>
+<section id='method' class='method-card' aria-labelledby='method-heading'><div class='eyebrow'>Interpretation contract</div><h2 id='method-heading'>How to read this report</h2><p class='method-note'>Latency percentiles describe successful requests and can be biased when errors occur. Throughput and token counts are context, not an automatic quality ranking. Production transport parity requires an explicit exact actual-versus-declared connection-policy match for every source. HTTP 429 evidence includes setup and replay phases from each sealed journal. This file contains no scripts, remote assets, remote fonts, or network requests.</p></section>
 <section id='metrics' aria-labelledby='metrics-heading'>
 <div class='section-head'><div><div class='eyebrow'>First-input baseline</div><h2 id='metrics-heading'>Absolute values and deltas</h2></div></div>
 <p class='method-note'>Baseline is explicitly the first input: <strong>{_html_text(baseline_title)}</strong>. Absolute delta is candidate minus baseline. {_html_text(color_note)}</p>
@@ -2486,6 +3422,7 @@ def compare_runs(out_dir, input_dirs) -> Path:
             zip(titles, summ, manifests)):
         role = "Baseline (first input)" if position == 0 else \
             f"Candidate {position}"
+        transport = _production_transport_evidence(summary)
         L += [
             f"### {role}: {title}",
             "",
@@ -2507,6 +3444,13 @@ def compare_runs(out_dir, input_dirs) -> Path:
             + markdown_plain_text(_comparison_workload_digest(manifest)),
             "- Sample count: "
             + markdown_plain_text(_comparison_sample_count(summary)),
+            "- Production transport parity: "
+            + markdown_plain_text(
+                f"{transport['status']}; benchmark policy="
+                f"{transport['actual_policy_id'] or 'not recorded'}; "
+                f"declared production policy="
+                f"{transport['declared_production_policy'] or 'not recorded'}; "
+                f"{transport['note']}"),
             "",
         ]
 
@@ -2540,6 +3484,7 @@ def compare_runs(out_dir, input_dirs) -> Path:
     warns: list[str] = []
     for title, summary in zip(raw_titles, summ):
         warns.extend(_explicit_measurement_warnings(title, summary))
+    warns.extend(_comparison_directional_coverage_issues(summ, titles))
 
     # Arithmetic can still be rendered when provenance is incomplete, but it
     # must not receive a green comparison state. Unknown endpoint identity or
@@ -2776,8 +3721,8 @@ def compare_runs(out_dir, input_dirs) -> Path:
             L.append("")
     elif not compatibility_issues:
         L += ["Comparability checks (harness version, cache reporting and "
-              "parity, error rate, sample size, steady state) all passed on "
-              "these runs.", ""]
+              "parity, production transport parity, error rate, sample size, "
+              "steady state) all passed on these runs.", ""]
 
     def pct(name, key):
         L.extend([f"## {name}", hdr, sep])
@@ -2786,7 +3731,12 @@ def compare_runs(out_dir, input_dirs) -> Path:
             L.append(f"| {q} | " + " | ".join(cells) + " |")
         L.append("")
 
-    pct("TTFT (ms)", "ttft_ms")
+    if _comparison_ttft_definition(summ) == "first_visible":
+        pct("TTFV: first visible content (ms)", "ttfv_ms")
+        pct("TTFT: reasoning/visible/refusal onset, diagnostic (ms)",
+            "ttft_ms")
+    else:
+        pct("TTFT (ms)", "ttft_ms")
     pct("TTFG / E2E (ms)", "e2e_ms")
     pct("interchunk max (ms)", "interchunk_max_ms")
 
@@ -2834,9 +3784,11 @@ def compare_runs(out_dir, input_dirs) -> Path:
               scalar("dispatch lag p95 (ms)",
                      lambda s: ((s.get("arrivals") or {}).get("dispatch_lag_ms")
                                 or {}).get("p95")),
-              scalar("wire lateness p95 (ms)",
-                     lambda s: ((s.get("arrivals") or {}).get("wire_lateness_ms")
-                                or {}).get("p95")), ""])
+              scalar("HTTP request-start lateness p95 (ms)",
+                     lambda s: (((s.get("arrivals") or {}).get(
+                         "http_request_start_lateness_ms")
+                         or (s.get("arrivals") or {}).get("wire_lateness_ms")
+                         or {}).get("p95"))), ""])
 
     comparison_text = "\n".join(L) + "\n"
     sources = [

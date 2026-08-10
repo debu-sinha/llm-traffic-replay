@@ -30,11 +30,26 @@ def _reconstructible_comparison_source(monkeypatch):
 def _summary(title, cache_p50):
     def tab(p50):
         return {"p50": p50, "p90": p50 * 1.2, "p95": p50 * 1.3,
-                "p99": p50 * 1.6, "n": 100}
+                "p99": p50 * 1.6, "n": 1}
     return {
-        "run": {"title": title, "input_mode": "profile"}, "error_rate": 0.0,
+        "run": {
+            "title": title, "input_mode": "profile",
+            "ttft_definition": "first_content",
+            "transport": {
+                "connection_policy_id":
+                    "fresh_http1_per_physical_attempt",
+                "production_connection_policy_declared":
+                    "fresh_http1_per_physical_attempt",
+                "production_connection_policy_match": True,
+                "production_connection_policy_assurance":
+                    "operator asserted an exact production policy match",
+                "production_comparability_warning": None,
+            },
+        }, "error_rate": 0.0,
         "requests_total": 1,
-        "ttft_ms": tab(400), "e2e_ms": tab(800), "interchunk_max_ms": tab(6),
+        "ttft_ms": tab(400), "ttft_corrected_ms": tab(400),
+        "e2e_ms": tab(800), "e2e_corrected_ms": tab(800),
+        "interchunk_max_ms": tab(6),
         "achieved_cache_fraction": {"p50": cache_p50, "p95": cache_p50 + 0.05},
         "throughput": {"input_tokens_per_min": 1_000_000,
                        "output_tokens_per_min": 5000},
@@ -58,7 +73,7 @@ def _summary(title, cache_p50):
         # cache tests below isolate the thing they name
         "harness_version": "0.3.0",
         "latency_basis": "send-to-first-token; connection excluded",
-        "schedule": {"seconds": 120, "requests": 1200,
+        "schedule": {"seconds": 120, "requests": 1,
                      "rate_min": 10.0, "rate_p50": 10.0,
                      "rate_p95": 10.0, "rate_max": 10.0,
                      "source": "synthetic"},
@@ -85,6 +100,17 @@ def _replace_manifest(d: Path, manifest: dict) -> None:
     _write_completion_marker(d)
 
 
+def _replace_summary(d: Path, summary: dict) -> None:
+    raw = json.dumps(summary).encode("utf-8")
+    (d / "summary.json").write_bytes(raw)
+    manifest = json.loads((d / "manifest.json").read_text())
+    manifest["artifacts"]["summary.json"] = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
+    _replace_manifest(d, manifest)
+
+
 def _seal(d: Path, manifest: dict) -> None:
     summary_raw = (d / "summary.json").read_bytes()
     requests = d / "requests.jsonl"
@@ -93,6 +119,8 @@ def _seal(d: Path, manifest: dict) -> None:
         "status": 200,
         "ok": True,
         "request_id": "request-0",
+        "global_index": 0,
+        "scheduled_s": 0.0,
     }, sort_keys=True) + "\n")
     requests_raw = requests.read_bytes()
     manifest.update({
@@ -118,16 +146,65 @@ def _seal(d: Path, manifest: dict) -> None:
 
 
 def _replace_requests(d: Path, rows: list[dict]) -> None:
+    replay_index = 0
+    normalized = []
+    for row in rows:
+        row = dict(row)
+        if row.get("phase") == "replay":
+            row.setdefault("request_id", f"request-{replay_index}")
+            row.setdefault("global_index", replay_index)
+            row.setdefault("scheduled_s", float(replay_index))
+            replay_index += 1
+        normalized.append(row)
     raw = b"".join(
         json.dumps(row, sort_keys=True).encode("utf-8") + b"\n"
-        for row in rows
+        for row in normalized
     )
     (d / "requests.jsonl").write_bytes(raw)
     manifest = json.loads((d / "manifest.json").read_text())
     manifest["artifacts"]["requests.jsonl"] = {
         "sha256": hashlib.sha256(raw).hexdigest(),
         "bytes": len(raw),
-        "row_count": len(rows),
+        "row_count": len(normalized),
+    }
+    replay = sorted(
+        (row for row in normalized if row.get("phase") == "replay"),
+        key=lambda row: row["global_index"])
+    indices = [row["global_index"] for row in replay]
+    timestamps = [float(row["scheduled_s"]) for row in replay]
+
+    def packed(values, fmt):
+        import struct
+        digest = hashlib.sha256()
+        for value in values:
+            digest.update(struct.pack(fmt, value))
+        return digest.hexdigest()
+
+    manifest["schedule"] = {
+        **(manifest.get("schedule") or {}),
+        "requests": len(replay),
+    }
+    manifest["schedule_identity"] = {
+        "encoding": "float64-le-seconds-from-run-start",
+        "global_timestamps_sha256": packed(timestamps, "<d"),
+        "global_count": len(replay),
+        "global_min_s": min(timestamps) if timestamps else None,
+        "global_max_s": max(timestamps) if timestamps else None,
+        "shard_timestamps_sha256": packed(timestamps, "<d"),
+        "shard_count": len(replay),
+        "shard_min_s": min(timestamps) if timestamps else None,
+        "shard_max_s": max(timestamps) if timestamps else None,
+    }
+    manifest["index_identity"] = {
+        "encoding": "int64-le",
+        "global_indices_sha256": packed(indices, "<q"),
+        "count": len(replay),
+        "min": min(indices) if indices else None,
+        "max": max(indices) if indices else None,
+        "global_count": len(replay),
+        "shard_index": 0,
+        "shard_total": 1,
+        "partition": "unsharded",
     }
     _replace_manifest(d, manifest)
 
@@ -226,6 +303,124 @@ def test_self_contained_html_names_first_input_baseline_and_binds_both_reports()
     assert verify_comparison_output(out) == manifest
 
 
+def test_comparison_matrix_exposes_identity_stability_and_local_admission():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    for index, source in enumerate(dirs):
+        summary = json.loads((source / "summary.json").read_text())
+        summary["response_identity"] = {
+            "status": "bound",
+            "expected_models": ["databricks-test-endpoint"],
+            "models": {"counts": {"databricks-test-endpoint": 1}},
+        }
+        summary["run"]["endpoint_metadata_stability"] = "stable"
+        summary["runtime_quota_admission"] = {
+            "status": "enforced",
+            "guard_id": f"guard-{index}",
+            "denied_attempts_in_captured_rows": 0,
+        }
+        _replace_summary(source, summary)
+
+    out = compare_runs(base / "comparison", dirs)
+    report = (out / "comparison.html").read_text()
+    assert "Response-model identity" in report
+    assert "Endpoint metadata: pre-run vs post-drain" in report
+    assert "Provider HTTP 429 / local quota admission" in report
+    assert "Production transport parity" in report
+    assert "benchmark policy:" in report
+    assert "declared production policy:" in report
+    assert "exact match: yes" in report
+    assert "local guard: enforced" in report
+    assert "guard-0" in report and "guard-1" in report
+
+
+@pytest.mark.parametrize("transport", [
+    None,
+    {
+        "connection_policy_id": "fresh_http1_per_physical_attempt",
+        "production_connection_policy_declared": None,
+        "production_connection_policy_match": False,
+        "production_connection_policy_assurance": None,
+        "production_comparability_warning":
+            "production connection behavior is unknown",
+    },
+])
+def test_legacy_sources_without_exact_transport_match_are_never_valid(
+        transport):
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    for source in dirs:
+        summary = json.loads((source / "summary.json").read_text())
+        assert "decision" not in summary, "fixture must exercise legacy input"
+        if transport is None:
+            summary["run"].pop("transport")
+        else:
+            summary["run"]["transport"] = dict(transport)
+        _replace_summary(source, summary)
+
+    out = compare_runs(base / "comparison", dirs)
+    report = (out / "comparison.html").read_text()
+    markdown = (out / "comparison.md").read_text()
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    assert manifest["comparison_state"] == "qualified"
+    assert manifest["comparison_valid"] is False
+    assert manifest["numeric_direction_labels_allowed"] is False
+    assert "QUALIFIED COMPARISON" in report
+    assert "Production transport parity" in report
+    assert "exact match: no" in report
+    assert "production transport parity is unverified" in report
+    assert "Production transport parity: UNVERIFIED" in markdown
+    assert "numerically preferred" not in report
+
+
+def test_production_parity_qualifies_without_falsely_changing_wire_contract():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    candidate = json.loads((dirs[1] / "summary.json").read_text())
+    transport = candidate["run"]["transport"]
+    transport.update({
+        "production_connection_policy_declared": None,
+        "production_connection_policy_match": False,
+        "production_connection_policy_assurance": None,
+        "production_comparability_warning":
+            "production application uses an unverified pooled client",
+    })
+    _replace_summary(dirs[1], candidate)
+
+    out = compare_runs(base / "comparison", dirs)
+    manifest = json.loads((out / "manifest.json").read_text())
+    report = (out / "comparison.html").read_text()
+
+    assert manifest["compatibility_issue_count"] == 0
+    assert manifest["warning_count"] >= 1
+    assert manifest["comparison_state"] == "qualified"
+    assert "Production transport parity" in report
+    assert "production application uses an unverified pooled client" in report
+
+
+def test_local_quota_denial_invalidates_comparison_without_http_429():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    candidate = json.loads((dirs[1] / "summary.json").read_text())
+    candidate["runtime_quota_admission"] = {
+        "status": "denied",
+        "guard_id": "guard-denied",
+        "denied_attempts_in_captured_rows": 1,
+        "invariant_errors": [],
+    }
+    _replace_summary(dirs[1], candidate)
+
+    out = compare_runs(base / "comparison", dirs)
+    report = (out / "comparison.html").read_text()
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert "INVALID COMPARISON" in report
+    assert "local runtime quota guard denied a physical POST" in report
+    assert "local guard: denied" in report
+    assert "HTTP 429: <strong>0/1</strong>" in report
+    assert manifest["comparison_state"] == "invalid"
+
+
 def test_comparison_source_cards_and_markdown_show_only_sealed_run_facts():
     base = _tmp()
     dirs = []
@@ -314,6 +509,69 @@ def test_valid_html_deltas_are_arithmetic_not_regression_verdicts():
     assert "no repeat-run uncertainty or practical-effect threshold" in report
     assert "winner" not in report.lower()
     assert "fastest" not in report.lower()
+
+
+def test_first_visible_comparison_uses_ttfv_as_primary_latency():
+    baseline = _summary("baseline", 0.60)
+    candidate = _summary("candidate", 0.60)
+    for summary, visible_p50 in ((baseline, 700.0), (candidate, 900.0)):
+        summary["run"]["ttft_definition"] = "first_visible"
+        summary["ttfv_ms"] = {
+            "p50": visible_p50, "p90": visible_p50 * 1.2,
+            "p95": visible_p50 * 1.3, "p99": visible_p50 * 1.6,
+            "n": 400,
+        }
+        summary["ttfv_corrected_ms"] = dict(summary["ttfv_ms"])
+        summary["ttft_corrected_ms"] = dict(summary["ttft_ms"])
+    clean = [{"phase": "replay", "status": 200, "ok": True}]
+
+    out, markdown = _compare_with_rows(
+        [baseline, candidate], [clean, clean])
+    html = (out / "comparison.html").read_text()
+
+    assert "Caller TTFV p50" in html
+    assert "Caller TTFT p50" not in html
+    assert "TTFT (reasoning/visible/refusal onset) p95" in html
+    assert "## TTFV: first visible content (ms)" in markdown
+    assert "## TTFT: reasoning/visible/refusal onset, diagnostic (ms)" \
+        in markdown
+
+
+def test_compare_conflicting_first_event_declarations_are_invalid():
+    baseline = _summary("baseline", 0.60)
+    candidate = _summary("candidate", 0.60)
+    candidate["run"]["ttft_definition"] = "first_visible"
+    md = _compare_summaries(
+        [baseline, candidate],
+        manifest_overrides={1: {
+            "config_identity": {
+                "sla_definition": {"ttft_definition": "first_content"},
+            },
+        }},
+    )
+
+    assert "INVALID COMPARISON" in md
+    assert "conflicting TTFT definition declarations inside candidate" in md
+
+
+def test_incomplete_caller_event_coverage_withholds_direction_labels():
+    baseline = _summary("baseline", 0.60)
+    candidate = _summary("candidate", 0.60)
+    candidate["ttft_ms"]["p50"] = 300.0
+    candidate["ttft_corrected_ms"]["n"] = 0
+
+    out, md = _compare_with_rows(
+        [baseline, candidate],
+        [[{"phase": "replay", "status": 200, "ok": True}]] * 2,
+    )
+    report = (out / "comparison.html").read_text()
+    manifest = json.loads((out / "manifest.json").read_text())
+
+    assert "QUALIFIED COMPARISON" in md
+    assert "complete caller/event latency coverage is not established" in md
+    assert "direction withheld" in report
+    assert "numerically preferred" not in report
+    assert manifest["numeric_direction_labels_allowed"] is False
 
 
 def test_missing_endpoint_identity_and_request_evidence_qualify_comparison():
@@ -420,6 +678,16 @@ def test_compare_missing_input_dir_gives_clean_error():
 
 def _manifest(summary, **overrides):
     count = int(summary["schedule"]["requests"])
+    import struct
+
+    def packed(values, fmt):
+        digest = hashlib.sha256()
+        for item in values:
+            digest.update(struct.pack(fmt, item))
+        return digest.hexdigest()
+
+    indices = list(range(count))
+    timestamps = [float(index) for index in indices]
     value = {
         "manifest_schema_version": 3,
         "git_commit": "a" * 40, "git_dirty": False,
@@ -429,22 +697,27 @@ def _manifest(summary, **overrides):
         "endpoint_model": "databricks-test-endpoint",
         "seed": 7, "request_params": {"temperature": 0.0,
                                        "max_output_tokens_cap": 512},
+        "config_identity": {
+            "sla_definition": {
+                "ttft_definition": summary["run"]["ttft_definition"],
+            },
+        },
         "schedule": summary["schedule"],
         "shard": "1/1",
         "schedule_identity": {
             "encoding": "float64-le-seconds-from-run-start",
-            "global_timestamps_sha256": "c" * 64,
+            "global_timestamps_sha256": packed(timestamps, "<d"),
             "global_count": count,
             "global_min_s": 0.0 if count else None,
             "global_max_s": float(count - 1) if count else None,
-            "shard_timestamps_sha256": "c" * 64,
+            "shard_timestamps_sha256": packed(timestamps, "<d"),
             "shard_count": count,
             "shard_min_s": 0.0 if count else None,
             "shard_max_s": float(count - 1) if count else None,
         },
         "index_identity": {
             "encoding": "int64-le",
-            "global_indices_sha256": "d" * 64,
+            "global_indices_sha256": packed(indices, "<q"),
             "count": count,
             "min": 0 if count else None,
             "max": count - 1 if count else None,
@@ -985,16 +1258,77 @@ def test_compare_rejects_a_copied_artifact_under_a_different_path():
         compare_runs(base / "out", dirs)
 
 
-def test_compare_marks_different_exact_global_schedules_invalid():
+def test_compare_rejects_global_schedule_identity_not_bound_to_replay():
     base = _tmp()
     dirs = _comparison_inputs(base)
     manifest = json.loads((dirs[1] / "manifest.json").read_text())
     manifest["schedule_identity"]["global_timestamps_sha256"] = "e" * 64
     _replace_manifest(dirs[1], manifest)
+    with pytest.raises(ValueError, match="global schedule/index identity"):
+        compare_runs(base / "out", dirs)
+
+
+def test_compare_does_not_treat_different_shards_as_same_workload_slice():
+    import struct
+
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    parent_timestamps = [0.0, 1.0]
+    digest = hashlib.sha256()
+    for value in parent_timestamps:
+        digest.update(struct.pack("<d", value))
+    parent_hash = digest.hexdigest()
+
+    for shard_index, directory in enumerate(dirs):
+        _replace_requests(directory, [{
+            "phase": "replay", "status": 200, "ok": True,
+            "request_id": f"request-{shard_index}",
+            "global_index": shard_index,
+            "scheduled_s": float(shard_index),
+        }])
+        manifest = json.loads((directory / "manifest.json").read_text())
+        shard = f"{shard_index + 1}/2"
+        manifest["shard"] = shard
+        manifest["schedule"]["shard"] = shard
+        manifest["schedule"]["total_requests"] = 2
+        manifest["schedule_identity"].update({
+            "global_timestamps_sha256": parent_hash,
+            "global_count": 2,
+            "global_min_s": 0.0,
+            "global_max_s": 1.0,
+        })
+        manifest["index_identity"].update({
+            "global_count": 2,
+            "shard_index": shard_index,
+            "shard_total": 2,
+            "partition": "round_robin_modulo",
+        })
+        _replace_manifest(directory, manifest)
+
     out = compare_runs(base / "out", dirs)
-    md = (out / "comparison.md").read_text()
-    assert "INVALID COMPARISON" in md
-    assert "different arrival schedule" in md
+    report = (out / "comparison.md").read_text()
+    assert "INVALID COMPARISON" in report
+    assert "different local replay schedule/index identity" in report
+
+
+def test_compare_rejects_local_schedule_identity_tampering():
+    base = _tmp()
+    dirs = _comparison_inputs(base)
+    path = dirs[1] / "requests.jsonl"
+    row = json.loads(path.read_text())
+    row["scheduled_s"] = 9.0
+    raw = (json.dumps(row, sort_keys=True) + "\n").encode()
+    path.write_bytes(raw)
+    manifest = json.loads((dirs[1] / "manifest.json").read_text())
+    manifest["artifacts"]["requests.jsonl"] = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+        "row_count": 1,
+    }
+    _replace_manifest(dirs[1], manifest)
+
+    with pytest.raises(ValueError, match="schedule_identity disagrees"):
+        compare_runs(base / "out", dirs)
 
 
 @pytest.mark.parametrize("dirty", [True, None])

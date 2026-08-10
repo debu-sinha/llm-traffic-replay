@@ -54,9 +54,10 @@ python3 -m traffic_replay benchmark \
   --profile configs/profile_measured.json \
   --sizing-concurrency 10 \
   --duration 300 \
+  --ttft-definition first_visible \
   --ttft-p95 YOUR_TTFT_P95_MS \
   --ttfg-p95 YOUR_TTFG_P95_MS \
-  --success-rate YOUR_SUCCESS_RATE \
+  --success-rate YOUR_FRACTION_STRICTLY_BETWEEN_0_AND_1 \
   --out-dir results/benchmark
 ```
 
@@ -65,16 +66,22 @@ Important operational facts:
 - Before credential lookup, endpoint metadata access, network diagnostics, or
   inference, `benchmark` freezes each local workload/trace input into a private
   temporary snapshot and validates that exact byte view. Validation includes
-  strict parsing, representative body construction, and the complete fixed
-  schedule. `sweep` does this for every exact requested rung, not only the
-  first rung or a generic base config.
-- Preflight sends two representative inference requests. After both reach
+  strict parsing and representative body construction. A fixed-rate or
+  trace-driven run also materializes its complete schedule at this boundary;
+  an unloaded sizing run cannot materialize its schedule until its paid sizing
+  sample derives the rate. `sweep` constructs every exact requested rung, not
+  only the first rung or a generic base config.
+- With preflight enabled, `benchmark` first claims a separate crash-visible
+  setup artifact at `OUT_DIR`'s sibling `OUT_DIR-setup-traffic/TIMESTAMP`.
+  Preflight then sends two representative inference requests. After both reach
   HTTP 200, if either lacks an acceptable answer, explicitly supplied
   `--probe-extra-body` candidates can each send one additional real request.
-  These calls can consume quota and incur cost. They occur before
-  the measured runner claims its artifact directory; metadata-only result rows
-  are then appended to the sealed `requests.jsonl` as `preflight` and `probe`
-  phases without request or response content. Preserve command output too if
+  These calls can consume quota and incur cost. Each completed row is fsynced
+  into the setup artifact. A normal refusal seals that artifact as an explicit
+  non-performance result; a crash leaves an incomplete diagnostic artifact.
+  When preflight passes, the same metadata-only rows are also included once in
+  the measured run's complete quota population as `preflight` and `probe`
+  phases, without request or response content. Preserve command output too if
   the human-readable probe decisions must be audited.
 - `--sizing-concurrency 10` does not hold ten concurrent requests. An unloaded
   sizing pass derives one fixed open-loop arrival rate from measured service
@@ -96,6 +103,10 @@ Important operational facts:
 - The default gate exits nonzero for a miss or invalid result. Use
   `--fail-on none` only when a non-gating diagnostic run is intentional.
 
+This example explicitly scores time to meaningful visible assistant content.
+Use `first_content` only when the written requirement intentionally counts the
+first visible, reasoning, or refusal onset as TTFT.
+
 To use a token environment variable instead of a named profile:
 
 ```bash
@@ -104,7 +115,8 @@ python3 -m traffic_replay benchmark \
   --host https://YOUR-WORKSPACE-HOST \
   --endpoint YOUR-ENDPOINT-NAME \
   --profile configs/profile_measured.json \
-  --sizing-concurrency 10
+  --sizing-concurrency 10 \
+  --ttft-definition first_visible
 ```
 
 Never place a bearer token in a run config. The harness refuses to send a
@@ -159,6 +171,7 @@ python3 -m traffic_replay benchmark \
   --profile configs/profile_measured.json \
   --fixed-rate YOUR_AUTHORIZED_REQUESTS_PER_SECOND \
   --duration 300 \
+  --ttft-definition first_visible \
   --rate-limits RATE_LIMITS.json
 ```
 
@@ -169,16 +182,18 @@ run; age equal to `max_age_days` is still accepted. The planner also refuses
 when a configured limit dimension cannot be bounded or reaches the configured
 `warning_utilization`. It budgets the complete harness schedule, setup and
 calibration traffic, worst-case physical attempts, a tokenizer-independent
-input bound, and offered `max_tokens` reservations. The input bound is one
-token per UTF-8 byte of the complete serialized request JSON plus 64 tokens for
-every message and one more 64-token request-level block. It therefore includes
-roles, message metadata, model, tools, provider controls, and JSON syntax, not
-only message content. Synthetic replay uses the larger of configured
-characters/token and the calibration hard ceiling of 12, so calibration cannot
-expand a request beyond the pre-traffic authorization. For a sweep, the tool
-constructs and validates every exact requested rung and budgets their union
-before credential or network access and before preflight, even if early stop
-would normally omit later rungs.
+engineering bound for input, and offered `max_tokens` reservations. The input
+bound counts one token per UTF-8 byte of the complete serialized request JSON,
+then adds a harness-defined 64-token allowance for every message and one more
+64-token request-level allowance. The 64-token constants are deliberately
+conservative harness assumptions, not a Databricks-published tokenizer or chat
+framing contract. The bound includes roles, message metadata, model, tools,
+provider controls, and JSON syntax, not only message content. Synthetic replay
+uses the larger of configured characters/token and the calibration hard ceiling
+of 12, so calibration cannot expand a request beyond the pre-traffic
+authorization. For a sweep, the tool constructs and validates every exact
+requested rung and budgets their union before credential or network access and
+before preflight, even if early stop would normally omit later rungs.
 
 If that offline plan passes, the tool reads serving-endpoint metadata and
 requires the direct route, `route_optimized=false`, the exact endpoint and
@@ -193,11 +208,32 @@ workspace traffic is invisible to the harness. A passing plan therefore means
 only that this harness's worst-case forecast is below its configured warning
 budget; it never proves provider quota headroom. A refusal exits with code 3.
 
+After a plan and endpoint binding pass, one command-scoped runtime guard covers
+every guarded physical inference `POST`: CLI preflight and probes, automatic
+fallbacks/retries, replay, and every rung of a sweep. Immediately before each
+`conn.request`, it atomically reserves the exact serialized request byte count,
+the conservative input bound above, offered `max_tokens`, and one query. It
+enforces every configured rolling window strictly below
+`limit * warning_utilization` and enforces `request_bytes_max` as an inclusive
+per-request ceiling. It never sleeps to wait for quota. A denial or internal
+accounting uncertainty permanently trips that command's guard and suppresses
+later physical attempts. Provisional reservations are released only when the
+client proves no `POST` began; otherwise they are conservatively committed when
+response headers or an ambiguous transport outcome is observed. Sharded runs
+use deterministic static partitions of the integer warning budget.
+
+Per-attempt guard IDs, scope IDs, sequence numbers, reservations, transitions,
+and the run-local baseline/final snapshots are persisted and reconciled against
+physical-attempt counters. Missing or inconsistent admission evidence makes the
+measurement invalid. This is still local harness admission, not provider-side
+telemetry: unrelated workspace traffic and provider burst state remain unknown.
+
 The `rate_limits` object has a closed schema:
 
 | Fields | Contract |
 |---|---|
-| `input_tokens_per_minute`, `output_tokens_per_minute`, `queries_per_hour` | At least one positive finite limit is required; only configured dimensions are enforced |
+| `input_tokens_per_minute`, `output_tokens_per_minute`, `queries_per_hour`, `queries_per_second` | Positive finite rolling limits; at least one rolling or per-request limit is required, and only configured dimensions are enforced |
+| `request_bytes_max` | Positive integer inclusive ceiling on exact serialized request-body bytes for each physical `POST` |
 | `warning_utilization` | Positive finite fraction no greater than 1; contact with the threshold refuses |
 | `source`, `as_of` | HTTPS source URL and non-future `YYYY-MM-DD` provider-fact date |
 | `verified_at`, `max_age_days` | Paired non-future `YYYY-MM-DD` operator-review date and positive integer freshness window; both are required to pass the paid-run gate |
@@ -206,7 +242,7 @@ The `rate_limits` object has a closed schema:
 | `note` | Optional nonempty operator note |
 
 See
-[`configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json`](https://github.com/debu-sinha/llm-traffic-replay/blob/main/configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json)
+[`configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json`](configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json)
 for structure only; its dated values must pass the freshness gate and still be
 rechecked against the official source. Prompt replay is bounded from the exact
 complete request built from the frozen messages with the conservative
@@ -224,6 +260,13 @@ before admission, credits unused reservation back after completion, and
 applies the most restrictive rolling limit. These are quota controls, not a
 measurement of model-serving capacity.
 
+The same current limits page publishes Foundation Model API workspace limits
+of 200 queries/second and 4 MB per request. The bundled snapshot uses the
+published 200 QPS and a conservative decimal ceiling of 4,000,000 serialized
+request bytes because that page does not state whether MB is decimal or binary.
+These workspace limits are separate from the GLM-specific Enterprise P2T row
+and still require a live recheck before the run.
+
 The managed `databricks-glm-5-2` endpoint is documented as pay-per-token.
 Current Databricks provisioned-throughput architecture lists do not list GLM
 5.2, so generic PT statements such as "no TPM limits" must not be attached to
@@ -231,26 +274,75 @@ this endpoint. Recheck the current
 [supported-model matrix](https://docs.databricks.com/aws/en/machine-learning/model-serving/foundation-model-overview)
 before testing any separately provisioned deployment.
 
-GLM-5.2 itself does support thinking off. Z.ai's current
-[Thinking Mode guide](https://docs.z.ai/guides/capabilities/thinking-mode)
-documents `{"thinking":{"type":"disabled"}}`, and its
-[Chat Completion reference](https://docs.z.ai/api-reference/llm/chat-completion)
-also documents `reasoning_effort` values `"none"` and `"minimal"` as
-thinking-skipping controls for the Z.ai API.
+The illustrative GLM 5.2 instrument canary described in the customer guide is
+exactly two preflight rows, one calibration row, and one measured replay row.
+With the default compatibility/fallback envelope that is at most 12 physical
+`POST` attempts. The illustrative output-budget p50/p95 is 320/480 tokens,
+which derives a 720-token safety cap. It explicitly selects the managed
+thinking-off path with `{"reasoning_effort":"none"}`. Its offline quota plan
+reserves a peak 89,202 input tokens/minute and 4,464 output tokens/minute. Those are
+conservative planned admission quantities, not observed usage, customer
+demand, performance, or capacity.
 
-That vendor behavior does not establish the request contract of the
-Databricks-managed adapter. The current Databricks
+For managed Databricks GLM 5.2, direct service-owner confirmation establishes
+this request contract: top-level `{"reasoning_effort":"none"}` disables
+reasoning, while omitting `reasoning_effort` selects maximum reasoning. That
+confirmation covers both the Unity AI Gateway model service
+`system.ai.glm-5-2` and direct managed endpoint request behavior. For a
+benchmark run, pass the managed control explicitly so it is sealed in the run
+configuration:
+
+```bash
+--extra-body '{"reasoning_effort":"none"}'
+```
+
+The current Databricks
 [reasoning-model guide](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models)
-was last updated on 2026-08-07 and classifies `databricks-glm-5-2` as
-reasoning-only, says it always uses internal reasoning, and gives no accepted
-GLM-specific `reasoning_effort` values. Treating those documents as distinct
-is important: this repository does not claim that GLM-5.2 lacks thinking-off;
-it declines to promise that a Z.ai or self-hosted control survives the
-Databricks adapter. Treat any candidate on that managed endpoint as an
-authorized runtime experiment. HTTP 200 alone is insufficient; require a
-completed visible/tool-call answer, reasoning-token/content evidence, and a
-repeat preflight with the selected control. This repository deliberately
-ships no Databricks GLM thinking-off default.
+classifies `databricks-glm-5-2` as reasoning-only and names
+`reasoning_effort`, but does not enumerate the GLM-specific accepted values.
+The `"none"` behavior above is therefore owner-confirmed managed behavior, not
+a value independently enumerated by that public guide. Preserve the control in
+the measured configuration and inspect reasoning plus visible-answer evidence;
+HTTP 200 by itself cannot prove a provider applied any behavioral control.
+
+The reasoning field is portable across those two managed Databricks routes;
+the tool's production qualification is not. Databricks documents the Unity AI
+Gateway
+[model-service query route](https://docs.databricks.com/aws/en/ai-gateway/query-model-services)
+and explains that a
+[model service can route and fall back across destinations](https://docs.databricks.com/aws/en/ai-gateway/model-services).
+This release can serialize a protocol-diagnostic request to
+`/ai-gateway/mlflow/v1/chat/completions` with model
+`system.ai.glm-5-2`, but its production-qualified Databricks path is only the
+exact direct `/serving-endpoints/.../invocations` route. A Gateway run has no
+supported quota or capacity conclusion because the harness does not yet bind
+the requested fully qualified model-service name to its destinations,
+routing, and fallbacks before and after the run, or enforce the intersection
+of Gateway and downstream quotas. The shipped GLM rate-limit snapshot refuses
+Gateway binding instead of implying equivalent coverage.
+
+Direct SGLang hosting has a different native request contract. Its
+[GLM-5.2 serving guide](https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.2)
+documents thinking as the default and disables it with the nested control:
+
+```bash
+--extra-body '{"chat_template_kwargs":{"enable_thinking":false}}'
+```
+
+When direct SGLang thinking stays enabled, its nested
+`chat_template_kwargs.reasoning_effort` has only two effective levels: unset
+maps to `Max`, and `"high"` maps to `High` and lowers effort. `"low"`,
+`"medium"`, and other values fall through to `Max`; none of those values is
+the SGLang thinking-off switch.
+
+Z.ai's hosted
+[Chat Completion API](https://docs.z.ai/api-reference/llm/chat-completion)
+separately documents `{"thinking":{"type":"disabled"}}`. Do not transfer any
+of these three provider-specific request shapes to another serving adapter.
+The bundled GLM canary explicitly selects the managed no-reasoning path.
+Removing or changing
+that control changes the workload contract and requires a newly planned run;
+omission selects maximum reasoning.
 
 Likewise, repeated-prefix construction is only cache-eligible traffic. Call it
 a server-observed cache hit only when the exact endpoint response reports a
@@ -271,7 +363,7 @@ one works, rerun with that object as `--extra-body` before starting load.
 
 An acceptable outcome for the gate and primary answer-latency population is:
 
-1. visible assistant content or at least one structurally valid tool call with
+1. no refusal marker, plus visible assistant content or at least one structurally valid tool call with
    a nonempty function name and arguments that decode to a JSON object;
 2. a completed stream; and
 3. no unrecoverable stream parse errors.
@@ -285,11 +377,12 @@ is excluded from answer-latency, token-throughput, cache-fidelity, calibration,
 and cost populations. The failure still remains in the request denominator and
 error evidence; it is never silently treated as a zero-token success.
 
-Reasoning controls are provider and model specific. Pass only a control that
-the target endpoint documents and accepts:
+Reasoning controls are provider and model specific. For managed Databricks
+GLM 5.2 on either Unity AI Gateway or the direct managed endpoint request
+route, the owner-confirmed thinking-off control is:
 
 ```bash
---extra-body '{"reasoning_effort":"low"}'
+--extra-body '{"reasoning_effort":"none"}'
 ```
 
 `extra_body` is a passthrough object. The harness always owns and overwrites
@@ -495,12 +588,13 @@ The harness records two related timing families:
 | Metric | Start and end |
 |---|---|
 | `connect_ms` | DNS, TCP, and TLS setup for the final attempt |
-| `ttfb_ms` | immediately before final-attempt `conn.request` to the first iterated response-body/SSE line (not necessarily the first response byte) |
-| `ttft_ms` | immediately before final-attempt `conn.request` to the first nonempty visible or reasoning content delta; tool-call fragments do not trigger it |
+| `ttfb_ms` | immediately before final-attempt `conn.request` to the first nonempty bounded response-body chunk returned by the client read; not the first socket byte or first parsed SSE line |
+| `ttft_ms` | immediately before final-attempt `conn.request` to the first nonempty visible, reasoning, or refusal delta; tool-call fragments do not trigger it |
 | `ttfr_ms` | immediately before final-attempt `conn.request` to the first reasoning delta |
 | `ttfv_ms` | immediately before final-attempt `conn.request` to the first meaningful visible content |
 | `ttf_tool_call_ms` | immediately before final-attempt `conn.request` to the first tool-call fragment |
 | `e2e_ms` | immediately before final-attempt `conn.request` through `[DONE]`, or response EOF when `[DONE]` is absent |
+| `interchunk_max_ms` | widest elapsed gap between successive SSE events that contain a nonempty visible, reasoning, or refusal delta; unavailable when fewer than two such events occur |
 | `caller_*` | scheduled monotonic target through the corresponding event |
 
 The final-attempt clocks begin after connection establishment but still include
@@ -518,11 +612,20 @@ labeled separately.
 
 `ttft_definition` controls acceptance-target scoring:
 
-- `first_content` scores the first visible or reasoning content delta.
+- `first_content` scores the first visible, reasoning, or refusal delta.
 - `first_visible` scores the first meaningful visible assistant content.
 
 Tool-call latency is reported separately. A tool-call-only answer can be an
 acceptable outcome even though it has no first-visible-content timing.
+
+`interchunk_max_ms` is a per-request maximum over content-bearing SSE events.
+It is not token-level inter-token latency: one SSE event can contain multiple
+tokens, heartbeats and usage-only events do not advance it, and tool-call-only
+fragments are excluded. When `acceptance_targets.interchunk_ms` is configured,
+each protocol-clean outcome above that cap counts against success;
+protocol-clean rows with fewer than two measured content events remain
+explicitly unmeasured, and any such row makes the configured interchunk check
+inconclusive.
 
 The optional network-path probe resolves the endpoint, then times several TCP
 connect attempts with DNS outside that probe timer. It records
@@ -531,10 +634,37 @@ indicators, not an exact RTT, not endpoint processing time, and not numbers to
 subtract from TTFT. If the probe fails, the benchmark continues without that
 evidence.
 
+### Response and endpoint identity
+
+For each streamed response, the client retains bounded `model`, `object`, and
+`system_fingerprint` fields when supplied, the Databricks
+`served-model-name` response header when supplied, plus SHA-256 of the response
+ID rather than the raw ID. Conflicting identity values inside one stream are
+protocol errors. At run level, multiple response-model values or a model that
+disagrees with an explicit request-body model invalidates a single-model
+benchmark. The serving endpoint name is not an expected OpenAI response-model
+value: for custom/PT endpoints, `served-model-name` is instead checked against
+the active served entities captured from the control plane. An unexpected
+served entity invalidates the result; incomplete binding is a caution. A
+fingerprint change is deployment context, not by itself a different model.
+
+When endpoint metadata capture is enabled, the runner reads the serving
+endpoint before its own sizing, calibration, and replay traffic and again only
+after all responses have drained. Canonical disagreement between the two
+captured normalized metadata summaries invalidates the single-configuration
+result; failure to capture both is explicit uncertainty.
+The normalized summary is a deliberately selected subset: endpoint name, task,
+`route_optimized`, READY state, and selected active served-entity identity,
+foundation-model, workload/provisioning, version, and scale-to-zero fields. It
+is not a comparison of the complete control-plane document. This comparison
+detects observed change in that subset, but it is not proof that an omitted
+field or undocumented data-plane revision stayed fixed between snapshots.
+
 ## Retries and physical requests
 
-`endpoint.max_retries` defaults to zero. When enabled, it applies to transport
-failures. A transport failure after `POST` may mean the endpoint received and
+`endpoint.max_retries` defaults to zero and accepts only integers from 0 through
+2. When enabled, it applies to transport failures. A transport failure after
+`POST` may mean the endpoint received and
 billed the request even though the client retries it. The journal records
 connection attempts, request attempts, retry count, and retry reasons.
 
@@ -562,22 +692,41 @@ cannot be recalled; its provider outcome and billing remain ambiguous. The run
 remains unsealed diagnostic evidence rather than being finalized as a
 completed benchmark.
 
+Every stdlib HTTP path bounds DNS separately because a socket timeout does not
+bound `getaddrinfo`. Concurrent lookups for one target share a daemon-only,
+DNS-only helper; a caller stops at its own deadline, and a late resolver result
+cannot open a socket or issue a request. Inference `total_timeout_s` covers DNS,
+TCP/TLS, upload, response headers, and the complete stream. Endpoint-metadata
+capture and workspace OAuth M2M also use an absolute watchdog, so a peer that
+dribbles bytes cannot extend their configured operation timeout indefinitely.
+
 Non-200 response bodies are not persisted. Error evidence contains the status,
 sampled body length, and a truncated SHA-256 digest.
 
 ## Run artifacts and recovery
 
-A runner-owned output directory is claimed before authentication, endpoint
-discovery, sizing, calibration, or replay traffic inside the measured runner.
-The higher-level benchmark preflight described above happens before this
-boundary, but only after the CLI has frozen and prevalidated the exact local
-inputs. Its metadata-only result rows are passed through a private API and
-appended to the sealed run journal as `preflight` and `probe` phases before
-runner-owned target traffic. Request and response content is not carried
-forward. The runner makes its own private snapshot before parsing. Persisted
-input evidence contains names, SHA-256 digests, byte counts, and construction
-metadata, not raw prompt text. `start.json` is updated atomically as target,
-schedule, and calibration facts become available.
+For high-level commands with preflight enabled, the CLI claims the separate
+`OUT_DIR-setup-traffic/TIMESTAMP` directory before the first preflight or probe
+`POST` and fsyncs every completed metadata-only row. A normal pass or refusal
+seals that directory with `performance_result=false`, `sla_result=false`, and
+`capacity_result=false`; a crash leaves its writing marker and partial journal
+as diagnostic evidence. The artifact records one explicit gate outcome:
+`preflight_passed`, `preflight_refused`, or
+`preflight_forced_unreadable`. Force authorizes a diagnostic run after an
+unreadable HTTP-200 preflight; it never relabels that gate as passed, and the
+canonical run and sweep decisions remain invalid. When the command proceeds,
+its setup rows are attached once to the measured run's complete request
+population, including on that explicitly forced diagnostic path.
+
+The measured runner claims its own output directory before authentication,
+endpoint discovery, sizing, calibration, or replay traffic within that runner
+boundary. Passed-in setup rows are appended as `preflight` and `probe` phases
+before runner-owned target traffic. Request and response content is not carried
+forward. The runner makes its own private input snapshot before parsing.
+Persisted input evidence contains names, SHA-256 digests, byte counts, and
+construction metadata, not raw prompt text. `start.json` is updated atomically
+as target, schedule, calibration, runtime-admission, and post-drain endpoint
+facts become available.
 
 During traffic, every completed row is appended to
 `requests.jsonl.partial`. The journal is fsynced every 16 rows by default,
@@ -684,7 +833,7 @@ tested-load facts from that object:
 | Evidence integrity | `VERIFIED`, `VERIFY_REQUIRED`, `TAMPERED` | Has the enclosing seal been checked? |
 | Measurement validity | `VALID`, `CAUTION`, `INVALID` | Are the measurement, coverage, compatibility, and workload-fidelity gates usable? |
 | Acceptance checks | `PASS`, `MISS`, `INCONCLUSIVE`, `NOT_EVALUATED` | What happened against explicitly configured performance targets? These are not called a contractual SLA unless their provenance establishes that. |
-| Quota state | `EXCEEDED`, `NOT_OBSERVED`, `UNKNOWN`, `NOT_EVALUATED` | What does captured HTTP-status evidence show? |
+| Quota state | `EXCEEDED`, `LOCAL_GUARD_REFUSED`, `NOT_OBSERVED`, `UNKNOWN`, `NOT_EVALUATED` | What do captured HTTP-status and local runtime-admission evidence show? |
 | Endpoint capacity | `HELD_AT_TESTED_LOAD`, `NOT_HELD_AT_TESTED_LOAD`, `INCONCLUSIVE`, `NOT_EVALUATED` | Did this verified, bound test point hold? |
 
 These dimensions are deliberately not collapsed into one green/red verdict.
@@ -694,6 +843,12 @@ acceptance `PASS` is explicitly qualified when measurement validity is not `VALI
 `HELD_AT_TESTED_LOAD` is only a statement about the observed point; every
 capacity state keeps `endpoint_ceiling_established=false` and
 `provider_headroom_established=false`.
+
+Response identity, the normalized pre-run/post-drain endpoint-stability
+comparison, and runtime-admission reconciliation are evidence gates, not three
+additional canonical decisions. Identity or stability failures feed
+measurement validity; runtime admission feeds quota state and measurement
+validity. The report still has exactly the five decision dimensions above.
 
 The files inside a newly written run say `VERIFY_REQUIRED` because a report
 cannot authenticate the manifest that will enclose it. That is not a claim
@@ -716,15 +871,18 @@ digital signature.
 `report.md` is the dependency-free textual alternative. Layout differs, but
 decision semantics do not.
 
-### Interpret HTTP 429 exactly
+### Interpret quota evidence exactly
 
-HTTP 429 is counted only from an integer HTTP `status` field, not by parsing
-an error string or body digest. `summary.json` records the exact count,
-denominator, status-coverage count, and phase breakdown over all sealed logical
-request rows supplied to quota accounting: preflight, explicit probes,
-sizing, calibration, and replay. Different redacted response-body digests do
-not fragment the aggregate; detailed rows remain distinct while the failure
-summary uses one stable `http 429 (rate limited)` key.
+HTTP 429 is counted only from the integer terminal HTTP `status` captured on
+each supplied request-operation row, not by parsing an error string or body
+digest. `summary.json` records the exact count, row denominator,
+status-coverage count, and phase breakdown across preflight, explicit probes,
+sizing, calibration, and replay. One row can contain more than one physical
+attempt, so this is not an attempt-by-attempt HTTP-status counter; per-attempt
+runtime-admission events and `request_attempts` are separate evidence.
+Different redacted response-body digests do not fragment the aggregate;
+detailed rows remain distinct while the failure summary uses one stable
+`http 429 (rate limited)` key.
 
 Any captured 429 produces quota `EXCEEDED`, measurement `INVALID`, and
 endpoint-capacity `INCONCLUSIVE`. It proves a rate-limit or quota rejection,
@@ -733,10 +891,19 @@ compute ceiling. Conversely, zero observed 429s with complete status coverage
 produces `NOT_OBSERVED`, not a provider-headroom claim. Missing status coverage
 produces `UNKNOWN`; internally inconsistent 429 aliases fail closed.
 
+A command-local runtime admission denial produces `LOCAL_GUARD_REFUSED`,
+invalidates measurement of the requested load, and makes capacity
+inconclusive. It means a physical `POST` was suppressed by the harness; it is
+not an HTTP 429 and is not endpoint-capacity evidence. Reconcile the guard's
+per-attempt events, run-local baseline, final snapshot, scope, and physical
+request counters before relying on a no-denial result. Guard-evidence
+inconsistency produces `UNKNOWN` even when no HTTP 429 was captured.
+
 Read the evidence in this order:
 
 1. completion marker and manifest integrity;
-2. acceptable outcomes, HTTP status coverage, and failures;
+2. runtime-admission reconciliation, HTTP status coverage, response identity,
+   endpoint metadata stability, acceptable outcomes, and failures;
 3. delivered arrival rate, queue/wire lateness, pending-limit drops, and
    measured concurrency;
 4. achieved token and cached-token coverage versus intended workload;
@@ -748,6 +915,13 @@ The primary latency population includes only structurally acceptable outcomes
 when answer observability is available. Failed and unacceptable requests do
 not disappear: they affect error and success-rate evidence. Percentiles alone
 must never be used to hide shed or malformed requests.
+
+Stability is computed after response drain from the persisted replay journal.
+Each time window uses the same acceptable-outcome population as headline
+latency, while failed/unacceptable attempts are counted separately as errors.
+A failure-only window has zero event coverage, not a fabricated latency. Read
+window error rate, event coverage, and survivor warnings together; a stable p95
+over a shrinking survivor set is not a stable endpoint.
 
 The sample gate uses roughly ten observations beyond a quantile:
 
@@ -763,7 +937,7 @@ marked indicative only. Success-rate scoring reports both the observed
 fraction and a one-sided 95 percent Wilson lower confidence bound. A clean
 verdict requires the lower bound, not only the observed fraction, to meet the
 target. This calculation assumes independent request outcomes. For scale, an
-all-success sample needs roughly 2,704 independent attempts before its lower
+all-success sample needs exactly 2,703 independent attempts before its lower
 bound can substantiate a 0.999 target. The latency floors above are evidence
 rules, not confidence intervals.
 
@@ -853,25 +1027,25 @@ rejected by `RunConfig` construction.
 | `profile_path` | `null` | Synthetic profile; exactly one workload input is required |
 | `prompts_file` | `null` | Real text prompts; exactly one workload input is required |
 | `duration_s` | `300` | Positive integer schedule seconds; trace cap when a trace is used |
-| `qps_base` | `25.0` | Positive finite base-state rate |
-| `qps_burst` | `350.0` | Positive finite burst-state rate |
-| `qps_min` | `10.0` | Positive finite scheduler floor |
-| `qps_max` | `500.0` | Positive finite scheduler ceiling |
+| `qps_base` | `25.0` | Positive finite base-state rate within inclusive `qps_min`/`qps_max` |
+| `qps_burst` | `350.0` | Positive finite burst-state rate within inclusive `qps_min`/`qps_max` |
+| `qps_min` | `10.0` | Positive finite scheduler floor no greater than `qps_max` |
+| `qps_max` | `500.0` | Positive finite scheduler ceiling no less than `qps_min` |
 | `rate_scale` | `1.0` | Deterministic thinning fraction in `(0, 1]` |
-| `max_concurrency` | `null` | Positive worker-thread safety ceiling when explicit. Fixed-rate omission normalizes to 256. Sizing derives a pool but caps it at 256 when omitted; an explicit value replaces that ceiling |
-| `max_pending_requests` | `null` | Running plus queued-work bound; runtime default is `max(2 * max_concurrency, max_concurrency + 1)` |
+| `max_concurrency` | `null` | Integer from 1 through 4,096 when explicit. Fixed-rate omission normalizes to 256. Sizing derives a pool but caps it at 256 when omitted; an explicit value replaces that ceiling |
+| `max_pending_requests` | `null` | Integer from 1 through 100,000 when explicit; running plus queued-work bound. Runtime default is `max(2 * max_concurrency, max_concurrency + 1)` |
 | `sizing_concurrency` | `null` | Positive unloaded sizing hint; derives one fixed rate and a safety-capped pool, does not hold concurrency |
 | `concurrency` | `null` | Legacy alias for `sizing_concurrency`; do not set both |
 | `seed` | `7` | Non-negative deterministic client-plan seed |
 | `cpt` | `4.0` | Positive initial characters-per-token estimate in profile mode |
-| `calibrate_n` | `12` | Non-negative extra calibration requests; actual count is capped by the unsharded schedule count |
+| `calibrate_n` | `12` | Integer from 0 through 10,000; actual calibration count is also capped by the unsharded schedule count |
 | `shard_index` | `0` | Zero-based shard index |
 | `shard_total` | `1` | Positive shard count with `0 <= shard_index < shard_total` |
 | `run_id` | `null` | Shared nonempty logical ID, required when `shard_total > 1` |
 | `start_at_unix` | `null` | Shared finite wall-clock start, required when `shard_total > 1` |
 | `start_tolerance_s` | `0.5` | Non-negative stale-start tolerance |
 | `timestamps_file` | `null` | Arrival trace replacing the synthetic schedule |
-| `pool_docs_per_bucket` | `40` | Positive reusable-prefix documents per size bucket in profile mode |
+| `pool_docs_per_bucket` | `40` | Integer from 1 through 10,000 reusable-prefix documents per size bucket in profile mode |
 | `pool_zipf_s` | `1.1` | Positive Zipf popularity exponent in profile mode |
 | `out_dir` | `"results"` | Parent for timestamped runner output |
 | `title` | `"traffic replay"` | Report title; control characters and credential patterns are sanitized |
@@ -881,9 +1055,17 @@ rejected by `RunConfig` construction.
 | `pricing` | `null` | Strict pricing object documented above |
 | `rate_limits` | `null` | Databricks pay-per-token quota snapshot; enables the conservative freshness, schedule-budget, and endpoint-binding gate described above |
 | `input_expectations` | `null` | Closed map for each configured `profile`, `prompts`, and optional `timestamps` input containing exact lowercase `sha256` and non-negative `bytes`; generated rerun configs use it to refuse changed external input bytes |
-| `capture_endpoint_metadata` | `true` | Best-effort Databricks serving-config lookup before inference traffic |
-| `measure_network_path` | `true` | Best-effort TCP-connect diagnostic before inference traffic |
+| `capture_endpoint_metadata` | `true` | Best-effort normalized Databricks serving-config summaries before runner-owned sizing, calibration, and replay traffic and after response drain; disagreement invalidates a single-configuration result and incomplete capture is explicit uncertainty |
+| `measure_network_path` | `true` | Best-effort TCP-connect diagnostic before runner-owned target traffic |
 | `ttft_definition` | `"first_content"` | `first_content` or `first_visible` for acceptance-target scoring |
+
+The exact synthetic scheduler additionally refuses `duration_s` above 604,800
+seconds or a projected upper-rate-times-duration above 1,000,000 arrivals. The
+precheck uses `qps_max` for an ordinary synthetic config and the derived fixed
+rate after sizing. A sampled schedule above 1,000,000 also refuses. An arrival
+trace is capped at 1,000,000 source rows but may span longer than 604,800
+seconds. These are implementation safety bounds, not supported endpoint rates
+or durations.
 
 Endpoint fields:
 
@@ -898,9 +1080,21 @@ Endpoint fields:
 | `read_timeout_s` | `120.0` | Positive finite idle timeout for each response read |
 | `total_timeout_s` | `180.0` | Positive finite absolute deadline for the whole request/stream; heartbeats cannot extend it |
 | `temperature` | `0.0` | Finite sampling temperature |
-| `max_retries` | `0` | Non-negative transport retry count; duplicate POST risk applies |
+| `max_retries` | `0` | Integer transport retry count from 0 through 2; duplicate POST risk applies |
 | `include_usage` | `true` | Request streamed usage and allow the explicit unsupported-field fallback |
 | `extra_body` | `null` | Credential-free finite JSON object merged below harness-owned keys; secret-like keys and credential-shaped values are rejected because request parameters are persisted as evidence. Output-budget aliases are rejected because the harness owns `max_tokens`; with `rate_limits`, `service_tier` must be absent or exactly `"default"` |
+| `production_connection_policy` | `null` | Closed production-client declaration. The only accepted value is `"fresh_http1_per_physical_attempt"`, and it must be set only when the real application opens a fresh HTTP/1.1 connection for every physical attempt. Unknown, pooled keep-alive, or HTTP/2 behavior leaves capacity inconclusive. |
+
+The built-in client deliberately opens one fresh HTTP/1.1 connection per
+physical attempt. This makes connection setup observable but is not equivalent
+to a pooled keep-alive or HTTP/2 production client. Every run records the exact
+transport contract. Unless the operator explicitly declares the same production
+policy, measurement validity is `CAUTION` and endpoint capacity is
+`INCONCLUSIVE`; latency and protocol diagnostics remain available. The matching
+declaration is an operator assertion recorded in evidence, not an observation of
+the production application. The `benchmark`, `sweep`, and `quickstart` commands
+expose the same closed declaration as
+`--production-connection-policy fresh_http1_per_physical_attempt`.
 
 A named auth profile is origin-bound. Its configured host must normalize to the
 same scheme, host, and port as `base_url`. A PAT profile has a `token` and may
@@ -920,7 +1114,11 @@ Accepted `acceptance_targets` fields are `ttft_ms`, `ttfg_ms`,
 `hard_timeouts`, `success_rate`, `interchunk_ms`, `targets_are`, `priority`,
 and `note`. Latency target objects accept only `p50`, `p90`, `p95`, and `p99`
 with positive finite milliseconds. Hard timeouts accept positive `ttft_s` and
-`ttfg_s` plus an optional note. Success rate is in `(0, 1]`.
+`ttfg_s` plus an optional note. Success rate is in `(0, 1)`; finite evidence
+cannot statistically demonstrate a true 100% success probability. Record
+ownership/provenance in nonempty `targets_are`. A sweep capacity conclusion
+requires it to positively identify customer-owned/agreed production targets
+and rejects illustrative, sample, placeholder, demo, or default policies.
 
 ### High-level command defaults
 
@@ -935,7 +1133,7 @@ config:
 | `sweep` | six geometric rungs from 1 through 32 requests/second, 120 seconds per rung, 60-second spacing after preflight and between rungs, fixed `cpt=4.0`, zero per-rung calibration requests, 256 workers, `results/sweep`, two-request preflight and early stop enabled, no provider-control candidates unless explicitly supplied |
 | `quickstart` | 240 seconds, `results/quickstart`, output config `configs/quickstart.json`; profile and sizing hint are required |
 | `run` | `fail-on=miss`, text output; run config is required |
-| `validate` | OS-assigned port 0, 25-second schedule, `results/validation`, 60 ms oracle-error tolerance, text output |
+| `validate` | OS-assigned port 0, 25-second schedule, `results/validation`, 60 ms oracle-error tolerance, text output; `--format json` prints only the validation comparison object |
 | `merge` / `compare` | output path plus at least two complete input run directories |
 
 When `benchmark` or `sweep` receives neither `--profile` nor `--prompts`, it
@@ -944,6 +1142,14 @@ p95 24,000 tokens; output p50 200 and p95 480 tokens; cache fraction p50 0.3
 and p95 0.7. The derived output safety cap is 720 tokens. These are CLI
 defaults, not measured workload facts, and should be replaced before a
 production conclusion.
+
+For command-line profile construction, a single `--input-tokens` or
+`--output-tokens` value is treated as p50 and silently derives p95 as 2.4 times
+that value. A single interior `--cache-fraction` value derives p95 as
+`p50 + 0.65 * (1 - p50)`; exact 0 or 1 stays constant. The generated output
+cap is `ceil(output_p95 * 1.5)`. These are convenience assumptions, not measured
+tails or recommendations. Production commands should pass explicit `p50,p95`
+pairs or, preferably, use a measured profile with stated provenance.
 
 `--cache-fraction` is the preferred public flag. It sets profile
 `cache_fraction`: the intended fraction of prompt tokens placed in a reusable
@@ -1033,7 +1239,8 @@ compatibility result into a valid one.
 
 ## Rate sweeps
 
-Use a fixed-rate ladder to find the highest tested rung that remains valid:
+Use a fixed-rate ladder to identify the highest tested rung that remains valid;
+this does not discover an endpoint ceiling:
 
 ```bash
 python3 -m traffic_replay sweep \
@@ -1044,7 +1251,13 @@ python3 -m traffic_replay sweep \
   --rate 1:32:6 \
   --duration 120 \
   --cooldown 60 \
-  --cpt YOUR_PREMEASURED_CHARACTERS_PER_TOKEN
+  --cpt YOUR_PREMEASURED_CHARACTERS_PER_TOKEN \
+  --max-concurrency 256 \
+  --max-pending-requests 512 \
+  --ttft-definition first_visible \
+  --ttft-p95 YOUR_TTFT_MS \
+  --ttfg-p95 YOUR_TTFG_MS \
+  --success-rate YOUR_FRACTION_STRICTLY_BETWEEN_0_AND_1
 ```
 
 The rate axis is open-loop requests per second. `--rate 1:32:6` is a six-rung
@@ -1082,7 +1295,8 @@ Before treating a run as production evidence:
 - pin endpoint identity, model, request parameters, reasoning controls, and
   output cap;
 - use real prompts or a measured profile with explicit limitations;
-- set your own acceptance targets and current pricing;
+- set customer-owned acceptance targets with explicit provenance and current
+  operator-supplied pricing;
 - bound workers and pending requests, then increase load in guarded steps;
 - monitor endpoint, client, network, quota, and cost telemetry externally;
 - retain only sealed manifest-v3 directories as benchmark evidence.
@@ -1095,9 +1309,9 @@ current official
 
 ## Architecture and repository layout
 
-See [Architecture](https://github.com/debu-sinha/llm-traffic-replay/blob/main/docs/ARCHITECTURE.md)
+See [Architecture](docs/ARCHITECTURE.md)
 for component and clock boundaries and
-[Production testing](https://github.com/debu-sinha/llm-traffic-replay/blob/main/docs/PRODUCTION_TESTING.md)
+[Production testing](docs/PRODUCTION_TESTING.md)
 for a staged runbook. The
 editable and rendered diagrams are in `docs/diagrams/`.
 
@@ -1107,10 +1321,22 @@ traffic_replay/data/             packaged validation profile
 tests/                           pytest suite
 configs/                         example profiles and run configs
 scripts/profile_from_logs.py     profile extractor for token/cache logs
+scripts/pack_notebook.py         clean-source notebook packer and verifier
+scripts/build_customer_pdf.py    stamped five-page field-guide builder/checker
 docs/                            runbooks and diagrams
 notebooks/                       workspace packaging and smoke notebook
 ```
 
-The checked-in report screenshots are historical format illustrations only.
+Release derivatives are reproducible checks, not performance evidence. From a
+clean tracked tree, run `python3 scripts/pack_notebook.py` to regenerate the
+self-contained workspace notebook and `python3 scripts/pack_notebook.py
+--check` to verify its exact payload, source identity, and collected test
+count. Run `python3 scripts/build_customer_pdf.py` to build the customer guide
+and `python3 scripts/build_customer_pdf.py --check` to verify its source stamp,
+five-page semantic contract, PDF metadata, and hash sidecar. The build ID and
+SHA-256 values detect inconsistency; they do not prove authorship or trusted
+time. PDF build and verification require the Playwright CLI with Chromium plus
+Poppler's `pdfinfo` and `pdftotext` executables on `PATH`.
+
 Trust the fields in the current `summary.json`, manifest schema v3, and reports
 generated by the current tested commit.

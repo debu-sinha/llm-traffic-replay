@@ -16,7 +16,8 @@
   "cpt": 4.0,
   "calibrate_n": 12,
   "out_dir": "results/pt",
-  "title": "guarded provisioned-throughput replay template",
-  "label": "Guarded template for a model and region explicitly supported on provisioned throughput. The bundled profile and its acceptance targets are illustrative. Replace both with measured workload and agreed targets. This file starts at rate_scale 0.1 with 256 workers and 512 pending requests. Do not raise load until preflight, delivered-rate, queue, endpoint, quota, and cost evidence are healthy. Size mean occupancy from measured mean service time; tail latency is headroom evidence, not Little's Law. Shard only after one generator is proven insufficient.",
+  "title": "bounded provisioned-throughput replay template",
+  "label": "UNVERIFIED ILLUSTRATIVE TEMPLATE for a model and region separately confirmed as provisioned-throughput eligible. Every workload, target, arrival-rate, burst, worker, pending, CPT, calibration, and output-cap value must be reviewed. This file has client bounds but no rate_limits object or built-in provider-capacity guard; enforce the applicable provisioned capacity and account limits externally. Replace the bundled profile and targets with measured workload and customer-owned requirements. Size mean occupancy from measured mean service time; tail latency is headroom evidence, not Little's Law. Shard only after one generator is proven insufficient.",
+  "ttft_definition": "first_visible",
   "max_output_tokens_cap": 512
 }

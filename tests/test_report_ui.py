@@ -94,7 +94,7 @@ def test_first_screen_model_keeps_quota_sla_and_capacity_independent():
     assert "Tested load held" not in body
     assert body.index("Decision summary") < body.index("What was tested")
     assert body.index("What was tested") < body.index(
-        "Endpoint service latency")
+        "Final-attempt request-path latency")
 
 
 def test_report_shell_is_self_contained_responsive_semantic_and_printable():
@@ -123,13 +123,108 @@ def test_report_shell_is_self_contained_responsive_semantic_and_printable():
     assert "Scroll horizontally; the Metric column stays visible." in body
     assert "class='table-scroll' tabindex='0' role='region'" in body
     assert ".dense-table .sticky-col{position:sticky" in body
+
+    print_css = body.split("@media print", 1)[1].split("</style>", 1)[0]
+    assert ".state-card .why{display:block" in print_css
+    assert ".gate-detail{display:block" in print_css
+    assert ".gate-detail>.decision-reasons{display:grid}" in print_css
+    assert ".fact .note{display:block" in print_css
+    assert ".state-card .why,.gate-detail{display:none}" not in print_css
+    assert "Why these states" in body
+    assert "every canonical gate code and message" in body
+    assert "Measurement validity" in body
+    assert "<section class='gate-detail' id='decision-reasons'" in body
+    assert "class='gate-reason-list'" in body
     assert ".table-scroll:focus-visible{outline:3px solid var(--blue)" in body
     assert "table:not(.dense-table){display:table;width:100%" in body
     assert "table:not(.dense-table) th.lbl{width:44%}" in body
+    mobile_css = body.split("@media(max-width:640px)", 1)[1].split(
+        "@media print", 1)[0]
+    assert ".decision-hero .claim-box{" in mobile_css
+    assert "display:block" in mobile_css
+    assert ".state-card .why{display:block" in mobile_css
+    assert ".section-head p{" in mobile_css
+    assert ".fact .note{display:block" in mobile_css
+    assert ".decision-hero .claim-box{display:none}" not in mobile_css
+    assert ".state-card .why{display:none}" not in mobile_css
+    assert ".section-head p{display:none}" not in mobile_css
+    assert ".fact .note{display:none}" not in mobile_css
     for heading in (
             "Evidence integrity", "Measurement validity", "Acceptance checks",
             "Quota state", "Endpoint capacity"):
         assert heading in body
+
+
+def test_additional_cautions_surface_identity_stability_and_runtime_admission():
+    summary = _summary()
+    summary["response_identity"].update({
+        "status": "invalid",
+        "invalid": "response model changed during the run",
+    })
+    summary["drift"] = {
+        "drift_kind": "variable",
+        "drift_headline": "tail latency varied across windows",
+    }
+    summary["runtime_quota_admission"] = {
+        "status": "invalid_evidence",
+        "denied_rows": 0,
+        "denied_attempts_in_captured_rows": 0,
+    }
+    summary["run"]["transport"] = {
+        "production_connection_policy_match": False,
+        "production_comparability_warning": (
+            "production uses a pooled HTTP/2 connection"),
+    }
+
+    body = render_html(summary, "caution coverage")
+
+    assert "Additional measurement and workload cautions" in body
+    assert "Response model identity" in body
+    assert "response model changed during the run" in body
+    assert "Stability" in body and "tail latency varied across windows" in body
+    assert "Runtime quota admission" in body
+    assert "failed its invariants" in body
+    assert "Transport parity" in body
+    assert "production uses a pooled HTTP/2 connection" in body
+
+
+def test_all_canonical_caution_details_precede_metrics_in_html_and_markdown():
+    summary = _summary()
+    summary["cache_fidelity"] = {
+        "warning": "cache reporting was unavailable for this run",
+    }
+    summary["network_path"] = {
+        "warning": "generator placement differs from production",
+    }
+    summary["run"].update({
+        "endpoint_metadata_warning": "post-drain metadata was unavailable",
+        "transport": {
+            "production_connection_policy_match": False,
+            "production_comparability_warning": (
+                "production connection reuse was not established"),
+        },
+    })
+
+    body = render_html(summary, "all caution details")
+    markdown = render_markdown(summary, "all caution details")
+
+    expected = {
+        "CACHE_FIDELITY_UNVERIFIED": (
+            "cache reporting was unavailable for this run"),
+        "NETWORK_PATH_CAUTION": "generator placement differs from production",
+        "ENDPOINT_METADATA_STABILITY_UNVERIFIED": (
+            "post-drain metadata was unavailable"),
+        "PRODUCTION_TRANSPORT_UNVERIFIED": (
+            "production connection reuse was not established"),
+    }
+    for code, message in expected.items():
+        assert code in body and message in body
+        assert body.index(code) < body.index("What was tested")
+        assert code in markdown and message in markdown
+        assert markdown.index(code) < markdown.index(
+            "final-attempt request-path metric")
+    decision_block = body[:body.index("What was tested")]
+    assert "plus " not in decision_block
 
 
 def test_unsealed_report_never_calls_captured_quota_rows_sealed():
@@ -236,10 +331,12 @@ def test_exact_caller_latency_is_primary_and_zero_throughput_is_visible():
 
     body = render_html(summary, "caller-first report")
 
-    assert "Caller TTFT p50" in body and ">500 <span class='u'>ms" in body
-    assert "Caller end to end p95" in body and ">700 <span class='u'>ms" in body
-    assert body.index("Caller TTFT p50") < body.index(
-        "Endpoint service latency")
+    assert "Exact caller TTFT p50" in body \
+        and ">500 <span class='u'>ms" in body
+    assert "Exact caller end to end p95" in body \
+        and ">700 <span class='u'>ms" in body
+    assert body.index("Exact caller TTFT p50") < body.index(
+        "Final-attempt request-path latency")
     assert "output throughput" in body
     assert ">0 <span class='u'>tok/min</span>" in body
 

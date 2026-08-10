@@ -20,6 +20,7 @@ import urllib.parse
 
 from .client import validate_bearer_transport
 from .json_input import loads_strict
+from .network import AbsoluteHTTPDeadline, bind_deadline_bounded_dns
 
 
 _MAX_RESPONSE_BYTES = 1024 * 1024
@@ -66,6 +67,53 @@ def endpoint_name_from_path(path: str) -> str | None:
                 and not any(char in name for char in ("\r", "\n", "\x00")):
             return name
     return None
+
+
+def invocation_endpoint_binding(endpoint_path: str,
+                                endpoint_metadata: dict | None) -> dict:
+    """Bind a direct invocation route to a ready control-plane endpoint.
+
+    This is deployment-mode neutral. It proves which named endpoint the
+    harness invoked, not whether that endpoint is pay-per-token or provisioned.
+    """
+    route_name = endpoint_name_from_path(endpoint_path)
+    reasons: list[str] = []
+    if route_name is None:
+        reasons.append(
+            "request path is not an exact direct serving-endpoint invocation "
+            "route")
+    if not isinstance(endpoint_metadata, dict):
+        reasons.append("serving endpoint metadata was not captured")
+        metadata_name = None
+        ready = None
+        entities = None
+    else:
+        metadata_name = endpoint_metadata.get("name")
+        ready = endpoint_metadata.get("ready")
+        entities = endpoint_metadata.get("served_entities")
+        if not isinstance(metadata_name, str) or metadata_name != route_name:
+            reasons.append(
+                "captured endpoint name does not match the invocation route")
+        if ready != "READY":
+            reasons.append("captured endpoint state is not exact READY")
+        if not isinstance(entities, list) or not entities:
+            reasons.append(
+                "captured endpoint metadata has no active served entity")
+    return {
+        "binding_schema_version": 1,
+        "binding_kind": "direct_invocation_endpoint",
+        "binding_complete": not reasons,
+        "route_endpoint_name": route_name,
+        "captured_endpoint_name": metadata_name,
+        "captured_ready": ready,
+        "served_entity_count": (
+            len(entities) if isinstance(entities, list) else None),
+        "reasons": reasons,
+        "note": (
+            "binds the exact invocation route to a READY endpoint and active "
+            "served-entity snapshot; it does not infer deployment mode, "
+            "provider quota headroom, or endpoint ceiling"),
+    }
 
 
 def rate_limit_endpoint_binding(rate_limits: dict,
@@ -326,28 +374,35 @@ def fetch_endpoint_metadata(base_url: str, path: str, token: str | None,
                 context=ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", api, headers={"Authorization": f"Bearer {token}"})
-        resp = conn.getresponse()
-        if resp.status != 200:
-            _note(f"serving-endpoints API returned HTTP {resp.status} for "
-                  f"'{name}', skipping the endpoint card")
-            return None
-        length = resp.getheader("Content-Length")
-        if length is not None:
-            try:
-                if int(length) > _MAX_RESPONSE_BYTES:
-                    _note(f"serving-endpoints API response for '{name}' was "
-                          "too large, skipping the endpoint card")
-                    return None
-            except ValueError:
-                pass
-        raw = resp.read(_MAX_RESPONSE_BYTES + 1)
-        if len(raw) > _MAX_RESPONSE_BYTES:
-            _note(f"serving-endpoints API response for '{name}' was too "
-                  "large, skipping the endpoint card")
-            return None
-        doc = loads_strict(raw)
-        return _summarize(doc)
+        bind_deadline_bounded_dns(conn)
+        with AbsoluteHTTPDeadline(conn, float(timeout)) as deadline:
+            conn.request(
+                "GET", api, headers={"Authorization": f"Bearer {token}"})
+            deadline.raise_if_expired()
+            resp = conn.getresponse()
+            deadline.raise_if_expired()
+            if resp.status != 200:
+                _note(f"serving-endpoints API returned HTTP {resp.status} for "
+                      f"'{name}', skipping the endpoint card")
+                return None
+            length = resp.getheader("Content-Length")
+            if length is not None:
+                try:
+                    if int(length) > _MAX_RESPONSE_BYTES:
+                        _note(
+                            f"serving-endpoints API response for '{name}' "
+                            "was too large, skipping the endpoint card")
+                        return None
+                except ValueError:
+                    pass
+            raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+            deadline.raise_if_expired()
+            if len(raw) > _MAX_RESPONSE_BYTES:
+                _note(f"serving-endpoints API response for '{name}' was too "
+                      "large, skipping the endpoint card")
+                return None
+            doc = loads_strict(raw)
+            return _summarize(doc)
     except Exception as exc:
         # never print the body or the token, only the failure class
         _note(f"could not read endpoint '{name}' ({type(exc).__name__}), "

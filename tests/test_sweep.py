@@ -2,7 +2,7 @@
 
 The axis is arrival rate, not concurrency, and that is a correctness choice
 rather than a convenience. An open-loop generator cannot hold a concurrency:
-in-flight is arrival rate times service time, and service time rises under
+mean in-flight is approximately achieved throughput times mean residence time
 load, so fixing the rate moves the concurrency. Offering concurrency as an
 input would mean either lying about it or going closed loop, and closed loop
 is what bakes coordinated omission into every other sweep in the category.
@@ -18,6 +18,18 @@ from pathlib import Path
 import pytest
 
 from traffic_replay.cli import _rungs
+
+
+def _exact_transport() -> dict:
+    return {
+        "connection_policy_id": "fresh_http1_per_physical_attempt",
+        "production_connection_policy_declared":
+            "fresh_http1_per_physical_attempt",
+        "production_connection_policy_match": True,
+        "production_connection_policy_assurance":
+            "operator asserted an exact production connection-policy match",
+        "production_comparability_warning": None,
+    }
 
 
 def test_a_range_becomes_a_geometric_ladder():
@@ -60,7 +72,16 @@ def _rung(rate, kind, held=None, err=0.0):
             "request_rows": 0, "replay_rows": 0,
             "calibration_rows": 0, "sizing_rows": 0,
             "preflight_rows": 0, "probe_rows": 0, "other_rows": 0,
-            "unknown_attempt_rows": 0}
+            "unknown_attempt_rows": 0,
+            "transport_connection_policy_id":
+                "fresh_http1_per_physical_attempt",
+            "production_connection_policy_declared":
+                "fresh_http1_per_physical_attempt",
+            "production_connection_policy_match": True,
+            "production_connection_policy_assurance":
+                "operator asserted an exact production connection-policy match",
+            "production_comparability_warning": None,
+            "transport_parity_status": "MATCH"}
 
 
 class _Args:
@@ -70,6 +91,8 @@ class _Args:
     _preflight_evidence = {
         "skipped": True, "attempted": 0, "reachable": 0, "readable": 0,
         "reasoning_probe_requests": 0,
+        "outcome": "skipped", "force_requested": False,
+        "gate_satisfied": False,
     }
 
 
@@ -209,20 +232,43 @@ def _sealed_run(path: Path, summary: dict, identity: str, *,
 
 def _summary(rate: float) -> dict:
     return {
+        "run": {"transport": _exact_transport()},
         "arrivals": {"achieved_qps_overall": rate},
         "requests_total": 1000,
+        "requests_ok": 1000,
         "requests_failed": 0,
         "error_rate": 0.0,
         "ttft_ms": {"p50": 100.0, "p95": 200.0},
         "e2e_ms": {"p50": 300.0},
         "concurrency": {"in_flight_p50": 2.0},
-        "answers": {"answer_rate": 1.0, "judged": 1000, "answered": 1000},
+        "answers": {"answer_rate": 1.0, "judged": 1000, "answered": 1000,
+                    "acceptable_outcomes": 1000},
         "drift": {"drift_kind": "stable", "drift_flag": False},
         "sample": {"n": 1000, "indicative_only": []},
-        "sla": {"success_rate": {
-            "target": 0.99, "met": True,
-            "statistically_demonstrated": True,
-        }},
+        "http_429_count": 0,
+        "http_429": {
+            "count": 0, "request_rows_examined": 1000,
+            "http_status_observed_for": 1000, "phases": {},
+            "scope": "all supplied request phases",
+        },
+        "rate_limits": {
+            "binding": {"binding_complete": True}, "warning": None,
+        },
+        "sla": {
+            "acceptance_config": {
+                "targets_are": "customer requirements",
+                "ttft_ms": {"p95": 500.0},
+                "success_rate": 0.99,
+            },
+            "ttft_vs_target": [{
+                "quantile": "p95", "target_ms": 500.0, "met": True,
+            }],
+            "success_rate": {
+                "target": 0.99, "actual": 1.0,
+                "one_sided_95pct_wilson_lower": 0.996,
+                "met": True, "statistically_demonstrated": True,
+            },
+        },
     }
 
 
@@ -336,17 +382,19 @@ def _unverified_record(rate: float) -> dict:
     }
 
 
-def test_the_ceiling_is_the_highest_rung_that_HELD():
-    """Every sweep in this category anchors its ceiling on the highest rung
-    it managed to submit, then reports a top rung its own error rate
-    disqualifies. The ceiling here is the last one that stayed valid."""
+def test_highest_held_rate_is_the_last_valid_rung_before_a_miss():
+    """A missed rung does not erase the lower tested rate that held.
+
+    Neither rung establishes an endpoint ceiling.
+    """
     tmp_path = Path(tempfile.mkdtemp(prefix='sweep-'))
     rungs = [_rung(1, "ok", held=2), _rung(2, "ok", held=5),
              _rung(4, "miss", held=9, err=0.4)]
     code = _report(rungs, tmp_path)
     body = (tmp_path / "sweep.md").read_text()
-    assert "Highest rate that held: 2 requests/second" in body
-    assert "carried about 5 concurrent" in body
+    assert "Highest rate that held: 2.00 delivered requests/second" in body
+    assert "2 requested rps rung" in body
+    assert "observed in-flight p50 5" in body
     assert "The next rung, 4 rps, missed" in body
     assert code == 0
 
@@ -356,18 +404,19 @@ def test_a_caution_is_not_claimed_as_a_proven_held_rung():
     rungs = [_rung(1, "ok", held=2), _rung(2, "caution", held=5)]
     _report(rungs, tmp_path)
     body = (tmp_path / "sweep.md").read_text()
-    assert "Highest rate that held: 1 requests/second" in body
+    assert "Highest rate that held: 1.00 delivered requests/second" in body
     assert "next rung, 2 rps, cautioned" in body
 
 
-def test_topping_out_says_the_ceiling_may_be_higher():
-    """Reporting the top rung as the ceiling when nothing failed would
-    understate the endpoint."""
+def test_topping_out_withholds_ceiling_and_requires_new_authorization():
+    """A held top rung is not authorization to keep increasing load."""
     tmp_path = Path(tempfile.mkdtemp(prefix='sweep-'))
     _report([_rung(1, "ok", held=2), _rung(2, "ok", held=4)], tmp_path)
     body = (tmp_path / "sweep.md").read_text()
-    assert "top of the ladder" in body
-    assert "Raise --rate" in body
+    assert "top of the authorized ladder" in body
+    assert "no ceiling was established" in body
+    assert "newly authorized window" in body
+    assert "Raise --rate" not in body
 
 
 def test_no_rung_holding_is_reported_and_exits_nonzero():
@@ -393,7 +442,7 @@ def test_concurrency_is_reported_as_measured_not_as_asked():
     _report([_rung(1, "ok", held=3)], tmp_path)
     body = (tmp_path / "sweep.md").read_text()
     assert "as measured, not as asked for" in body
-    assert "| held |" in body
+    assert "| in-flight p50 |" in body
 
 
 def test_the_config_the_sweep_builds_is_actually_a_valid_run_config():
@@ -468,16 +517,38 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
         }
         return None
 
-    def fake_run(rc, quiet=False, prior_request_rows=None):
+    def fake_run(rc, quiet=False, prior_request_rows=None,
+                 preflight_gate=None, runtime_quota_guard=None):
         runs.append(rc)
         prior_seen.append(list(prior_request_rows or []))
+        assert runtime_quota_guard is None
+        if len(runs) == 1:
+            assert preflight_gate == {
+                "skipped": False, "attempted": 2, "reachable": 2,
+                "readable": 2, "reasoning_probe_requests": 0,
+                "outcome": "preflight_passed", "force_requested": False,
+                "gate_satisfied": True,
+            }
+        else:
+            assert preflight_gate is None
         d = Path(rc.out_dir) / "fake"
         summary = {
-            "arrivals": {"achieved_qps_overall": rc.qps_base},
-            "error_rate": 0.0,
-            "ttft_ms": {"p50": 10.0, "p95": 20.0},
-            "e2e_ms": {"p50": 30.0},
-            "concurrency": {"in_flight_p50": 2.0}}
+                "run": {"transport": _exact_transport()},
+                "arrivals": {"achieved_qps_overall": rc.qps_base},
+                "error_rate": 0.0,
+                "ttft_ms": {"p50": 10.0, "p95": 20.0},
+                "ttfv_ms": {"p50": 15.0, "p95": 25.0, "n": 1000},
+                "e2e_ms": {"p50": 30.0},
+                "sla": {
+                    "ttft_definition": "first_visible",
+                    "ttft_metric": "ttfv_ms",
+                    "acceptance_config": {
+                        "targets_are": "customer requirements",
+                        "ttft_ms": {"p95": 100.0},
+                        "success_rate": 0.99,
+                    },
+                },
+                "concurrency": {"in_flight_p50": 2.0}}
         _sealed_run(
             d, summary, f"rate-{rc.qps_base:g}",
             run_config=vars(rc).copy(),
@@ -497,6 +568,7 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
         "--prompts", str(prompts), "--output-tokens", "40,90",
         "--auth-profile", "workspace-test",
         "--extra-body", '{"chat_template_kwargs":{"enable_thinking":false}}',
+        "--ttft-p95", "100", "--success-rate", "0.99",
         "--max-concurrency", "17", "--max-pending-requests", "23",
         "--out-dir", str(root / "out")])
 
@@ -505,7 +577,11 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
     assert len(representative_sets[0]) == 2
     assert len(runs) == 2
     assert [len(rows) for rows in prior_seen] == [2, 0]
-    assert sleeps == [3, 3]
+    # The monkeypatch replaces process-global time.sleep, so unrelated daemon
+    # teardown can contribute tiny waits when this test follows deadline
+    # tests. Assert the two command cooldowns exactly without making the test
+    # order-dependent on sub-10ms background polling.
+    assert [seconds for seconds in sleeps if seconds >= 0.01] == [3, 3]
     assert [r.qps_base for r in runs] == [1.0, 2.0]
     assert len({r.prompts_file for r in runs}) == 1
     for rc in runs:
@@ -530,6 +606,24 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
     assert sealed_base["calibrate_n"] == 0
     assert sealed_base["cpt"] == 3.5
     assert sealed_base["ttft_definition"] == "first_visible"
+    sweep_manifest = json.loads((root / "out" / "manifest.json").read_text())
+    context = sweep_manifest["report_context"]
+    assert context["planned_rates"] == [1.0, 2.0]
+    assert context["attempted_rates"] == [1.0, 2.0]
+    assert context["omitted_rates"] == []
+    assert context["termination_reason"] == "completed_planned_ladder"
+    assert context["progression_policy"] == {
+        "early_stop_on_definitive_fail": True,
+        "diagnostic_only": False,
+        "invalid_or_quota_always_stops": True,
+    }
+    assert len(context["cooldown_records"]) == 2
+    assert all(record["requested_s"] == 3.0
+               for record in context["cooldown_records"])
+    assert all(record["elapsed_s"] < 1.0
+               for record in context["cooldown_records"])
+    report = (root / "out" / "sweep.md").read_text()
+    assert "requested cooldown was not actually observed" in report
     for rate in (1, 2):
         saved = json.loads((root / "out" / f"rate_{rate}" /
                             "run-config.json").read_text())
@@ -563,7 +657,35 @@ def test_sweep_aggregate_seals_report_config_and_exact_rung_identities(tmp_path)
         manifest_raw).hexdigest()
     assert completion["manifest_bytes"] == len(manifest_raw)
     assert set(manifest["artifacts"]) == {
-        "sweep-base-config.json", "sweep.md"}
+        "sweep-base-config.json", "sweep.md", "sweep.html"}
+    html = (out / "sweep.html").read_text()
+    assert html.startswith("<!doctype html>")
+    assert manifest["artifact_id"] in html
+    assert "Offered versus observed" in html
+    assert "one-sided 95% Wilson lower confidence bound" in html
+    assert "Request-start late p95" in html
+    assert "Endpoint metadata: pre-run vs post-drain" not in html
+    assert "Endpoint stability" in html
+    assert "Transport parity" in html
+    assert "benchmark policy:" in html
+    assert "declared production policy:" in html
+    assert "explicit exact match: yes" in html
+    assert "Runtime admission" in html
+    assert "A browser print or PDF is an unsealed derivative" in html
+    assert "UNSEALED PRINT/PDF DERIVATIVE" in html
+    assert "<caption>Sealed offered-load" in html
+    assert "aria-describedby='rungs-scroll-hint'" in html
+    assert "Scroll horizontally; the Asked column stays visible." in html
+    assert "class='sticky-col'" in html
+    assert ".table-wrap:focus-visible" in html
+    assert "@page{size:landscape" in html
+    assert "thead th,.sticky-col{position:static" in html
+    assert "<script" not in html.lower()
+    assert "<link" not in html.lower()
+    assert "@import" not in html.lower()
+    assert "url(" not in html.lower()
+    assert "http://" not in html.lower()
+    assert "https://" not in html.lower()
     assert all(not Path(record["dir"]).is_absolute()
                for record in manifest["rungs"])
     for source, d in zip(manifest["sources"], dirs):
@@ -585,7 +707,8 @@ def test_sweep_aggregate_seals_report_config_and_exact_rung_identities(tmp_path)
     assert verify_sweep_output(copied)["artifact_id"] == manifest["artifact_id"]
 
 
-@pytest.mark.parametrize("name", ["sweep.md", "sweep-base-config.json"])
+@pytest.mark.parametrize(
+    "name", ["sweep.md", "sweep.html", "sweep-base-config.json"])
 def test_sweep_verifier_rejects_tampered_headline_or_config(tmp_path, name):
     from traffic_replay.sweep_artifacts import verify_sweep_output
 
@@ -974,15 +1097,235 @@ def test_preflight_and_probe_rows_are_manifest_bound_once_on_the_first_rung(
     assert "proves neither QPH recovery" in report
 
 
-def test_higher_pass_after_lower_failure_is_invalid_not_a_ceiling():
+def test_higher_pass_after_lower_failure_is_valid_but_has_no_boundary():
     from traffic_replay.sweep_artifacts import sweep_outcome
 
     low = _rung(1.0, "miss")
     high = _rung(2.0, "ok")
     outcome = sweep_outcome([low, high])
-    assert outcome["exit_code"] == 2
+    assert outcome["invalid"] is False
+    assert outcome["invalid_reasons"] == []
+    assert outcome["capacity_conclusion"] == "NON_MONOTONIC_NO_BOUNDARY"
+    assert outcome["exit_code"] == 1
     assert outcome["highest_held_rate"] is None
     assert outcome["non_monotonic"] is True
+
+
+def test_underpowered_rung_does_not_make_later_pass_non_monotonic():
+    from traffic_replay.sweep_artifacts import sweep_outcome
+
+    low = {**_rung(1.0, "caution"),
+           "state": "INSUFFICIENT_EVIDENCE"}
+    high = {**_rung(4.0, "ok"), "state": "PASS"}
+    outcome = sweep_outcome([low, high])
+
+    assert outcome["non_monotonic"] is False
+    assert outcome["highest_sla_passing_tested_rate"] == 4.0
+    assert outcome["capacity_conclusion"] == "TOP_OF_LADDER_PASSED"
+    assert outcome["exit_code"] == 0
+
+
+def test_first_visible_sweep_projection_uses_caller_ttfv_not_raw_ttft():
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    summary = {
+        "run": {"transport": _exact_transport()},
+        "http_429_count": 0,
+        "ttft_ms": {"n": 1000, "p50": 10.0, "p95": 12.0},
+        "ttfv_ms": {"n": 1000, "p50": 1000.0, "p95": 1100.0},
+        "ttfv_corrected_ms": {
+            "n": 1000, "p50": 1200.0, "p95": 1400.0},
+        "e2e_corrected_ms": {"n": 1000, "p50": 1800.0, "p95": 2000.0},
+        "answers": {"answer_rate": 1.0, "judged": 1000,
+                    "answered": 1000},
+        "error_rate": 0.0,
+        "drift": {"drift_kind": "stable"},
+        "sample": {"n": 1000, "indicative_only": []},
+        "sla": {
+            "ttft_definition": "first_visible",
+            "ttft_metric": "ttfv_corrected_ms",
+            "ttfg_metric": "e2e_corrected_ms",
+            "acceptance_config": {
+                "targets_are": "customer requirements",
+                "ttft_ms": {"p95": 1500.0}, "success_rate": 0.99},
+            "ttft_vs_target": [{"quantile": "p95", "target_ms": 1500.0,
+                                "met": True}],
+            "success_rate": {"target": 0.99, "met": True,
+                             "statistically_demonstrated": True},
+        },
+    }
+
+    decision = classify_sweep_rung(summary)
+
+    assert decision["state"] == "PASS"
+    assert decision["first_event_definition"] == "first_visible"
+    assert decision["latency_metric"] == "ttfv_corrected_ms"
+    assert decision["latency_basis"] == "caller_experienced"
+    assert decision["latency_p50"] == 1200.0
+    assert decision["latency_p95"] == 1400.0
+    assert decision["transport_connection_policy_id"] == \
+        "fresh_http1_per_physical_attempt"
+    assert decision["production_connection_policy_declared"] == \
+        "fresh_http1_per_physical_attempt"
+    assert decision["production_connection_policy_match"] is True
+    assert decision["transport_parity_status"] == "MATCH"
+
+
+def test_missing_transport_parity_is_sealed_as_insufficient_evidence():
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    summary = _summary(4.0)
+    summary["run"].pop("transport")
+
+    decision = classify_sweep_rung(summary)
+
+    assert decision["state"] == "INSUFFICIENT_EVIDENCE"
+    assert decision["kind"] == "caution"
+    assert decision["transport_connection_policy_id"] is None
+    assert decision["production_connection_policy_declared"] is None
+    assert decision["production_connection_policy_match"] is None
+    assert decision["transport_parity_status"] == "UNVERIFIED"
+    assert "Production transport parity is not established" in decision["text"]
+
+
+def test_legacy_pass_rung_without_transport_can_never_render_green():
+    from traffic_replay.sweep_artifacts import (
+        render_sweep_html, render_sweep_report)
+
+    rung = _rung(4.0, "ok", held=3.0)
+    for field in (
+            "transport_connection_policy_id",
+            "production_connection_policy_declared",
+            "production_connection_policy_match",
+            "production_connection_policy_assurance",
+            "production_comparability_warning",
+            "transport_parity_status"):
+        rung.pop(field)
+    context = {
+        "endpoint": "/serving-endpoints/example/invocations",
+        "sweep_wall_s": 1.0,
+        "cooldown_s": 0.0,
+        "cooldown_events": 0,
+        "preflight": {
+            "skipped": True, "attempted": 0, "reachable": 0,
+            "readable": 0, "reasoning_probe_requests": 0,
+        },
+    }
+
+    markdown = render_sweep_report([rung], context)
+    html = render_sweep_html([rung], context, "legacy-transport-fixture")
+
+    assert "No publishable SLA-passing rung was established" in markdown
+    assert "Highest rate that held" not in markdown
+    assert "TRANSPORT PARITY UNVERIFIED" in html
+    assert "Production transport parity is not established" in html
+    assert "TESTED RATE HELD" not in html
+
+
+def test_current_rung_schema_verifies_every_transport_parity_field(tmp_path):
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    artifact, records, _dirs = _claim_with_rungs(tmp_path)
+    records[0].update(classify_sweep_rung(_summary(1.0)))
+    records[0]["production_connection_policy_match"] = False
+    try:
+        with pytest.raises(
+                ValueError,
+                match="production_connection_policy_match disagrees"):
+            _seal(artifact, records)
+    finally:
+        artifact.close()
+
+
+def test_runtime_quota_refusal_stops_a_rung_without_claiming_capacity():
+    from traffic_replay.sweep_artifacts import classify_sweep_rung
+
+    summary = _summary(4.0)
+    summary["runtime_quota_admission"] = {
+        "status": "denied",
+        "denied_rows": 1,
+        "denied_attempts_in_captured_rows": 1,
+        "invariant_errors": [],
+    }
+
+    decision = classify_sweep_rung(summary)
+
+    assert decision["state"] == "QUOTA_LIMITED"
+    assert decision["quota_status"] == "LIMITED"
+
+
+def test_sweep_quota_evidence_pools_all_rungs_and_preflight_once(tmp_path):
+    from traffic_replay.sweep_artifacts import SweepArtifacts
+
+    base = _base_config(tmp_path)
+    artifact = SweepArtifacts.claim(tmp_path / "sweep-quota", base)
+    prompt_values = ((500, 100, 100), (100, 100))
+    next_stamp = 1_700_000_000.0
+    total_rows = 0
+    for position, (rate, values) in enumerate(zip((1.0, 2.0), prompt_values)):
+        root = artifact.path / f"rate_{rate:g}"
+        rows = []
+        for offset, prompt_tokens in enumerate(values):
+            phase = ("preflight" if position == 0 and offset == 0
+                     else "calibration")
+            stamp = next_stamp
+            next_stamp += 1.0
+            rows.append({
+                "phase": phase, "ok": True, "status": 200,
+                "first_send_unix": stamp, "t_send_unix": stamp,
+                "finished_unix": stamp + 0.1, "request_attempts": 1,
+                "prompt_tokens": prompt_tokens, "completion_tokens": 10,
+                "max_tokens_requested": 20, "stream_complete": True,
+                "parse_errors": 0,
+            })
+        total_rows += len(rows)
+        run_dir = _sealed_run(
+            root / "run", _summary(rate), f"quota-{position}",
+            run_config=_rung_config(base, rate, root), request_rows=rows)
+        artifact.add_rung(rate, run_dir, _summary(rate))
+
+    evidence = artifact.pooled_quota_evidence()
+
+    assert evidence["request_rows"] == total_rows == 5
+    assert evidence["http_429_count"] == 0
+    assert evidence["observed_rate_windows"][
+        "input_tokens_by_first_send"]["max"] == 900.0
+    assert evidence["observed_rate_windows"][
+        "physical_queries_by_first_send"]["max"] == 5.0
+    assert evidence["observed_rate_windows"]["traffic_scope"]["phases"][
+        "preflight"]["rows"] == 1
+    artifact.close()
+
+
+def test_targetless_production_sweep_refuses_before_preflight_or_run(
+        monkeypatch, tmp_path, capsys):
+    from traffic_replay.cli import main
+
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text('{"prompt":"hello"}\n')
+    calls = {"preflight": 0, "run": 0}
+
+    def forbidden_preflight(*args, **kwargs):
+        calls["preflight"] += 1
+        raise AssertionError("preflight must not run")
+
+    def forbidden_run(*args, **kwargs):
+        calls["run"] += 1
+        raise AssertionError("run must not run")
+
+    monkeypatch.setattr("traffic_replay.cli._check_preflight",
+                        forbidden_preflight)
+    monkeypatch.setattr("traffic_replay.runner.run", forbidden_run)
+    code = main([
+        "sweep", "--host", "https://ws.example", "--endpoint", "ep",
+        "--rate", "1,2", "--duration", "7", "--cooldown", "0",
+        "--prompts", str(prompts), "--skip-preflight",
+        "--out-dir", str(tmp_path / "out"),
+    ])
+
+    assert code == 2
+    assert calls == {"preflight": 0, "run": 0}
+    assert "refused before endpoint traffic" in capsys.readouterr().out.lower()
 
 
 def test_a_manifest_bound_invalid_rung_removes_an_earlier_capacity_conclusion():
@@ -992,6 +1335,108 @@ def test_a_manifest_bound_invalid_rung_removes_an_earlier_capacity_conclusion():
     assert outcome["exit_code"] == 2
     assert outcome["highest_held_rate"] is None
     assert outcome["invalid_reports"]
+
+
+def test_forced_unreadable_preflight_invalidates_sweep_capacity_and_report():
+    from traffic_replay.sweep_artifacts import (
+        render_sweep_report, sweep_outcome)
+
+    rung = _rung(1.0, "ok", held=2)
+    rung.update(
+        source_position=0, state="PASS", quota_status="NO_429_OBSERVED")
+    gate = {
+        "skipped": False, "attempted": 2, "reachable": 2,
+        "readable": 0, "reasoning_probe_requests": 0,
+        "outcome": "preflight_forced_unreadable",
+        "force_requested": True, "gate_satisfied": False,
+    }
+
+    outcome = sweep_outcome([rung], gate)
+
+    assert outcome["invalid"] is True
+    assert outcome["exit_code"] == 2
+    assert outcome["highest_held_rate"] is None
+    assert outcome["capacity_conclusion"] == "INVALID_EVIDENCE"
+    assert "forced after an unreadable" in outcome["invalid_reasons"][0]
+
+    # Exercise the canonical renderer directly; sealing is independently
+    # covered by the sweep artifact tests.
+    context = {
+        "endpoint": "/serving-endpoints/example/invocations",
+        "sweep_wall_s": 1.0,
+        "cooldown_s": 0.0,
+        "cooldown_events": 0,
+        "preflight": gate,
+    }
+    body = render_sweep_report([rung], context)
+    assert "INVALID SWEEP:" in body
+    assert "preflight_forced_unreadable" in body
+
+
+def test_sweep_decision_percentages_never_round_unequal_boundaries_equal():
+    from traffic_replay.sweep_artifacts import _decision_percent_display
+
+    actual, lower, target = _decision_percent_display(
+        1.0, 0.9989996902, 0.999)
+
+    assert actual != target
+    assert lower != target
+    assert (actual, lower, target) == (
+        "100.00000%", "99.89997%", "99.90000%")
+
+
+def test_sweep_held_claim_uses_achieved_not_requested_rate():
+    from traffic_replay.sweep_artifacts import render_sweep_report, sweep_outcome
+
+    rung = _rung(32.0, "ok", held=20)
+    rung["achieved_rps"] = 25.7
+    outcome = sweep_outcome([rung])
+
+    assert outcome["highest_sla_passing_tested_rate"] == 32.0
+    assert outcome["highest_achieved_rate_at_sla_passing_rung"] == 25.7
+    assert outcome["highest_held_rate"] == 25.7
+    body = render_sweep_report([rung], {
+        "endpoint": "/serving-endpoints/example/invocations",
+        "sweep_wall_s": 1.0,
+        "cooldown_s": 0.0,
+        "cooldown_events": 0,
+        "preflight": {
+            "skipped": True, "attempted": 0, "reachable": 0,
+            "readable": 0, "reasoning_probe_requests": 0,
+        },
+    })
+    assert "Highest rate that held: 25.70 delivered requests/second" in body
+    assert "32 requested rps rung" in body
+
+
+def test_sweep_highest_delivered_claim_is_maximum_across_passing_rungs():
+    from traffic_replay.sweep_artifacts import render_sweep_report, sweep_outcome
+
+    lower = _rung(10.0, "ok", held=10)
+    lower["achieved_rps"] = 10.0
+    higher = _rung(20.0, "ok", held=8)
+    higher["achieved_rps"] = 8.0
+    outcome = sweep_outcome([lower, higher])
+
+    assert outcome["highest_sla_passing_tested_rate"] == 20.0
+    assert outcome[
+        "achieved_rate_at_highest_requested_sla_passing_rung"] == 8.0
+    assert outcome["highest_achieved_rate_at_sla_passing_rung"] == 10.0
+    assert outcome[
+        "requested_rate_at_highest_achieved_sla_passing_rung"] == 10.0
+    assert outcome["highest_held_rate"] == 10.0
+    body = render_sweep_report([lower, higher], {
+        "endpoint": "/serving-endpoints/example/invocations",
+        "sweep_wall_s": 1.0,
+        "cooldown_s": 0.0,
+        "cooldown_events": 0,
+        "preflight": {
+            "skipped": True, "attempted": 0, "reachable": 0,
+            "readable": 0, "reasoning_probe_requests": 0,
+        },
+    })
+    assert "Highest rate that held: 10.00 delivered requests/second" in body
+    assert "10 requested rps rung" in body
 
 
 def test_verify_sweep_command_rederives_a_sealed_conclusion(tmp_path, capsys):

@@ -16,7 +16,8 @@
   "cpt": 4.0,
   "calibrate_n": 8,
   "out_dir": "results/smoke",
-  "title": "smoke test: client correctness only",
-  "label": "SMOKE TEST ONLY: verifies auth, streaming, timing capture, outcome parsing, and usage coverage. This validation profile is not a production workload, so its latency is not performance evidence.",
+  "title": "diagnostic smoke test: client mechanics only",
+  "label": "SMOKE TEST ONLY: the profile, arrival rates, worker limits, output cap, and cache shape are UNVERIFIED ILLUSTRATIVE values. This run can diagnose auth, streaming, timing capture, outcome parsing, and usage coverage; it cannot establish production latency, throughput, demand, cache behavior, or capacity.",
+  "ttft_definition": "first_visible",
   "max_output_tokens_cap": 32
 }

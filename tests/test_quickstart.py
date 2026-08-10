@@ -57,6 +57,12 @@ def test_sla_targets_are_expressible_on_the_command_line():
     assert "command line" in at["targets_are"]
 
 
+def test_quickstart_persists_the_configured_first_event_definition():
+    cfg = _run_quickstart(
+        _tmp() / "q.json", "--ttft-definition", "first_visible")
+    assert cfg["ttft_definition"] == "first_visible"
+
+
 def test_no_targets_means_no_acceptance_block_rather_than_a_guess():
     cfg = _run_quickstart(_tmp() / "q.json")
     assert "acceptance_targets" not in cfg
@@ -65,6 +71,7 @@ def test_no_targets_means_no_acceptance_block_rather_than_a_guess():
 @pytest.mark.parametrize("flag,value", [
     ("--ttft-p95", "0"),
     ("--success-rate", "0"),
+    ("--success-rate", "1.0"),
     ("--success-rate", "1.1"),
 ])
 def test_quickstart_rejects_invalid_sla_instead_of_silently_dropping_it(
@@ -120,17 +127,21 @@ def test_the_env_var_still_works_when_no_profile_is_set():
         os.environ.pop("TR_TEST_TOKEN", None)
 
 
-def test_an_unresolvable_profile_fails_closed_without_env_fallback():
+def test_an_unresolvable_profile_fails_closed_without_env_fallback(
+        tmp_path, monkeypatch):
     """A typo must not repurpose an unrelated environment credential."""
-    import os
     import pytest
     from traffic_replay.runner import AuthProfileError
-    os.environ["TR_TEST_TOKEN"] = "fallback"
-    try:
-        cfg = EndpointConfig(base_url="https://x", path="/p",
-                             auth_profile="no-such-profile-here",
-                             auth_token_env="TR_TEST_TOKEN")
-        with pytest.raises(AuthProfileError, match="does not exist"):
-            _token(cfg)
-    finally:
-        os.environ.pop("TR_TEST_TOKEN", None)
+
+    config_path = tmp_path / "databrickscfg"
+    config_path.write_text(
+        "[some-other-profile]\nhost = https://x\ntoken = dapi-not-real\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_path))
+    monkeypatch.setenv("TR_TEST_TOKEN", "fallback")
+
+    cfg = EndpointConfig(base_url="https://x", path="/p",
+                         auth_profile="no-such-profile-here",
+                         auth_token_env="TR_TEST_TOKEN")
+    with pytest.raises(AuthProfileError, match="does not exist"):
+        _token(cfg)

@@ -17,6 +17,7 @@ from traffic_replay.quota_planner import (
     _workload_values,
     _rolling_peak,
     QuotaPlanError,
+    RuntimeQuotaGuard,
     plan_run_quota,
     plan_sweep_quota,
     render_quota_plan,
@@ -147,6 +148,43 @@ def test_low_rate_glm_shape_passes_only_as_a_harness_budget(tmp_path):
     assert f"verified={date.today().isoformat()}" in rendered
 
 
+def test_workspace_qps_is_planned_as_an_inclusive_one_second_window(
+        tmp_path):
+    plan = plan_run_quota(_rc(
+        tmp_path, rate=60.0, duration=2,
+        limits=_limits(
+            input_tokens_per_minute=1_000_000_000,
+            output_tokens_per_minute=1_000_000_000,
+            queries_per_hour=1_000_000,
+            queries_per_second=200)))
+
+    qps = plan["windows"]["queries_per_second"]
+    assert qps["window_seconds"] == 1.0
+    assert qps["planned_peak"] >= 160
+    assert qps["ratio_to_configured_limit"] >= 0.8
+    assert plan["may_start"] is False
+
+
+def test_payload_limit_is_preplanned_and_exactly_rechecked_at_runtime(
+        tmp_path):
+    plan = plan_run_quota(_rc(
+        tmp_path, rate=1.0, duration=2,
+        profile=_profile(
+            tmp_path / "payload-profile.json", input_tokens=1_000,
+            output_tokens=10),
+        limits=_limits(
+            input_tokens_per_minute=1_000_000_000,
+            output_tokens_per_minute=1_000_000_000,
+            queries_per_hour=1_000_000,
+            request_bytes_max=100)))
+
+    payload = plan["hard_limits"]["request_bytes_max"]
+    assert payload["planned_max"] > 100
+    assert payload["configured_limit"] == 100
+    assert plan["may_start"] is False
+    assert "exact bytes rechecked before POST" in render_quota_plan(plan)
+
+
 def test_rolling_peak_keeps_exact_boundary_event_conservatively():
     events = [
         {"t": 0.0, "queries": 2},
@@ -193,7 +231,9 @@ def test_stale_snapshot_refuses_before_paid_traffic(tmp_path):
     stale = (date.today() - timedelta(days=8)).isoformat()
 
     plan = plan_run_quota(_rc(
-        tmp_path, limits=_limits(verified_at=stale, max_age_days=7)))
+        tmp_path, limits=_limits(
+            as_of=(date.today() - timedelta(days=30)).isoformat(),
+            verified_at=stale, max_age_days=7)))
 
     assert plan["may_start"] is False
     freshness = plan["rate_limit_snapshot_freshness"]
@@ -375,6 +415,68 @@ def test_prior_request_without_provider_usage_never_uses_intended_fallback(
     assert plan["windows"]["input_tokens_per_minute"]["planned_peak"] is None
     assert any("prior_request input tokens are unknown" in unknown
                for unknown in plan["unknowns"])
+
+
+def test_prior_request_without_provider_usage_uses_committed_guard_reservation(
+        tmp_path):
+    trace = tmp_path / "one-guarded-prior-replay.txt"
+    trace.write_text("0\n")
+    rc = _rc(
+        tmp_path, duration=1,
+        profile=_profile(tmp_path / "guarded-prior.json", input_tokens=1,
+                         output_tokens=1),
+        timestamps_file=str(trace),
+        limits=_limits(input_tokens_per_minute=1_000_000,
+                       output_tokens_per_minute=1_000_000,
+                       queries_per_hour=100_000))
+    baseline = plan_run_quota(rc)
+    guard = RuntimeQuotaGuard(rc.rate_limits)
+    handle = guard.reserve(
+        b"{}", 1, 1, "prior-without-usage", 1)
+    guard.mark_post_may_have_started(handle)
+    guard.commit(handle, reason="response_headers")
+    reserved = handle.event["reservation"]["input_tokens"]
+    prior = _clean_prior_row(
+        request_attempts=1, connection_attempts=1, retries=0,
+        retry_reasons=[], prompt_tokens=None, completion_tokens=0,
+        cached_tokens=None, reasoning_tokens=None, max_tokens_requested=1,
+        quota_guard_events=[handle.event])
+
+    plan = plan_run_quota(rc, prior_rows=[prior])
+
+    assert plan["may_start"] is True
+    assert plan["unknowns"] == []
+    assert plan["windows"]["input_tokens_per_minute"][
+        "planned_peak"] == baseline["windows"][
+            "input_tokens_per_minute"]["planned_peak"] + reserved
+
+
+def test_missing_usage_rejects_duplicate_or_incomplete_guard_reservations(
+        tmp_path):
+    trace = tmp_path / "bad-guarded-prior-replay.txt"
+    trace.write_text("0\n")
+    rc = _rc(
+        tmp_path, duration=1,
+        profile=_profile(tmp_path / "bad-guarded-prior.json",
+                         input_tokens=1, output_tokens=1),
+        timestamps_file=str(trace),
+        limits=_limits(input_tokens_per_minute=1_000_000,
+                       output_tokens_per_minute=1_000_000,
+                       queries_per_hour=100_000))
+    guard = RuntimeQuotaGuard(rc.rate_limits)
+    handle = guard.reserve(b"{}", 1, 1, "duplicate", 1)
+    guard.mark_post_may_have_started(handle)
+    guard.commit(handle, reason="response_headers")
+    prior = _clean_prior_row(
+        prompt_tokens=None, completion_tokens=0, cached_tokens=None,
+        reasoning_tokens=None,
+        quota_guard_events=[handle.event, handle.event])
+
+    plan = plan_run_quota(rc, prior_rows=[prior])
+
+    assert plan["may_start"] is False
+    assert any("prior_request input tokens are unknown" in item
+               for item in plan["unknowns"])
 
 
 def test_chat_framing_bound_scales_with_message_count(tmp_path):
@@ -598,6 +700,14 @@ def test_reasoning_probe_quota_uses_deep_merged_candidate_body(tmp_path):
     assert submitted_probe["thinking"] == merged["thinking"]
     assert submitted_probe["routing"] == merged["routing"]
     assert submitted_probe["tools"] == merged["tools"]
+
+    with pytest.raises(ValueError, match="quota-aware reasoning probes"):
+        _quota_setup_plans(
+            dict(rc.__dict__),
+            SimpleNamespace(
+                skip_preflight=False,
+                probe_extra_body=[{"service_tier": "priority"}]),
+            representative_plans=representatives)
 
     baseline = plan_run_quota(rc)
     planned = plan_run_quota(rc, setup_plans=setup)
@@ -1092,6 +1202,7 @@ def test_sweep_prevalidates_every_exact_rung_before_quota(
         "--host", "https://unit-test.cloud.databricks.com",
         "--endpoint", "databricks-glm-5-2",
         "--rate", "100,200,300", "--duration", "1",
+        "--diagnostic-only",
         "--input-tokens", "10,10", "--output-tokens", "1,1",
         "--out-dir", str(tmp_path / "ordered"),
     ])
@@ -1127,6 +1238,7 @@ def test_long_low_rate_sweep_base_never_inherits_bursty_defaults(
         "--host", "https://unit-test.cloud.databricks.com",
         "--endpoint", "databricks-glm-5-2",
         "--rate", "1", "--duration", "3000",
+        "--diagnostic-only",
         "--input-tokens", "10,10", "--output-tokens", "1,1",
         "--out-dir", str(tmp_path / "long-low-rate"),
     ])

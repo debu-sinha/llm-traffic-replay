@@ -18,7 +18,9 @@ Record these before sending traffic:
   [limits and quotas](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits);
 - a workload input with its source digest and known fidelity limits;
 - request parameters, reasoning policy, tool schema behavior, and output cap;
-- TTFT definition, acceptance targets, hard timeouts, and success-rate target;
+- TTFT definition and customer-owned acceptance targets, including
+  `targets_are` provenance, hard timeouts, and a success-rate target strictly
+  between 0 and 1;
 - the generator region, host size, process count, and expected network path;
 - the operator-supplied pricing source, product/tier applicability, and
   effective date if diagnostic cost arithmetic will be reported;
@@ -54,6 +56,7 @@ python3 -m traffic_replay benchmark \
   --profile configs/profile_validation_small.json \
   --sizing-concurrency 2 \
   --duration 60 \
+  --ttft-definition first_visible \
   --out-dir results/protocol-smoke \
   --fail-on none
 ```
@@ -62,22 +65,47 @@ This sends real inference traffic. Review:
 
 - both representative requests reached the intended route;
 - the response is valid SSE for this client;
-- visible content or a structurally valid tool call completed cleanly;
+- non-refusal visible content or a structurally valid non-refusal tool call completed cleanly;
 - `request_attempts` is understood, especially usage fallback or auth refresh;
 - prompt, completion, cached, and reasoning usage fields are either present
   with named source paths or explicitly absent;
 - model, route, and request controls in the manifest match the intended target;
-- endpoint metadata was captured, or its absence is explained;
+- response-model identity is consistent and bound where reported;
+- the recorded fresh-HTTP/1.1-per-attempt transport is either the real
+  application's exact connection behavior or explicitly treated as a
+  diagnostic mismatch; do not use a transport-qualified run for capacity;
+- endpoint metadata was captured both before runner-owned sizing, calibration,
+  and replay traffic and after response drain, or its incomplete coverage is
+  explained;
 - no secret or response body content appears in artifacts.
 
 This stage validates mechanics only. Its latency is not a capacity result.
 
+The harness does not pool connections and does not use HTTP/2. Production
+capacity therefore remains inconclusive by default even when protocol and SLA
+checks pass. Only add
+`--production-connection-policy fresh_http1_per_physical_attempt` when the real
+application is known to use that exact policy. This flag records an operator
+assertion; it does not inspect production traffic. For pooled or HTTP/2 clients,
+retain the qualification until a future matching transport adapter exists.
+
 Before credentials, endpoint metadata, network diagnostics, or this preflight,
 the command copies the workload and optional trace to private temporary bytes,
-strictly parses that exact view, constructs representative bodies, and
-materializes the complete fixed schedule. A local refusal therefore does not
-need target access. The runner repeats input capture and validation before its
-own traffic boundary.
+strictly parses that exact view, and constructs representative bodies. A
+fixed-rate or trace-driven run also materializes its complete schedule at this
+boundary. The sizing example above is the explicit exception: its paid sizing
+sample must derive a rate before that schedule can exist. The runner repeats
+input capture and validation before its own traffic boundary.
+
+Before the first preflight or probe `POST`, the CLI claims
+`results/protocol-smoke-setup-traffic/TIMESTAMP` and fsyncs each completed
+metadata-only row. A normal pass or refusal seals it as an explicit
+non-performance/non-SLA/non-capacity artifact; a crash leaves incomplete
+diagnostic evidence. A forced unreadable preflight is sealed as
+`preflight_forced_unreadable`, never `preflight_passed`; force permits only an
+INVALID diagnostic run. Whenever the command proceeds past this gate, the same
+rows are attached once to the measured run's complete quota population without
+request or response content.
 
 For a Databricks pay-per-token smoke test, do not combine the quota gate with
 `--sizing-concurrency`: paid sizing traffic is required to derive that rate,
@@ -111,7 +139,7 @@ lifetime, and rotation have been approved.
 ### Reasoning and tool-call endpoints
 
 For a reasoning model, choose `ttft_definition=first_content` when the
-configured latency target starts at the first visible-or-reasoning content
+configured latency target starts at the first visible, reasoning, or refusal
 delta, or
 `ttft_definition=first_visible` when it starts at meaningful visible assistant
 content. Those are the only two selectable TTFT definitions. First reasoning
@@ -121,9 +149,16 @@ basis.
 
 All final-attempt latency clocks begin immediately before `conn.request` on an
 already-established connection and therefore include request upload. TTFB is
-the first iterated response-body/SSE line, not necessarily the first response
-byte. Tool-call fragments do not trigger TTFT; first-visible and
-first-tool-call timings remain separate.
+the first nonempty bounded response-body chunk returned by the client read,
+not the first socket byte or first parsed SSE line. Tool-call fragments do not
+trigger TTFT; first-visible and first-tool-call timings remain separate.
+
+`interchunk_max_ms` is the widest elapsed gap between successive SSE events
+with a nonempty visible, reasoning, or refusal delta. It is not token-level
+inter-token latency: events can batch tokens, heartbeats and usage-only events
+do not advance it, and tool-call-only fragments are excluded. Fewer than two
+qualifying events leaves a protocol-clean row unmeasured; any such row makes a
+configured interchunk check inconclusive.
 
 Reasoning controls are model-specific request contract. Use the provider's
 documented field and supported value for the exact model. Do not copy a
@@ -134,10 +169,11 @@ The harness does not guess these controls. A repeatable
 `--probe-extra-body '{...}'` explicitly sends one additional real preflight
 request per supplied candidate after an unreadable answer. Use it only for
 model-documented candidates in an authorized probe. Metadata-only result rows
-for those calls are sealed into the run journal and quota evidence without
-request or response content; retain stdout and stderr too for the human-readable
-decision. A candidate is not copied into the measured config; rerun with the
-selected object as `--extra-body`.
+for those calls are first fsynced and sealed in the setup-traffic artifact and,
+after a pass, are also included once in the measured run's quota evidence
+without request or response content. Retain stdout and stderr too for the
+human-readable decision. A candidate is not copied into the measured config;
+rerun with the selected object as `--extra-body`.
 
 The measured `extra_body` is persisted as reproducibility evidence, while
 probe candidates and outcomes are reported in preflight text with displayed
@@ -229,9 +265,10 @@ python3 -m traffic_replay sweep \
   --cpt YOUR_PREMEASURED_CHARACTERS_PER_TOKEN \
   --max-concurrency 256 \
   --max-pending-requests 512 \
+  --ttft-definition first_visible \
   --ttft-p95 YOUR_TTFT_MS \
   --ttfg-p95 YOUR_TTFG_MS \
-  --success-rate YOUR_RATE \
+  --success-rate YOUR_FRACTION_STRICTLY_BETWEEN_0_AND_1 \
   --rate-limits RATE_LIMITS.json \
   --out-dir results/rate-sweep
 ```
@@ -260,9 +297,11 @@ includes their union, the two preflight requests, explicitly configured probes,
 calibration, offered `max_tokens` reservations, and worst-case physical
 attempts. Cooldown is not credited as a quota reset.
 
-Input demand is bounded independently of the provider tokenizer at one token
-per UTF-8 byte of the complete serialized request JSON plus 64 framing tokens
-for every message and one more 64-token request-level block. Roles, message
+Input demand uses a tokenizer-independent engineering bound of one token per
+UTF-8 byte of the complete serialized request JSON, plus a harness-defined
+64-token allowance for every message and one more 64-token request-level
+allowance. The 64-token constants are conservative harness assumptions, not a
+Databricks-published tokenizer or chat-framing contract. Roles, message
 metadata, model, tools, provider controls, and JSON syntax are included.
 Synthetic replay uses the larger of configured characters/token and the
 calibration hard ceiling of 12. This supports both frozen prompt messages and
@@ -280,6 +319,19 @@ tier remains a configured assertion, and unrelated workspace traffic is not
 included. A gate pass is harness-budget evidence only, never provider-headroom
 proof; a refusal exits with code 3.
 
+After that offline plan and endpoint binding pass, one non-waiting runtime
+guard spans preflight/probes, every physical fallback or retry, replay, and all
+sweep rungs. Immediately before each `conn.request`, it atomically reserves
+exact serialized request bytes, the conservative input bound, offered
+`max_tokens`, and one query. Rolling dimensions remain strictly below
+`limit * warning_utilization`; `request_bytes_max` is an inclusive per-request
+ceiling. A denial or accounting uncertainty permanently trips the guard rather
+than waiting for a reset. Reservations are released only when no `POST` could
+have begun; otherwise they are conservatively committed at response headers or
+an ambiguous transport outcome. Persisted guard scope, per-attempt transitions,
+and run-local baseline/final snapshots must reconcile with physical attempts.
+This covers only traffic from this command, not other workspace traffic.
+
 For the managed `databricks-glm-5-2` P2T endpoint, the live page last updated
 2026-08-07 currently gives 200,000 ITPM, 20,000 OTPM, and 7,200 QPH for an
 Enterprise workspace. It pre-reserves requested `max_tokens`; short observed
@@ -287,17 +339,57 @@ answers do not retroactively make an unsafe offered load safe. The current
 provisioned-throughput architecture list does not list GLM 5.2, so generic PT
 limits must not be presented as this endpoint's capacity.
 
-GLM-5.2 itself supports thinking off: Z.ai's current
-[Thinking Mode guide](https://docs.z.ai/guides/capabilities/thinking-mode)
-documents `{"thinking":{"type":"disabled"}}`, and the Z.ai
-[Chat Completion reference](https://docs.z.ai/api-reference/llm/chat-completion)
-documents `reasoning_effort="none"` and `"minimal"` as thinking-skipping
-values. Current Databricks documentation, by contrast, calls the managed
-`databricks-glm-5-2` endpoint reasoning-only and always-reasoning, and does not
-publish accepted GLM-specific values. Do not assume the Z.ai contract survives
-the Databricks adapter. Any candidate control is experimental on the managed
-endpoint until it changes reasoning evidence and a repeat preflight passes;
-HTTP acceptance alone does not establish support.
+The same current limits page publishes 200 queries/second per Foundation Model
+API workspace and a 4 MB request limit. The bundled dated snapshot uses 200
+QPS and a conservative 4,000,000-byte serialized-request ceiling because the
+page does not specify a decimal or binary MB convention. Recheck both workspace
+limits and the GLM-specific row immediately before use.
+
+The illustrative GLM 5.2 canary has a fully disclosed worst-case plan: two
+preflight rows, one calibration row, and one measured replay row; no probes are
+configured. The default fallback envelope allows at most 12 physical `POST`
+attempts. Its illustrative output-budget p50/p95 is 320/480 tokens, which
+derives a 720-token request cap. It explicitly selects the managed no-reasoning
+path with `{"reasoning_effort":"none"}`. The offline gate reserves a peak
+89,202 input tokens/minute and 4,464 output tokens/minute. These are
+conservative planned admission values, not observed usage, customer demand, or
+a performance/capacity result.
+
+For managed Databricks GLM 5.2, direct service-owner confirmation establishes
+that top-level `{"reasoning_effort":"none"}` disables reasoning and omission
+selects maximum reasoning. That behavior is confirmed for both Unity AI
+Gateway model service `system.ai.glm-5-2` and the direct managed endpoint. The
+current public Databricks
+[reasoning-model guide](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models)
+still classifies `databricks-glm-5-2` as reasoning-only and names
+`reasoning_effort` without enumerating accepted GLM-specific values. Treat the
+off value as owner-confirmed managed behavior, not as a value independently
+enumerated by that guide. Preserve it in `extra_body`, inspect reasoning and
+visible-answer evidence, and repeat preflight; HTTP acceptance alone does not
+prove that a behavioral control was applied.
+
+Databricks documents the Unity AI Gateway
+[model-service query API](https://docs.databricks.com/aws/en/ai-gateway/query-model-services)
+and its
+[destination routing and fallback model](https://docs.databricks.com/aws/en/ai-gateway/model-services).
+The harness can POST the Gateway protocol, but this release production-
+qualifies only the exact direct `/serving-endpoints/.../invocations` route.
+Gateway is protocol-diagnostic only: requested FQN-to-destination identity,
+routing/fallback pre/post state, and the intersection of Gateway plus
+downstream quotas are not bound. Such a run supports no tool quota or capacity
+conclusion, and the shipped GLM quota snapshot refuses that route.
+
+Direct SGLang hosting uses the nested native switch documented by its
+[GLM-5.2 serving guide](https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.2):
+`{"chat_template_kwargs":{"enable_thinking":false}}`. Thinking is the
+SGLang default when that control is absent. With thinking enabled, nested
+`reasoning_effort` unset maps to `Max`, `"high"` maps to `High`, and other
+values fall through to `Max`; it is not the off switch. Z.ai's hosted
+[Chat Completion API](https://docs.z.ai/api-reference/llm/chat-completion)
+uses `{"thinking":{"type":"disabled"}}`. Do not copy any request shape across
+serving adapters. The illustrative canary above explicitly selects the managed
+no-reasoning path. Removing the field selects maximum reasoning and requires a
+separately planned workload.
 
 At each rung, inspect external endpoint and quota telemetry as well as the
 harness report. Stop when any configured operational guard is breached,
@@ -325,16 +417,26 @@ with zero request attempts. Already-issued traffic cannot be recalled, and its
 provider outcome and billing remain ambiguous. The directory remains an
 unsealed diagnostic artifact; do not turn it into a completed run manually.
 
+DNS is part of these bounds even though the standard socket timeout does not
+bound `getaddrinfo`: a daemon-only, DNS-only single-flight helper stops each
+caller at its deadline and cannot make a late connection or `POST`. The
+inference deadline covers the full stream. Endpoint metadata and workspace
+OAuth M2M additionally use an absolute connection watchdog, so periodic body
+bytes cannot keep those operations alive past their configured timeout.
+
 After the ladder finishes, run
 `python3 -m traffic_replay verify-sweep results/rate-sweep`. Do not quote a
 ceiling if verification reports an incomplete source, unknown request attempt,
 per-rung calibration, or a higher pass after a lower failure.
 
-HTTP 429 accounting is exact and phase-aware. Only an integer HTTP `status` of
-429 counts; the tool does not infer it from error text or a redacted body
-digest. The denominator is every sealed logical request row supplied to quota
-accounting across preflight, probes, sizing, calibration, and replay, and the
-summary also records status coverage and per-phase counts. Any 429 means quota
+HTTP 429 accounting is row-exact and phase-aware. Only an integer terminal
+HTTP `status` of 429 counts; the tool does not infer it from error text or a
+redacted body digest. The denominator is every supplied request-operation row
+across preflight, probes, sizing, calibration, and replay, and the summary also
+records status coverage and per-phase counts. A row may contain multiple
+physical attempts, so this is not an attempt-by-attempt status counter;
+per-attempt runtime-admission events and `request_attempts` are separate. Any
+429 means quota
 `EXCEEDED`, measurement `INVALID`, and endpoint capacity `INCONCLUSIVE`. It
 still cannot identify whether input tokens, output reservations, queries,
 account policy, an edge component, or another limit caused the rejection.
@@ -348,11 +450,15 @@ enough to observe multiple 60-second stability windows. Five minutes produces
 five nominal windows, but setup and drain remain outside the schedule.
 
 Copy an example config, replace all placeholders, set one measured workload,
-and retain conservative client bounds. `configs/run_pt_full.json` starts at
-`rate_scale=0.1`, `max_concurrency=256`, and
+and retain conservative client bounds. In the filename
+`configs/run_pt_full.json`, `pt` means provisioned throughput, not
+pay-per-token. The template starts at `rate_scale=0.1`,
+`max_concurrency=256`, and
 `max_pending_requests=512`; it is not permission to raise `rate_scale` to 1.0
 on one process. Size client resources from measured mean occupancy and validate
-delivery at every step.
+delivery at every step. The template has client bounds but deliberately has no
+`rate_limits` object or provider-capacity guard; enforce the applicable
+provisioned allocation and account limits externally.
 
 Little's Law uses mean occupancy:
 
@@ -420,7 +526,7 @@ dimensions rather than one combined verdict:
 | Evidence integrity | `VERIFIED`, `VERIFY_REQUIRED`, `TAMPERED` |
 | Measurement validity | `VALID`, `CAUTION`, `INVALID` |
 | Acceptance checks | `PASS`, `MISS`, `INCONCLUSIVE`, `NOT_EVALUATED` |
-| Quota state | `EXCEEDED`, `NOT_OBSERVED`, `UNKNOWN`, `NOT_EVALUATED` |
+| Quota state | `EXCEEDED`, `LOCAL_GUARD_REFUSED`, `NOT_OBSERVED`, `UNKNOWN`, `NOT_EVALUATED` |
 | Endpoint capacity | `HELD_AT_TESTED_LOAD`, `NOT_HELD_AT_TESTED_LOAD`, `INCONCLUSIVE`, `NOT_EVALUATED` |
 
 `summary.json` is canonical; `report.html` and `report.md` render the same
@@ -430,8 +536,43 @@ it. Verify the completed marker/manifest chain externally; do not edit the
 sealed report to manufacture `VERIFIED`. A qualified or invalid measurement
 can retain the observed acceptance-check result, but a retained pass is
 explicitly not a clean acceptance pass. `HELD_AT_TESTED_LOAD` never means
-endpoint ceiling or
-provider headroom.
+endpoint ceiling or provider headroom.
+
+Response identity, the normalized pre-run/post-drain endpoint-stability
+comparison, and runtime-admission reconciliation are evidence gates, not three
+additional decision dimensions. Identity and stability feed measurement
+validity; runtime admission feeds quota state and measurement validity. The
+canonical report remains exactly the five dimensions above.
+
+Treat `LOCAL_GUARD_REFUSED` separately from HTTP 429. It means the local
+command-scoped guard suppressed a physical `POST`, so the requested load was
+not delivered; it is not endpoint-capacity evidence. A clean quota review must
+also reconcile guard scope, every per-attempt admission transition, the
+run-local baseline/final snapshots, and physical-attempt counts. Inconsistent
+guard evidence makes quota unknown and measurement invalid.
+
+Review response and control-plane identity before latency. Multiple response
+models, or a response model that disagrees with an explicit request-body model,
+invalidates a single-model benchmark. The endpoint name is not an expected
+OpenAI response-model value for a custom/PT route. Bind each Databricks
+`served-model-name` response header to an active served entity captured from
+the control plane; an unexpected entity invalidates the result and incomplete
+binding is a caution. Response IDs are hashed; response objects and system
+fingerprints are bounded context. With endpoint capture enabled, compare
+the normalized metadata summary captured before runner-owned sizing,
+calibration, and replay traffic to the summary captured only after every
+response drains. A change invalidates the single-configuration result; missing
+either capture is explicit uncertainty. The compared summary is a selected
+subset: endpoint name, task, `route_optimized`, READY state, and selected active
+served-entity identity, foundation-model, workload/provisioning, version, and
+scale-to-zero fields. It does not cover every control-plane field or prove an
+undocumented data-plane revision stayed fixed.
+
+Stability is computed after drain from persisted replay rows. Window latency
+uses the same acceptable-outcome population as headline latency; failures and
+unacceptable outcomes remain separate window errors. A failure-only window has
+zero event coverage rather than a percentile. Do not accept a stable survivor
+p95 while error rate rises or event coverage falls.
 
 Create that external evidence as a separate sibling receipt. Replace the
 example timestamp with the exact completed run directory:
@@ -496,6 +637,10 @@ Accept a result only if all of the following are true:
 - source state is clean and the commit is retained;
 - endpoint, workload, request, schedule, execution, and artifact identities
   match the experiment record;
+- runtime quota admission is either not configured or fully reconciled with no
+  denial, invariant error, or unexplained physical attempt;
+- response model is consistently bound where reported, and pre/post-drain
+  endpoint metadata is stable or any missing coverage is explicitly resolved;
 - scheduled and delivered load match within the documented acceptance policy;
 - no pending-limit drops or unexplained physical duplicate attempts exist;
 - acceptable answer/tool outcome and usage coverage are sufficient;
@@ -506,7 +651,8 @@ Accept a result only if all of the following are true:
 - the observed success fraction meets its target and the one-sided 95 percent
   Wilson lower confidence bound also meets it, under the stated independent
   outcome assumption;
-- stability is established for the run itself;
+- stability is established over the acceptable-outcome population while
+  window error rate and event coverage remain healthy;
 - cost is explicitly labeled unverified operator-supplied arithmetic over
   replay rows only, and aggregate per-token totals plus provisioned effective
   rates are withheld for missing/invalid usage, corrupt or incomplete streams,

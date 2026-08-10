@@ -15,10 +15,11 @@ never find the knee.
 Two different lateness numbers come out of this, and they answer different
 questions. dispatch_lag_ms is stamped in the dispatcher just before the
 submit, so it sees the dispatcher falling behind but NOT a saturated pool,
-because ThreadPoolExecutor.submit() queues rather than blocking. Wire
-lateness, computed in metrics from first_send_unix against the schedule, is
-when the client began sending, and it grows under either. Read wire lateness
-to decide whether the client kept up.
+because ThreadPoolExecutor.submit() queues rather than blocking. HTTP
+request-start lateness, computed from the exact monotonic clock immediately
+before the first conn.request invocation, grows under either. It does not
+observe upload completion or endpoint receipt; use it only to decide whether
+the client began requests on schedule.
 
 Warmup/calibration: the first `calibrate_n` requests run at low rate before
 the schedule proper. In profile mode their endpoint-reported prompt_tokens
@@ -34,11 +35,12 @@ import inspect
 import json
 import math
 import os
+import stat
 import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,14 +56,23 @@ from .artifacts import (
 )
 from .client import (EndpointClient, EndpointConfig, RequestResult,
                      normalized_origin,
-                     validate_bearer_transport)
+                     validate_bearer_token, validate_bearer_transport)
 from .config_validation import (validate_acceptance_targets,
                                 validate_pricing, validate_rate_limits)
 from .json_input import loads_strict
 from .metrics import summarize, write_outputs
+from .network import AbsoluteHTTPDeadline, bind_deadline_bounded_dns
 from .prefix_pool import PrefixPool
-from .schedule import (load_trace, make_schedule, schedule_report, shard,
-                       validate_schedule_capacity)
+from .schedule import (
+    MAX_EXACT_ANALYSIS_REQUEST_ROWS,
+    load_trace,
+    make_schedule,
+    schedule_report,
+    shard,
+    thin_schedule_ceiling,
+    validate_exact_analysis_capacity,
+    validate_schedule_capacity,
+)
 from .textgen import TextMaterializer, calibrate_cpt
 
 
@@ -70,13 +81,43 @@ _MAX_CONCURRENCY = 4096
 _MAX_PENDING_REQUESTS = 100_000
 _MAX_POOL_DOCS_PER_BUCKET = 10_000
 _MAX_CALIBRATION_REQUESTS = 10_000
+_MIN_SIZING_PROBES = 4
+_MAX_SIZING_PROBES = 8
 _AUTH_RESPONSE_MAX_BYTES = 64 * 1024
-_AUTH_TOKEN_MAX_BYTES = 64 * 1024
 _AUTH_CREDENTIAL_MAX_BYTES = 8 * 1024
 _AUTH_M2M_TIMEOUT_S = 15.0
 _AUTH_CLI_TIMEOUT_S = 30.0
 _AUTH_DISABLED_DEFAULT_SECTION = (
     "__traffic_replay_reserved_defaults_do_not_use__")
+_CANCELLATION_DRAIN_TIMEOUT_S = 2.0
+
+# Local workload files are intentionally snapshotted into memory exactly once
+# before credentials or network access.  These byte/record bounds make that
+# operation predictable and ensure sparse files, giant records, and hostile
+# special files fail before allocation or blocking I/O.
+_INPUT_LIMITS = {
+    "profile": {
+        "max_bytes": 16 * 1024 * 1024,
+        "max_lines": 100_000,
+        "max_line_bytes": 16 * 1024 * 1024,
+    },
+    "prompts": {
+        "max_bytes": 64 * 1024 * 1024,
+        "max_lines": MAX_EXACT_ANALYSIS_REQUEST_ROWS,
+        "max_line_bytes": 4 * 1024 * 1024,
+    },
+    "prompts_json": {
+        "max_bytes": 64 * 1024 * 1024,
+        "max_lines": 100_000,
+        "max_line_bytes": 64 * 1024 * 1024,
+    },
+    "timestamps": {
+        "max_bytes": 16 * 1024 * 1024,
+        "max_lines": MAX_EXACT_ANALYSIS_REQUEST_ROWS,
+        "max_line_bytes": 64 * 1024,
+    },
+}
+_MAX_PROMPT_RECORD_BYTES = 4 * 1024 * 1024
 
 
 @dataclasses.dataclass
@@ -355,30 +396,105 @@ def _shard_concurrency(rc) -> int | None:
     return q + (1 if rc.shard_index < r else 0)
 
 
-def _file_identity(path: str | None) -> str | None:
+def _input_limits(path: str | os.PathLike, input_kind: str | None) -> dict:
+    kind = input_kind
+    if kind is None:
+        suffix = Path(path).suffix.lower()
+        if suffix in {".txt", ".jsonl", ".ndjson"}:
+            kind = "prompts"
+        elif suffix in {".trace", ".timestamps"}:
+            kind = "timestamps"
+        else:
+            kind = "profile"
+    if kind == "prompts" and Path(path).suffix.lower() == ".json":
+        kind = "prompts_json"
+    try:
+        return _INPUT_LIMITS[kind]
+    except KeyError as exc:
+        raise ValueError(f"unknown workload input kind: {input_kind!r}") from exc
+
+
+def _file_identity(path: str | None, *, input_kind: str | None = None) \
+        -> str | None:
     if not path:
         return None
     try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    except OSError:
+        raw, _info = _read_stable_bytes(path, input_kind=input_kind)
+        return hashlib.sha256(raw).hexdigest()
+    except (OSError, ValueError):
         return f"unreadable:{path}"
 
 
-def _read_stable_bytes(path: str) -> tuple[bytes, os.stat_result]:
-    """Read one immutable view of an input, rejecting concurrent mutation."""
+def _read_stable_bytes(path: str, *, input_kind: str | None = None) \
+        -> tuple[bytes, os.stat_result]:
+    """Read one bounded immutable regular-file view without following links."""
     source = Path(path)
+    limits = _input_limits(source, input_kind)
     try:
-        fd = os.open(source, os.O_RDONLY)
+        path_info = source.lstat()
+    except OSError as exc:
+        raise ValueError(f"cannot inspect input {source}: {exc}") from exc
+    if not stat.S_ISREG(path_info.st_mode):
+        raise ValueError(f"workload input is not a regular file: {source}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) \
+        | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(source, flags)
     except OSError as exc:
         raise ValueError(f"cannot snapshot input {source}: {exc}") from exc
     try:
         before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"workload input is not a regular file: {source}")
+        if (path_info.st_dev, path_info.st_ino) != \
+                (before.st_dev, before.st_ino):
+            raise ValueError(
+                f"input changed while it was being opened: {source}")
+        if before.st_size > limits["max_bytes"]:
+            raise ValueError(
+                f"{input_kind or 'workload'} input {source} declares "
+                f"{before.st_size:,} bytes, above its "
+                f"{limits['max_bytes']:,}-byte snapshot limit")
         chunks = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
+        remaining = before.st_size
+        line_count = 0
+        current_line_bytes = 0
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
             if not chunk:
-                break
+                raise ValueError(
+                    f"input was truncated while being snapshotted: {source}")
             chunks.append(chunk)
+            remaining -= len(chunk)
+            parts = chunk.split(b"\n")
+            if len(parts) == 1:
+                current_line_bytes += len(chunk)
+                if current_line_bytes > limits["max_line_bytes"]:
+                    raise ValueError(
+                        f"{input_kind or 'workload'} input {source} contains "
+                        f"a line above its {limits['max_line_bytes']:,}-byte "
+                        "record limit")
+            else:
+                first_size = current_line_bytes + len(parts[0])
+                if first_size > limits["max_line_bytes"] \
+                        or any(len(part) > limits["max_line_bytes"]
+                               for part in parts[1:-1]):
+                    raise ValueError(
+                        f"{input_kind or 'workload'} input {source} contains "
+                        f"a line above its {limits['max_line_bytes']:,}-byte "
+                        "record limit")
+                line_count += len(parts) - 1
+                if line_count > limits["max_lines"]:
+                    raise ValueError(
+                        f"{input_kind or 'workload'} input {source} exceeds "
+                        f"its {limits['max_lines']:,}-line limit")
+                current_line_bytes = len(parts[-1])
+                if current_line_bytes > limits["max_line_bytes"]:
+                    raise ValueError(
+                        f"{input_kind or 'workload'} input {source} contains "
+                        f"a line above its {limits['max_line_bytes']:,}-byte "
+                        "record limit")
+        extra = os.read(fd, 1)
         after = os.fstat(fd)
     finally:
         os.close(fd)
@@ -387,7 +503,13 @@ def _read_stable_bytes(path: str) -> tuple[bytes, os.stat_result]:
     identity_after = (after.st_dev, after.st_ino, after.st_size,
                       after.st_mtime_ns, after.st_ctime_ns)
     raw = b"".join(chunks)
-    if identity_before != identity_after or len(raw) != before.st_size:
+    if raw and not raw.endswith(b"\n"):
+        line_count += 1
+        if line_count > limits["max_lines"]:
+            raise ValueError(
+                f"{input_kind or 'workload'} input {source} exceeds its "
+                f"{limits['max_lines']:,}-line limit")
+    if identity_before != identity_after or len(raw) != before.st_size or extra:
         raise ValueError(
             f"input changed while it was being snapshotted: {source}")
     return raw, before
@@ -404,7 +526,7 @@ def _snapshot_run_inputs(rc: RunConfig, directory: Path) \
         original = getattr(rc, field)
         if not original:
             continue
-        raw, info = _read_stable_bytes(original)
+        raw, info = _read_stable_bytes(original, input_kind=key)
         # Keep the original basename so effective configs and sweep identity
         # remain comparable while the private parent directory prevents name
         # collisions between profile/prompts/trace inputs.
@@ -544,8 +666,8 @@ def _resolved_run_id(rc: RunConfig) -> str:
         return rc.run_id
     material = {
         "seed": rc.seed,
-        "profile": _file_identity(rc.profile_path),
-        "prompts": _file_identity(rc.prompts_file),
+        "profile": _file_identity(rc.profile_path, input_kind="profile"),
+        "prompts": _file_identity(rc.prompts_file, input_kind="prompts"),
         "endpoint_path": rc.endpoint.get("path"),
         "endpoint_model": rc.endpoint.get("model"),
         "extra_body": rc.endpoint.get("extra_body") or {},
@@ -743,24 +865,84 @@ def _representative_plans(
     return plans
 
 
+def _validate_prompt_resources(prompts: list[list[dict]], path: str) -> None:
+    """Bound decoded prompt count and any one replayable request record."""
+    if len(prompts) > MAX_EXACT_ANALYSIS_REQUEST_ROWS:
+        raise ValueError(
+            f"prompts input {path} contains {len(prompts):,} prompts, above "
+            f"the exact-analysis limit of "
+            f"{MAX_EXACT_ANALYSIS_REQUEST_ROWS:,}")
+    for index, messages in enumerate(prompts):
+        encoded = json.dumps(
+            messages, ensure_ascii=False, separators=(",", ":"),
+            allow_nan=False).encode("utf-8")
+        if len(encoded) > _MAX_PROMPT_RECORD_BYTES:
+            raise ValueError(
+                f"prompt item {index} in {path} is {len(encoded):,} bytes, "
+                f"above the {_MAX_PROMPT_RECORD_BYTES:,}-byte per-request "
+                "workload limit")
+
+
 @dataclasses.dataclass
 class PrevalidatedRunInputs:
     """Fully parsed, endpoint-free inputs reusable by preflight and runner.
 
     The object deliberately retains the parsed workload source and exact
     deterministic schedule so a caller does not validate one file view and
-    later reread another.  A sizing-derived schedule is necessarily ``None``
-    until the unloaded service-time pass determines its fixed rate; the
-    sizing probe workload is still fully constructed here.
+    later reread another. A sizing-derived final schedule cannot exist until
+    unloaded service time is measured; its configured-qps ceiling schedule is
+    materialized here so the final schedule is guaranteed to be a subset of a
+    pretraffic-approved row population.
     """
 
     rc: RunConfig
     full_schedule: dict | None
+    sizing_schedule_ceiling: dict | None
     workload: _PreparedWorkload | None
     profile: prof.Profile | None
     prompts: list[list[dict]] | None
     representative_plans: list[dict]
     schedule_kind: str
+
+
+def exact_analysis_row_counts(
+        prevalidated: PrevalidatedRunInputs) -> dict[str, int]:
+    """Return the conservative rows one run can materialize exactly."""
+    if not isinstance(prevalidated, PrevalidatedRunInputs):
+        raise TypeError("expected PrevalidatedRunInputs")
+    rc = prevalidated.rc
+    if rc.sizing_concurrency is None:
+        replay = len((prevalidated.full_schedule or {}).get("timestamps", ()))
+        sizing = 0
+    else:
+        replay = len(
+            (prevalidated.sizing_schedule_ceiling or {}).get("timestamps", ()))
+        sizing = sizing_probe_row_count(rc.calibrate_n)
+    return {
+        "replay_rows": replay,
+        "calibration_rows": min(rc.calibrate_n, replay),
+        "sizing_rows": sizing,
+    }
+
+
+def sizing_probe_row_count(calibrate_n: int) -> int:
+    """Return the exact number of paid rows used by concurrency sizing."""
+    if not isinstance(calibrate_n, int) or isinstance(calibrate_n, bool) \
+            or calibrate_n < 0:
+        raise ValueError("calibrate_n must be a non-negative integer")
+    return max(_MIN_SIZING_PROBES,
+               min(calibrate_n, _MAX_SIZING_PROBES))
+
+
+def enforce_exact_analysis_envelope(
+        prevalidated: PrevalidatedRunInputs, *, setup_rows: int = 0,
+        context: str = "run") -> int:
+    """Enforce the exact-analysis row envelope for one validated workload."""
+    return validate_exact_analysis_capacity(
+        **exact_analysis_row_counts(prevalidated),
+        setup_rows=setup_rows,
+        context=context,
+    )
 
 
 def _loaded_source_run_id(
@@ -863,11 +1045,17 @@ def prevalidate_run_inputs(
             from .prompts import load_prompts
             loaded_prompts = load_prompts(checked.prompts_file)
 
+    if loaded_prompts is not None:
+        _validate_prompt_resources(
+            loaded_prompts, str(checked.prompts_file))
+
     full_schedule = None
+    sizing_schedule_ceiling = None
     if checked.sizing_concurrency is None:
         if checked.timestamps_file:
             full_schedule = load_trace(
-                checked.timestamps_file, duration_cap_s=checked.duration_s)
+                checked.timestamps_file, duration_cap_s=checked.duration_s,
+                row_limit=MAX_EXACT_ANALYSIS_REQUEST_ROWS)
             schedule_kind = "timestamp_trace"
         else:
             full_schedule = make_schedule(
@@ -877,18 +1065,33 @@ def prevalidate_run_inputs(
                 qps_min=checked.qps_min,
                 qps_max=checked.qps_max,
                 rate_scale=checked.rate_scale,
-                seed=checked.seed + 16)
+                seed=checked.seed + 16,
+                request_limit=MAX_EXACT_ANALYSIS_REQUEST_ROWS)
             schedule_kind = "deterministic_synthetic"
         total_n = len(full_schedule["timestamps"])
         if require_nonempty_schedule and total_n == 0:
             raise RuntimeError(
                 "schedule produced zero arrivals; raise rate_scale or duration")
     else:
-        # The only schedule that cannot exist before endpoint traffic: sizing
-        # derives its fixed rate from unloaded service time. RunConfig rejects
-        # a timestamp trace combined with this mode.
-        schedule_kind = "sizing_derived_after_prevalidation"
-        total_n = max(4, min(checked.calibrate_n, 8))
+        # The final rate depends on paid service-time probes, but it is capped
+        # by qps_max. Materialize that maximum-rate Poisson schedule now; the
+        # post-sizing schedule is an exact deterministic subset, so analysis
+        # can never grow past this pretraffic-approved population.
+        sizing_schedule_ceiling = make_schedule(
+            duration_s=checked.duration_s,
+            qps_base=checked.qps_max,
+            qps_burst=checked.qps_max,
+            qps_min=checked.qps_max,
+            qps_max=checked.qps_max,
+            rate_scale=1.0,
+            seed=checked.seed + 16,
+            request_limit=MAX_EXACT_ANALYSIS_REQUEST_ROWS)
+        if not len(sizing_schedule_ceiling["timestamps"]):
+            raise RuntimeError(
+                "sizing qps_max ceiling produced zero arrivals; increase "
+                "duration_s or qps_max")
+        schedule_kind = "sizing_subset_of_prevalidated_qps_max_ceiling"
+        total_n = sizing_probe_row_count(checked.calibrate_n)
 
     workload = None
     if total_n > 0:
@@ -919,15 +1122,18 @@ def prevalidate_run_inputs(
             loaded_prompts=loaded_prompts,
             resolved_run_id=_loaded_source_run_id(
                 checked, loaded_profile, loaded_prompts))
-    return PrevalidatedRunInputs(
+    result = PrevalidatedRunInputs(
         rc=checked,
         full_schedule=full_schedule,
+        sizing_schedule_ceiling=sizing_schedule_ceiling,
         workload=workload,
         profile=loaded_profile,
         prompts=loaded_prompts,
         representative_plans=representatives,
         schedule_kind=schedule_kind,
     )
+    enforce_exact_analysis_envelope(result, context="run prevalidation")
+    return result
 
 
 def _annotate_result(res, phase: str, plan: dict, body_hash: str) -> dict:
@@ -989,6 +1195,7 @@ def _exception_result(request_id: str, phase: str, plan: dict,
         "queue_wait_ms": None, "caller_ttfb_ms": None,
         "caller_ttft_ms": None, "caller_ttfr_ms": None,
         "caller_ttfv_ms": None, "caller_ttf_tool_call_ms": None,
+        "caller_send_ms": None,
         "caller_e2e_ms": None,
         "finished_unix": None,
         "status": None, "ok": False, "error": error,
@@ -1033,12 +1240,13 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
     """Derive a fixed open-loop rate from an unloaded concurrency hint.
 
     This does not hold concurrency. It measures unloaded service time once,
-    computes ``rate = sizing_concurrency / e2e_p50``, and leaves that rate
+    computes ``rate = sizing_concurrency / mean(e2e)`` by Little's Law, and
+    leaves that rate
     fixed while the endpoint slows or speeds up under load.
     """
     import numpy as _np
 
-    probe_n = max(4, min(rc.calibrate_n, 8))
+    probe_n = sizing_probe_row_count(rc.calibrate_n)
     workload = (prevalidated_workload if prevalidated_workload is not None
                 else _PreparedWorkload(rc, probe_n))
     if prevalidated_workload is not None \
@@ -1076,9 +1284,17 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
             "check auth and "
             "the endpoint path, or set qps_base and max_concurrency directly.")
 
+    mean = float(_np.mean(e2e)) / 1000.0
     p50 = float(_np.percentile(e2e, 50)) / 1000.0
     p95 = float(_np.percentile(e2e, 95)) / 1000.0
-    rate = rc.sizing_concurrency / max(p50, 1e-3)
+    # L = lambda * W uses mean residence time, not median. A skewed service
+    # distribution can have a p50 far below its mean; dividing by p50 would
+    # systematically offer too much load and overshoot the sizing hint.
+    uncapped_rate = rc.sizing_concurrency / max(mean, 1e-3)
+    # qps_max is the pretraffic sizing ceiling. The final arrival process is
+    # thinned from its already materialized schedule, so a very fast sizing
+    # response cannot create an unbounded post-paid workload.
+    rate = min(uncapped_rate, float(rc.qps_max))
     validate_schedule_capacity(rc.duration_s, rate)
     derived_pool_size = max(rc.sizing_concurrency * 2,
                             int(math.ceil(rate * p95 * 1.5)))
@@ -1086,8 +1302,9 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
                 else _DEFAULT_MAX_CONCURRENCY)
     pool_size = min(derived_pool_size, pool_cap)
     if not quiet:
-        print(f"[runner] sizing from {len(e2e)} probe requests: e2e p50 "
-              f"{p50 * 1000:.0f} ms, p95 {p95 * 1000:.0f} ms")
+        print(f"[runner] sizing from {len(e2e)} probe requests: e2e mean "
+              f"{mean * 1000:.0f} ms, p50 {p50 * 1000:.0f} ms, "
+              f"p95 {p95 * 1000:.0f} ms")
         print(f"[runner] sizing hint {rc.sizing_concurrency}: offering a fixed "
               f"{rate:.2f} rps with pool {pool_size}"
               + (f" (derived {derived_pool_size}, capped by explicit "
@@ -1097,6 +1314,9 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
                  f"{_DEFAULT_MAX_CONCURRENCY}-thread safety limit)"
                  if pool_size < derived_pool_size
                  and rc.max_concurrency is None else "")
+              + (f" (uncapped sizing rate {uncapped_rate:.2f} rps was "
+                 f"limited by configured qps_max={rc.qps_max:g})"
+                 if uncapped_rate > rate else "")
               + "; concurrency is measured, not held")
     return dataclasses.replace(
         rc, qps_base=rate, qps_burst=rate, qps_min=rate, qps_max=rate,
@@ -1114,24 +1334,10 @@ def _auth_bytes_fingerprint(value: bytes) -> str:
 
 def _validated_bearer_token(value, *, source: str) -> str:
     """Return one header-safe bearer token without ever echoing its value."""
-    if not isinstance(value, str) or not value:
-        raise AuthProfileError(
-            f"{source} did not provide a non-empty access token")
     try:
-        encoded = value.encode("ascii", errors="strict")
-    except UnicodeEncodeError:
-        raise AuthProfileError(
-            f"{source} returned a bearer token with non-ASCII characters") \
-            from None
-    if len(encoded) > _AUTH_TOKEN_MAX_BYTES:
-        raise AuthProfileError(
-            f"{source} returned an oversized bearer token "
-            f"(bytes={len(encoded)})")
-    if any(byte < 0x21 or byte > 0x7e for byte in encoded):
-        raise AuthProfileError(
-            f"{source} returned a bearer token with unsafe whitespace or "
-            "control characters")
-    return value
+        return validate_bearer_token(value, source=source)
+    except ValueError as exc:
+        raise AuthProfileError(str(exc)) from None
 
 
 def _validated_m2m_credential(value: str, *, field: str,
@@ -1221,15 +1427,22 @@ def _mint_workspace_m2m_token(origin: tuple[str, str, int],
         conn = http.client.HTTPSConnection(
             host, port, timeout=_AUTH_M2M_TIMEOUT_S,
             context=ssl.create_default_context())
-        conn.request("POST", "/oidc/v1/token", body=body, headers=headers)
-        response = conn.getresponse()
-        status = response.status
-        if not isinstance(status, int) or isinstance(status, bool) \
-                or not 100 <= status <= 599:
-            raise AuthProfileError(
-                "Databricks OAuth M2M token endpoint returned an invalid "
-                "HTTP status")
-        raw = _read_bounded_auth_response(response)
+        bind_deadline_bounded_dns(conn)
+        with AbsoluteHTTPDeadline(
+                conn, _AUTH_M2M_TIMEOUT_S) as deadline:
+            conn.request("POST", "/oidc/v1/token", body=body, headers=headers)
+            deadline.raise_if_expired()
+            response = conn.getresponse()
+            deadline.raise_if_expired()
+            status = response.status
+            if not isinstance(status, int) or isinstance(status, bool) \
+                    or not 100 <= status <= 599:
+                raise AuthProfileError(
+                    "Databricks OAuth M2M token endpoint returned an invalid "
+                    "HTTP status")
+            raw = _read_bounded_auth_response(response)
+            deadline.raise_if_expired()
+            content_type = response.getheader("Content-Type")
         fingerprint = _auth_bytes_fingerprint(raw)
         if status != 200:
             hint = {
@@ -1240,7 +1453,6 @@ def _mint_workspace_m2m_token(origin: tuple[str, str, int],
             raise AuthProfileError(
                 "Databricks OAuth M2M token endpoint returned HTTP "
                 f"{status} ({fingerprint}); {hint}")
-        content_type = response.getheader("Content-Type")
         media_type = (
             content_type.split(";", 1)[0].strip().lower()
             if isinstance(content_type, str) else "")
@@ -1299,6 +1511,77 @@ def _mint_workspace_m2m_token(origin: tuple[str, str, int],
                 pass
 
 
+class _CLIOutputLimitError(RuntimeError):
+    """A subprocess crossed its bounded-capture envelope."""
+
+    def __init__(self, captured: bytes):
+        super().__init__("bounded CLI output limit exceeded")
+        self.captured = captured
+
+
+def _run_cli_bounded(command: list[str], *, env: dict[str, str],
+                     timeout_s: float, max_stdout_bytes: int) \
+        -> tuple[int, bytes]:
+    """Run a CLI while draining at most ``max_stdout_bytes + 1`` bytes.
+
+    stderr is discarded at the file-descriptor boundary, so neither memory
+    nor exception text can accumulate it. stdout is drained incrementally;
+    crossing the cap kills the child immediately instead of waiting for an
+    unbounded ``communicate()`` capture to return.
+    """
+    import selectors
+    import subprocess
+    process = None
+    selector = selectors.DefaultSelector()
+    raw = bytearray()
+    deadline = time.monotonic() + timeout_s
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=env)
+        if process.stdout is None:
+            raise OSError("Databricks CLI stdout pipe was not created")
+        stdout_fd = process.stdout.fileno()
+        os.set_blocking(stdout_fd, False)
+        selector.register(stdout_fd, selectors.EVENT_READ)
+        stdout_eof = False
+        while not stdout_eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout_s)
+            events = selector.select(min(remaining, 0.25))
+            if not events:
+                continue
+            for key, _mask in events:
+                chunk = os.read(
+                    key.fd,
+                    min(8192, max_stdout_bytes + 1 - len(raw)))
+                if not chunk:
+                    stdout_eof = True
+                    selector.unregister(key.fd)
+                    break
+                raw.extend(chunk)
+                if len(raw) > max_stdout_bytes:
+                    raise _CLIOutputLimitError(bytes(raw))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout_s)
+        returncode = process.wait(timeout=remaining)
+        return returncode, bytes(raw)
+    except BaseException:
+        if process is not None and process.poll() is None:
+            process.kill()
+            try:
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        raise
+    finally:
+        selector.close()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+
+
 def _mint_cli_u2m_token(name: str, cfg_path) -> str:
     """Mint only the named CLI U2M profile, with auth env fallback removed."""
     import subprocess
@@ -1312,36 +1595,32 @@ def _mint_cli_u2m_token(name: str, cfg_path) -> str:
     if os.environ.get("DATABRICKS_AUTH_STORAGE"):
         cli_env["DATABRICKS_AUTH_STORAGE"] = \
             os.environ["DATABRICKS_AUTH_STORAGE"]
+    command = ["databricks", "auth", "token", "-p", name]
     try:
-        result = subprocess.run(
-            ["databricks", "auth", "token", "-p", name],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=_AUTH_CLI_TIMEOUT_S, env=cli_env, check=False)
+        returncode, raw = _run_cli_bounded(
+            command, env=cli_env, timeout_s=_AUTH_CLI_TIMEOUT_S,
+            max_stdout_bytes=_AUTH_RESPONSE_MAX_BYTES)
     except subprocess.TimeoutExpired:
         raise AuthProfileError(
             f"Databricks U2M profile {name!r} token mint timed out after "
             f"{_AUTH_CLI_TIMEOUT_S:g} seconds; run 'databricks auth login "
             f"--profile {name}' interactively") from None
+    except _CLIOutputLimitError as exc:
+        fingerprint = _auth_bytes_fingerprint(exc.captured)
+        raise AuthProfileError(
+            f"Databricks U2M profile {name!r} returned an oversized token "
+            f"response ({fingerprint})") from None
     except OSError as exc:
         raise AuthProfileError(
             f"Databricks U2M profile {name!r} could not invoke the "
             f"Databricks CLI ({type(exc).__name__}); install the CLI and run "
             f"'databricks auth login --profile {name}'") from None
-    if result.returncode != 0:
+    if returncode != 0:
         raise AuthProfileError(
             f"Databricks U2M profile {name!r} token mint exited with status "
-            f"{result.returncode}; run 'databricks auth login --profile "
+            f"{returncode}; run 'databricks auth login --profile "
             f"{name}' interactively")
-    raw = result.stdout
-    if not isinstance(raw, bytes):
-        raise AuthProfileError(
-            f"Databricks U2M profile {name!r} returned a non-byte token "
-            "response")
     fingerprint = _auth_bytes_fingerprint(raw)
-    if len(raw) > _AUTH_RESPONSE_MAX_BYTES:
-        raise AuthProfileError(
-            f"Databricks U2M profile {name!r} returned an oversized token "
-            f"response ({fingerprint})")
     try:
         envelope = loads_strict(raw)
     except (UnicodeError, ValueError):
@@ -1512,7 +1791,9 @@ def _token(cfg: EndpointConfig) -> str | None:
     tok = os.environ.get(cfg.auth_token_env) or None
     if tok:
         validate_bearer_transport(cfg.base_url)
-    return tok
+        return _validated_bearer_token(
+            tok, source=f"environment variable {cfg.auth_token_env}")
+    return None
 
 
 def _prepare_prior_request_rows(value) -> list[dict]:
@@ -1706,8 +1987,65 @@ def _prepare_prior_request_rows(value) -> list[dict]:
     return prepared
 
 
+def _validated_preflight_gate(value, prior_rows: list[dict]) -> dict | None:
+    """Validate command-level preflight state carried into a measured run."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("preflight_gate must be an object")
+    expected = {
+        "skipped", "attempted", "reachable", "readable",
+        "reasoning_probe_requests", "outcome", "force_requested",
+        "gate_satisfied",
+    }
+    if set(value) != expected:
+        raise ValueError("preflight_gate has unknown or missing fields")
+    if value.get("skipped") is not False:
+        raise ValueError("a carried preflight_gate cannot be skipped")
+    if not isinstance(value.get("force_requested"), bool) \
+            or not isinstance(value.get("gate_satisfied"), bool):
+        raise ValueError("preflight_gate boolean fields are invalid")
+    counts = {}
+    for field in ("attempted", "reachable", "readable",
+                  "reasoning_probe_requests"):
+        item = value.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise ValueError(f"preflight_gate.{field} must be non-negative")
+        counts[field] = item
+    if counts["attempted"] <= 0 \
+            or counts["reachable"] > counts["attempted"] \
+            or counts["readable"] > counts["reachable"]:
+        raise ValueError("preflight_gate counts disagree")
+    preflight_rows = sum(row.get("phase") == "preflight"
+                         for row in prior_rows)
+    probe_rows = sum(row.get("phase") == "probe" for row in prior_rows)
+    if preflight_rows != counts["attempted"] \
+            or probe_rows != counts["reasoning_probe_requests"]:
+        raise ValueError(
+            "preflight_gate counts disagree with prior_request_rows")
+    outcome = value.get("outcome")
+    if outcome == "preflight_passed":
+        valid = (counts["reachable"] == counts["attempted"]
+                 and counts["readable"] == counts["attempted"]
+                 and value["gate_satisfied"] is True)
+    elif outcome == "preflight_forced_unreadable":
+        valid = (value["force_requested"] is True
+                 and value["gate_satisfied"] is False
+                 and counts["reachable"] == counts["attempted"]
+                 and counts["readable"] < counts["attempted"])
+    else:
+        # Reachability failures are refused even with --force. Unknown,
+        # skipped, and refused states must never enter measured execution.
+        valid = False
+    if not valid:
+        raise ValueError(
+            "preflight_gate outcome does not authorize measured execution")
+    return copy.deepcopy(value)
+
+
 def run(rc: RunConfig, token_override: str | None = None,
-        quiet: bool = False, prior_request_rows=None) -> dict:
+        quiet: bool = False, prior_request_rows=None,
+        runtime_quota_guard=None, preflight_gate=None) -> dict:
     # Freeze all nested request/policy configuration and re-run validation in
     # case a caller mutated the dataclass after constructing it.
     rc = dataclasses.replace(
@@ -1718,6 +2056,7 @@ def run(rc: RunConfig, token_override: str | None = None,
         rate_limits=copy.deepcopy(rc.rate_limits),
         input_expectations=copy.deepcopy(rc.input_expectations))
     prior_rows = _prepare_prior_request_rows(prior_request_rows)
+    preflight_gate = _validated_preflight_gate(preflight_gate, prior_rows)
     prompts_mode = bool(rc.prompts_file)
     if prompts_mode and rc.profile_path:
         raise ValueError("set profile_path or prompts_file, not both")
@@ -1755,6 +2094,9 @@ def run(rc: RunConfig, token_override: str | None = None,
         # authorize a different schedule or workload realization from the one
         # that is eventually sent.
         prevalidated = prevalidate_run_inputs(work_rc)
+        enforce_exact_analysis_envelope(
+            prevalidated, setup_rows=len(prior_rows),
+            context="run including carried setup traffic")
         # This gate is intentionally before token lookup, endpoint metadata,
         # network measurement, sizing, calibration, or replay.  A quota-aware
         # config that cannot be bounded must not spend inference traffic in
@@ -1763,6 +2105,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             enforce_quota_plan,
             plan_run_quota,
             render_quota_plan,
+            runtime_quota_scope_material,
         )
         quota_plan = plan_run_quota(
             work_rc, prior_rows=prior_rows, prevalidated=prevalidated)
@@ -1770,6 +2113,37 @@ def run(rc: RunConfig, token_override: str | None = None,
                 and not quiet:
             print(render_quota_plan(quota_plan))
         enforce_quota_plan(quota_plan)
+        if work_rc.rate_limits is not None:
+            from .quota_planner import RuntimeQuotaGuard
+            guard_scope = runtime_quota_scope_material(
+                work_rc.rate_limits, work_rc.endpoint)
+            if runtime_quota_guard is None:
+                runtime_quota_guard = RuntimeQuotaGuard(
+                    work_rc.rate_limits,
+                    shard_index=work_rc.shard_index,
+                    shard_total=work_rc.shard_total,
+                    scope_material=guard_scope)
+            elif not runtime_quota_guard.matches(
+                    work_rc.rate_limits,
+                    shard_index=work_rc.shard_index,
+                    shard_total=work_rc.shard_total,
+                    scope_material=guard_scope):
+                raise ValueError(
+                    "runtime quota guard does not match this run's rate "
+                    "limits or shard allocation")
+            if prior_rows:
+                # A command-level guard already owns CLI preflight/probe
+                # events; a newly constructed direct-run guard imports them
+                # conservatively at the current instant. The guard
+                # deduplicates same-command events and rejects any prior POST
+                # whose physical-attempt evidence is missing.
+                runtime_quota_guard.seed_prior_rows(prior_rows)
+        elif runtime_quota_guard is not None:
+            raise ValueError(
+                "runtime_quota_guard requires rate_limits in the run config")
+        runtime_quota_guard_baseline = (
+            runtime_quota_guard.snapshot()
+            if runtime_quota_guard is not None else None)
         started_utc = datetime.fromtimestamp(
             run_started_at, timezone.utc).isoformat()
         start_provenance = {
@@ -1786,6 +2160,11 @@ def run(rc: RunConfig, token_override: str | None = None,
             "source": source,
             "token_override_supplied": token_override is not None,
             "quota_plan": quota_plan,
+            "runtime_quota_guard": (
+                copy.deepcopy(runtime_quota_guard_baseline)),
+            "runtime_quota_guard_baseline": (
+                copy.deepcopy(runtime_quota_guard_baseline)),
+            "preflight_gate": copy.deepcopy(preflight_gate),
             "schedule_configuration": {
                 key: getattr(original_rc, key) for key in (
                     "duration_s", "qps_base", "qps_burst", "qps_min",
@@ -1822,10 +2201,17 @@ def run(rc: RunConfig, token_override: str | None = None,
                             "the measured runner; sealed here for quota "
                             "accounting"),
                     })
-            token = (token_override if token_override is not None
-                     else _token(ecfg))
-            client = EndpointClient(ecfg, token,
-                                    refresh=lambda: _token(ecfg))
+            token = (
+                _validated_bearer_token(
+                    token_override, source="explicit token override")
+                if token_override is not None else _token(ecfg))
+            # An explicit override is a caller-selected identity. Refreshing it
+            # from the endpoint config could silently switch principals after
+            # a 401, so only config-resolved credentials are refreshable.
+            refresh = None if token_override is not None else lambda: _token(ecfg)
+            client = EndpointClient(
+                ecfg, token, refresh=refresh,
+                runtime_quota_guard=runtime_quota_guard)
             req_params = {
                 "temperature": ecfg.temperature,
                 "max_output_tokens_cap": original_rc.max_output_tokens_cap,
@@ -1847,13 +2233,17 @@ def run(rc: RunConfig, token_override: str | None = None,
 
             endpoint_meta = None
             endpoint_binding = None
+            invocation_binding = None
             if original_rc.capture_endpoint_metadata:
                 from .endpoint_meta import (
                     fetch_endpoint_metadata,
+                    invocation_endpoint_binding,
                     rate_limit_endpoint_binding,
                 )
                 endpoint_meta = fetch_endpoint_metadata(
                     ecfg.base_url, ecfg.path, token, timeout=5.0)
+                invocation_binding = invocation_endpoint_binding(
+                    ecfg.path, endpoint_meta)
                 if original_rc.rate_limits is not None:
                     endpoint_binding = rate_limit_endpoint_binding(
                         original_rc.rate_limits, endpoint_meta, ecfg.path)
@@ -1867,6 +2257,7 @@ def run(rc: RunConfig, token_override: str | None = None,
                         and not quota_plan.get("may_start")
                         else "target-snapshotted"),
                 endpoint_metadata=endpoint_meta,
+                invocation_binding=invocation_binding,
                 endpoint_binding=endpoint_binding,
                 quota_plan=quota_plan,
                 network_path=net_path)
@@ -1887,12 +2278,23 @@ def run(rc: RunConfig, token_override: str | None = None,
             # Capture the complete unsharded schedule, then select this
             # process's globally indexed subset. Exact binary identities are
             # persisted before calibration and measured replay traffic.
-            if prevalidated.full_schedule is not None:
+            if sizing_requested is not None:
+                ceiling = prevalidated.sizing_schedule_ceiling
+                if ceiling is None:
+                    raise RuntimeError(
+                        "sizing prevalidation did not retain its qps_max "
+                        "schedule ceiling")
+                fraction = (float(effective_rc.qps_base)
+                            / float(work_rc.qps_max))
+                full_sched = thin_schedule_ceiling(
+                    ceiling, fraction, seed=effective_rc.seed + 31)
+            elif prevalidated.full_schedule is not None:
                 full_sched = prevalidated.full_schedule
             elif effective_rc.timestamps_file:
                 full_sched = load_trace(
                     effective_rc.timestamps_file,
-                    duration_cap_s=effective_rc.duration_s)
+                    duration_cap_s=effective_rc.duration_s,
+                    row_limit=MAX_EXACT_ANALYSIS_REQUEST_ROWS)
             else:
                 full_sched = make_schedule(
                     duration_s=effective_rc.duration_s,
@@ -1901,7 +2303,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                     qps_min=effective_rc.qps_min,
                     qps_max=effective_rc.qps_max,
                     rate_scale=effective_rc.rate_scale,
-                    seed=effective_rc.seed + 16)
+                    seed=effective_rc.seed + 16,
+                    request_limit=MAX_EXACT_ANALYSIS_REQUEST_ROWS)
             total_n = len(full_sched["timestamps"])
             if total_n == 0:
                 raise RuntimeError(
@@ -1967,17 +2370,29 @@ def run(rc: RunConfig, token_override: str | None = None,
                 plan = workload.plan(i, body_rid)
                 body_hash = _payload_hash(
                     ecfg, plan["messages"], plan["max_output"])
-                try:
-                    res = _send_request(
-                        client, plan["messages"], plan["max_output"], rid,
-                        0.0, 0.0, plan["intended"], plan["chars"])
-                    row = _annotate_result(
-                        res, "calibration", plan, body_hash)
-                except Exception as exc:
+                if (runtime_quota_guard is not None
+                        and runtime_quota_guard.tripped):
                     row = _exception_result(
                         rid, "calibration", plan, body_hash,
-                        "unexpected worker exception: "
-                        f"{type(exc).__name__}: {exc}")
+                        "request omitted after runtime quota admission "
+                        "refusal; no HTTP POST was attempted",
+                        known_not_sent=True)
+                    row.update(
+                        quota_guard_id=runtime_quota_guard.guard_id,
+                        quota_guard_denied=True,
+                        quota_guard_events=[])
+                else:
+                    try:
+                        res = _send_request(
+                            client, plan["messages"], plan["max_output"], rid,
+                            0.0, 0.0, plan["intended"], plan["chars"])
+                        row = _annotate_result(
+                            res, "calibration", plan, body_hash)
+                    except Exception as exc:
+                        row = _exception_result(
+                            rid, "calibration", plan, body_hash,
+                            "unexpected worker exception: "
+                            f"{type(exc).__name__}: {exc}")
                 artifact.append(row)
                 calibration_rows.append(row)
                 if (_clean_measurement_row(row)
@@ -2021,7 +2436,10 @@ def run(rc: RunConfig, token_override: str | None = None,
                     "cpt was left unchanged")
             artifact.update_start(
                 status="replay-ready", calibration=calibration,
-                endpoint_metadata=endpoint_meta, network_path=net_path)
+                endpoint_metadata=endpoint_meta, network_path=net_path,
+                runtime_quota_guard=(
+                    runtime_quota_guard.snapshot()
+                    if runtime_quota_guard is not None else None))
 
             # ---- paced replay --------------------------------------------
             if effective_rc.start_at_unix is not None:
@@ -2089,11 +2507,11 @@ def run(rc: RunConfig, token_override: str | None = None,
                 for local_i in range(n):
                     target = t0 + float(ts[local_i])
                     now = time.monotonic()
-                    if target > now:
-                        time.sleep(target - now)
-                    lag_ms = max(
-                        (time.monotonic() - target) * 1000.0, 0.0)
-
+                    while target > now and not (
+                            runtime_quota_guard is not None
+                            and runtime_quota_guard.tripped):
+                        time.sleep(min(target - now, 0.1))
+                        now = time.monotonic()
                     # Both bookkeeping and the executor queue stay bounded.
                     # Rows are journaled as soon as this dispatcher observes
                     # completion; no run-sized in-memory result list exists.
@@ -2108,7 +2526,31 @@ def run(rc: RunConfig, token_override: str | None = None,
                     plan = workload.plan(global_i, body_rid)
                     body_hash = _payload_hash(
                         ecfg, plan["messages"], plan["max_output"])
+                    # Dispatch lateness includes all synchronous dispatcher
+                    # work required to make this request submit-ready.  A
+                    # timestamp taken before plan construction/body hashing
+                    # hid generator-side saturation as though the dispatcher
+                    # were on time.
+                    lag_ms = max(
+                        (time.monotonic() - target) * 1000.0, 0.0)
                     prog.sent()
+                    if (runtime_quota_guard is not None
+                            and runtime_quota_guard.tripped):
+                        row = _exception_result(
+                            rid, "replay", plan, body_hash,
+                            "request omitted after runtime quota admission "
+                            "refusal; no HTTP POST was attempted",
+                            scheduled_s=float(ts[local_i]),
+                            dispatch_lag_ms=lag_ms,
+                            known_not_sent=True)
+                        row.update(
+                            quota_guard_id=runtime_quota_guard.guard_id,
+                            quota_guard_denied=True,
+                            quota_guard_events=[])
+                        artifact.append(row)
+                        prog.done(None)
+                        prog.paint()
+                        continue
                     if len(pending) >= pending_limit:
                         artifact.append(_exception_result(
                             rid, "replay", plan, body_hash,
@@ -2121,15 +2563,20 @@ def run(rc: RunConfig, token_override: str | None = None,
                         prog.paint()
                         continue
 
-                    send_args = (
-                        plan["messages"], plan["max_output"], rid,
-                        float(ts[local_i]), lag_ms, plan["intended"],
-                        plan["chars"])
                     send_kwargs = {}
                     if supports_scheduled_clock:
                         send_kwargs["scheduled_monotonic"] = target
                     if supports_cancellation:
                         send_kwargs["cancellation_event"] = cancellation_event
+                    # Keep the persisted value adjacent to the actual queue
+                    # handoff so quota checks and pending-pool bookkeeping are
+                    # included too.
+                    lag_ms = max(
+                        (time.monotonic() - target) * 1000.0, 0.0)
+                    send_args = (
+                        plan["messages"], plan["max_output"], rid,
+                        float(ts[local_i]), lag_ms, plan["intended"],
+                        plan["chars"])
                     fut = ex.submit(client.send, *send_args, **send_kwargs)
                     fut.add_done_callback(_progress_done)
                     pending[fut] = (
@@ -2155,22 +2602,48 @@ def run(rc: RunConfig, token_override: str | None = None,
                         # cancellation still prevents new POSTs and retries
                         # even if a custom client cannot interrupt active I/O.
                         pass
+                running = {}
                 for fut, context in list(pending.items()):
-                    if not fut.cancel():
-                        continue
-                    rid, plan, body_hash, scheduled_s, lag_ms = context
+                    if fut.cancel():
+                        rid, plan, body_hash, scheduled_s, lag_ms = context
+                        try:
+                            artifact.append(_exception_result(
+                                rid, "replay", plan, body_hash,
+                                "operator cancellation before request send",
+                                scheduled_s=scheduled_s,
+                                dispatch_lag_ms=lag_ms,
+                                known_not_sent=True))
+                        except Exception:
+                            # Preserve the original BaseException. start.json
+                            # and the append-only journal remain recoverable.
+                            pass
+                    else:
+                        running[fut] = context
+
+                # A running worker may already have emitted a physical POST.
+                # Socket shutdown normally makes it return immediately; drain
+                # for a short bounded interval and persist its exact result.
+                # If a custom/non-cooperative transport remains stuck, write
+                # one explicit unknown row so the journal never implies that
+                # zero requests ran or were billable.
+                drained, still_running = wait(
+                    tuple(running), timeout=_CANCELLATION_DRAIN_TIMEOUT_S)
+                for fut in drained:
+                    try:
+                        artifact.append(_collect(fut, running[fut]))
+                    except Exception:
+                        pass
+                for fut in still_running:
+                    rid, plan, body_hash, scheduled_s, lag_ms = running[fut]
                     try:
                         artifact.append(_exception_result(
                             rid, "replay", plan, body_hash,
-                            "operator cancellation before request send",
+                            "outcome unknown after operator cancellation; "
+                            "the running worker may have emitted an HTTP POST",
                             scheduled_s=scheduled_s,
                             dispatch_lag_ms=lag_ms,
-                            known_not_sent=True))
+                            known_not_sent=False))
                     except Exception:
-                        # Preserve the original BaseException. start.json and
-                        # the append-only journal remain an incomplete,
-                        # recoverable artifact even if this best-effort row
-                        # cannot be written.
                         pass
                 ex.shutdown(wait=False, cancel_futures=True)
                 try:
@@ -2183,6 +2656,40 @@ def run(rc: RunConfig, token_override: str | None = None,
                     ex.shutdown(wait=True)
             prog.finish()
             artifact.sync()
+
+            # A pre-run control-plane snapshot cannot prove the endpoint stayed
+            # unchanged while traffic ran. Re-read only after every response
+            # has drained. A changed document invalidates a single-config
+            # benchmark; a failed second read remains explicit uncertainty.
+            endpoint_meta_after = None
+            endpoint_metadata_stability = "not_requested"
+            endpoint_metadata_warning = None
+            if original_rc.capture_endpoint_metadata:
+                from .endpoint_meta import fetch_endpoint_metadata
+                endpoint_meta_after = fetch_endpoint_metadata(
+                    ecfg.base_url, ecfg.path, client.token, timeout=5.0)
+                if endpoint_meta is None or endpoint_meta_after is None:
+                    endpoint_metadata_stability = "unverified"
+                    endpoint_metadata_warning = (
+                        "serving endpoint metadata could not be captured both "
+                        "before and after the replay, so configuration "
+                        "stability was not established")
+                elif canonical_sha256(endpoint_meta) != canonical_sha256(
+                        endpoint_meta_after):
+                    endpoint_metadata_stability = "changed"
+                    endpoint_metadata_warning = (
+                        "serving endpoint metadata changed between the "
+                        "pre-run and post-drain snapshots")
+                else:
+                    endpoint_metadata_stability = "stable"
+                artifact.update_start(
+                    status="endpoint-post-snapshotted",
+                    endpoint_metadata_after=endpoint_meta_after,
+                    endpoint_metadata_stability=endpoint_metadata_stability,
+                    endpoint_metadata_warning=endpoint_metadata_warning,
+                    runtime_quota_guard=(
+                        runtime_quota_guard.snapshot()
+                        if runtime_quota_guard is not None else None))
 
             load_meta = {
                 "load_mode": load_mode,
@@ -2212,9 +2719,27 @@ def run(rc: RunConfig, token_override: str | None = None,
                 "title": original_rc.title,
                 "request_params": req_params,
                 "endpoint_metadata": endpoint_meta,
+                "endpoint_metadata_after": endpoint_meta_after,
+                "endpoint_metadata_stability": endpoint_metadata_stability,
+                "endpoint_metadata_warning": endpoint_metadata_warning,
+                "invocation_binding": invocation_binding,
                 "network_path": net_path,
+                # EndpointClient always exposes this contract.  Lightweight
+                # injected transports used by library callers and tests may
+                # not; absence remains explicit instead of crashing after all
+                # paid traffic has already completed.
+                "transport": (
+                    client.transport_contract()
+                    if callable(getattr(client, "transport_contract", None))
+                    else None),
                 "quota_plan": quota_plan,
                 "endpoint_binding": endpoint_binding,
+                "runtime_quota_guard": (
+                    runtime_quota_guard.snapshot()
+                    if runtime_quota_guard is not None else None),
+                "runtime_quota_guard_baseline": (
+                    copy.deepcopy(runtime_quota_guard_baseline)),
+                "preflight_gate": copy.deepcopy(preflight_gate),
                 "shard": (f"{effective_rc.shard_index + 1}/"
                           f"{effective_rc.shard_total}"),
                 "endpoint_base_url": ecfg.base_url,

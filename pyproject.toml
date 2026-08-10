@@ -28,7 +28,7 @@ build-backend = "setuptools.build_meta"
 include = ["traffic_replay*"]
 
 [tool.setuptools.package-data]
-traffic_replay = ["data/*.json"]
+traffic_replay = ["data/*.json", "_build_provenance.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

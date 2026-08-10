@@ -87,6 +87,35 @@ def test_partial_calibration_keeps_original_cpt_and_is_disclosed(
     assert calibration["cpt_final"] == calibration["cpt_initial"] == rc.cpt
 
 
+def test_dispatch_lag_includes_submit_preparation_work(tmp_path, monkeypatch):
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def send(self, _messages, _max_tokens, request_id, scheduled_s,
+                 dispatch_lag_ms, intended, chars_sent, **_kwargs):
+            return _result(
+                request_id, scheduled_s, dispatch_lag_ms, intended, chars_sent)
+
+    original_plan = _PreparedWorkload.plan
+
+    def slow_plan(self, global_index, request_id):
+        time.sleep(0.03)
+        return original_plan(self, global_index, request_id)
+
+    monkeypatch.setattr("traffic_replay.runner.EndpointClient", Client)
+    monkeypatch.setattr(_PreparedWorkload, "plan", slow_plan)
+    out = run(_cfg(
+        tmp_path / "dispatch-preparation", duration_s=1,
+        max_concurrency=1), quiet=True)
+    rows = [json.loads(line) for line in (
+        Path(out["out_dir"]) / "requests.jsonl").read_text().splitlines()]
+    replay = [row for row in rows if row.get("phase") == "replay"]
+
+    assert replay
+    assert min(row["dispatch_lag_ms"] for row in replay) >= 25.0
+
+
 def test_preflight_profile_uses_concrete_p50_p95_shape_and_budgets(tmp_path):
     rc = _cfg(tmp_path, max_output_tokens_cap=20)
     plans = _representative_plans(rc)
@@ -140,6 +169,44 @@ def test_readable_preflight_gate_does_not_depend_on_reasoning_schema(
     assert result["budget"] == max(result["budgets"])
     assert result["failed_probe_index"] == result["budgets"].index(
         max(result["budgets"]))
+
+
+def test_preflight_rejects_mixed_visible_refusal_outcomes(
+        tmp_path, monkeypatch, capsys):
+    from traffic_replay.cli import _check_preflight, _preflight
+
+    class MixedRefusalClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def send(self, messages, max_tokens, request_id, scheduled_s,
+                 dispatch_lag_ms, intended, chars_sent):
+            row = _result(request_id, scheduled_s, dispatch_lag_ms,
+                          intended, chars_sent)
+            # Some APIs include explanatory visible text alongside a
+            # structured refusal marker. The refusal marker is authoritative.
+            row.refusal_seen = True
+            return row
+
+    monkeypatch.setattr(
+        "traffic_replay.client.EndpointClient", MixedRefusalClient)
+    cfg = vars(_cfg(tmp_path)).copy()
+    result = _preflight(cfg)
+
+    assert result["reachable"] == result["attempted"] == 2
+    assert result["visible"] is True
+    assert result["readable"] == 0
+    assert result["budget"] == max(result["budgets"])
+    assert all(row["refusal_seen"] for row in result["_request_rows"])
+
+    class Args:
+        force = False
+        probe_extra_body = []
+
+    args = Args()
+    assert _check_preflight(cfg, args) == 3
+    assert args._preflight_evidence["readable"] == 0
+    assert "non-refusal visible content" in capsys.readouterr().out
 
 
 def test_preflight_probe_budget_is_largest_failure_not_largest_success(

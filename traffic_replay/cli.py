@@ -272,10 +272,9 @@ def cmd_compare(args) -> int:
 def _pair(text, what):
     """Parse "10000" or "10000,24000" into a p50/p95 pair.
 
-    A single value gets a p95 2.4x above it, which is roughly the spread of
-    the agent traffic this was built for. Someone who knows their real p95
-    passes both. Nobody should have to author a JSON file to say how big
-    their prompts are.
+    A single value uses an explicitly disclosed convenience heuristic.  It is
+    not a measured tail, target, or provider recommendation; production work
+    must pass both values or use a measured profile with provenance.
     """
     raw_parts = str(text).split(",")
     if any(not x.strip() for x in raw_parts):
@@ -298,9 +297,9 @@ def _pair(text, what):
     if len(vals) > 1:
         p95 = vals[1]
     elif frac:
-        # a fraction has no room for a 2.4x tail. move it most of the way to
-        # 1 instead, which is the shape a cache-reuse distribution actually
-        # has, and keeps it a legal probability.
+        # A fraction has no room for the numeric 2.4x convenience spread. Use
+        # the separately disclosed bounded heuristic; this is an assumption,
+        # not an empirical claim about cache-reuse distributions.
         p95 = (p50 if p50 in (0.0, 1.0)
                else p50 + (1.0 - p50) * 0.65)
     else:
@@ -314,7 +313,8 @@ def _pair(text, what):
     return {"p50": p50, "p95": p95}
 
 
-def _preflight(cfg: dict, *, representative_plans=None) -> dict:
+def _preflight(cfg: dict, *, representative_plans=None,
+               runtime_quota_guard=None, row_sink=None) -> dict:
     """Send a couple of real requests and report what the endpoint does.
 
     This exists because the ways this tool produces a confidently wrong
@@ -338,7 +338,10 @@ def _preflight(cfg: dict, *, representative_plans=None) -> dict:
     rc = RunConfig(**clean)
     ecfg = EndpointConfig(**rc.endpoint)
     tok = _token(ecfg)
-    client = EndpointClient(ecfg, tok, refresh=lambda: _token(ecfg))
+    client_kwargs = {"refresh": lambda: _token(ecfg)}
+    if runtime_quota_guard is not None:
+        client_kwargs["runtime_quota_guard"] = runtime_quota_guard
+    client = EndpointClient(ecfg, tok, **client_kwargs)
     plans = (_representative_plans(rc) if representative_plans is None
              else list(representative_plans))
     if not plans:
@@ -357,8 +360,8 @@ def _preflight(cfg: dict, *, representative_plans=None) -> dict:
                 scheduled_s=0.0, dispatch_lag_ms=0.0,
                 intended=plan["intended"], chars_sent=plan["chars"])
             rows.append(res)
-            request_rows.append(
-                _annotate_result(res, "preflight", plan, body_hash))
+            request_row = _annotate_result(
+                res, "preflight", plan, body_hash)
         except Exception as exc:
             rows.append(exc)
             request_row = _exception_result(
@@ -370,8 +373,16 @@ def _preflight(cfg: dict, *, representative_plans=None) -> dict:
             # accounting.
             request_row["request_attempts"] = None
             request_row["connection_attempts"] = None
-            request_rows.append(request_row)
+        request_rows.append(request_row)
+        if callable(row_sink):
+            row_sink(request_row)
     out["_request_rows"] = request_rows
+    transport_contract = getattr(client, "transport_contract", None)
+    out["transport"] = (
+        transport_contract() if callable(transport_contract) else None)
+    out["include_usage_support_state"] = (
+        out["transport"].get("include_usage_support_state")
+        if isinstance(out["transport"], dict) else None)
     reached = [r for r in rows
                if not isinstance(r, Exception) and r.status == 200]
     out["reachable"] = len(reached)
@@ -427,6 +438,10 @@ def _benchmark_config(args) -> dict:
         ep["auth_token_env"] = args.token_env
     if args.model:
         ep["model"] = args.model
+    production_policy = getattr(
+        args, "production_connection_policy", None)
+    if production_policy is not None:
+        ep["production_connection_policy"] = production_policy
     if args.extra_body:
         try:
             from .json_input import loads_strict
@@ -478,6 +493,9 @@ def _benchmark_config(args) -> dict:
             "Describe the capacity this ran on. Shared pay-per-token is not "
             "a performance claim for a dedicated endpoint."),
     }
+    ttft_definition = getattr(args, "ttft_definition", None)
+    if ttft_definition is not None:
+        cfg["ttft_definition"] = ttft_definition
     if fixed_rate is not None:
         cfg.update(
             qps_base=fixed_rate, qps_burst=fixed_rate,
@@ -490,11 +508,9 @@ def _benchmark_config(args) -> dict:
     inp = _pair(args.input_tokens, "input-tokens")
     outp = _pair(args.output_tokens, "output-tokens")
     if args.prompts:
-        try:
-            from .prompts import load_prompts
-            load_prompts(args.prompts)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise SystemExit(f"invalid --prompts {args.prompts!r}: {exc}")
+        # The bounded no-follow snapshot in _freeze_and_prevalidate_cli_config
+        # is the first read. An eager pathlib read here could block on a FIFO
+        # or parse a different file view from the one eventually replayed.
         cfg["prompts_file"] = args.prompts
     elif args.profile:
         cfg["profile_path"] = args.profile
@@ -523,14 +539,10 @@ def _benchmark_config(args) -> dict:
     # and the cap defaults to 512, so a workload wanting more than that was
     # silently clipped. size the cap from whatever actually decides the
     # output distribution for THIS run, which is the given profile when one
-    # was passed and the flags otherwise.
+    # was passed and the flags otherwise. A supplied profile is intentionally
+    # not read here; the cap is replaced from its private bounded snapshot in
+    # _freeze_and_prevalidate_cli_config.
     _p95 = outp["p95"]
-    if args.profile:
-        try:
-            from .profile import Profile
-            _p95 = float(Profile.from_json(args.profile).output_tokens["p95"])
-        except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
-            raise SystemExit(f"invalid --profile {args.profile!r}: {exc}")
     # Keep enough headroom above p95 that the cap is a safety guard rather
     # than the distribution itself. There is deliberately no hidden 512-token
     # floor: preflight and replay must use the workload's configured budget.
@@ -549,8 +561,9 @@ def _benchmark_config(args) -> dict:
             raise SystemExit(f"--{name} targets must be positive and finite")
     if args.success_rate is not None and (
             not math.isfinite(float(args.success_rate))
-            or not (0 < args.success_rate <= 1)):
-        raise SystemExit("--success-rate must be in (0, 1]")
+            or not (0 < args.success_rate < 1)):
+        raise SystemExit("--success-rate must be in (0, 1); finite evidence "
+                         "cannot statistically demonstrate 100% reliability")
     if ttft or ttfg or args.success_rate is not None:
         t: dict = {"targets_are": "yours, passed on the command line"}
         if ttft:
@@ -575,6 +588,15 @@ def _benchmark_config(args) -> dict:
                 f"invalid --rate-limits file {rate_limits_path!r}: {exc}") \
                 from exc
         cfg["rate_limits"] = rate_limits
+    if sizing is not None:
+        # Two representative preflight requests are always constructed. Each
+        # explicit candidate can add one paid reasoning-control probe if the
+        # representatives are unreadable; reserve the whole possible setup
+        # population before generating the replay ceiling.
+        setup_rows = (0 if getattr(args, "skip_preflight", False)
+                      else 2 + len(
+                          getattr(args, "probe_extra_body", None) or []))
+        _apply_cli_sizing_resource_ceiling(cfg, setup_rows=setup_rows)
     return cfg
 
 
@@ -606,18 +628,57 @@ def _quota_setup_plans(cfg: dict, args, *, representative_plans=None) \
         base_extra = cfg.get("endpoint", {}).get("extra_body") or {}
         for probe in probes:
             candidate = copy.deepcopy(largest)
-            candidate["_quota_extra_body"] = _deep_merge(
+            merged_extra = _deep_merge(
                 copy.deepcopy(base_extra), copy.deepcopy(probe))
+            if cfg.get("rate_limits") is not None \
+                    and "service_tier" in merged_extra \
+                    and merged_extra["service_tier"] != "default":
+                raise ValueError(
+                    "quota-aware reasoning probes require service_tier to "
+                    "be absent or the exact string 'default'; another tier "
+                    "needs its own verified rate-limit scope")
+            candidate["_quota_extra_body"] = merged_extra
             plans.append(candidate)
     return plans
+
+
+def _apply_cli_sizing_resource_ceiling(cfg: dict, *, setup_rows: int) -> None:
+    """Give generated sizing configs a QPS ceiling that fits exact analysis.
+
+    The runner still counts the concrete seeded Poisson schedule and refuses
+    any overage before credentials or traffic. This prevents the unrelated
+    500-QPS dataclass default from invalidating the normal sizing workflow.
+    """
+    from .runner import RunConfig, sizing_probe_row_count
+    from .schedule import conservative_sizing_qps_ceiling
+
+    rc = RunConfig(**cfg)
+    if rc.sizing_concurrency is None:
+        return
+    ceiling = conservative_sizing_qps_ceiling(
+        rc.duration_s,
+        calibration_rows=rc.calibrate_n,
+        sizing_rows=sizing_probe_row_count(rc.calibrate_n),
+        setup_rows=setup_rows,
+        context="generated CLI sizing run",
+    )
+    cfg.update(
+        qps_base=ceiling,
+        qps_burst=ceiling,
+        qps_min=ceiling,
+        qps_max=ceiling,
+        rate_scale=1.0,
+    )
 
 
 def _quota_gate(cfg: dict, args, *, rates: list[float] | None = None,
                 prevalidated=None, prevalidated_rungs=None) \
         -> int | None:
     """Refuse a known-unsafe paid workload before CLI preflight traffic."""
+    args._quota_endpoint_metadata = None
     if cfg.get("rate_limits") is None:
         args._quota_plan = None
+        args._runtime_quota_guard = None
         return None
     from .quota_planner import (
         bind_quota_plan_to_endpoint,
@@ -640,8 +701,21 @@ def _quota_gate(cfg: dict, args, *, rates: list[float] | None = None,
         representatives = prevalidated.representative_plans
     elif prevalidated_rungs:
         representatives = prevalidated_rungs[0].representative_plans
-    setup = _quota_setup_plans(
-        cfg, args, representative_plans=representatives)
+    try:
+        setup = _quota_setup_plans(
+            cfg, args, representative_plans=representatives)
+    except ValueError as exc:
+        plan = {
+            "plan_kind": "sweep" if rates is not None else "run",
+            "status": "refused",
+            "may_start": False,
+            "refusal_stage": "rate_limit_scope_validation",
+            "refusal_reasons": [str(exc)],
+        }
+        args._quota_plan = plan
+        args._runtime_quota_guard = None
+        print("[quota-plan] REFUSED before endpoint traffic: " + str(exc))
+        return 3
     try:
         if rates is None:
             rc = (prevalidated.rc if prevalidated is not None
@@ -674,10 +748,23 @@ def _quota_gate(cfg: dict, args, *, rates: list[float] | None = None,
         endpoint = EndpointConfig(**cfg["endpoint"])
         metadata = fetch_endpoint_metadata(
             endpoint.base_url, endpoint.path, _token(endpoint), timeout=5.0)
+        args._quota_endpoint_metadata = metadata
         binding = rate_limit_endpoint_binding(
             cfg["rate_limits"], metadata, endpoint.path)
         plan = bind_quota_plan_to_endpoint(plan, binding)
     args._quota_plan = plan
+    args._runtime_quota_guard = None
+    if plan is not None and plan.get("may_start"):
+        from .quota_planner import (
+            RuntimeQuotaGuard,
+            runtime_quota_scope_material,
+        )
+        args._runtime_quota_guard = RuntimeQuotaGuard(
+            cfg["rate_limits"],
+            shard_index=int(cfg.get("shard_index", 0)),
+            shard_total=int(cfg.get("shard_total", 1)),
+            scope_material=runtime_quota_scope_material(
+                cfg["rate_limits"], cfg["endpoint"]))
     if plan is not None:
         print(render_quota_plan(plan))
     return None if plan is None or plan.get("may_start") else 3
@@ -721,8 +808,9 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 
 
 def _answer_is_complete(result) -> bool:
-    """A completed answer may be visible text or valid structured tool use."""
-    return bool(result.stream_complete and not result.parse_errors
+    """A completed non-refusal may be visible text or valid tool use."""
+    return bool(not getattr(result, "refusal_seen", False)
+                and result.stream_complete and not result.parse_errors
                 and (result.visible_content_seen
                      or (getattr(result, "valid_tool_calls", 0) or 0) > 0))
 
@@ -730,7 +818,9 @@ def _answer_is_complete(result) -> bool:
 def _probe_reasoning_levers(cfg: dict, budget: int,
                             candidates: list[dict],
                             probe_index: int = 1, *,
-                            representative_plans=None) -> list[dict]:
+                            representative_plans=None,
+                            runtime_quota_guard=None,
+                            row_sink=None) -> list[dict]:
     """Send one request per user-supplied control and report what each did.
 
     This runs only when the endpoint has already proven it produces no
@@ -769,8 +859,10 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
         ec = copy.deepcopy(cfg["endpoint"])
         ec["extra_body"] = _deep_merge(ec.get("extra_body") or {}, extra)
         ecfg = EndpointConfig(**ec)
-        client = EndpointClient(ecfg, _token(ecfg),
-                                refresh=lambda: _token(ecfg))
+        client_kwargs = {"refresh": lambda: _token(ecfg)}
+        if runtime_quota_guard is not None:
+            client_kwargs["runtime_quota_guard"] = runtime_quota_guard
+        client = EndpointClient(ecfg, _token(ecfg), **client_kwargs)
         request_id = f"lever-{name}"
         body_hash = _payload_hash(ecfg, plan["messages"], budget)
         try:
@@ -785,11 +877,15 @@ def _probe_reasoning_levers(cfg: dict, budget: int,
                 f"{type(e).__name__}: {_safe_probe_detail(e)}")
             row["request_attempts"] = None
             row["connection_attempts"] = None
+            if callable(row_sink):
+                row_sink(row)
             out.append({"name": name, "extra": extra, "verdict": "error",
                         "detail": _safe_probe_detail(e)[:160],
                         "_request_row": row})
             continue
         row = _annotate_result(r, "probe", plan, body_hash)
+        if callable(row_sink):
+            row_sink(row)
         if r.status != 200:
             # a refusal is the most useful answer of all: it usually names
             # the reason, and it rules the flag out for good.
@@ -874,13 +970,260 @@ def _refuse(levers: list[dict], args) -> int:
     return 3
 
 
+def _claim_setup_traffic_evidence(cfg: dict, args, *, command: str):
+    """Claim a crash-visible journal before CLI inference setup traffic.
+
+    Preflight and reasoning probes happen before the measured runner owns a
+    run directory.  They are still paid physical POSTs.  A separate sealed
+    setup artifact prevents a normal preflight refusal (or a process crash)
+    from making that traffic disappear from the evidence chain.
+    """
+    import copy
+    import uuid
+    from datetime import datetime, timezone
+
+    from .artifacts import (
+        RunArtifacts, redact_secrets, snapshot_source_state,
+        strict_json_dumps,
+    )
+    from .runner import (
+        RunConfig, _effective_config, _resolved_workload_id,
+    )
+
+    clean = {key: value for key, value in cfg.items()
+             if not key.startswith("_")}
+    rc = RunConfig(**copy.deepcopy(clean))
+    inputs = copy.deepcopy(rc.input_expectations or {})
+    now = time.time()
+    logical_run_id = f"setup-{uuid.uuid4().hex}"
+    execution_id = f"execution-{uuid.uuid4().hex}"
+    artifact_id = f"artifact-{uuid.uuid4().hex}"
+    guard = getattr(args, "_runtime_quota_guard", None)
+    baseline = guard.snapshot() if guard is not None else None
+    source = snapshot_source_state(Path(__file__).parent)
+    start = {
+        "start_schema_version": 1,
+        "status": "setup-traffic-writing",
+        "artifact_kind": "command_setup_traffic",
+        "command": command,
+        "run_started_at_unix": now,
+        "run_started_at_utc": datetime.fromtimestamp(
+            now, timezone.utc).isoformat(),
+        "logical_run_id": logical_run_id,
+        "workload_id": _resolved_workload_id(rc, inputs),
+        "execution_id": execution_id,
+        "artifact_id": artifact_id,
+        "effective_config": _effective_config(rc, rc),
+        "inputs": inputs,
+        "source": source,
+        "runtime_quota_guard": copy.deepcopy(baseline),
+        "runtime_quota_guard_baseline": copy.deepcopy(baseline),
+        "note": (
+            "preflight/probe request evidence only; this artifact is not a "
+            "latency, SLA, throughput, or capacity result"),
+    }
+    requested_root = Path(rc.out_dir)
+    setup_root = requested_root.parent / (
+        requested_root.name + "-setup-traffic")
+    requested = setup_root / time.strftime(
+        "%Y%m%d-%H%M%S", time.localtime(now))
+    artifact = RunArtifacts.claim(
+        requested, start, sync_every_rows=1, artifact_id=artifact_id)
+    state = {
+        "artifact": artifact,
+        "baseline": baseline,
+        "digests": {},
+        "config": clean,
+        "command": command,
+        "sealed": False,
+    }
+
+    def sink(row: dict) -> None:
+        if state["sealed"]:
+            raise RuntimeError("setup traffic evidence is already sealed")
+        if not isinstance(row, dict):
+            raise ValueError("setup request evidence row must be an object")
+        phase = row.get("phase")
+        request_id = row.get("request_id")
+        if phase not in {"preflight", "probe"} \
+                or not isinstance(request_id, str) or not request_id:
+            raise ValueError(
+                "setup request evidence needs preflight/probe phase and a "
+                "request_id")
+        safe = redact_secrets(row)
+        encoded = strict_json_dumps(safe)
+        import hashlib
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        key = (phase, request_id)
+        previous = state["digests"].get(key)
+        if previous is not None:
+            if previous != digest:
+                raise ValueError(
+                    "conflicting setup request evidence for "
+                    f"{phase}/{request_id}")
+            return
+        artifact.append(safe)
+        artifact.sync()
+        state["digests"][key] = digest
+
+    state["sink"] = sink
+    args._setup_traffic_state = state
+    args._setup_request_sink = sink
+    args._setup_traffic_artifact_path = str(artifact.path)
+    return state
+
+
+def _seal_setup_traffic_evidence(cfg: dict, args, *, outcome: str,
+                                 exit_code: int | None) -> Path:
+    """Seal the already-claimed setup journal as an auditable non-result."""
+    import copy
+    import hashlib
+
+    from .client import EndpointConfig
+    from .metrics import summarize, write_outputs
+
+    state = getattr(args, "_setup_traffic_state", None)
+    if not isinstance(state, dict) or state.get("sealed"):
+        raise RuntimeError("no open setup traffic evidence artifact")
+    artifact = state["artifact"]
+    sink = state["sink"]
+    # Test doubles and third-party wrappers may return rows without invoking
+    # the streaming sink. Reconcile them before sealing; production rows are
+    # deduplicated by phase/request_id plus canonical digest.
+    for row in list(getattr(args, "_preflight_request_rows", []) or []):
+        sink(row)
+    guard = getattr(args, "_runtime_quota_guard", None)
+    final_guard = guard.snapshot() if guard is not None else None
+    preflight_gate = copy.deepcopy(getattr(args, "_preflight_evidence", None))
+    if not isinstance(preflight_gate, dict) \
+            or preflight_gate.get("outcome") != outcome:
+        raise ValueError("setup outcome disagrees with preflight gate evidence")
+    artifact.update_start(
+        status="setup-traffic-sealing",
+        setup_outcome=outcome,
+        setup_exit_code=exit_code,
+        preflight_gate=copy.deepcopy(preflight_gate),
+        durable_request_rows=artifact.row_count,
+        runtime_quota_guard=copy.deepcopy(final_guard))
+    rows = list(artifact.read_rows())
+    endpoint = EndpointConfig(**cfg["endpoint"])
+    empty_vector_sha256 = hashlib.sha256(b"").hexdigest()
+    schedule_identity = {
+        "encoding": "float64-le-seconds-from-run-start",
+        "global_timestamps_sha256": empty_vector_sha256,
+        "global_count": 0,
+        "global_min_s": None,
+        "global_max_s": None,
+        "shard_timestamps_sha256": empty_vector_sha256,
+        "shard_count": 0,
+        "shard_min_s": None,
+        "shard_max_s": None,
+    }
+    index_identity = {
+        "encoding": "int64-le",
+        "global_indices_sha256": empty_vector_sha256,
+        "count": 0,
+        "min": None,
+        "max": None,
+        "global_count": 0,
+        "shard_index": int(cfg.get("shard_index", 0)),
+        "shard_total": int(cfg.get("shard_total", 1)),
+        "partition": (
+            "unsharded" if int(cfg.get("shard_total", 1)) == 1
+            else "round_robin_modulo"),
+    }
+    title = str(cfg.get("title") or "benchmark") + \
+        " - setup traffic evidence"
+    run_meta = {
+        "title": title,
+        "label": (
+            "CLI preflight/probe evidence only. Do not use this artifact as "
+            "a performance, SLA, throughput, or endpoint-capacity result."),
+        "artifact_kind": "command_setup_traffic",
+        "setup_outcome": outcome,
+        "preflight_gate": copy.deepcopy(preflight_gate),
+        "endpoint_path": endpoint.path,
+        "endpoint_base_url": endpoint.base_url,
+        "endpoint_model": endpoint.model,
+        "endpoint_metadata": getattr(
+            args, "_quota_endpoint_metadata", None),
+        "endpoint_metadata_stability": "not_applicable_setup_only",
+        "transport": getattr(args, "_preflight_transport", None),
+        "input_mode": (
+            "prompts" if cfg.get("prompts_file") else "profile"),
+        "profile_path": (
+            Path(cfg["profile_path"]).name
+            if cfg.get("profile_path") else None),
+        "prompts_file": (
+            Path(cfg["prompts_file"]).name
+            if cfg.get("prompts_file") else None),
+        "ttft_definition": cfg.get("ttft_definition", "first_content"),
+        "schedule_identity": schedule_identity,
+        "index_identity": index_identity,
+        "shard": (f"{int(cfg.get('shard_index', 0)) + 1}/"
+                  f"{int(cfg.get('shard_total', 1))}"),
+        "runtime_quota_guard_baseline": copy.deepcopy(state["baseline"]),
+        "runtime_quota_guard": copy.deepcopy(final_guard),
+    }
+    summary = summarize(
+        [], schedule_meta={
+            "requests": 0,
+            "seconds": 0,
+            "source": "command setup traffic only; no replay schedule",
+            "rate_min": 0.0,
+            "rate_p50": 0.0,
+            "rate_p95": 0.0,
+            "rate_max": 0.0,
+        }, run_meta=run_meta,
+        ttft_definition=cfg.get("ttft_definition", "first_content"),
+        rate_limits=cfg.get("rate_limits"),
+        rate_limit_results=rows)
+    summary["setup_traffic"] = {
+        "artifact_kind": "command_setup_traffic",
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "request_rows": len(rows),
+        "preflight_gate": copy.deepcopy(preflight_gate),
+        "performance_result": False,
+        "sla_result": False,
+        "capacity_result": False,
+        "note": (
+            "these rows are attached once to the measured run's complete "
+            "request population when the command proceeds past the setup "
+            "gate, including an explicitly forced diagnostic run"),
+    }
+    out = write_outputs(
+        None, summary, artifact.path, title, artifact_run=artifact,
+        start_provenance=artifact.start_provenance)
+    state["sealed"] = True
+    args._setup_request_sink = None
+    args._setup_traffic_artifact_path = str(out)
+    return out
+
+
+def _abort_setup_traffic_evidence(args, error: BaseException) -> None:
+    state = getattr(args, "_setup_traffic_state", None)
+    if not isinstance(state, dict) or state.get("sealed"):
+        return
+    state["artifact"].abort(error)
+    args._setup_request_sink = None
+
+
 def _check_preflight(cfg: dict, args, *, representative_plans=None) \
         -> int | None:
     """Run the shared benchmark/sweep gate; return an exit code on refusal."""
     print("[preflight] sending 2 representative workload requests")
-    pf_res = (_preflight(cfg) if representative_plans is None
-              else _preflight(
-                  cfg, representative_plans=representative_plans))
+    guard = getattr(args, "_runtime_quota_guard", None)
+    preflight_kwargs = {}
+    if representative_plans is not None:
+        preflight_kwargs["representative_plans"] = representative_plans
+    if guard is not None:
+        preflight_kwargs["runtime_quota_guard"] = guard
+    setup_sink = getattr(args, "_setup_request_sink", None)
+    if callable(setup_sink):
+        preflight_kwargs["row_sink"] = setup_sink
+    pf_res = _preflight(cfg, **preflight_kwargs)
+    args._preflight_transport = pf_res.get("transport")
     args._preflight_request_rows = list(pf_res.get("_request_rows") or [])
     args._preflight_evidence = {
         "skipped": False,
@@ -902,6 +1245,15 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
     if not pf_res.get("usage_reported"):
         print("[preflight] WARNING: at least one response reported no token "
               "usage, so throughput and per-token cost may be incomplete")
+    if pf_res.get("include_usage_support_state") is False \
+            and cfg.get("endpoint", {}).get("include_usage", True):
+        # The preflight already paid for and recorded the provider's explicit
+        # rejection plus fallback POST. Freeze the learned capability into the
+        # measured config so concurrent replay workers do not rediscover it
+        # during the benchmark and distort both load and retries.
+        cfg["endpoint"]["include_usage"] = False
+        print("[preflight] endpoint rejected stream_options.include_usage; "
+              "the measured config is frozen with include_usage=false")
     if not pf_res.get("cache_reported"):
         print("[preflight] note: at least one response had no cached-token "
               "field, so achieved cache coverage may be incomplete")
@@ -916,8 +1268,9 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
     if pf_res.get("readable") != pf_res.get("attempted"):
         print(f"[preflight] only {pf_res.get('readable', 0)}/"
               f"{pf_res['attempted']} produced a valid completed answer. "
-              "This gate accepts visible content or a structurally valid tool "
-              "call, plus clean stream completion.")
+              "This gate accepts non-refusal visible content or a "
+              "structurally valid non-refusal tool call, plus clean stream "
+              "completion.")
         levers: list[dict] = []
         candidates = list(getattr(args, "probe_extra_body", None) or [])
         if candidates:
@@ -929,6 +1282,10 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
             }
             if representative_plans is not None:
                 probe_kwargs["representative_plans"] = representative_plans
+            if guard is not None:
+                probe_kwargs["runtime_quota_guard"] = guard
+            if callable(setup_sink):
+                probe_kwargs["row_sink"] = setup_sink
             levers = _probe_reasoning_levers(cfg, **probe_kwargs)
             probe_rows = []
             for lever in levers:
@@ -946,6 +1303,56 @@ def _check_preflight(cfg: dict, args, *, representative_plans=None) \
         if not getattr(args, "force", False):
             return _refuse(levers, args)
     return None
+
+
+def _finalize_preflight_evidence(args, refused: int | None) -> dict:
+    """Freeze the truthful command-level preflight gate state.
+
+    ``--force`` authorizes a diagnostic run after an unreadable HTTP-200
+    preflight. It does not turn that gate into a pass, and it does not bypass
+    a reachability failure. Keep the state separate from the command exit
+    code so setup artifacts and downstream reports cannot infer "passed"
+    merely because the command continued.
+    """
+    raw = getattr(args, "_preflight_evidence", None)
+    if not isinstance(raw, dict):
+        raw = {}
+    counts = {}
+    for field in ("attempted", "reachable", "readable",
+                  "reasoning_probe_requests"):
+        value = raw.get(field, 0)
+        counts[field] = (
+            int(value) if isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0 else 0)
+    skipped = bool(raw.get("skipped", False))
+    force_requested = bool(getattr(args, "force", False))
+    complete = bool(
+        counts["attempted"] > 0
+        and counts["reachable"] == counts["attempted"]
+        and counts["readable"] == counts["attempted"])
+    if skipped:
+        outcome = "skipped"
+    elif refused is not None:
+        outcome = "preflight_refused"
+    elif complete:
+        outcome = "preflight_passed"
+    elif force_requested and counts["reachable"] == counts["attempted"]:
+        outcome = "preflight_forced_unreadable"
+    elif force_requested:
+        # Defensive state for an injected/custom gate. The production gate
+        # refuses reachability failures even when --force is present.
+        outcome = "preflight_forced_failed"
+    else:
+        outcome = "preflight_state_unknown"
+    evidence = {
+        "skipped": skipped,
+        **counts,
+        "outcome": outcome,
+        "force_requested": force_requested,
+        "gate_satisfied": outcome == "preflight_passed",
+    }
+    args._preflight_evidence = evidence
+    return evidence
 
 
 def _freeze_and_prevalidate_cli_config(cfg: dict, directory: Path):
@@ -1015,8 +1422,9 @@ def cmd_benchmark(args) -> int:
     config, run it. Three of those four steps are things a person should not
     have to do to answer "does this endpoint meet my latency target".
     """
+    import copy
     from .immutable_config import publish_legacy_copy, write_immutable_json
-    from .runner import RunConfig, run
+    from .runner import RunConfig, enforce_exact_analysis_envelope, run
     import tempfile
 
     cfg = _benchmark_config(args)
@@ -1039,6 +1447,20 @@ def cmd_benchmark(args) -> int:
                     OverflowError) as exc:
                 return _input_validation_refusal(exc)
 
+        # Include the maximum logical setup population (the two preflight
+        # representatives plus every explicitly requested reasoning probe)
+        # before credential lookup or setup traffic. The runner rechecks the
+        # actual carried rows, but that is too late to authorize preflight.
+        try:
+            setup_rows = len(_quota_setup_plans(
+                work_cfg, args,
+                representative_plans=prevalidated.representative_plans))
+            enforce_exact_analysis_envelope(
+                prevalidated, setup_rows=setup_rows,
+                context="benchmark including possible setup traffic")
+        except (TypeError, ValueError, RuntimeError, OverflowError) as exc:
+            return _input_validation_refusal(exc, json_mode=json_mode)
+
         if json_mode:
             import contextlib
             with contextlib.redirect_stdout(sys.stderr):
@@ -1057,20 +1479,36 @@ def cmd_benchmark(args) -> int:
             return quota_refused
         if not args.skip_preflight:
             representatives = prevalidated.representative_plans
-            if json_mode:
-                import contextlib
-                with contextlib.redirect_stdout(sys.stderr):
+            _claim_setup_traffic_evidence(
+                work_cfg, args, command="benchmark")
+            try:
+                if json_mode:
+                    import contextlib
+                    with contextlib.redirect_stdout(sys.stderr):
+                        refused = _check_preflight(
+                            work_cfg, args,
+                            representative_plans=representatives)
+                else:
                     refused = _check_preflight(
                         work_cfg, args,
                         representative_plans=representatives)
-            else:
-                refused = _check_preflight(
-                    work_cfg, args, representative_plans=representatives)
+                preflight_gate = _finalize_preflight_evidence(args, refused)
+                setup_path = _seal_setup_traffic_evidence(
+                    work_cfg, args,
+                    outcome=preflight_gate["outcome"],
+                    exit_code=refused)
+            except BaseException as exc:
+                _abort_setup_traffic_evidence(args, exc)
+                raise
+            setup_stream = sys.stderr if json_mode else sys.stdout
+            print(f"[preflight] setup traffic evidence sealed at "
+                  f"{setup_path}", file=setup_stream)
             if refused is not None:
                 if json_mode:
                     print(json.dumps({"passed": False,
                                       "stage": "preflight",
-                                      "exit_code": refused},
+                                      "exit_code": refused,
+                                      "setup_artifact": str(setup_path)},
                                      allow_nan=False))
                 return refused
 
@@ -1079,6 +1517,8 @@ def cmd_benchmark(args) -> int:
         # rerun config; workload bytes/plans remain the validated objects above.
         if "ttft_definition" in work_cfg:
             cfg["ttft_definition"] = work_cfg["ttft_definition"]
+        if work_cfg.get("endpoint", {}).get("include_usage") is False:
+            cfg["endpoint"]["include_usage"] = False
 
         # Validate the final configuration before writing a rerun file or
         # starting the measured workload. The runner receives the private
@@ -1090,6 +1530,11 @@ def cmd_benchmark(args) -> int:
         run_options = {}
         if args._preflight_request_rows:
             run_options["prior_request_rows"] = args._preflight_request_rows
+        if not args.skip_preflight:
+            run_options["preflight_gate"] = copy.deepcopy(
+                args._preflight_evidence)
+        if getattr(args, "_runtime_quota_guard", None) is not None:
+            run_options["runtime_quota_guard"] = args._runtime_quota_guard
         out = run(rc, quiet=json_mode, **run_options)
         code = _finish(out, getattr(args, "fail_on", "miss"),
                        getattr(args, "format", "text"))
@@ -1159,9 +1604,17 @@ def cmd_sweep(args) -> int:
     import tempfile
     import time as _time
     from .artifacts import redact_secrets
-    from .metrics import _verdict
-    from .runner import RunConfig, prevalidate_run_inputs, run
-    from .sweep_artifacts import SweepArtifacts, rate_label
+    from .runner import (
+        RunConfig,
+        exact_analysis_row_counts,
+        prevalidate_run_inputs,
+        run,
+    )
+    from .schedule import validate_exact_analysis_capacity
+    from .sweep_artifacts import (
+        SweepArtifacts, classify_sweep_rung, rate_label,
+        sweep_acceptance_policy,
+    )
 
     if args.duration <= 0:
         raise SystemExit("--duration must be a positive number of seconds")
@@ -1193,6 +1646,10 @@ def cmd_sweep(args) -> int:
         "reachable": 0,
         "readable": 0,
         "reasoning_probe_requests": 0,
+        "outcome": ("skipped" if args.skip_preflight
+                    else "preflight_state_unknown"),
+        "force_requested": bool(getattr(args, "force", False)),
+        "gate_satisfied": False,
     }
     frozen_inputs = tempfile.TemporaryDirectory(
         prefix="traffic-replay-sweep-inputs-")
@@ -1202,6 +1659,14 @@ def cmd_sweep(args) -> int:
                 _freeze_and_prevalidate_cli_config(
                     base, Path(frozen_inputs.name))
             prevalidated_rungs = [first_prevalidated]
+            setup_rows = len(_quota_setup_plans(
+                work_base, args,
+                representative_plans=(
+                    first_prevalidated.representative_plans)))
+            totals = exact_analysis_row_counts(first_prevalidated)
+            validate_exact_analysis_capacity(
+                **totals, setup_rows=setup_rows,
+                context="complete sweep including possible setup traffic")
             for rate in rates[1:]:
                 check_cfg = copy.deepcopy(work_base)
                 check_cfg.update(
@@ -1212,9 +1677,29 @@ def cmd_sweep(args) -> int:
                                 / f"rate_{rate_label(rate)}"),
                     title=work_base["title"]
                           + f" @ {rate_label(rate)} requests/second")
-                prevalidated_rungs.append(prevalidate_run_inputs(
+                checked_rung = prevalidate_run_inputs(
                     RunConfig(**check_cfg),
-                    reuse_source=first_prevalidated))
+                    reuse_source=first_prevalidated)
+                prevalidated_rungs.append(checked_rung)
+                for field, value in exact_analysis_row_counts(
+                        checked_rung).items():
+                    totals[field] += value
+                validate_exact_analysis_capacity(
+                    **totals, setup_rows=setup_rows,
+                    context=("complete sweep including possible setup "
+                             "traffic"))
+            acceptance = work_base.get("acceptance_targets")
+            if acceptance is None and first_prevalidated.profile is not None:
+                acceptance = (first_prevalidated.profile.extra or {}).get(
+                    "acceptance_targets")
+            policy_ok, policy_reason = sweep_acceptance_policy(acceptance)
+            if not policy_ok and not args.diagnostic_only:
+                raise ValueError(
+                    "production capacity sweep refused before endpoint "
+                    f"traffic: {policy_reason}. Provide both a customer "
+                    "latency target and --success-rate, or pass "
+                    "--diagnostic-only to run every rung without publishing "
+                    "a held rate or capacity conclusion")
         except (OSError, TypeError, ValueError, RuntimeError,
                 OverflowError) as exc:
             frozen_inputs.cleanup()
@@ -1227,10 +1712,23 @@ def cmd_sweep(args) -> int:
             frozen_inputs.cleanup()
             return quota_refused
         if not args.skip_preflight:
-            refused = _check_preflight(
-                work_base, args,
-                representative_plans=(
-                    first_prevalidated.representative_plans))
+            _claim_setup_traffic_evidence(
+                work_base, args, command="sweep")
+            try:
+                refused = _check_preflight(
+                    work_base, args,
+                    representative_plans=(
+                        first_prevalidated.representative_plans))
+                preflight_gate = _finalize_preflight_evidence(args, refused)
+                setup_path = _seal_setup_traffic_evidence(
+                    work_base, args,
+                    outcome=preflight_gate["outcome"],
+                    exit_code=refused)
+            except BaseException as exc:
+                _abort_setup_traffic_evidence(args, exc)
+                raise
+            print(f"[preflight] setup traffic evidence sealed at "
+                  f"{setup_path}")
             if refused is not None:
                 frozen_inputs.cleanup()
                 return refused
@@ -1238,6 +1736,8 @@ def cmd_sweep(args) -> int:
         # validate the final config only after that mutation.
         if "ttft_definition" in work_base:
             base["ttft_definition"] = work_base["ttft_definition"]
+        if work_base.get("endpoint", {}).get("include_usage") is False:
+            base["endpoint"]["include_usage"] = False
         RunConfig(**work_base)
         sweep_artifact = SweepArtifacts.claim(
             args.out_dir, base, identity_config=work_base)
@@ -1247,6 +1747,25 @@ def cmd_sweep(args) -> int:
     out_root = sweep_artifact.path
     args._sweep_endpoint_path = base["endpoint"]["path"]
     args._cooldown_events = 0
+    args._cooldown_records = []
+    args._sweep_planned_rates = list(rates)
+
+    def apply_cooldown(after: str) -> None:
+        if not args.cooldown:
+            return
+        wall_start = _time.time()
+        mono_start = _time.monotonic()
+        _time.sleep(args.cooldown)
+        mono_end = _time.monotonic()
+        wall_end = _time.time()
+        args._cooldown_events += 1
+        args._cooldown_records.append({
+            "after": after,
+            "requested_s": float(args.cooldown),
+            "started_at_unix": wall_start,
+            "finished_at_unix": wall_end,
+            "elapsed_s": max(0.0, mono_end - mono_start),
+        })
 
     nominal = (len(rates) * args.duration
                + max(0, len(rates) - 1) * args.cooldown
@@ -1268,8 +1787,7 @@ def cmd_sweep(args) -> int:
     rungs: list[dict] = []
     try:
         if args.cooldown and not args.skip_preflight:
-            _time.sleep(args.cooldown)
-            args._cooldown_events += 1
+            apply_cooldown("preflight")
         for i, rate in enumerate(rates):
             public_cfg = copy.deepcopy(base)
             public_cfg.update(
@@ -1305,11 +1823,18 @@ def cmd_sweep(args) -> int:
                 if i == 0 and args._preflight_request_rows:
                     run_options["prior_request_rows"] = \
                         args._preflight_request_rows
+                if i == 0 and not args.skip_preflight:
+                    run_options["preflight_gate"] = copy.deepcopy(
+                        args._preflight_evidence)
+                if getattr(args, "_runtime_quota_guard", None) is not None:
+                    run_options["runtime_quota_guard"] = \
+                        args._runtime_quota_guard
                 out = run(rung_rc, quiet=False, **run_options)
                 s, source_position = sweep_artifact.add_rung(
                     rate, out["out_dir"], expected_summary=out["summary"])
                 accounting = sweep_artifact.rung_accounting(source_position)
-                kind, verdict_text = _verdict(s)
+                decision = classify_sweep_rung(s)
+                kind, verdict_text = decision["kind"], decision["text"]
                 out_dir = Path(out["out_dir"]).resolve(strict=True).relative_to(
                     out_root.resolve(strict=True)).as_posix()
             except Exception as exc:
@@ -1319,29 +1844,62 @@ def cmd_sweep(args) -> int:
                                 f"{type(exc).__name__}: {safe_error}")
                 s = {}
                 out_dir = rung_root.relative_to(out_root).as_posix()
+                decision = {
+                    "state": "INVALID", "quota_status": "UNKNOWN",
+                    "first_event_definition": work_base.get(
+                        "ttft_definition", "first_content"),
+                    "latency_metric": None, "latency_basis": None,
+                    "latency_n": None, "latency_p50": None,
+                    "latency_p95": None, "e2e_metric": None,
+                    "e2e_basis": None, "e2e_n": None,
+                    "e2e_p50": None, "e2e_p95": None,
+                    "success_rate_target": None,
+                    "success_rate_actual": None,
+                    "success_rate_wilson_lower_95": None,
+                    "success_rate_statistically_demonstrated": None,
+                    "request_start_lateness_p95": None,
+                    "dispatch_lag_p95": None,
+                    "response_identity_status": None,
+                    "endpoint_metadata_stability": None,
+                    "runtime_quota_admission_status": None,
+                    "runtime_quota_guard_id": None,
+                }
             cc = s.get("concurrency") or {}
             rungs.append({
                 "rate": rate, "kind": kind, "text": verdict_text,
+                **decision,
                 "dir": out_dir, "source_position": source_position,
                 "held": cc.get("in_flight_p50"),
                 "achieved_rps": (s.get("arrivals") or {}).get(
                     "achieved_qps_overall"),
                 "err": s.get("error_rate"),
-                "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
-                "ttft_p95": (s.get("ttft_ms") or {}).get("p95"),
-                "e2e_p50": (s.get("e2e_ms") or {}).get("p50"),
+                # Backward-compatible aliases now point to the configured
+                # first-event and E2E populations, not hard-wired raw TTFT.
+                "ttft_p50": decision.get("latency_p50"),
+                "ttft_p95": decision.get("latency_p95"),
+                "e2e_p50": decision.get("e2e_p50"),
                 "wall_s": _time.monotonic() - rung_started,
                 **accounting,
             })
             print(f"[sweep] rung {i + 1}: {kind.upper()} {verdict_text[:90]}")
             print()
-            if kind != "ok" and not args.no_early_stop:
-                print(f"[sweep] stopping: rung {i + 1} was not an unqualified OK. pass "
-                      "--no-early-stop to climb the whole ladder anyway.")
+            state = decision["state"]
+            if state in {"INVALID", "QUOTA_LIMITED"}:
+                print(f"[sweep] stopping: rung {i + 1} was {state}; higher "
+                      "paid load is unsafe and cannot repair this evidence.")
+                break
+            if state == "FAIL" and not args.no_early_stop:
+                print(f"[sweep] stopping: rung {i + 1} definitively missed "
+                      "the configured acceptance policy. pass "
+                      "--no-early-stop only to diagnose non-monotonicity.")
+                break
+            if state == "NO_CRITERION" and not args.diagnostic_only:
+                # Defensive: the pre-traffic gate above should make this
+                # unreachable, but never continue paid traffic on policy drift.
+                print("[sweep] stopping: no publishable acceptance criterion")
                 break
             if args.cooldown and i + 1 < len(rates):
-                _time.sleep(args.cooldown)
-                args._cooldown_events += 1
+                apply_cooldown(f"rung_{rate_label(rate)}")
 
         args._sweep_wall_s = _time.monotonic() - sweep_started
         return _sweep_report(rungs, sweep_artifact, args)
@@ -1354,20 +1912,65 @@ def _sweep_report(rungs: list[dict], sweep_artifact, args) -> int:
     """Render and seal the one conclusion derivable from rung evidence."""
     from .sweep_artifacts import render_sweep_report, sweep_outcome
 
+    planned_rates = list(getattr(args, "_sweep_planned_rates",
+                                 [rung["rate"] for rung in rungs]))
+    attempted_rates = [float(rung["rate"]) for rung in rungs]
+    omitted_rates = planned_rates[len(attempted_rates):]
+    if not omitted_rates:
+        termination_reason = "completed_planned_ladder"
+    else:
+        termination_reason = {
+            "INVALID": "invalid_measurement",
+            "QUOTA_LIMITED": "quota_limited",
+            "FAIL": "definitive_sla_failure_early_stop",
+            "NO_CRITERION": "missing_capacity_criterion",
+        }.get(rungs[-1].get("state"), "stopped_before_planned_ladder_end")
+    quota_evidence_fn = getattr(sweep_artifact, "pooled_quota_evidence", None)
+    sweep_quota = (quota_evidence_fn() if callable(quota_evidence_fn) else {
+        "traffic_population": "report_sink_has_no_manifest_bound_rows",
+        "request_rows": sum(int(rung.get("request_rows") or 0)
+                            for rung in rungs),
+        "http_429_count": 0,
+        "quota_status": "UNKNOWN",
+        "observed_rate_windows": {},
+        "configured_rate_limits": None,
+        "runtime_quota_admission": {
+            "status": "not_configured",
+            "guard_ids": [],
+            "denied_rows": 0,
+            "denied_attempts_in_captured_rows": 0,
+            "invariant_errors": [],
+        },
+    })
     context = {
         "endpoint": getattr(args, "_sweep_endpoint_path", args.endpoint),
         "sweep_wall_s": getattr(args, "_sweep_wall_s", 0.0),
         "cooldown_s": float(getattr(args, "cooldown", 0)),
         "cooldown_events": int(getattr(args, "_cooldown_events", 0)),
+        "cooldown_records": list(getattr(args, "_cooldown_records", [])),
+        "planned_rates": planned_rates,
+        "attempted_rates": attempted_rates,
+        "omitted_rates": omitted_rates,
+        "progression_policy": {
+            "early_stop_on_definitive_fail": not bool(getattr(
+                args, "no_early_stop", False)),
+            "diagnostic_only": bool(getattr(args, "diagnostic_only", False)),
+            "invalid_or_quota_always_stops": True,
+        },
+        "termination_reason": termination_reason,
+        "sweep_quota_evidence": sweep_quota,
         "preflight": getattr(args, "_preflight_evidence", {
             "skipped": True,
             "attempted": 0,
             "reachable": 0,
             "readable": 0,
             "reasoning_probe_requests": 0,
+            "outcome": "skipped",
+            "force_requested": False,
+            "gate_satisfied": False,
         }),
     }
-    outcome = sweep_outcome(rungs)
+    outcome = sweep_outcome(rungs, context["preflight"])
     body = render_sweep_report(rungs, context)
     path = sweep_artifact.path / "sweep.md"
     sweep_artifact.seal(
@@ -1398,11 +2001,16 @@ def cmd_verify_sweep(args) -> int:
         return 2
     result = {
         "verified": True,
+        "integrity_verified": True,
         "artifact_id": manifest["artifact_id"],
         "sweep_valid": manifest["sweep_valid"],
         "result_exit_code": manifest["exit_code"],
         "highest_held_rate_requests_per_second": manifest[
             "highest_held_rate_requests_per_second"],
+        "highest_sla_passing_tested_rate_requests_per_second": manifest[
+            "highest_sla_passing_tested_rate_requests_per_second"],
+        "capacity_conclusion": manifest["capacity_conclusion"],
+        "boundary_status": manifest["boundary_status"],
         "invalid_reasons": manifest["invalid_reasons"],
         "input_count": manifest["input_count"],
         "rung_count": manifest["rung_count"],
@@ -1411,17 +2019,21 @@ def cmd_verify_sweep(args) -> int:
         print(json.dumps(result, indent=2, allow_nan=False))
     elif manifest["sweep_valid"]:
         print("VERIFIED: the sweep report, config, source runs, traffic "
-              "counts, ceiling and exit status agree.")
+              "counts, experiment state and exit status agree.")
         print(f"artifact: {manifest['artifact_id']}")
         print(f"rungs: {manifest['rung_count']} attempted, "
               f"{manifest['input_count']} internally hash-verified")
-        print("highest held rate: "
-              f"{manifest['highest_held_rate_requests_per_second']}")
+        print("highest SLA-passing tested rate: "
+              f"{manifest['highest_sla_passing_tested_rate_requests_per_second']}")
+        print(f"capacity conclusion: {manifest['capacity_conclusion']}")
     else:
         print("VERIFIED EVIDENCE, INVALID SWEEP: no capacity conclusion.")
         for reason in manifest["invalid_reasons"]:
             print(f"- {reason}")
-    return 0 if manifest["sweep_valid"] else 2
+    # Exit status reports artifact integrity only. An intact but inconclusive
+    # experiment is not tampering; callers can inspect capacity_conclusion or
+    # the original result_exit_code as a separate policy gate.
+    return 0
 
 
 def cmd_verify_run(args) -> int:
@@ -1513,6 +2125,10 @@ def cmd_quickstart(args) -> int:
         ep["auth_token_env"] = args.token_env
     if args.model:
         ep["model"] = args.model
+    production_policy = getattr(
+        args, "production_connection_policy", None)
+    if production_policy is not None:
+        ep["production_connection_policy"] = production_policy
 
     sizing = getattr(args, "sizing_concurrency", None)
     legacy = getattr(args, "legacy_concurrency", None)
@@ -1535,6 +2151,8 @@ def cmd_quickstart(args) -> int:
     }
     if args.max_output_tokens is not None:
         cfg["max_output_tokens_cap"] = args.max_output_tokens
+    if getattr(args, "ttft_definition", None) is not None:
+        cfg["ttft_definition"] = args.ttft_definition
 
     # SLA targets. the whole reason to run this is "do we meet ours", so it
     # has to be expressible here. without them the report falls back to the
@@ -1563,6 +2181,10 @@ def cmd_quickstart(args) -> int:
         from .config_validation import validate_acceptance_targets
         from .profile import Profile
         from .runner import RunConfig
+        # quickstart runs the generated config directly, without the benchmark
+        # command's separate setup gate. Reserve calibration and sizing rows
+        # and derive its replay ceiling from the same exact-analysis envelope.
+        _apply_cli_sizing_resource_ceiling(cfg, setup_rows=0)
         EndpointConfig(**ep)
         Profile.from_json(args.profile)
         validate_acceptance_targets(cfg.get("acceptance_targets"))
@@ -1652,10 +2274,18 @@ def main(argv=None) -> int:
                    help="env var holding a bearer token, if not using a profile")
     s.add_argument("--model", default=None,
                    help="only for shared /chat/completions routes")
+    s.add_argument(
+        "--production-connection-policy",
+        choices=("fresh_http1_per_physical_attempt",), default=None,
+        help="declare that the real application opens a fresh HTTP/1.1 "
+             "connection for every physical attempt. Omit unless this exact "
+             "production behavior is known")
     s.add_argument("--extra-body", default=None,
-                   help='JSON merged into each request, e.g. '
-                        '\'{"reasoning_effort": "low"}\' when the target '
-                        'documents that control')
+                   help='JSON merged into each request. Managed Databricks '
+                        'GLM 5.2 thinking off: '
+                        '\'{"reasoning_effort":"none"}\'; direct SGLang: '
+                        '\'{"chat_template_kwargs":'
+                        '{"enable_thinking":false}}\'')
     s.add_argument("--ttft-p50", type=float, default=None,
                    help="your TTFT target in ms. same for --ttft-p90/p95/p99")
     s.add_argument("--ttft-p90", type=float, default=None)
@@ -1667,7 +2297,14 @@ def main(argv=None) -> int:
     s.add_argument("--ttfg-p95", type=float, default=None)
     s.add_argument("--ttfg-p99", type=float, default=None)
     s.add_argument("--success-rate", type=float, default=None,
-                   help="fraction 0-1, e.g. 0.99")
+                   metavar="FRACTION_IN_(0,1)",
+                   help="fraction strictly between 0 and 1, e.g. 0.99")
+    s.add_argument(
+        "--ttft-definition", choices=("first_content", "first_visible"),
+        default=None,
+        help="event scored by TTFT targets: first_content is the first "
+             "visible, reasoning, or refusal onset; first_visible waits "
+             "for user-visible assistant content")
     s.add_argument("--out-dir", default="results/benchmark")
     s.add_argument("--max-concurrency", type=int, default=None,
                    help="worker bound; sizing derives it when omitted")
@@ -1678,8 +2315,10 @@ def main(argv=None) -> int:
     s.add_argument(
         "--rate-limits", dest="rate_limits_file", default=None,
         metavar="JSON_FILE",
-        help="dated provider quota snapshot; enables a conservative "
-             "pre-traffic token/query budget gate")
+        help="dated provider quota snapshot; enables conservative planning "
+             "and command-scoped no-wait admission for QPS, QPH, token "
+             "windows, and serialized request bytes before every physical "
+             "inference POST")
     s.add_argument("--skip-preflight", action="store_true",
                    help="skip the 2-request endpoint check. not recommended")
     s.add_argument(
@@ -1700,7 +2339,8 @@ def main(argv=None) -> int:
 
     s = sub.add_parser(
         "sweep",
-        help="climb a rate ladder and report the highest rate that held")
+        help="climb an authorized rate ladder and report the highest tested "
+             "rate that held; this is not an endpoint ceiling")
     s.add_argument("--host", required=True)
     s.add_argument("--endpoint", required=True)
     s.add_argument("--rate", default="1:32",
@@ -1734,7 +2374,16 @@ def main(argv=None) -> int:
              "route-optimized serving")
     s.add_argument("--token-env", default="DATABRICKS_TOKEN")
     s.add_argument("--model", default=None)
-    s.add_argument("--extra-body", default=None)
+    s.add_argument(
+        "--production-connection-policy",
+        choices=("fresh_http1_per_physical_attempt",), default=None,
+        help="declare the real application's exact fresh-HTTP/1.1-per-attempt "
+             "behavior; omit for pooled, keep-alive, HTTP/2, or unknown clients")
+    s.add_argument(
+        "--extra-body", default=None,
+        help='JSON merged into each request. Managed Databricks GLM 5.2 '
+             'thinking off: \'{"reasoning_effort":"none"}\'; direct SGLang: '
+             '\'{"chat_template_kwargs":{"enable_thinking":false}}\'')
     s.add_argument("--ttft-p50", type=float, default=None)
     s.add_argument("--ttft-p90", type=float, default=None)
     s.add_argument("--ttft-p95", type=float, default=None)
@@ -1743,7 +2392,20 @@ def main(argv=None) -> int:
     s.add_argument("--ttfg-p90", type=float, default=None)
     s.add_argument("--ttfg-p95", type=float, default=None)
     s.add_argument("--ttfg-p99", type=float, default=None)
-    s.add_argument("--success-rate", type=float, default=None)
+    s.add_argument(
+        "--success-rate", type=float, default=None,
+        metavar="FRACTION_IN_(0,1)",
+        help="fraction strictly between 0 and 1, e.g. 0.99")
+    s.add_argument(
+        "--ttft-definition", choices=("first_content", "first_visible"),
+        default=None,
+        help="event scored by TTFT targets: first_content is the first "
+             "visible, reasoning, or refusal onset; first_visible waits "
+             "for user-visible assistant content")
+    s.add_argument(
+        "--diagnostic-only", action="store_true",
+        help="allow a targetless ladder, run every safe rung, and publish no "
+             "held-rate or endpoint-capacity conclusion")
     s.add_argument("--out-dir", default="results/sweep")
     s.add_argument("--max-concurrency", type=int, default=256,
                    help="fixed worker bound reused unchanged at every rung")
@@ -1755,7 +2417,8 @@ def main(argv=None) -> int:
         "--rate-limits", dest="rate_limits_file", default=None,
         metavar="JSON_FILE",
         help="dated provider quota snapshot; the whole ladder is budgeted "
-             "before preflight traffic")
+             "before preflight traffic and every physical inference POST is "
+             "then admitted by the same command-local no-wait guard")
     s.add_argument("--skip-preflight", action="store_true",
                    help="skip the representative endpoint gate")
     s.add_argument(
@@ -1807,6 +2470,11 @@ def main(argv=None) -> int:
                    help="env var holding a bearer token, if not using a profile")
     s.add_argument("--model", default=None,
                    help="only for shared /chat/completions routes")
+    s.add_argument(
+        "--production-connection-policy",
+        choices=("fresh_http1_per_physical_attempt",), default=None,
+        help="declare the real application's exact fresh-HTTP/1.1-per-attempt "
+             "behavior; omit when unknown")
     s.add_argument("--max-output-tokens", type=int, default=None)
     s.add_argument("--out-dir", default="results/quickstart")
     s.add_argument("--title", default=None)
@@ -1821,7 +2489,15 @@ def main(argv=None) -> int:
     s.add_argument("--ttfg-p90", type=float, default=None)
     s.add_argument("--ttfg-p95", type=float, default=None)
     s.add_argument("--ttfg-p99", type=float, default=None)
-    s.add_argument("--success-rate", type=float, default=None)
+    s.add_argument("--success-rate", type=float, default=None,
+                   metavar="FRACTION_IN_(0,1)",
+                   help="acceptance fraction strictly between 0 and 1")
+    s.add_argument(
+        "--ttft-definition", choices=("first_content", "first_visible"),
+        default=None,
+        help="event scored by TTFT targets: first_content is the first "
+             "visible, reasoning, or refusal onset; first_visible waits "
+             "for user-visible assistant content")
     s.add_argument("--out", default="configs/quickstart.json")
     s.set_defaults(fn=cmd_quickstart)
 
@@ -1843,7 +2519,7 @@ def main(argv=None) -> int:
     s.add_argument("--tolerance-ms", type=float, default=60.0)
     s.add_argument("--quiet", action="store_true")
     s.add_argument("--format", choices=("text", "json"), default="text",
-                   help="json prints the full comparison report")
+                   help="json prints only the validation comparison object")
     s.set_defaults(fn=cmd_validate)
 
     s = sub.add_parser("merge", help="pool sharded run outputs into one")

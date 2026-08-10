@@ -360,8 +360,13 @@ def test_cli_matching_fixture_passes_gate_and_invokes_runner(
         lambda *_args, **_kwargs: _metadata())
     calls = []
 
-    def fake_run(rc, quiet=False):
-        calls.append(rc)
+    def fake_run(rc, quiet=False, *, runtime_quota_guard=None,
+                 prior_request_rows=None):
+        calls.append({
+            "config": rc,
+            "runtime_quota_guard": runtime_quota_guard,
+            "prior_request_rows": prior_request_rows,
+        })
         return {"out_dir": rc.out_dir, "summary": {}}
 
     monkeypatch.setattr("traffic_replay.runner.run", fake_run)
@@ -372,3 +377,4 @@ def test_cli_matching_fixture_passes_gate_and_invokes_runner(
 
     assert main(args) == 0
     assert len(calls) == 1
+    assert calls[0]["runtime_quota_guard"] is not None

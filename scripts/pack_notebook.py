@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build and verify the self-contained Databricks smoke notebook payload.
+"""Build and verify the self-contained Databricks diagnostic notebook payload.
 
-The notebook carries the tracked package, its real pytest suite, and a small
-allowlist of public sample inputs. Packing is deliberately strict: collection
-comes from pytest, the unpacked copy must pass every collected case, and a
-SHA-256 digest binds the displayed notebook to the exact canonical payload.
+The notebook carries the tracked package sources, its real pytest suite, and
+an explicit allowlist of public examples plus test dependencies. Packing is
+deliberately strict: collection comes from pytest, the unpacked copy must pass
+every collected case, and a SHA-256 digest binds the displayed notebook to the
+exact canonical payload.
 
 Run after committing runtime or test changes, then commit the notebook:
 
@@ -32,6 +33,7 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK = ROOT / "notebooks" / "smoke_test_e2e_demo.ipynb"
+NOTEBOOK_CONTRACT = "notebooks/smoke_test_e2e_demo.contract.json"
 
 # This script is also run by absolute path from outside the repository. Make
 # its checked-in package parser available without depending on an editable
@@ -41,6 +43,15 @@ if str(ROOT) not in sys.path:
 from traffic_replay.json_input import (  # noqa: E402
     json_error_detail,
     loads_strict,
+)
+from traffic_replay._build_provenance import (  # noqa: E402
+    PROVENANCE_FILENAME,
+    build_provenance_for_source,
+    make_provenance_record,
+    provenance_input_path,
+    provenance_json,
+    source_inventory_from_contents,
+    validate_embedded_provenance,
 )
 
 PUBLIC_CONFIGS = (
@@ -54,8 +65,25 @@ PUBLIC_CONFIGS = (
     "configs/run_pt_full.json",
     "configs/run_prompts.json",
 )
-EXPLICIT_FILES = ("pyproject.toml", "scripts/profile_from_logs.py",
-                  *PUBLIC_CONFIGS)
+NOTEBOOK_SUPPORT_FILES = (
+    "README.md",
+    "CHANGELOG.md",
+    "TODO.md",
+    "MANIFEST.in",
+    "setup.py",
+    "scripts/build_customer_pdf.py",
+    "scripts/pack_notebook.py",
+    "scripts/profile_from_logs.py",
+    "docs/ARCHITECTURE.md",
+    "docs/PRODUCTION_TESTING.md",
+    "docs/RUN_YOUR_OWN_BENCHMARK.md",
+    "docs/customer/benchmark-your-own-endpoint.html",
+    "docs/diagrams/architecture.excalidraw",
+    "docs/diagrams/architecture.svg",
+    "docs/diagrams/load-model.svg",
+    "docs/diagrams/request-sequence.svg",
+)
+EXPLICIT_FILES = ("pyproject.toml", *NOTEBOOK_SUPPORT_FILES, *PUBLIC_CONFIGS)
 PACKAGE_SUFFIXES = {".py", ".json", ".jsonl", ".txt", ".typed"}
 TEST_SUFFIXES = {".py", ".json", ".jsonl", ".txt", ".csv"}
 COLLECT_TIMEOUT_S = 180
@@ -89,13 +117,30 @@ def _git_paths(*args: str) -> list[str]:
             if item]
 
 
-def _tracked_payload_paths() -> list[str]:
-    tracked = _git_paths(
-        "ls-files", "-z", "--", "traffic_replay", "tests", "configs",
-        "pyproject.toml", "scripts/profile_from_logs.py")
+def _git_checkout_owns_root() -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=ROOT,
+            capture_output=True, check=False)
+    except OSError:
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        top = Path(result.stdout.decode("utf-8").strip()).resolve()
+        return top == ROOT.resolve()
+    except (OSError, UnicodeError):
+        return False
+
+
+def _select_payload_paths(candidates: list[str]) -> list[str]:
     selected: set[str] = set()
     explicit = set(EXPLICIT_FILES)
-    for rel in tracked:
+    for rel in candidates:
+        pure = PurePosixPath(rel)
+        if pure.is_absolute() or not pure.parts or ".." in pure.parts \
+                or pure.as_posix() != rel:
+            raise SystemExit(f"unsafe notebook input path: {rel!r}")
         suffix = PurePosixPath(rel).suffix
         if rel in explicit:
             selected.add(rel)
@@ -121,6 +166,183 @@ def _tracked_payload_paths() -> list[str]:
     return sorted(selected)
 
 
+def _sdist_embedded_identity() -> dict:
+    record, origin, error = build_provenance_for_source(
+        ROOT / "traffic_replay", ROOT)
+    if origin != "embedded_build":
+        raise SystemExit(
+            "Git-less notebook checking requires a source distribution with "
+            "valid embedded build provenance"
+            + (f": {error}" if error else ""))
+    return record
+
+
+def _sdist_payload_paths() -> list[str]:
+    """Enumerate archive-declared inputs in a trusted Git-less sdist."""
+    _sdist_embedded_identity()
+    manifests = list(ROOT.glob("*.egg-info/SOURCES.txt"))
+    if len(manifests) != 1:
+        raise SystemExit(
+            "Git-less notebook checking requires exactly one sdist "
+            "SOURCES.txt manifest")
+    try:
+        candidates = manifests[0].read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise SystemExit(f"cannot read sdist SOURCES.txt: {exc}") from exc
+    if not candidates or len(candidates) != len(set(candidates)):
+        raise SystemExit("sdist SOURCES.txt is empty or contains duplicates")
+    generated = f"traffic_replay/{PROVENANCE_FILENAME}"
+    return _select_payload_paths(
+        [relative for relative in candidates if relative != generated])
+
+
+def _tracked_payload_paths() -> list[str]:
+    if not _git_checkout_owns_root():
+        return _sdist_payload_paths()
+    tracked = _git_paths(
+        "ls-files", "-z", "--", "traffic_replay", "tests",
+        *EXPLICIT_FILES)
+    return _select_payload_paths(tracked)
+
+
+def _packed_notebook_source_commit() -> str:
+    """Recover and validate the payload commit in a Git-less sdist."""
+    notebook = _read_notebook()
+    source = _notebook_source(notebook)
+    payloads = re.findall(
+        r'^PAYLOAD = "([^"]+)"$', source, re.MULTILINE)
+    digests = re.findall(
+        r'^PAYLOAD_SHA256 = "([0-9a-f]{64})"$', source, re.MULTILINE)
+    if len(payloads) != 1 or len(digests) != 1:
+        raise SystemExit(
+            "sdist notebook has ambiguous payload or digest metadata")
+    try:
+        raw = base64.b64decode(payloads[0], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise SystemExit("sdist notebook payload is not valid base64") from exc
+    if hashlib.sha256(raw).hexdigest() != digests[0]:
+        raise SystemExit("sdist notebook payload does not match its digest")
+    try:
+        files = loads_strict(raw)
+    except ValueError as exc:
+        raise SystemExit(
+            f"sdist notebook payload is invalid JSON ({json_error_detail(exc)})"
+        ) from exc
+    if not isinstance(files, dict) or not all(
+            isinstance(rel, str) and isinstance(text, str)
+            for rel, text in files.items()):
+        raise SystemExit("sdist notebook payload must map paths to text")
+    target = f"traffic_replay/{PROVENANCE_FILENAME}"
+    try:
+        embedded = loads_strict(files[target].encode("utf-8"))
+        version_matches = re.findall(
+            r'^__version__\s*=\s*"([^"]+)"\s*$',
+            files["traffic_replay/__init__.py"], re.MULTILINE)
+    except (KeyError, UnicodeError, ValueError) as exc:
+        raise SystemExit(
+            "sdist notebook payload provenance is missing or invalid") from exc
+    if len(version_matches) != 1:
+        raise SystemExit("sdist notebook payload package version is invalid")
+    tree, count = _source_inventory_from_payload(files)
+    valid, reason = validate_embedded_provenance(
+        embedded, expected_version=version_matches[0],
+        source_tree_sha256=tree, source_file_count=count)
+    if not valid:
+        raise SystemExit(
+            f"sdist notebook payload provenance is invalid: {reason}")
+    return embedded["git_commit"]
+
+
+def _payload_source_commit(paths: list[str]) -> str:
+    """Return the clean commit that last changed any payload source.
+
+    The generated notebook is committed after its source inputs. Using the
+    last payload-source commit keeps the embedded identity stable across that
+    artifact-only commit while still proving that every packed byte is
+    recoverable from one Git revision.
+    """
+    if not _git_checkout_owns_root():
+        _sdist_embedded_identity()
+        commit = _packed_notebook_source_commit()
+        if not isinstance(commit, str) or not re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit):
+            raise SystemExit("sdist notebook source commit is invalid")
+        return commit
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=ROOT, capture_output=True, check=False)
+    if status.returncode != 0:
+        detail = status.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(f"git could not establish a clean source tree: {detail}")
+    if status.stdout:
+        raise SystemExit(
+            "notebook packing requires a clean Git tree; commit the source "
+            "changes before generating the notebook")
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", *paths], cwd=ROOT,
+        capture_output=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(
+            f"git could not resolve the payload source commit: {detail}")
+    try:
+        commit = result.stdout.decode("ascii").strip()
+    except UnicodeError as exc:
+        raise SystemExit("payload source commit was not ASCII") from exc
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) \
+            or set(commit) == {"0"}:
+        raise SystemExit("payload source commit is missing or invalid")
+    exact = subprocess.run(
+        ["git", "diff", "--quiet", commit, "--", *paths], cwd=ROOT,
+        capture_output=True, check=False)
+    if exact.returncode != 0:
+        raise SystemExit(
+            "payload inputs are not all reconstructible from the resolved "
+            f"source commit {commit}")
+    return commit
+
+
+def _source_inventory_from_payload(files: dict[str, str]) \
+        -> tuple[str, int]:
+    package_files = {
+        rel.removeprefix("traffic_replay/"): text.encode("utf-8")
+        for rel, text in files.items()
+        if rel.startswith("traffic_replay/")
+        and provenance_input_path(rel.removeprefix("traffic_replay/"))
+    }
+    try:
+        digest, inventory = source_inventory_from_contents(package_files)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"notebook package provenance inventory is invalid: {exc}") from exc
+    return digest, len(inventory)
+
+
+def _add_embedded_provenance(
+        files: dict[str, str], source_commit: str) -> None:
+    target = f"traffic_replay/{PROVENANCE_FILENAME}"
+    if target in files:
+        raise SystemExit(
+            f"{target} must be generated by the notebook packer, not tracked")
+    tree_digest, source_count = _source_inventory_from_payload(files)
+    version_match = re.findall(
+        r'^__version__\s*=\s*"([^"]+)"\s*$',
+        files.get("traffic_replay/__init__.py", ""), re.MULTILINE)
+    if len(version_match) != 1:
+        raise SystemExit("could not derive one package version for provenance")
+    record = make_provenance_record(
+        version=version_match[0], git_commit=source_commit, git_dirty=False,
+        git_status_sha256=hashlib.sha256(b"").hexdigest(),
+        source_tree_sha256=tree_digest, source_file_count=source_count)
+    valid, reason = validate_embedded_provenance(
+        record, expected_version=version_match[0],
+        source_tree_sha256=tree_digest, source_file_count=source_count)
+    if not valid:
+        raise SystemExit(f"generated notebook provenance is invalid: {reason}")
+    files[target] = provenance_json(record)
+
+
 def _assert_public_payload(rel: str, text: str) -> None:
     for pattern in _SECRET_PATTERNS:
         if pattern.search(text):
@@ -129,10 +351,12 @@ def _assert_public_payload(rel: str, text: str) -> None:
 
 
 def collect() -> dict[str, str]:
-    """Return every tracked public file needed by the smoke notebook."""
+    """Return every public file needed by the diagnostic notebook."""
     files: dict[str, str] = {}
     root_resolved = ROOT.resolve(strict=True)
-    for rel in _tracked_payload_paths():
+    paths = _tracked_payload_paths()
+    source_commit = _payload_source_commit(paths)
+    for rel in paths:
         path = ROOT / rel
         if path.is_symlink() or not path.is_file():
             raise SystemExit(f"notebook input must be a regular file: {rel}")
@@ -149,6 +373,16 @@ def collect() -> dict[str, str]:
         files[rel] = text
     if not files:
         raise SystemExit("notebook payload would be empty")
+    contract = _normalized_notebook_contract()
+    committed_contract = _notebook_contract_at_commit(source_commit)
+    if contract != committed_contract:
+        raise SystemExit(
+            "the diagnostic notebook contract is not reconstructible from "
+            f"payload source commit {source_commit}; commit notebook semantic "
+            "changes together with a payload source change before packing")
+    _assert_public_payload(NOTEBOOK_CONTRACT, contract)
+    files[NOTEBOOK_CONTRACT] = contract
+    _add_embedded_provenance(files, source_commit)
     return files
 
 
@@ -260,7 +494,7 @@ def verify(files: dict[str, str]) -> int:
                        for name in ("failures", "errors", "skipped"))):
             print(_tail(result), file=sys.stderr)
             raise SystemExit(
-                "packed pytest suite is not completely green: "
+                "packed pytest suite did not pass completely: "
                 f"exit={result.returncode}, collected={len(nodeids)}, "
                 f"junit={counts}")
         return len(nodeids)
@@ -337,9 +571,79 @@ def _read_notebook() -> dict:
     return notebook
 
 
+def _normalize_notebook_contract(notebook: dict) -> str:
+    """Remove only generated payload metadata from one notebook object."""
+    _assert_clean_notebook(notebook)
+    for cell in notebook["cells"]:
+        source = ("".join(cell.get("source", []))
+                  if isinstance(cell.get("source"), list)
+                  else str(cell.get("source", "")))
+        source = re.sub(
+            r'^PAYLOAD = "[^"]*"$', 'PAYLOAD = ""', source,
+            flags=re.MULTILINE)
+        source = re.sub(
+            r'^PAYLOAD_SHA256 = "[0-9a-f]*"$',
+            'PAYLOAD_SHA256 = "' + "0" * 64 + '"', source,
+            flags=re.MULTILINE)
+        source = re.sub(
+            r'^PACKED_VERSION = "[^"]*"$', 'PACKED_VERSION = "CONTRACT"',
+            source, flags=re.MULTILINE)
+        source = re.sub(
+            r"^EXPECTED_PAYLOAD_FILES = \d+$",
+            "EXPECTED_PAYLOAD_FILES = 0", source, flags=re.MULTILINE)
+        source = re.sub(
+            r"^EXPECTED_PYTEST_CASES = \d+$",
+            "EXPECTED_PYTEST_CASES = 0", source, flags=re.MULTILINE)
+        source = re.sub(
+            r"run the full pytest suite \(\d+ cases\)",
+            "run the full pytest suite (0 cases)", source)
+        source = re.sub(
+            r"Self-contained runnable payload \([^)]*\)",
+            "Self-contained runnable payload "
+            "(vCONTRACT, 0 payload files, 0 pytest cases)", source)
+        cell["source"] = source.splitlines(keepends=True)
+    return json.dumps(
+        notebook, indent=1, ensure_ascii=False, allow_nan=False) + "\n"
+
+
+def _normalized_notebook_contract() -> str:
+    """Return executable-cell intent without recursively packing payload.
+
+    The complete notebook cannot contain itself. This normalized copy removes
+    only generated payload metadata, so the pytest suite unpacked from the
+    notebook can still assert the paid-canary safety contract it will run.
+    """
+    return _normalize_notebook_contract(_read_notebook())
+
+
+def _notebook_contract_at_commit(commit: str) -> str:
+    if not _git_checkout_owns_root():
+        _sdist_embedded_identity()
+        if _packed_notebook_source_commit() != commit:
+            raise SystemExit("sdist notebook source commit changed while read")
+        return _normalized_notebook_contract()
+    relative = NOTEBOOK.relative_to(ROOT).as_posix()
+    result = subprocess.run(
+        ["git", "show", f"{commit}:{relative}"], cwd=ROOT,
+        capture_output=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(
+            f"git could not reconstruct the notebook contract: {detail}")
+    try:
+        notebook = loads_strict(result.stdout)
+    except ValueError as exc:
+        raise SystemExit(
+            "committed diagnostic notebook is invalid JSON "
+            f"({json_error_detail(exc)})") from exc
+    if not isinstance(notebook, dict):
+        raise SystemExit("committed diagnostic notebook root is not an object")
+    return _normalize_notebook_contract(notebook)
+
+
 def _claims(source: str) -> tuple[tuple[str, int, int], int]:
     headers = re.findall(
-        r"Self-contained runnable payload \(v([^,]+), (\d+) tracked files, "
+        r"Self-contained runnable payload \(v([^,]+), (\d+) payload files, "
         r"(\d+) pytest cases\)", source)
     cells = re.findall(
         r"run the full pytest suite \((\d+) cases\)", source)
@@ -386,6 +690,11 @@ def check() -> None:
     if actual_digest != digest_matches[0]:
         raise SystemExit("notebook payload does not match its SHA-256 claim")
     if actual_raw != expected_raw:
+        if not _git_checkout_owns_root():
+            raise SystemExit(
+                "source distribution contains a stale or noncanonical "
+                "notebook payload; rebuild it from an owning Git checkout "
+                "after packing the notebook")
         raise SystemExit(
             "notebook payload is stale or noncanonical; run: "
             "python3 scripts/pack_notebook.py")
@@ -394,6 +703,11 @@ def check() -> None:
     actual = metadata(files, tests)
     claimed, cell_count = _claims(source)
     if claimed != actual or cell_count != tests:
+        if not _git_checkout_owns_root():
+            raise SystemExit(
+                "source distribution contains stale notebook metadata; "
+                "rebuild it from an owning Git checkout after packing the "
+                "notebook")
         raise SystemExit(
             "notebook displayed metadata is stale: "
             f"claims {claimed} / cell cases {cell_count}, tree is {actual}; "
@@ -405,6 +719,10 @@ def check() -> None:
 
 
 def pack() -> None:
+    if not _git_checkout_owns_root():
+        raise SystemExit(
+            "notebook generation requires the owning Git checkout; a source "
+            "distribution supports --check only")
     files = collect()
     test_count = verify(files)
     raw = payload_bytes(files)
@@ -462,7 +780,7 @@ def pack() -> None:
             source, count = re.subn(
                 r"Self-contained runnable payload \([^)]*\)",
                 f"Self-contained runnable payload (v{version}, "
-                f"{file_count} tracked files, {expected_tests} pytest cases)",
+                f"{file_count} payload files, {expected_tests} pytest cases)",
                 source)
             hits["header"] += count
         cell["source"] = source.splitlines(keepends=True)

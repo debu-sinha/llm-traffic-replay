@@ -52,6 +52,203 @@ def test_a_single_number_becomes_a_p50_and_a_p95():
     assert p["p95"] > p["p50"]
 
 
+def test_preflight_refusal_seals_every_paid_setup_row(tmp_path, monkeypatch):
+    from traffic_replay.run_verification import verify_run_output
+
+    rows = [{
+        "phase": "preflight",
+        "request_id": f"preflight-{index}",
+        "request_attempts": 1,
+        "connection_attempts": 1,
+        "status": 503,
+        "ok": False,
+        "first_send_unix": 1_800_000_000.0 + index,
+        "t_send_unix": 1_800_000_000.0 + index,
+        "finished_unix": 1_800_000_000.5 + index,
+        "error": "fixture unavailable",
+    } for index in range(2)]
+
+    def refusing_preflight(_cfg, *, representative_plans=None,
+                           runtime_quota_guard=None, row_sink=None):
+        assert len(representative_plans) == 2
+        assert runtime_quota_guard is None
+        for row in rows:
+            row_sink(row)
+        return {
+            "attempted": 2,
+            "reachable": 0,
+            "readable": 0,
+            "error": "fixture unavailable",
+            "_request_rows": rows,
+            "transport": {"fixture": True},
+        }
+
+    monkeypatch.setattr(
+        "traffic_replay.cli._preflight", refusing_preflight)
+    out_dir = tmp_path / "benchmark"
+
+    code = main([
+        "benchmark", "--host", "https://example.invalid",
+        "--endpoint", "my-ep", "--fixed-rate", "2",
+        "--duration", "2", "--input-tokens", "10,20",
+        "--output-tokens", "5,10", "--out-dir", str(out_dir),
+    ])
+
+    assert code == 2
+    setup_runs = sorted((tmp_path / "benchmark-setup-traffic").iterdir())
+    assert len(setup_runs) == 1
+    setup = setup_runs[0]
+    assert (setup / ".traffic-replay-complete").is_file()
+    assert not (setup / ".traffic-replay-writing").exists()
+    persisted = [json.loads(line) for line in
+                 (setup / "requests.jsonl").read_text().splitlines()]
+    assert persisted == rows
+    summary = json.loads((setup / "summary.json").read_text())
+    gate = {
+        "skipped": False,
+        "attempted": 2,
+        "reachable": 0,
+        "readable": 0,
+        "reasoning_probe_requests": 0,
+        "outcome": "preflight_refused",
+        "force_requested": False,
+        "gate_satisfied": False,
+    }
+    assert summary["setup_traffic"] == {
+        "artifact_kind": "command_setup_traffic",
+        "outcome": "preflight_refused",
+        "exit_code": 2,
+        "request_rows": 2,
+        "preflight_gate": gate,
+        "performance_result": False,
+        "sla_result": False,
+        "capacity_result": False,
+        "note": (
+            "these rows are attached once to the measured run's complete "
+            "request population when the command proceeds past the setup "
+            "gate, including an explicitly forced diagnostic run"),
+    }
+    assert summary["run"]["preflight_gate"] == gate
+    assert json.loads((setup / "start.json").read_text())[
+        "preflight_gate"] == gate
+    verified = verify_run_output(setup)
+    assert verified["decision"]["evidence_integrity"]["code"] == "VERIFIED"
+    assert verified["decision"]["endpoint_capacity"]["code"] == \
+        "NOT_EVALUATED"
+
+
+def test_forced_unreadable_preflight_is_never_labeled_passed_and_reaches_run(
+        tmp_path, monkeypatch):
+    from traffic_replay.run_verification import verify_run_output
+
+    rows = [{
+        "phase": "preflight",
+        "request_id": f"forced-preflight-{index}",
+        "request_attempts": 1,
+        "connection_attempts": 1,
+        "retries": 0,
+        "retry_reasons": [],
+        "status": 200,
+        "ok": True,
+        "first_attempt_unix": 1_800_000_000.0 + index,
+        "first_send_unix": 1_800_000_000.1 + index,
+        "t_send_unix": 1_800_000_000.1 + index,
+        "finished_unix": 1_800_000_000.5 + index,
+        "stream_complete": True,
+        "visible_content_seen": False,
+        "reasoning_seen": True,
+        "valid_tool_calls": 0,
+        "refusal_seen": False,
+        "parse_errors": 0,
+    } for index in range(2)]
+
+    def unreadable_preflight(_cfg, *, representative_plans=None,
+                             runtime_quota_guard=None, row_sink=None):
+        assert len(representative_plans) == 2
+        for row in rows:
+            row_sink(row)
+        return {
+            "attempted": 2, "reachable": 2, "readable": 0,
+            "usage_reported": True, "cache_reported": True,
+            "reasoning": True, "budgets": [5, 10], "budget": 10,
+            "failed_probe_index": 1, "_request_rows": rows,
+            "transport": {"fixture": True},
+        }
+
+    runner_calls = []
+
+    def fake_run(rc, quiet=False, *, prior_request_rows=None,
+                 preflight_gate=None, runtime_quota_guard=None):
+        runner_calls.append({
+            "rows": list(prior_request_rows or []),
+            "gate": preflight_gate,
+        })
+        return {"out_dir": rc.out_dir, "summary": {}}
+
+    monkeypatch.setattr("traffic_replay.cli._preflight", unreadable_preflight)
+    monkeypatch.setattr("traffic_replay.runner.run", fake_run)
+    monkeypatch.setattr("traffic_replay.cli._finish", lambda *_args: 0)
+    out_dir = tmp_path / "forced-benchmark"
+
+    code = main([
+        "benchmark", "--host", "https://example.invalid",
+        "--endpoint", "my-ep", "--fixed-rate", "2", "--duration", "2",
+        "--input-tokens", "10,20", "--output-tokens", "5,10",
+        "--out-dir", str(out_dir), "--force",
+    ])
+
+    assert code == 0
+    assert len(runner_calls) == 1
+    gate = runner_calls[0]["gate"]
+    assert gate == {
+        "skipped": False,
+        "attempted": 2,
+        "reachable": 2,
+        "readable": 0,
+        "reasoning_probe_requests": 0,
+        "outcome": "preflight_forced_unreadable",
+        "force_requested": True,
+        "gate_satisfied": False,
+    }
+    assert runner_calls[0]["rows"] == rows
+    setup = next((tmp_path / "forced-benchmark-setup-traffic").iterdir())
+    summary = json.loads((setup / "summary.json").read_text())
+    assert summary["setup_traffic"]["outcome"] == \
+        "preflight_forced_unreadable"
+    assert summary["setup_traffic"]["preflight_gate"] == gate
+    assert "preflight_passed" not in (setup / "summary.json").read_text()
+    verified = verify_run_output(setup)
+    assert verified["decision"]["measurement_validity"]["code"] == "INVALID"
+    assert "FORCED_UNREADABLE_PREFLIGHT" in verified["decision"][
+        "measurement_validity"]["reason_codes"]
+
+
+@pytest.mark.parametrize("gate", [
+    {
+        "skipped": False, "attempted": 2, "reachable": 2, "readable": 0,
+        "reasoning_probe_requests": 0, "outcome": "preflight_passed",
+        "force_requested": True, "gate_satisfied": True,
+    },
+    {
+        "skipped": False, "attempted": 2, "reachable": 1, "readable": 0,
+        "reasoning_probe_requests": 0,
+        "outcome": "preflight_forced_unreadable",
+        "force_requested": True, "gate_satisfied": False,
+    },
+    {
+        "skipped": False, "attempted": 2, "reachable": 1, "readable": 0,
+        "reasoning_probe_requests": 0, "outcome": "preflight_forced_failed",
+        "force_requested": True, "gate_satisfied": False,
+    },
+])
+def test_runner_refuses_false_or_transport_failed_forced_preflight_gate(gate):
+    from traffic_replay.runner import _validated_preflight_gate
+
+    rows = [{"phase": "preflight"}, {"phase": "preflight"}]
+    with pytest.raises(ValueError, match="does not authorize"):
+        _validated_preflight_gate(gate, rows)
+
+
 def test_two_numbers_are_taken_as_given():
     assert _pair("10000,24000", "input-tokens") == {"p50": 10000, "p95": 24000}
 

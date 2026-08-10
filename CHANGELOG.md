@@ -24,6 +24,12 @@ code, workload, request, schedule, and timing definitions.
   dated source freshness and conservatively budgets preflight, probes,
   calibration, replay, retries, input-token targets, and offered output-token
   reservations before inference begins.
+- Add a command-scoped, non-waiting runtime quota guard for every physical
+  inference `POST`, including preflight, probes, compatibility/auth fallbacks,
+  transport retries, replay, and all sweep rungs. It enforces strict rolling
+  warning budgets plus exact serialized request-byte ceilings, permanently
+  trips on denial or accounting uncertainty, statically partitions shard
+  budgets, and persists per-attempt admission transitions for reconciliation.
 - Bind a passing plan to live serving-endpoint metadata, including the direct
   route, `route_optimized=false`, exact endpoint and served-entity names, and
   positive `system.ai.<model>` foundation-model identity for every active
@@ -32,14 +38,20 @@ code, workload, request, schedule, and timing definitions.
   Workspace tier and unrelated workspace traffic remain outside the tool's
   independent knowledge, so a pass is not provider-headroom proof.
 - Bound planned input demand at one token per UTF-8 byte of the complete
-  serialized request JSON plus 64 framing tokens per message and per request,
-  including roles, message metadata, model, tools, provider controls, and JSON
-  syntax. Synthetic workloads use the larger of configured characters/token
+  serialized request JSON plus harness-defined conservative 64-token allowances
+  per message and per request; these allowances are engineering assumptions,
+  not a provider tokenizer contract. Include roles, message metadata, model,
+  tools, provider controls, and JSON syntax. Synthetic workloads use the larger
+  of configured characters/token
   and the calibration hard ceiling of 12; prompt mode is bounded from its
   exact frozen messages.
 - Preserve preflight and explicit probe outcomes as content-free request rows
   in the sealed run journal, with their physical attempts included in quota
   evidence.
+- Claim and fsync a separate setup-traffic artifact before CLI preflight/probe
+  inference. Seal normal pass/refusal evidence as an explicit non-performance,
+  non-SLA, non-capacity result; leave crashes incomplete, and attach passing
+  metadata-only rows once to the measured artifact's complete quota population.
 
 ### Auditable decisions and artifacts
 
@@ -56,12 +68,35 @@ code, workload, request, schedule, and timing definitions.
 - Qualify run comparisons when endpoint identity, HTTP-status coverage,
   request-journal coverage, or replay coverage is missing; invalid comparisons
   do not present directional deltas as conclusions.
+- Bind clean wheel and source-distribution builds to provenance schema v2,
+  covering every shipped package Python file and instrument-owned JSON input.
+  Git-less installs reject missing, dirty, malformed, or source-mismatched
+  provenance; the deterministic build ID is an integrity checksum, not a
+  signature or trusted-time assertion.
+- Generate the self-contained Databricks diagnostic notebook from a clean
+  tracked source inventory and make it verify its payload, source provenance,
+  and exact collected test count before endpoint access. Generate the
+  five-page customer field-guide PDF from clean HTML with visible source
+  commit/hash stamps, semantic page checks, and a hash sidecar. Neither
+  derivative is benchmark evidence.
 
 ### Measurement and reporting correctness
 
 - Separate final-attempt request-path clocks from exact caller-experienced
   clocks, retain HTTP status by execution phase, and keep intended cache reuse
   distinct from endpoint-reported cached tokens.
+- Capture bounded response model/object/fingerprint identity and hashed response
+  IDs. Conflicting stream identity is a protocol error; mixed or unexpected
+  response models invalidate a single-model benchmark, while fingerprint
+  rotation remains context.
+- Re-read and normalize serving-endpoint metadata only after response drain and
+  compare it with the normalized pre-run summary. Changed summarized metadata
+  invalidates a single-configuration benchmark; incomplete capture remains
+  explicit uncertainty.
+- Define interchunk latency exactly as the widest gap between successive
+  visible/reasoning/refusal-bearing SSE events, excluding heartbeats,
+  usage-only events, and tool-call-only fragments. Stability windows now use
+  the headline acceptable-outcome population and retain failures separately.
 - Prefer the accurately named `--cache-fraction` flag for reusable-prefix token
   share; retain `--cache-hit-rate` only as a compatibility alias, never as a
   request-level hit-probability claim.
@@ -83,6 +118,10 @@ code, workload, request, schedule, and timing definitions.
 - Replace the report and comparison layouts with responsive, print-aware HTML
   views that surface evidence limitations and decision blockers before
   latency tables.
+- Record the built-in fresh-HTTP/1.1-per-physical-attempt transport as a closed
+  machine contract. Capacity is inconclusive unless an operator explicitly
+  declares that exact production connection policy; the report preserves that
+  declaration as an assertion rather than claiming production observation.
 
 ### Databricks GLM 5.2 reference data
 
@@ -90,10 +129,24 @@ code, workload, request, schedule, and timing definitions.
   pay-per-token quota snapshot sourced from the live Databricks limits page.
   These inputs do not certify customer demand, endpoint capacity, latency,
   throughput, or provider quota headroom.
-- Document the provider boundary for thinking controls: Z.ai documents
-  thinking-off controls for its GLM-5.2 API, while current Databricks managed
-  endpoint documentation describes `databricks-glm-5-2` as reasoning-only and
-  does not publish accepted GLM-specific off values.
+- Include the current Foundation Model API workspace ceilings of 200 QPS and
+  4 MB/request in the dated snapshot. Because the source does not state a
+  decimal/binary MB convention, enforce a conservative 4,000,000 serialized
+  request bytes and require a live pre-run recheck.
+- Relabel the bundled blended and validation profiles and the provisioned
+  template as unverified illustrative inputs. The provisioned template has
+  client bounds but no built-in provider-capacity or quota guard. Make the
+  bundled smoke, provisioned, and prompts templates score visible answer onset
+  explicitly rather than inheriting reasoning-inclusive `first_content`.
+- Record the owner-confirmed managed Databricks GLM 5.2 request contract:
+  top-level `{"reasoning_effort":"none"}` disables reasoning, while omission
+  selects maximum reasoning. The public Databricks guide classifies the model
+  as reasoning-only and names the field but does not enumerate GLM-specific
+  accepted values. Keep this managed control distinct from direct SGLang's
+  nested `{"chat_template_kwargs":{"enable_thinking":false}}` switch and
+  Z.ai's hosted API request shape. The managed field applies on Unity AI
+  Gateway and direct endpoint requests, but production qualification remains
+  direct-only until Gateway routing, identity, and combined quotas are bound.
 
 ## 0.5.1 - 2026-08-07
 

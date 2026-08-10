@@ -47,9 +47,22 @@ def test_large_negative_clock_error_cannot_pass_a_signed_percentile_check():
 def test_tool_call_only_response_is_a_valid_completed_agent_answer():
     result = SimpleNamespace(
         stream_complete=True, parse_errors=0, visible_content_seen=False,
-        valid_tool_calls=1)
+        valid_tool_calls=1, refusal_seen=False)
     assert _answer_is_complete(result)
     result.valid_tool_calls = 0
+    assert not _answer_is_complete(result)
+
+
+@pytest.mark.parametrize("visible,valid_tool_calls", [(True, 0), (False, 1)])
+def test_refusal_is_never_a_completed_answer_even_with_usable_output(
+        visible, valid_tool_calls):
+    result = SimpleNamespace(
+        stream_complete=True, parse_errors=0,
+        visible_content_seen=visible,
+        valid_tool_calls=valid_tool_calls,
+        refusal_seen=True,
+    )
+
     assert not _answer_is_complete(result)
 
 

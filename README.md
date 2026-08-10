@@ -665,7 +665,7 @@ This file is an arrival-only distribution. It cannot carry prompt, request ID,
 conversation, tool, or workflow fields; additional JSON keys fail closed
 because sorting would otherwise detach them from line order. Prompts are
 assigned to the resulting chronological schedule independently. Use a future
-traffic-pack/request-manifest adapter—not `timestamps_file`—when timestamp and
+traffic-pack/request-manifest adapter - not `timestamps_file` - when timestamp and
 request-envelope pairing must be preserved.
 
 Without a trace, the scheduler generates a seeded two-state modulated Poisson

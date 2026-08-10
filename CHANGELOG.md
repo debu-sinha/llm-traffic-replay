@@ -80,8 +80,8 @@ code, workload, request, schedule, and timing definitions.
   captured traffic counts, and all five canonical decision codes.
 - Embed a report field glossary in both HTML and Markdown. Define calibration
   explicitly as real paid unloaded traffic used only for synthetic
-  characters-per-token estimation—not warm-up exclusion, quality, latency,
-  capacity, or quota-reservation evidence—and add a complete output data
+  characters-per-token estimation - not warm-up exclusion, quality, latency,
+  capacity, or quota-reservation evidence - and add a complete output data
   dictionary for summaries, request rows, manifests, and receipts.
 
 ## 0.6.0 - 2026-08-08

@@ -308,8 +308,8 @@ def test_reasoning_probe_effect_is_only_known_for_request_rejection():
 
     markdown = render_markdown(summary, "rejected probe")
     html = render_html(summary, "rejected probe")
-    assert "not applied — request rejected" in markdown
-    assert "not applied — request rejected" in html
+    assert "not applied - request rejected" in markdown
+    assert "not applied - request rejected" in html
 
 
 def test_reasoning_probe_report_withholds_unsupported_effect_claim():

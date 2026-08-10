@@ -4372,10 +4372,10 @@ def _reasoning_control_probe_display(summary: dict) -> list[dict]:
         if disposition == "rejected" \
                 and effective_status == "not_applied_request_rejected" \
                 and effective_value is None:
-            effective_behavior = "not applied — request rejected"
+            effective_behavior = "not applied - request rejected"
         else:
             effective_behavior = (
-                "unknown — this probe does not establish that the provider "
+                "unknown - this probe does not establish that the provider "
                 "applied the requested control or changed model behavior")
             if effective_status != "unknown" or effective_value is not None:
                 faults.append("unsupported effective-behavior claim withheld")
@@ -4660,7 +4660,7 @@ def render_markdown(summary: dict, title: str, *,
         "## Field glossary (how to read every displayed value)",
         "",
         "Every displayed field uses the definitions below. Missing, unknown, "
-        "and null are evidence states—not zeros.",
+        "and null are evidence states - not zeros.",
         "",
         *[f"- **{name}:** {definition}"
           for name, definition in _REPORT_FIELD_GLOSSARY],
@@ -7615,7 +7615,7 @@ def render_html(summary: dict, title: str, *,
         "<h2 id='field-glossary-heading'>Field glossary: how to read every "
         "displayed value</h2>"
         "<div class='banner warn'>Missing, unknown, NOT REPORTED, and null "
-        "are evidence states—not zeros and not successes.</div>"
+        "are evidence states - not zeros and not successes.</div>"
         "<dl>" + "".join(
             f"<dt><b>{esc(name)}</b></dt><dd>{esc(definition)}</dd>"
             for name, definition in _REPORT_FIELD_GLOSSARY) + "</dl></section>")

@@ -914,20 +914,20 @@ Even a clean, externally verified run does not by itself prove:
 
 Provider sources, rechecked 2026-08-10:
 
-- [Databricks-hosted foundation models](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/supported-models) — current endpoint name, text input, context, architecture, and intended workload description.
-- [July 2026 release notes](https://docs.databricks.com/aws/en/release-notes/product/2026/july) — dated announcement of GLM 5.2 as a Databricks-hosted Foundation Model API model.
-- [Foundation Model APIs limits and quotas](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits) — current dated P2T and workspace limit facts and provider admission accounting.
-- [Supported foundation models on Model Serving](https://docs.databricks.com/aws/en/machine-learning/model-serving/foundation-model-overview) — current regional P2T matrix, the `⥂` availability qualifier, and provisioned-throughput architecture list.
-- [Query reasoning models](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models) — public GLM reasoning classification and `reasoning_effort` field; it does not enumerate the GLM-specific `none` behavior separately confirmed by serving engineering.
-- [Foundation Model API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference) — Chat Completions request, streaming and non-streaming response forms, usage fields, and model-varying parameter caveats.
-- [Function calling on Databricks](https://docs.databricks.com/aws/en/machine-learning/model-serving/function-calling) — current GLM P2T support and Public Preview function/schema limitations.
-- [Query a model with the Open Responses API](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-open-responses-models) — generic Open Responses availability and per-model feature boundary; this release does not implement that wire contract.
-- [Priority pay-per-token](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/priority-mode) — current supported-model list, which does not list GLM 5.2.
-- [Query model APIs](https://docs.databricks.com/aws/en/ai-gateway/query-model-services) — Unity AI Gateway model-service and API routes.
-- [Govern model APIs](https://docs.databricks.com/aws/en/ai-gateway/model-services) — model-service destination routing and fallback behavior that limits Gateway capacity claims here.
-- [Track model usage](https://docs.databricks.com/aws/en/ai-gateway/usage-tracking) — Gateway system-table token-detail and cache-hit telemetry; it is not a direct GLM response-field guarantee.
-- [Databricks CLI authentication commands](https://docs.databricks.com/aws/en/dev-tools/cli/reference/auth-commands) — CLI user-to-machine token behavior.
-- [Route-optimized serving authentication](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-route-optimization) — separate scoped-authentication boundary not implemented by this resolver.
+- [Databricks-hosted foundation models](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/supported-models) - current endpoint name, text input, context, architecture, and intended workload description.
+- [July 2026 release notes](https://docs.databricks.com/aws/en/release-notes/product/2026/july) - dated announcement of GLM 5.2 as a Databricks-hosted Foundation Model API model.
+- [Foundation Model APIs limits and quotas](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits) - current dated P2T and workspace limit facts and provider admission accounting.
+- [Supported foundation models on Model Serving](https://docs.databricks.com/aws/en/machine-learning/model-serving/foundation-model-overview) - current regional P2T matrix, the `⥂` availability qualifier, and provisioned-throughput architecture list.
+- [Query reasoning models](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models) - public GLM reasoning classification and `reasoning_effort` field; it does not enumerate the GLM-specific `none` behavior separately confirmed by serving engineering.
+- [Foundation Model API reference](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference) - Chat Completions request, streaming and non-streaming response forms, usage fields, and model-varying parameter caveats.
+- [Function calling on Databricks](https://docs.databricks.com/aws/en/machine-learning/model-serving/function-calling) - current GLM P2T support and Public Preview function/schema limitations.
+- [Query a model with the Open Responses API](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-open-responses-models) - generic Open Responses availability and per-model feature boundary; this release does not implement that wire contract.
+- [Priority pay-per-token](https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/priority-mode) - current supported-model list, which does not list GLM 5.2.
+- [Query model APIs](https://docs.databricks.com/aws/en/ai-gateway/query-model-services) - Unity AI Gateway model-service and API routes.
+- [Govern model APIs](https://docs.databricks.com/aws/en/ai-gateway/model-services) - model-service destination routing and fallback behavior that limits Gateway capacity claims here.
+- [Track model usage](https://docs.databricks.com/aws/en/ai-gateway/usage-tracking) - Gateway system-table token-detail and cache-hit telemetry; it is not a direct GLM response-field guarantee.
+- [Databricks CLI authentication commands](https://docs.databricks.com/aws/en/dev-tools/cli/reference/auth-commands) - CLI user-to-machine token behavior.
+- [Route-optimized serving authentication](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-route-optimization) - separate scoped-authentication boundary not implemented by this resolver.
 
 The managed `reasoning_effort:none` behavior and omitted maximum-reasoning
 default are engagement-specific serving-engineering confirmations. The

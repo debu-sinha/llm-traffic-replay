@@ -269,6 +269,24 @@ def _payload_source_commit(paths: list[str]) -> str:
             raise SystemExit("sdist notebook source commit is invalid")
         return commit
 
+    history = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"], cwd=ROOT,
+        capture_output=True, check=False)
+    if history.returncode != 0:
+        detail = history.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(
+            f"git could not establish repository history depth: {detail}")
+    try:
+        shallow = history.stdout.decode("ascii").strip()
+    except UnicodeError as exc:
+        raise SystemExit("Git history depth was not ASCII") from exc
+    if shallow == "true":
+        raise SystemExit(
+            "notebook packing requires complete Git history; fetch the full "
+            "history (GitHub Actions: actions/checkout with fetch-depth: 0)")
+    if shallow != "false":
+        raise SystemExit("Git returned an invalid repository history depth")
+
     status = subprocess.run(
         ["git", "status", "--porcelain=v1", "--untracked-files=all"],
         cwd=ROOT, capture_output=True, check=False)

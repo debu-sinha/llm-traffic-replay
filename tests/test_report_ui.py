@@ -97,6 +97,35 @@ def test_first_screen_model_keeps_quota_sla_and_capacity_independent():
         "Final-attempt request-path latency")
 
 
+def test_customer_takeaway_leads_with_caller_latency_and_plain_caveats():
+    summary = _summary()
+    body = render_html(summary, "customer report")
+    markdown = render_markdown(summary, "customer report")
+
+    takeaway = body.index("Customer takeaway")
+    decision = body.index("Decision summary")
+    request_path = body.index("Final-attempt request-path latency")
+    assert takeaway < decision < request_path
+    assert "User-perceived latency from scheduled request time" in body
+    assert "Caller TTFT" in body
+    assert "Caller end-to-end" in body
+    assert "Answer quality:</b> not evaluated" in body
+    assert "do not establish correctness, task success, or usefulness" in body
+    assert "natural completion behavior was not measured" in body
+    assert "synthetic workload shape" in body
+    assert "does not establish an endpoint ceiling, quota headroom" in body
+    assert "calibration request row(s) were sent outside the measured replay" \
+        in body
+    assert "Calibration estimates characters per token" in body
+    assert "integrity says whether the recorded artifact bytes verify" in body
+    assert markdown.index("## Customer takeaway") < markdown.index(
+        "## Decision states")
+    assert "user-perceived latency from scheduled request time" in markdown
+    assert "Answer quality:** not evaluated" in markdown
+    assert "integrity says whether the recorded artifact bytes verify" \
+        in markdown
+
+
 def test_report_shell_is_self_contained_responsive_semantic_and_printable():
     body = render_html(_summary(), "responsive report")
 

@@ -23,6 +23,7 @@ include scripts/profile_from_logs.py
 include notebooks/smoke_test_e2e_demo.ipynb
 
 include docs/ARCHITECTURE.md
+include docs/OUTPUT_FIELD_REFERENCE.md
 include docs/PRODUCTION_TESTING.md
 include docs/RUN_YOUR_OWN_BENCHMARK.md
 include docs/customer/benchmark-your-own-endpoint.html

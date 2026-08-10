@@ -1,5 +1,14 @@
 # Changelog
 
+## Guided customer configuration
+
+- Add interactive and noninteractive `init-config` setup for common
+  Databricks/OpenAI telemetry exports, custom column mappings, customer-owned
+  SLA files, exact schedules, and referenced run configs.
+- Add zero-traffic `check-config` validation with plain-language workload,
+  SLA, request-count, token, cost, dropped-row, modeling, and assumption
+  output.
+
 This file records behavior changes. It does not certify benchmark numbers from
 older artifacts. Compare only sealed runs whose manifests prove compatible
 code, workload, request, schedule, and timing definitions.

@@ -101,12 +101,11 @@ def _finish(out, fail_on: str = "miss", fmt: str = "text") -> int:
 
 
 def cmd_run(args) -> int:
-    from .json_input import loads_strict
     from .quota_planner import QuotaPlanError
     from .runner import RunConfig, run
-    cfg = loads_strict(Path(args.config).read_text())
-    if not isinstance(cfg, dict):
-        raise ValueError("run config JSON must be an object")
+    cfg, precedence = _load_run_config_with_sla(Path(args.config))
+    if precedence:
+        print(precedence, file=sys.stderr)
     if cfg.get("concurrency") is not None and cfg.get("sizing_concurrency") is None:
         print("warning: config field 'concurrency' is legacy; it is treated as "
               "'sizing_concurrency', which derives a fixed open-loop rate and "
@@ -126,6 +125,35 @@ def cmd_run(args) -> int:
         return 3
     return _finish(out, getattr(args, "fail_on", "miss"),
                    getattr(args, "format", "text"))
+
+
+def _load_run_config_with_sla(path: Path) -> tuple[dict, str | None]:
+    """Load a run config and resolve its separately owned SLA document."""
+    from .config_validation import validate_acceptance_targets
+    from .json_input import loads_strict
+
+    cfg = loads_strict(path.read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError("run config JSON must be an object")
+    cfg = dict(cfg)
+    sla_path = cfg.pop("customer_sla_path", None)
+    if sla_path is None:
+        return cfg, None
+    if not isinstance(sla_path, str) or not sla_path.strip():
+        raise ValueError("customer_sla_path must be a non-empty string")
+    resolved = Path(sla_path)
+    if not resolved.is_absolute():
+        resolved = path.parent / resolved
+    sla = loads_strict(resolved.read_text(encoding="utf-8"))
+    validate_acceptance_targets(sla, "customer SLA")
+    if "acceptance_targets" in cfg:
+        validate_acceptance_targets(
+            cfg["acceptance_targets"], "inline acceptance_targets")
+        return cfg, (
+            "SLA precedence: inline acceptance_targets override "
+            f"customer_sla_path {resolved}")
+    cfg["acceptance_targets"] = sla
+    return cfg, f"SLA source: {resolved} (no inline override)"
 
 
 def _validation_error_stats(values) -> dict:
@@ -3051,6 +3079,281 @@ def cmd_init_databricks(args) -> int:
     return 0
 
 
+_TELEMETRY_FIELD_PRESETS = {
+    "databricks": {
+        "input": "input_token_count", "output": "output_token_count",
+        "cached": "input_cached_tokens",
+    },
+    "openai": {
+        "input": "prompt_tokens", "output": "completion_tokens",
+        "cached": "cached_tokens",
+    },
+}
+
+
+def _guided_value(args, name: str, prompt: str, *, cast=str):
+    value = getattr(args, name)
+    if value is not None:
+        return value
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            f"init-config requires --{name.replace('_', '-')} in "
+            "noninteractive mode")
+    try:
+        raw = input(prompt).strip()
+        return cast(raw)
+    except (EOFError, ValueError) as exc:
+        raise SystemExit(f"invalid value for {prompt.rstrip()}") from exc
+
+
+def _write_json_file(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8")
+
+
+def cmd_init_config(args) -> int:
+    """Create separately owned workload, SLA, schedule, and run files."""
+    import subprocess
+
+    source = Path(_guided_value(
+        args, "telemetry", "Telemetry CSV or JSONL path: "))
+    provider = _guided_value(
+        args, "provider", "Telemetry provider (databricks/openai/custom): ")
+    if provider not in {"databricks", "openai", "custom"}:
+        raise SystemExit("--provider must be databricks, openai, or custom")
+    preset = _TELEMETRY_FIELD_PRESETS.get(provider, {})
+
+    def column(name: str, label: str) -> str:
+        explicit = getattr(args, name)
+        if explicit:
+            return explicit
+        if preset.get(label):
+            return preset[label]
+        return _guided_value(args, name, f"Column for {label} tokens: ")
+
+    input_field = column("input_field", "input")
+    output_field = column("output_field", "output")
+    cached_field = column("cached_field", "cached")
+    profile_name = _guided_value(args, "name", "Workload name: ")
+    start_ms = float(_guided_value(
+        args, "response_start_ms",
+        "95% of responses must start within how many milliseconds? ",
+        cast=float))
+    finish_ms = float(_guided_value(
+        args, "response_finish_ms",
+        "95% of responses must finish within how many milliseconds? ",
+        cast=float))
+    success_percent = float(_guided_value(
+        args, "success_percent",
+        "What percentage of requests must succeed (less than 100)? ",
+        cast=float))
+    abandon_start_ms = float(_guided_value(
+        args, "abandon_start_ms",
+        "Abandon a request if no response starts after how many ms? ",
+        cast=float))
+    abandon_finish_ms = float(_guided_value(
+        args, "abandon_finish_ms",
+        "Abandon a request if it has not finished after how many ms? ",
+        cast=float))
+    sla_source = _guided_value(
+        args, "sla_source",
+        "Plain-language SLA source (for example, Customer contract dated "
+        "2026-08-10): ")
+    host = _guided_value(args, "host", "Workspace base URL: ")
+    endpoint = _guided_value(args, "endpoint", "Serving endpoint name: ")
+    request_count = int(_guided_value(
+        args, "requests", "Number of measured requests: ", cast=int))
+    duration = int(_guided_value(
+        args, "duration", "Load-window duration in seconds: ", cast=int))
+    if not (0 < success_percent < 100):
+        raise SystemExit("--success-percent must be greater than 0 and less than 100")
+    if min(start_ms, finish_ms, abandon_start_ms, abandon_finish_ms) <= 0:
+        raise SystemExit("all response and abandonment times must be positive")
+    if abandon_start_ms < start_ms or abandon_finish_ms < finish_ms:
+        raise SystemExit(
+            "abandonment times must be at least their corresponding SLA times")
+    if request_count <= 0 or duration <= 0:
+        raise SystemExit("--requests and --duration must be positive")
+    if not str(sla_source).strip():
+        raise SystemExit("--sla-source must identify a customer-owned source")
+
+    out_dir = Path(args.out_dir).resolve()
+    profile_path = out_dir / "workload-profile.json"
+    sla_path = out_dir / "customer-sla.json"
+    schedule_path = out_dir / "workload-schedule.timestamps"
+    config_path = out_dir / "run-config.json"
+    existing = [path for path in (
+        profile_path, sla_path, schedule_path, config_path) if path.exists()]
+    if existing and not args.overwrite:
+        raise SystemExit(
+            "init-config refused to overwrite existing output(s): "
+            + ", ".join(str(path) for path in existing)
+            + "; pass --overwrite only after reviewing them")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, "-m", "scripts.profile_from_logs",
+        "--input", str(source),
+        "--name", str(profile_name), "--out", str(profile_path),
+        "--input-field", input_field, "--output-field", output_field,
+        "--cached-field", cached_field, "--mode", args.mode,
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=300)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "profile extraction failed").strip()
+        raise SystemExit(detail) from None
+    if completed.stderr.strip():
+        print(completed.stderr.strip())
+
+    percentile = args.sla_percentile
+    sla = {
+        "targets_are": str(sla_source),
+        "ttft_ms": {percentile: start_ms},
+        "ttfg_ms": {percentile: finish_ms},
+        "success_rate": success_percent / 100.0,
+        "hard_timeouts": {
+            "ttft_s": abandon_start_ms / 1000.0,
+            "ttfg_s": abandon_finish_ms / 1000.0,
+            "note": "Caller-owned abandonment limits from the guided setup.",
+        },
+        "priority": args.priority,
+        "note": (args.sla_note or
+                 "Generated from plain-language customer service expectations."),
+    }
+    if args.interchunk_ms is not None:
+        sla["interchunk_ms"] = args.interchunk_ms
+    from .config_validation import validate_acceptance_targets
+    validate_acceptance_targets(sla, "customer SLA")
+    _write_json_file(sla_path, sla)
+
+    timestamps = [((index + 0.5) * duration / request_count)
+                  for index in range(request_count)]
+    schedule_path.write_text(
+        "".join(f"{value:.9f}\n" for value in timestamps), encoding="utf-8")
+    endpoint_path = (endpoint if str(endpoint).startswith("/") else
+                     f"/serving-endpoints/{endpoint}/invocations")
+    endpoint_config = {
+        "base_url": str(host).rstrip("/"), "path": endpoint_path,
+        "adapter": args.endpoint_adapter, "temperature": 0.0,
+    }
+    if args.auth_profile:
+        endpoint_config["auth_profile"] = args.auth_profile
+    else:
+        endpoint_config["auth_token_env"] = args.token_env
+    run_config = {
+        "profile_path": str(profile_path),
+        "customer_sla_path": str(sla_path),
+        "endpoint": endpoint_config,
+        "timestamps_file": str(schedule_path),
+        "duration_s": duration,
+        "calibrate_n": args.calibrate_requests,
+        "max_concurrency": args.max_concurrency,
+        "max_pending_requests": args.max_pending_requests,
+        "ttft_definition": "first_visible",
+        "out_dir": str(out_dir / "results"),
+        "title": f"Customer-owned workload validation: {profile_name}",
+        "label": str(sla_source),
+    }
+    _write_json_file(config_path, run_config)
+    print(f"workload profile: {profile_path}")
+    print(f"customer SLA:     {sla_path}")
+    print(f"run config:       {config_path}")
+    print("SLA precedence: inline acceptance_targets override customer_sla_path; "
+          "this generated config has no inline override.")
+    return cmd_check_config(argparse.Namespace(config=str(config_path)))
+
+
+def cmd_check_config(args) -> int:
+    """Validate and explain one configuration without endpoint traffic."""
+    import numpy as np
+    from .profile import Profile, sample
+    from .runner import RunConfig, prevalidate_run_inputs
+
+    config_path = Path(args.config)
+    try:
+        cfg, precedence = _load_run_config_with_sla(config_path)
+        rc = RunConfig(**cfg)
+        prevalidated = prevalidate_run_inputs(rc)
+        profile = Profile.from_json(rc.profile_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"CONFIG INVALID: {exc}") from exc
+    replay_count = len((prevalidated.full_schedule or {}).get("timestamps", ()))
+    calibration_count = min(rc.calibrate_n, replay_count)
+    modeled = sample(profile, max(replay_count, 10_000), seed=rc.seed,
+                     max_output=rc.max_output_tokens_cap or 8_192)
+
+    def quantiles(values) -> str:
+        q = np.percentile(values, [50, 90, 95, 99])
+        return ", ".join(
+            f"p{name} {float(value):,.0f}"
+            for name, value in zip((50, 90, 95, 99), q))
+
+    targets = rc.acceptance_targets or {}
+    target_q = next(iter((targets.get("ttft_ms") or {"missing": None})))
+    start = (targets.get("ttft_ms") or {}).get(target_q)
+    finish = (targets.get("ttfg_ms") or {}).get(target_q)
+    success = targets.get("success_rate")
+    extraction = profile.extra.get("extraction") or {}
+    estimated_input = int(np.sum(modeled["input_tokens"][:replay_count]))
+    estimated_output = int(np.sum(modeled["output_tokens"][:replay_count]))
+    print("CONFIG VALID - ZERO ENDPOINT TRAFFIC SENT")
+    print(f"workload: prompt tokens {quantiles(modeled['input_tokens'])}")
+    print(f"workload: answer-token budgets {quantiles(modeled['output_tokens'])}")
+    print("cache meaning: reusable prompt-token share, not request cache-hit rate")
+    print("modeling: " + str((profile.sampling or {}).get(
+        "mode", "legacy independent quantile model")))
+    if extraction:
+        print("recovered rows: " + str(extraction.get("total_records", "unknown"))
+              + "; dropped input/output/cache: "
+              + "/".join(str(extraction.get(key, "unknown")) for key in (
+                  "dropped_input_records", "dropped_output_records",
+                  "dropped_cache_records")))
+    if start is not None and finish is not None and success is not None:
+        print(f"SLA: {target_q[1:]}% must show visible answer content within "
+              f"{start:g} ms and finish within {finish:g} ms; at least "
+              f"{100 * success:g}% must succeed")
+    else:
+        print("SLA INCOMPLETE: start, finish, or success target is missing")
+    hard = targets.get("hard_timeouts") or {}
+    print("abandonment: no visible answer after "
+          f"{hard.get('ttft_s', 'NOT SET')} s; unfinished after "
+          f"{hard.get('ttfg_s', 'NOT SET')} s")
+    print("SLA ownership: " + str(targets.get("targets_are") or "MISSING"))
+    print(precedence or "SLA source: inline acceptance_targets")
+    print(f"traffic plan: {replay_count} measured replay + "
+          f"{calibration_count} calibration + 0 preflight requests")
+    print(f"estimated replay tokens: {estimated_input:,} input + "
+          f"{estimated_output:,} output")
+    if rc.pricing:
+        pricing = rc.pricing
+        if pricing["mode"] == "per_token":
+            cached = int(np.sum(modeled["prefix_tokens"][:replay_count]))
+            uncached = max(0, estimated_input - cached)
+            dbu = (
+                uncached * pricing["input_dbu_per_m"] / 1_000_000
+                + cached * pricing.get(
+                    "cache_read_dbu_per_m", pricing["input_dbu_per_m"])
+                / 1_000_000
+                + estimated_output * pricing["output_dbu_per_m"] / 1_000_000)
+        else:
+            dbu = pricing["dbu_per_hour"] * rc.duration_s / 3600.0
+        print(f"estimated replay cost: {dbu:,.6f} DBU / "
+              f"${dbu * pricing['usd_per_dbu']:,.4f}; excludes setup, "
+              "calibration, retries, and unrelated traffic")
+    else:
+        print("COST NOT CALCULATED: no pricing was supplied")
+    illustrative = "illustrative" in " ".join(
+        str(value).lower() for value in (profile.label, profile.provenance,
+                                         targets.get("targets_are")))
+    print("remaining fields: " + (
+        "ILLUSTRATIVE values remain; replace them before acceptance use"
+        if illustrative else "no illustrative workload/SLA label detected"))
+    return 0
+
+
 def main(argv=None) -> int:
     from . import __version__
 
@@ -3387,6 +3690,65 @@ def main(argv=None) -> int:
     s.add_argument("--out-dir", default="results/databricks-starter",
                    help="result directory used by the starter config")
     s.set_defaults(fn=cmd_init_databricks)
+
+    s = sub.add_parser(
+        "init-config",
+        help="guided workload, customer SLA, schedule, and run setup")
+    s.add_argument("--telemetry", default=None,
+                   help="CSV or JSONL token telemetry export")
+    s.add_argument("--provider", choices=("databricks", "openai", "custom"),
+                   default=None, help="select common telemetry column names")
+    s.add_argument("--input-field", default=None,
+                   help="custom prompt/input-token column")
+    s.add_argument("--output-field", default=None,
+                   help="custom answer/output-token column")
+    s.add_argument("--cached-field", default=None,
+                   help="custom cached-prompt-token column")
+    s.add_argument("--mode", choices=("quantiles", "empirical-joint"),
+                   default="quantiles",
+                   help="quantiles models independent marginals; empirical-"
+                        "joint preserves complete observed combinations")
+    s.add_argument("--name", default=None, help="workload profile name")
+    s.add_argument("--response-start-ms", type=float, default=None,
+                   help="plain-language response-start target")
+    s.add_argument("--response-finish-ms", type=float, default=None,
+                   help="plain-language full-response target")
+    s.add_argument("--success-percent", type=float, default=None,
+                   help="required successful percentage, greater than 0 and "
+                        "less than 100")
+    s.add_argument("--abandon-start-ms", type=float, default=None,
+                   help="hard limit before visible answer content starts")
+    s.add_argument("--abandon-finish-ms", type=float, default=None,
+                   help="hard limit before the full response finishes")
+    s.add_argument("--sla-percentile", choices=("p50", "p90", "p95", "p99"),
+                   default="p95")
+    s.add_argument("--sla-source", default=None,
+                   help="required customer-owned source and date")
+    s.add_argument("--priority", default="customer acceptance requirements")
+    s.add_argument("--sla-note", default=None)
+    s.add_argument("--interchunk-ms", type=float, default=None)
+    s.add_argument("--host", default=None)
+    s.add_argument("--endpoint", default=None)
+    s.add_argument("--auth-profile", default=None)
+    s.add_argument("--token-env", default="DATABRICKS_TOKEN")
+    s.add_argument("--endpoint-adapter",
+                   default="openai.chat_completions.sse/v1")
+    s.add_argument("--requests", type=int, default=None)
+    s.add_argument("--duration", type=int, default=None)
+    s.add_argument("--calibrate-requests", type=_calibration_request_count_arg,
+                   default=12)
+    s.add_argument("--max-concurrency", type=int, default=256)
+    s.add_argument("--max-pending-requests", type=int, default=256)
+    s.add_argument("--out-dir", default="configs/customer-benchmark")
+    s.add_argument("--overwrite", action="store_true",
+                   help="replace the four named generated outputs")
+    s.set_defaults(fn=cmd_init_config)
+
+    s = sub.add_parser(
+        "check-config",
+        help="validate and explain a run config without endpoint traffic")
+    s.add_argument("--config", required=True)
+    s.set_defaults(fn=cmd_check_config)
 
     s = sub.add_parser("run", help="replay against a real endpoint")
     s.add_argument("--config", required=True)

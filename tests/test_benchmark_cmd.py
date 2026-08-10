@@ -46,6 +46,45 @@ def _immutable_files(out_dir: Path, section: str, filename: str) -> list[Path]:
     return sorted(root.glob(f"*/{filename}"))
 
 
+def _bind_preflight_fixture_rows(cfg, plans, rows):
+    """Make mocked HTTP rows carry the same exact evidence as production."""
+    from traffic_replay.client import EndpointConfig, serialize_request_body
+    from traffic_replay.runner import (
+        RunConfig, _attach_setup_request_binding, _payload_hash,
+    )
+
+    rc = RunConfig(**{key: value for key, value in cfg.items()
+                      if not key.startswith("_")})
+    ecfg = EndpointConfig(**rc.endpoint)
+    for position, (plan, row) in enumerate(
+            zip(plans, rows, strict=True), start=1):
+        row.update(
+            request_id=plan["request_id"],
+            global_index=plan["global_index"],
+            sample_index=plan["sample_index"],
+            prompt_index=plan["prompt_index"],
+            body_request_id=plan.get("body_request_id"),
+            max_tokens_requested=plan["max_output"],
+            request_body_sha256=_payload_hash(
+                ecfg, plan["messages"], plan["max_output"]),
+            physical_request_body_sha256s=[hashlib.sha256(
+                serialize_request_body(
+                    ecfg, plan["messages"], plan["max_output"],
+                    include_usage=ecfg.include_usage)).hexdigest()],
+            endpoint_adapter=ecfg.adapter,
+            response_mode="streaming",
+            first_attempt_unix=row.get("first_attempt_unix",
+                                       row["first_send_unix"] - 0.001),
+            retries=row.get("retries", 0),
+            retry_reasons=row.get("retry_reasons", []),
+        )
+        _attach_setup_request_binding(
+            row, endpoint=rc.endpoint,
+            max_output_tokens_cap=rc.max_output_tokens_cap,
+            plan=plan, phase="preflight", position=position)
+    return rows
+
+
 def test_a_single_number_becomes_a_p50_and_a_p95():
     p = _pair("10000", "input-tokens")
     assert p["p50"] == 10000
@@ -72,6 +111,7 @@ def test_preflight_refusal_seals_every_paid_setup_row(tmp_path, monkeypatch):
                            runtime_quota_guard=None, row_sink=None):
         assert len(representative_plans) == 2
         assert runtime_quota_guard is None
+        _bind_preflight_fixture_rows(_cfg, representative_plans, rows)
         for row in rows:
             row_sink(row)
         return {
@@ -104,16 +144,18 @@ def test_preflight_refusal_seals_every_paid_setup_row(tmp_path, monkeypatch):
                  (setup / "requests.jsonl").read_text().splitlines()]
     assert persisted == rows
     summary = json.loads((setup / "summary.json").read_text())
-    gate = {
-        "skipped": False,
-        "attempted": 2,
-        "reachable": 0,
-        "readable": 0,
-        "reasoning_probe_requests": 0,
-        "outcome": "preflight_refused",
-        "force_requested": False,
-        "gate_satisfied": False,
+    gate = summary["run"]["preflight_gate"]
+    assert {key: gate[key] for key in (
+        "skipped", "attempted", "reachable", "readable",
+        "reasoning_probe_requests", "outcome", "force_requested",
+        "gate_satisfied", "evidence_mode",
+    )} == {
+        "skipped": False, "attempted": 2, "reachable": 0,
+        "readable": 0, "reasoning_probe_requests": 0,
+        "outcome": "preflight_refused", "force_requested": False,
+        "gate_satisfied": False, "evidence_mode": "carried_setup_rows",
     }
+    assert len(gate["binding_sha256"]) == 64
     assert summary["setup_traffic"] == {
         "artifact_kind": "command_setup_traffic",
         "outcome": "preflight_refused",
@@ -135,6 +177,142 @@ def test_preflight_refusal_seals_every_paid_setup_row(tmp_path, monkeypatch):
     assert verified["decision"]["evidence_integrity"]["code"] == "VERIFIED"
     assert verified["decision"]["endpoint_capacity"]["code"] == \
         "NOT_EVALUATED"
+
+
+def test_reasoning_probe_evidence_survives_setup_seal_and_verification(
+        tmp_path, monkeypatch):
+    from traffic_replay.cli import _probe_evidence_envelope
+    from traffic_replay.run_verification import verify_run_output
+
+    preflight_rows = [{
+        "phase": "preflight",
+        "request_id": f"preflight-{index}",
+        "request_attempts": 1,
+        "connection_attempts": 1,
+        "retries": 0,
+        "retry_reasons": [],
+        "status": 200,
+        "ok": True,
+        "first_attempt_unix": 1_800_000_000.0 + index,
+        "first_send_unix": 1_800_000_000.1 + index,
+        "t_send_unix": 1_800_000_000.1 + index,
+        "finished_unix": 1_800_000_000.5 + index,
+        "stream_complete": True,
+        "visible_content_seen": False,
+        "reasoning_seen": True,
+        "valid_tool_calls": 0,
+        "refusal_seen": False,
+        "parse_errors": 0,
+    } for index in range(2)]
+
+    def unreadable_preflight(_cfg, *, representative_plans=None,
+                             runtime_quota_guard=None, row_sink=None):
+        _bind_preflight_fixture_rows(
+            _cfg, representative_plans, preflight_rows)
+        for row in preflight_rows:
+            row_sink(row)
+        return {
+            "attempted": 2, "reachable": 2, "readable": 0,
+            "usage_reported": True, "cache_reported": True,
+            "reasoning": True, "budgets": [5, 10], "budget": 10,
+            "failed_probe_index": 1, "_request_rows": preflight_rows,
+            "transport": {"fixture": True},
+        }
+
+    candidate = {"reasoning_effort": "none"}
+    probe_row = {
+        "phase": "probe", "request_id": "probe-01-fixture",
+        "request_attempts": 1, "connection_attempts": 1,
+        "retries": 0, "retry_reasons": [],
+        "status": 200, "ok": True,
+        "first_attempt_unix": 1_800_000_003.0,
+        "first_send_unix": 1_800_000_003.1,
+        "t_send_unix": 1_800_000_003.1,
+        "finished_unix": 1_800_000_003.5,
+        "stream_complete": True, "visible_content_seen": True,
+        "reasoning_seen": False, "valid_tool_calls": 0,
+        "refusal_seen": False, "parse_errors": 0,
+        "request_body_sha256": "a" * 64,
+        "physical_request_body_sha256s": ["b" * 64],
+    }
+    envelope = None
+
+    def probe(_cfg, budget, candidates, probe_index, *,
+              representative_plans=None, runtime_quota_guard=None,
+              row_sink=None):
+        nonlocal envelope
+        from traffic_replay.client import EndpointConfig, serialize_request_body
+        from traffic_replay.runner import (
+            RunConfig, _attach_setup_request_binding, _payload_hash,
+            _stable_request_id,
+        )
+        assert candidates == [candidate]
+        rc = RunConfig(**_cfg)
+        plan = representative_plans[probe_index]
+        ec = dict(rc.endpoint)
+        ec["extra_body"] = {**(ec.get("extra_body") or {}), **candidate}
+        ecfg = EndpointConfig(**ec)
+        probe_row.update(
+            request_id=_stable_request_id(
+                plan["execution_scope_id"], 1, "probe"),
+            global_index=plan["global_index"],
+            sample_index=plan["sample_index"],
+            prompt_index=plan["prompt_index"],
+            body_request_id=plan.get("body_request_id"),
+            max_tokens_requested=budget,
+            request_body_sha256=_payload_hash(
+                ecfg, plan["messages"], budget),
+            physical_request_body_sha256s=[hashlib.sha256(
+                serialize_request_body(
+                    ecfg, plan["messages"], budget,
+                    include_usage=True)).hexdigest()],
+            endpoint_adapter=ecfg.adapter,
+            response_mode="streaming",
+        )
+        bound_plan = dict(plan, max_output=budget)
+        _attach_setup_request_binding(
+            probe_row, endpoint=ec,
+            max_output_tokens_cap=rc.max_output_tokens_cap,
+            plan=bound_plan, phase="probe", position=1)
+        envelope = _probe_evidence_envelope(
+            candidate=candidate, position=1, disposition="accepted",
+            evidence_method="single_request_behavior_observation",
+            row=probe_row)
+        probe_row["reasoning_control_probe"] = envelope
+        row_sink(probe_row)
+        return [{
+            "name": "candidate 1", "extra": candidate,
+            "verdict": "works", "disposition": "accepted",
+            "effective_status": "unknown", "effective_value": None,
+            "evidence_method": "single_request_behavior_observation",
+            "confidence": "unknown_effect", "detail": "fixture answer",
+            "evidence": envelope, "_request_row": probe_row,
+        }]
+
+    monkeypatch.setattr("traffic_replay.cli._preflight", unreadable_preflight)
+    monkeypatch.setattr("traffic_replay.cli._probe_reasoning_levers", probe)
+    out_dir = tmp_path / "probe-benchmark"
+    code = main([
+        "benchmark", "--host", "https://example.invalid",
+        "--endpoint", "my-ep", "--fixed-rate", "2",
+        "--duration", "2", "--input-tokens", "10,20",
+        "--output-tokens", "5,10", "--out-dir", str(out_dir),
+        "--probe-extra-body", json.dumps(candidate),
+    ])
+
+    assert code == 3
+    setup = next((tmp_path / "probe-benchmark-setup-traffic").iterdir())
+    rows = [json.loads(line) for line in
+            (setup / "requests.jsonl").read_text().splitlines()]
+    assert rows[-1]["reasoning_control_probe"] == envelope
+    start = json.loads((setup / "start.json").read_text())
+    summary = json.loads((setup / "summary.json").read_text())
+    gate = start["preflight_gate"]
+    assert gate == summary["run"]["preflight_gate"]
+    assert gate == summary["setup_traffic"]["preflight_gate"]
+    assert gate["reasoning_control_probes"] == [envelope]
+    verified = verify_run_output(setup)
+    assert verified["decision"]["evidence_integrity"]["code"] == "VERIFIED"
 
 
 def test_forced_unreadable_preflight_is_never_labeled_passed_and_reaches_run(
@@ -165,6 +343,7 @@ def test_forced_unreadable_preflight_is_never_labeled_passed_and_reaches_run(
     def unreadable_preflight(_cfg, *, representative_plans=None,
                              runtime_quota_guard=None, row_sink=None):
         assert len(representative_plans) == 2
+        _bind_preflight_fixture_rows(_cfg, representative_plans, rows)
         for row in rows:
             row_sink(row)
         return {
@@ -178,10 +357,12 @@ def test_forced_unreadable_preflight_is_never_labeled_passed_and_reaches_run(
     runner_calls = []
 
     def fake_run(rc, quiet=False, *, prior_request_rows=None,
-                 preflight_gate=None, runtime_quota_guard=None):
+                 preflight_gate=None, runtime_quota_guard=None,
+                 setup_artifact_reference=None):
         runner_calls.append({
             "rows": list(prior_request_rows or []),
             "gate": preflight_gate,
+            "setup": setup_artifact_reference,
         })
         return {"out_dir": rc.out_dir, "summary": {}}
 
@@ -200,7 +381,11 @@ def test_forced_unreadable_preflight_is_never_labeled_passed_and_reaches_run(
     assert code == 0
     assert len(runner_calls) == 1
     gate = runner_calls[0]["gate"]
-    assert gate == {
+    assert {key: gate[key] for key in (
+        "skipped", "attempted", "reachable", "readable",
+        "reasoning_probe_requests", "outcome", "force_requested",
+        "gate_satisfied", "evidence_mode",
+    )} == {
         "skipped": False,
         "attempted": 2,
         "reachable": 2,
@@ -209,8 +394,11 @@ def test_forced_unreadable_preflight_is_never_labeled_passed_and_reaches_run(
         "outcome": "preflight_forced_unreadable",
         "force_requested": True,
         "gate_satisfied": False,
+        "evidence_mode": "carried_setup_rows",
     }
     assert runner_calls[0]["rows"] == rows
+    assert runner_calls[0]["setup"]["preflight_binding_sha256"] == \
+        gate["binding_sha256"]
     setup = next((tmp_path / "forced-benchmark-setup-traffic").iterdir())
     summary = json.loads((setup / "summary.json").read_text())
     assert summary["setup_traffic"]["outcome"] == \
@@ -245,7 +433,8 @@ def test_runner_refuses_false_or_transport_failed_forced_preflight_gate(gate):
     from traffic_replay.runner import _validated_preflight_gate
 
     rows = [{"phase": "preflight"}, {"phase": "preflight"}]
-    with pytest.raises(ValueError, match="does not authorize"):
+    with pytest.raises(ValueError, match=(
+            "does not authorize|unknown or missing fields")):
         _validated_preflight_gate(gate, rows)
 
 

@@ -47,11 +47,22 @@ def test_customer_guide_publishes_the_current_safety_contract():
             "capacity stays inconclusive",
             "Published Enterprise P2T defaults: tier and headroom not verified",
             "Verify Enterprise tier and shared-workspace headroom before paid traffic",
-            'Owner-confirmed behavior',
+            "Source facts rechecked: 10 Aug 2026",
+            "Current implemented/tested scope",
+            "text-only, streaming OpenAI-compatible Chat Completions",
+            "standard Databricks workspace-origin direct route",
+            "traffic_replay adapters",
+            'Serving-engineering-confirmed behavior',
             '{"reasoning_effort":"none"}',
             '{"chat_template_kwargs":{"enable_thinking":false}}',
+            "public P2T endpoint",
+            "system.ai.glm-5-2",
+            "system.ai.databricks-glm-5-2",
+            "https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.2",
             build_customer_pdf.STAMP):
         assert required in body
+    assert body.count(
+        "--endpoint-adapter</span> openai.chat_completions.sse/v1") == 3
     assert body.count("--ttft-definition</span> first_visible") == 3
     assert body.count("<tr><td>") == 5
     assert "Read eight decisions" not in body
@@ -111,6 +122,7 @@ def test_published_glm_canary_numbers_are_recomputed_from_its_exact_command(
         auth_profile=None,
         token_env="DATABRICKS_TOKEN",
         model=None,
+        endpoint_adapter=flag("--endpoint-adapter"),
         production_connection_policy=None,
         extra_body=flag("--extra-body"),
         fixed_rate=float(flag("--fixed-rate")),
@@ -142,6 +154,8 @@ def test_published_glm_canary_numbers_are_recomputed_from_its_exact_command(
         probe_extra_body=[],
     )
     config = _benchmark_config(args)
+    assert config["endpoint"]["adapter"] == (
+        "openai.chat_completions.sse/v1")
     frozen = tmp_path / "frozen-inputs"
     frozen.mkdir()
     config, prevalidated = _freeze_and_prevalidate_cli_config(config, frozen)

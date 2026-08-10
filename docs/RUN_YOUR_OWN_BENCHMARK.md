@@ -123,10 +123,12 @@ With a profile:
 python3 -m traffic_replay benchmark \
   --host https://YOUR-WORKSPACE-HOST \
   --endpoint YOUR-ENDPOINT-NAME \
+  --endpoint-adapter openai.chat_completions.sse/v1 \
   --auth-profile YOUR-DATABRICKS-PROFILE \
   --profile configs/profile_measured.json \
   --sizing-concurrency 2 \
   --duration 60 \
+  --calibrate-requests YOUR_AUTHORIZED_CALIBRATION_REQUESTS \
   --ttft-definition first_visible \
   --ttft-p95 YOUR_TTFT_MS \
   --ttfg-p95 YOUR_TTFG_MS \
@@ -135,6 +137,14 @@ python3 -m traffic_replay benchmark \
 ```
 
 With prompts, replace `--profile ...` with `--prompts prompts.jsonl`.
+
+`--calibrate-requests` accepts an integer from 0 through 10,000; the actual
+count is capped by the schedule. These are separate, billable pre-replay
+requests. With clean usage, profile mode can use them to correct its
+characters-per-token estimate. Prompt mode does not retokenize the supplied
+messages but still sends the configured calibration rows. Any positive count
+warms endpoint/model state and may repeat an exact replay payload; zero avoids
+harness calibration only and is not proof of a cold cache or cold worker.
 
 Before resolving credentials or making a network connection, the command
 copies the workload and optional trace to private temporary bytes, strictly
@@ -189,10 +199,12 @@ authorized fixed rate instead:
 python3 -m traffic_replay benchmark \
   --host https://YOUR-WORKSPACE-HOST \
   --endpoint YOUR-PAY-PER-TOKEN-ENDPOINT \
+  --endpoint-adapter openai.chat_completions.sse/v1 \
   --auth-profile YOUR-DATABRICKS-PROFILE \
   --profile configs/profile_measured.json \
   --fixed-rate YOUR_AUTHORIZED_REQUESTS_PER_SECOND \
   --duration 60 \
+  --calibrate-requests YOUR_AUTHORIZED_CALIBRATION_REQUESTS \
   --ttft-definition first_visible \
   --rate-limits RATE_LIMITS.json \
   --out-dir results/p2t-smoke
@@ -273,7 +285,10 @@ Tool-call-only outcomes have a separate time-to-first-tool-call metric.
 Final-attempt clocks begin immediately before `conn.request`, include request
 upload, and exclude connection setup. TTFB means the first nonempty bounded
 response-body chunk returned by the client read, not the first socket byte or
-first parsed SSE line. A tool-call fragment does not trigger TTFT;
+first parsed SSE line. `ttse_ms` separately records the first complete framed
+event emitted by the selected adapter parser. That event is not necessarily a
+token or content: it can be usage-only, terminal, or a content-free parse
+diagnostic. A tool-call fragment does not trigger TTFT;
 first-visible and first-tool-call timings stay separate.
 
 `interchunk_max_ms` is the widest elapsed gap between successive SSE events
@@ -284,7 +299,7 @@ protocol-clean request with fewer than two qualifying events has no interchunk
 measurement; if an interchunk target is configured, any such row makes that
 check inconclusive.
 
-For managed Databricks GLM 5.2, direct service-owner confirmation establishes
+For managed Databricks GLM 5.2, serving-engineering-confirmed evidence establishes
 that top-level `reasoning_effort="none"` disables reasoning. Leaving the field
 unset selects maximum reasoning. This behavior is confirmed for both Unity AI
 Gateway model service `system.ai.glm-5-2` and the direct managed endpoint. Seal
@@ -298,11 +313,16 @@ The current Databricks
 [reasoning-model guide](https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models)
 classifies `databricks-glm-5-2` as reasoning-only and names
 `reasoning_effort`, but does not enumerate the accepted GLM-specific values.
-Consequently, `"none"` is owner-confirmed managed behavior rather than a value
+Consequently, `"none"` is serving-engineering-confirmed managed behavior rather than a value
 independently enumerated by the public guide. A successful HTTP status still
 does not prove the requested behavior was applied. Require a completed answer,
 inspect reasoning evidence, and pass the full two-representative preflight
 with the selected control.
+
+High-level commands send numeric `temperature: 0.0` by default. Use
+`--omit-temperature` only when the exact route requires omission and preserve
+that choice as a distinct run configuration; `temperature` is adapter-owned
+and cannot be supplied through `--extra-body`.
 
 Request compatibility is broader than this tool's production qualification.
 Databricks documents the Unity AI Gateway
@@ -406,14 +426,17 @@ physical-attempt reconciliation makes quota state unknown and measurement
 invalid.
 
 For eligible streamed responses, inspect response-model and routed-entity
-coverage. Multiple response-model values, or a response model that disagrees
-with an explicit request-body model, invalidates a single-model benchmark. Do
-not compare the OpenAI response `model` to the serving endpoint name: custom/PT
-endpoints can legitimately return an underlying model name. The Databricks
-`served-model-name` response header is checked against active served entities
-captured from the control plane; an unexpected entity invalidates the result
-and incomplete binding is a caution. Response IDs are stored only as SHA-256;
-`object` and `system_fingerprint` are bounded context.
+coverage. Multiple response-model values invalidate a single-model benchmark.
+One stable response-model name that differs from an explicit request-body
+model produces an unverified-identity caution; alias or revision naming can
+differ, so the mismatch alone is not proof that another model served the
+request. Do not compare the OpenAI response `model` to the serving endpoint
+name: custom/PT endpoints can legitimately return an underlying model name.
+The Databricks `served-model-name` response header is checked against active
+served entities captured from the control plane; an unexpected entity or
+route contradiction invalidates the result and incomplete binding is a
+caution. Response IDs are stored only as SHA-256; `object` and
+`system_fingerprint` are bounded context.
 
 When endpoint metadata capture is enabled, the runner compares a snapshot from
 before its own sizing, calibration, and replay traffic with a second snapshot
@@ -521,6 +544,7 @@ After the small run is valid:
 python3 -m traffic_replay sweep \
   --host https://YOUR-WORKSPACE-HOST \
   --endpoint YOUR-ENDPOINT-NAME \
+  --endpoint-adapter openai.chat_completions.sse/v1 \
   --auth-profile YOUR-DATABRICKS-PROFILE \
   --profile configs/profile_measured.json \
   --rate 1,2,4,8 \

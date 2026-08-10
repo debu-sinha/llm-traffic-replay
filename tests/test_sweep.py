@@ -84,16 +84,24 @@ def _rung(rate, kind, held=None, err=0.0):
             "transport_parity_status": "MATCH"}
 
 
+def _passed_preflight():
+    return {
+        "skipped": False,
+        "attempted": 2,
+        "reachable": 2,
+        "readable": 2,
+        "reasoning_probe_requests": 0,
+        "outcome": "preflight_passed",
+        "force_requested": False,
+        "gate_satisfied": True,
+    }
+
+
 class _Args:
     endpoint = "my-endpoint"
     cooldown = 0
     _cooldown_events = 0
-    _preflight_evidence = {
-        "skipped": True, "attempted": 0, "reachable": 0, "readable": 0,
-        "reasoning_probe_requests": 0,
-        "outcome": "skipped", "force_requested": False,
-        "gate_satisfied": False,
-    }
+    _preflight_evidence = _passed_preflight()
 
 
 class _ReportSink:
@@ -232,7 +240,10 @@ def _sealed_run(path: Path, summary: dict, identity: str, *,
 
 def _summary(rate: float) -> dict:
     return {
-        "run": {"transport": _exact_transport()},
+        "run": {
+            "transport": _exact_transport(),
+            "preflight_gate": _passed_preflight(),
+        },
         "arrivals": {"achieved_qps_overall": rate},
         "requests_total": 1000,
         "requests_ok": 1000,
@@ -296,17 +307,30 @@ def _claim_with_rungs(tmp_path: Path, rates=(1.0,)):
     for i, rate in enumerate(rates):
         rung_root = artifact.path / f"rate_{rate:g}"
         cfg = _rung_config(base, rate, rung_root)
+        setup_rows = ([
+            {"phase": "preflight", "request_id": "fixture-pf-1",
+             "request_attempts": 1, "first_send_unix": 1.0},
+            {"phase": "preflight", "request_id": "fixture-pf-2",
+             "request_attempts": 1, "first_send_unix": 2.0},
+        ] if i == 0 else [])
         d = _sealed_run(
             rung_root / "run", _summary(rate), f"rung-{i}",
-            run_config=cfg)
+            run_config=cfg, request_rows=setup_rows)
         _verified, position = artifact.add_rung(rate, d, _summary(rate))
-        records.append(_record(rate, position, d.relative_to(artifact.path)))
+        record = _record(rate, position, d.relative_to(artifact.path))
+        record.update(artifact.rung_accounting(position))
+        records.append(record)
         dirs.append(d)
     return artifact, records, dirs
 
 
-def _report_context(artifact, *, skipped=True, attempted=0, reachable=0,
-                    readable=0, probes=0, cooldown=0.0, events=0):
+def _report_context(artifact, *, skipped=False, attempted=2, reachable=2,
+                    readable=2, probes=0, cooldown=0.0, events=0):
+    complete = bool(
+        attempted > 0 and reachable == attempted and readable == attempted)
+    outcome = ("skipped" if skipped else
+               "preflight_passed" if complete else
+               "preflight_state_unknown")
     return {
         "endpoint": artifact._base_config["endpoint"]["path"],
         "sweep_wall_s": 1.5,
@@ -318,6 +342,9 @@ def _report_context(artifact, *, skipped=True, attempted=0, reachable=0,
             "reachable": reachable,
             "readable": readable,
             "reasoning_probe_requests": probes,
+            "outcome": outcome,
+            "force_requested": False,
+            "gate_satisfied": complete,
         },
     }
 
@@ -327,7 +354,7 @@ def _seal(artifact, records, *, context=None):
         render_sweep_report, sweep_outcome)
 
     context = context or _report_context(artifact)
-    outcome = sweep_outcome(records)
+    outcome = sweep_outcome(records, context["preflight"])
     return artifact.seal(
         render_sweep_report(records, context), records,
         exit_code=outcome["exit_code"],
@@ -502,15 +529,54 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
     representative_sets = []
 
     def fake_preflight(cfg, args, *, representative_plans=None):
+        from traffic_replay.client import EndpointConfig, serialize_request_body
+        from traffic_replay.runner import (
+            RunConfig, _attach_setup_request_binding, _payload_hash,
+            _rescope_representative_plans,
+        )
         preflight.append(json.loads(json.dumps(cfg)))
+        representative_plans = _rescope_representative_plans(
+            representative_plans, args._setup_traffic_execution_id)
+        args._preflight_representative_plans = representative_plans
         representative_sets.append(representative_plans)
         cfg["ttft_definition"] = "first_visible"
-        args._preflight_request_rows = [
-            {"phase": "preflight", "request_id": "pf-1",
-             "request_attempts": 1, "first_send_unix": 1.0},
-            {"phase": "preflight", "request_id": "pf-2",
-             "request_attempts": 1, "first_send_unix": 2.0},
-        ]
+        rc = RunConfig(**cfg)
+        ecfg = EndpointConfig(**rc.endpoint)
+        rows = []
+        for position, plan in enumerate(representative_plans, start=1):
+            physical = hashlib.sha256(serialize_request_body(
+                ecfg, plan["messages"], plan["max_output"],
+                include_usage=True)).hexdigest()
+            row = {
+                "phase": "preflight", "request_id": plan["request_id"],
+                "global_index": plan["global_index"],
+                "sample_index": plan["sample_index"],
+                "prompt_index": plan["prompt_index"],
+                "body_request_id": plan["body_request_id"],
+                "request_attempts": 1, "connection_attempts": 1,
+                "retries": 0, "retry_reasons": [],
+                "first_attempt_unix": float(position) - 0.1,
+                "first_send_unix": float(position),
+                "t_send_unix": float(position),
+                "finished_unix": float(position) + 0.1,
+                "status": 200, "ok": True, "stream_complete": True,
+                "visible_content_seen": True, "reasoning_seen": False,
+                "valid_tool_calls": 0, "refusal_seen": False,
+                "parse_errors": 0,
+                "max_tokens_requested": plan["max_output"],
+                "request_body_sha256": _payload_hash(
+                    ecfg, plan["messages"], plan["max_output"]),
+                "physical_request_body_sha256s": [physical],
+                "endpoint_adapter": ecfg.adapter,
+                "response_mode": "streaming",
+            }
+            _attach_setup_request_binding(
+                row, endpoint=rc.endpoint,
+                max_output_tokens_cap=rc.max_output_tokens_cap,
+                plan=plan, phase="preflight", position=position)
+            args._setup_request_sink(row)
+            rows.append(row)
+        args._preflight_request_rows = rows
         args._preflight_evidence = {
             "skipped": False, "attempted": 2, "reachable": 2,
             "readable": 2, "reasoning_probe_requests": 0,
@@ -518,19 +584,16 @@ def test_sweep_reuses_the_exact_workload_and_runs_one_preflight(monkeypatch):
         return None
 
     def fake_run(rc, quiet=False, prior_request_rows=None,
-                 preflight_gate=None, runtime_quota_guard=None):
+                 preflight_gate=None, runtime_quota_guard=None,
+                 setup_artifact_reference=None):
         runs.append(rc)
         prior_seen.append(list(prior_request_rows or []))
         assert runtime_quota_guard is None
-        if len(runs) == 1:
-            assert preflight_gate == {
-                "skipped": False, "attempted": 2, "reachable": 2,
-                "readable": 2, "reasoning_probe_requests": 0,
-                "outcome": "preflight_passed", "force_requested": False,
-                "gate_satisfied": True,
-            }
-        else:
-            assert preflight_gate is None
+        assert preflight_gate["evidence_mode"] == (
+            "carried_setup_rows" if len(runs) == 1
+            else "inherited_setup_artifact")
+        assert setup_artifact_reference["preflight_binding_sha256"] == \
+            preflight_gate["binding_sha256"]
         d = Path(rc.out_dir) / "fake"
         summary = {
                 "run": {"transport": _exact_transport()},
@@ -904,13 +967,14 @@ def test_sweep_refuses_arbitrary_prose_even_when_the_caller_supplies_matching_nu
     from traffic_replay.sweep_artifacts import sweep_outcome
 
     artifact, records, _dirs = _claim_with_rungs(tmp_path)
-    outcome = sweep_outcome(records)
+    context = _report_context(artifact)
+    outcome = sweep_outcome(records, context["preflight"])
     with pytest.raises(ValueError, match="not the canonical report"):
         artifact.seal(
             "# Highest rate that held: 999999 requests/second\n",
             records, exit_code=outcome["exit_code"],
             highest_held_rate=outcome["highest_held_rate"],
-            report_context=_report_context(artifact))
+            report_context=context)
     assert not (artifact.path / "sweep.md").exists()
     artifact.close()
 
@@ -1018,7 +1082,12 @@ def test_per_rung_calibration_invalidates_the_capacity_conclusion(tmp_path):
     _summary_value, position = artifact.add_rung(1.0, run_dir)
     record = _record(1.0, position, run_dir.relative_to(artifact.path))
     record.update(artifact.rung_accounting(position))
-    out = _seal(artifact, [record])
+    out = _seal(
+        artifact,
+        [record],
+        context=_report_context(
+            artifact, skipped=True, attempted=0, reachable=0, readable=0),
+    )
     manifest = verify_sweep_output(out)
 
     assert manifest["exit_code"] == 2
@@ -1102,7 +1171,7 @@ def test_higher_pass_after_lower_failure_is_valid_but_has_no_boundary():
 
     low = _rung(1.0, "miss")
     high = _rung(2.0, "ok")
-    outcome = sweep_outcome([low, high])
+    outcome = sweep_outcome([low, high], _passed_preflight())
     assert outcome["invalid"] is False
     assert outcome["invalid_reasons"] == []
     assert outcome["capacity_conclusion"] == "NON_MONOTONIC_NO_BOUNDARY"
@@ -1117,12 +1186,83 @@ def test_underpowered_rung_does_not_make_later_pass_non_monotonic():
     low = {**_rung(1.0, "caution"),
            "state": "INSUFFICIENT_EVIDENCE"}
     high = {**_rung(4.0, "ok"), "state": "PASS"}
-    outcome = sweep_outcome([low, high])
+    outcome = sweep_outcome([low, high], _passed_preflight())
 
     assert outcome["non_monotonic"] is False
     assert outcome["highest_sla_passing_tested_rate"] == 4.0
     assert outcome["capacity_conclusion"] == "TOP_OF_LADDER_PASSED"
     assert outcome["exit_code"] == 0
+
+
+@pytest.mark.parametrize(
+    ("preflight", "reason_fragment"),
+    [
+        (None, "no representative capability preflight was supplied"),
+        ({
+            "skipped": True,
+            "attempted": 0,
+            "reachable": 0,
+            "readable": 0,
+            "reasoning_probe_requests": 0,
+            "outcome": "skipped",
+            "force_requested": False,
+            "gate_satisfied": False,
+        }, "explicitly skipped"),
+    ],
+)
+def test_missing_or_skipped_preflight_cannot_create_a_sweep_capacity_point(
+        preflight, reason_fragment):
+    from traffic_replay.sweep_artifacts import sweep_outcome
+
+    rung = {**_rung(8.0, "ok", held=8), "state": "PASS"}
+    outcome = sweep_outcome([rung], preflight)
+
+    assert outcome["invalid"] is False
+    assert outcome["preflight_established"] is False
+    assert reason_fragment in outcome["exploratory_reasons"][0]
+    assert outcome["highest_sla_passing_tested_rate"] is None
+    assert outcome["highest_achieved_rate_at_sla_passing_rung"] is None
+    assert outcome["highest_held_rate"] is None
+    assert outcome["capacity_conclusion"] == \
+        "PREFLIGHT_NOT_ESTABLISHED_EXPLORATORY"
+    assert outcome["boundary_status"] == "PREFLIGHT_NOT_ESTABLISHED"
+    assert outcome["exit_code"] == 1
+
+
+def test_skipped_preflight_report_never_renders_a_green_held_rate():
+    from traffic_replay.sweep_artifacts import render_sweep_report
+
+    rung = {**_rung(8.0, "ok", held=8), "state": "PASS"}
+    body = render_sweep_report([rung], {
+        "endpoint": "/serving-endpoints/example/invocations",
+        "sweep_wall_s": 1.0,
+        "cooldown_s": 0.0,
+        "cooldown_events": 0,
+        "preflight": {
+            "skipped": True,
+            "attempted": 0,
+            "reachable": 0,
+            "readable": 0,
+            "reasoning_probe_requests": 0,
+        },
+    })
+
+    assert "EXPLORATORY SWEEP" in body
+    assert "no highest-held rate" in body
+    assert "Highest rate that held" not in body
+
+
+def test_passed_preflight_label_without_complete_counts_is_rejected():
+    from traffic_replay.sweep_artifacts import sweep_outcome
+
+    false_gate = {
+        **_passed_preflight(),
+        "attempted": 0,
+        "reachable": 0,
+        "readable": 0,
+    }
+    with pytest.raises(ValueError, match="passed.*disagrees with counts"):
+        sweep_outcome([_rung(8.0, "ok", held=8)], false_gate)
 
 
 def test_first_visible_sweep_projection_uses_caller_ttfv_not_raw_ttft():
@@ -1215,9 +1355,10 @@ def test_legacy_pass_rung_without_transport_can_never_render_green():
     markdown = render_sweep_report([rung], context)
     html = render_sweep_html([rung], context, "legacy-transport-fixture")
 
-    assert "No publishable SLA-passing rung was established" in markdown
+    assert "EXPLORATORY SWEEP" in markdown
+    assert "no highest-held rate" in markdown
     assert "Highest rate that held" not in markdown
-    assert "TRANSPORT PARITY UNVERIFIED" in html
+    assert "EXPLORATORY - NO PREFLIGHT" in html
     assert "Production transport parity is not established" in html
     assert "TESTED RATE HELD" not in html
 
@@ -1331,7 +1472,9 @@ def test_targetless_production_sweep_refuses_before_preflight_or_run(
 def test_a_manifest_bound_invalid_rung_removes_an_earlier_capacity_conclusion():
     from traffic_replay.sweep_artifacts import sweep_outcome
 
-    outcome = sweep_outcome([_rung(1.0, "ok"), _rung(2.0, "invalid")])
+    outcome = sweep_outcome(
+        [_rung(1.0, "ok"), _rung(2.0, "invalid")],
+        _passed_preflight())
     assert outcome["exit_code"] == 2
     assert outcome["highest_held_rate"] is None
     assert outcome["invalid_reports"]
@@ -1390,7 +1533,7 @@ def test_sweep_held_claim_uses_achieved_not_requested_rate():
 
     rung = _rung(32.0, "ok", held=20)
     rung["achieved_rps"] = 25.7
-    outcome = sweep_outcome([rung])
+    outcome = sweep_outcome([rung], _passed_preflight())
 
     assert outcome["highest_sla_passing_tested_rate"] == 32.0
     assert outcome["highest_achieved_rate_at_sla_passing_rung"] == 25.7
@@ -1400,10 +1543,7 @@ def test_sweep_held_claim_uses_achieved_not_requested_rate():
         "sweep_wall_s": 1.0,
         "cooldown_s": 0.0,
         "cooldown_events": 0,
-        "preflight": {
-            "skipped": True, "attempted": 0, "reachable": 0,
-            "readable": 0, "reasoning_probe_requests": 0,
-        },
+        "preflight": _passed_preflight(),
     })
     assert "Highest rate that held: 25.70 delivered requests/second" in body
     assert "32 requested rps rung" in body
@@ -1416,7 +1556,7 @@ def test_sweep_highest_delivered_claim_is_maximum_across_passing_rungs():
     lower["achieved_rps"] = 10.0
     higher = _rung(20.0, "ok", held=8)
     higher["achieved_rps"] = 8.0
-    outcome = sweep_outcome([lower, higher])
+    outcome = sweep_outcome([lower, higher], _passed_preflight())
 
     assert outcome["highest_sla_passing_tested_rate"] == 20.0
     assert outcome[
@@ -1430,10 +1570,7 @@ def test_sweep_highest_delivered_claim_is_maximum_across_passing_rungs():
         "sweep_wall_s": 1.0,
         "cooldown_s": 0.0,
         "cooldown_events": 0,
-        "preflight": {
-            "skipped": True, "attempted": 0, "reachable": 0,
-            "readable": 0, "reasoning_probe_requests": 0,
-        },
+        "preflight": _passed_preflight(),
     })
     assert "Highest rate that held: 10.00 delivered requests/second" in body
     assert "10 requested rps rung" in body
@@ -1460,8 +1597,8 @@ def test_preflight_preserves_metadata_rows_and_marks_exception_attempt_unknown(
     calls = 0
 
     class Client:
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, cfg, *_args, **_kwargs):
+            self.cfg = cfg
 
         def send(self, _messages, max_tokens, request_id, scheduled_s,
                  dispatch_lag_ms, intended, chars_sent):
@@ -1470,7 +1607,7 @@ def test_preflight_preserves_metadata_rows_and_marks_exception_attempt_unknown(
             if calls == 2:
                 raise TimeoutError("provider outcome unknown")
             now = time.time()
-            return RequestResult(
+            result = RequestResult(
                 request_id=request_id, scheduled_s=scheduled_s,
                 dispatch_lag_ms=dispatch_lag_ms, t_send_unix=now,
                 ttfb_ms=1.0, ttft_ms=1.0, ttfr_ms=None, ttfv_ms=1.0,
@@ -1486,6 +1623,12 @@ def test_preflight_preserves_metadata_rows_and_marks_exception_attempt_unknown(
                 visible_content_seen=True, first_send_unix=now,
                 max_tokens_requested=max_tokens, request_attempts=1,
                 connection_attempts=1)
+            from traffic_replay.client import serialize_request_body
+            result.physical_request_body_sha256s = [hashlib.sha256(
+                serialize_request_body(
+                    self.cfg, _messages, max_tokens,
+                    include_usage=True)).hexdigest()]
+            return result
 
     monkeypatch.setattr("traffic_replay.client.EndpointClient", Client)
     result = _preflight(_base_config(tmp_path))

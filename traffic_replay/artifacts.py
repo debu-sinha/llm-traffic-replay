@@ -73,6 +73,23 @@ _NON_SECRET_TOKEN_KEYS = {
 }
 _HEADER_KEYS = {"header", "headers", "httpheader", "httpheaders",
                 "requestheader", "requestheaders"}
+# JSON Schema uses object keys below these maps as *declared names*, not as
+# request controls.  For example, ``properties.password`` describes a field;
+# it does not send a password.  This exception is enabled only while redacting
+# a validated endpoint ``extra_body``/probe candidate, and only for values with
+# the structural type required by the corresponding schema keyword.  Keeping
+# the exception path- and shape-scoped prevents an arbitrary evidence object
+# named ``properties`` from becoming a credential-redaction bypass.
+_SCHEMA_OBJECT_MAP_KEYS = {
+    "properties", "patternproperties", "defs", "definitions",
+    "dependentschemas",
+}
+_SCHEMA_ARRAY_MAP_KEYS = {"dependentrequired"}
+_SCHEMA_MIXED_MAP_KEYS = {"dependencies"}
+_SCHEMA_CONTEXT_KEYS = {"extrabody", "candidateredacted"}
+_SCHEMA_INSTANCE_VALUE_KEYS = {
+    "default", "const", "enum", "example", "examples",
+}
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _BASIC_VALUE = re.compile(
     r"(?i)\bbasic\s+([A-Za-z0-9+/]+={0,2})(?![A-Za-z0-9+/=])")
@@ -131,6 +148,40 @@ def _header_container_key(key: object) -> bool:
     return (normalized in _HEADER_KEYS
             or normalized.endswith("header")
             or normalized.endswith("headers"))
+
+
+def _schema_named_map_kind(key: object) -> str | None:
+    normalized = _normalized_key(key)
+    if normalized in _SCHEMA_OBJECT_MAP_KEYS:
+        return "object"
+    if normalized in _SCHEMA_ARRAY_MAP_KEYS:
+        return "array"
+    if normalized in _SCHEMA_MIXED_MAP_KEYS:
+        return "mixed"
+    return None
+
+
+def _schema_named_entry_is_structural(kind: str, value: object) -> bool:
+    if kind == "object":
+        return isinstance(value, (dict, bool))
+    if kind == "array":
+        return isinstance(value, list) and all(
+            isinstance(item, str) for item in value)
+    return (isinstance(value, (dict, bool))
+            or (isinstance(value, list) and all(
+                isinstance(item, str) for item in value)))
+
+
+def _nonempty_schema_instance_value(value: object) -> bool:
+    """Whether metadata on a credential-named field could carry a value."""
+    if value is None or value == "":
+        return False
+    if isinstance(value, (list, tuple, dict)) and not value:
+        return False
+    # Credentials are textual or structured.  Numeric/boolean schema defaults
+    # are not credential material even when the declared property is named
+    # ``token`` (for example, a token-count output field).
+    return isinstance(value, (str, list, tuple, dict))
 
 
 def _redact_url(value: str) -> str:
@@ -200,29 +251,118 @@ def _redact_string(value: str, *, header_context: bool = False) -> str:
     return value
 
 
-def redact_secrets(value, key: str | None = None, *, header_context=False):
+def _redact_secrets_impl(
+        value, key: str | None, *, header_context: bool,
+        schema_context: bool, schema_subject_sensitive: bool,
+        found: list[bool]):
+    if key is not None and _secret_key(key):
+        found[0] = True
+        return "<redacted>"
+
+    normalized = _normalized_key(key) if key is not None else ""
+    schema_context = schema_context or normalized in _SCHEMA_CONTEXT_KEYS
+    if schema_subject_sensitive \
+            and normalized in _SCHEMA_INSTANCE_VALUE_KEYS \
+            and _nonempty_schema_instance_value(value):
+        found[0] = True
+        return "<redacted>"
+
+    child_header_context = header_context or (
+        key is not None and _header_container_key(key))
+    if child_header_context \
+            and not isinstance(value, (dict, list, tuple, str)):
+        if value is not None:
+            found[0] = True
+            return "<redacted>"
+        return None
+
+    if isinstance(value, dict):
+        # A named JSON-Schema map is special only inside a known request-body
+        # context and never inside an actual HTTP-header container.  Its entry
+        # names are preserved, while each schema/value remains recursively
+        # scanned.  Invalid entry shapes fall back to normal credential-key
+        # handling and therefore fail closed.
+        map_kind = None if child_header_context or not schema_context \
+            else _schema_named_map_kind(key)
+        if map_kind is not None:
+            result = {}
+            for child_key, child_value in value.items():
+                child_name = str(child_key)
+                if _schema_named_entry_is_structural(
+                        map_kind, child_value):
+                    result[child_name] = _redact_secrets_impl(
+                        child_value, None, header_context=False,
+                        schema_context=True,
+                        schema_subject_sensitive=(
+                            _secret_key(child_name)
+                            or _header_container_key(child_name)),
+                        found=found)
+                else:
+                    result[child_name] = _redact_secrets_impl(
+                        child_value, child_name,
+                        header_context=child_header_context,
+                        schema_context=schema_context,
+                        schema_subject_sensitive=False, found=found)
+            return result
+        return {
+            str(child_key): _redact_secrets_impl(
+                child_value, str(child_key),
+                header_context=child_header_context,
+                schema_context=schema_context,
+                schema_subject_sensitive=schema_subject_sensitive,
+                found=found)
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _redact_secrets_impl(
+                item, None, header_context=child_header_context,
+                schema_context=schema_context,
+                schema_subject_sensitive=schema_subject_sensitive,
+                found=found)
+            for item in value
+        ]
+    if isinstance(value, str):
+        safe = _redact_string(value, header_context=child_header_context)
+        if safe != value:
+            found[0] = True
+        return safe
+    return value
+
+
+def redact_secrets_with_status(value, key: str | None = None, *,
+                               header_context: bool = False,
+                               schema_context: bool = False):
+    """Return ``(redacted_copy, found_secret_material)``.
+
+    ``schema_context`` is for validated endpoint request bodies.  It preserves
+    structurally valid JSON-Schema property/definition names such as
+    ``password`` while still redacting credential-bearing controls, header
+    values, secret-shaped strings, and populated defaults/examples attached to
+    credential-named properties.
+    """
+    found = [False]
+    safe = _redact_secrets_impl(
+        value, key, header_context=header_context,
+        schema_context=schema_context, schema_subject_sensitive=False,
+        found=found)
+    return safe, found[0]
+
+
+def redact_secrets(value, key: str | None = None, *, header_context=False,
+                   schema_context: bool = False):
     """Return a JSON-safe copy with credentials removed.
 
     Matching is semantic rather than a broad ``"token" in key`` test.  Model
     controls such as ``min_tokens``, ``max_tokens`` and ``token_limit`` are
-    behavioral configuration and must remain visible and comparable.
+    behavioral configuration and must remain visible and comparable.  Schema
+    name exemptions are disabled by default and activate automatically only
+    below known ``extra_body``/probe-candidate evidence keys.
     """
-    if key is not None and _secret_key(key):
-        return "<redacted>"
-    child_header_context = header_context or (
-        key is not None and _header_container_key(key))
-    if header_context and not isinstance(value, (dict, list, tuple, str)):
-        return "<redacted>" if value is not None else None
-    if isinstance(value, dict):
-        return {str(k): redact_secrets(v, str(k),
-                                       header_context=child_header_context)
-                for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [redact_secrets(v, header_context=child_header_context)
-                for v in value]
-    if isinstance(value, str):
-        return _redact_string(value, header_context=child_header_context)
-    return value
+    safe, _ = redact_secrets_with_status(
+        value, key, header_context=header_context,
+        schema_context=schema_context)
+    return safe
 
 
 def sanitize_display_text(value: object) -> str:

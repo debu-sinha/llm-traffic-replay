@@ -19,4 +19,38 @@ Design principles:
      HTTP client keep deployment requirements explicit.
 """
 
-__version__ = "0.6.0"
+from .adapters import (
+    DEFAULT_ENDPOINT_ADAPTER,
+    EndpointAdapter,
+    EventMilestones,
+    ResponseOutcome,
+    endpoint_adapter_contract,
+    get_endpoint_adapter,
+    list_endpoint_adapters,
+    register_endpoint_adapter,
+)
+from .capabilities import (
+    CAPABILITY_SCHEMA_VERSION,
+    CapabilityCatalog,
+    CapabilityProfile,
+    load_capability_profile,
+    seal_capability_profile,
+)
+
+__version__ = "0.7.0"
+
+__all__ = [
+    "DEFAULT_ENDPOINT_ADAPTER",
+    "EndpointAdapter",
+    "EventMilestones",
+    "ResponseOutcome",
+    "CAPABILITY_SCHEMA_VERSION",
+    "CapabilityCatalog",
+    "CapabilityProfile",
+    "endpoint_adapter_contract",
+    "get_endpoint_adapter",
+    "list_endpoint_adapters",
+    "load_capability_profile",
+    "register_endpoint_adapter",
+    "seal_capability_profile",
+]

@@ -189,9 +189,8 @@ def test_exact_notebook_canary_has_one_replay_and_passes_offline_quota_plan(
     assert profile.input_tokens == {"p50": 1000.0, "p95": 2000.0}
     assert profile.output_tokens == {"p50": 320.0, "p95": 480.0}
     assert "workload shape only" in profile.provenance
-    assert "reasoning_effort=none" in profile.provenance
-    assert "same field is confirmed for AI Gateway" in profile.provenance
-    assert "does not establish Gateway control-plane" in profile.provenance
+    assert "reasoning controls" in profile.provenance
+    assert "belong to the run configuration" in profile.provenance
     assert rc.max_output_tokens_cap == 720
     for disclosed in (
             "input p50/p95 of 1,000/2,000 tokens",

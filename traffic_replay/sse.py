@@ -388,6 +388,13 @@ def _usage_invariant_errors(usage: dict) -> list[str]:
             errors.append(
                 "stream usage cached tokens exceed prompt_tokens at "
                 + ".".join(path))
+    cached_values = {
+        value for path in CACHED_TOKEN_PATHS
+        if (value := count(path)) is not None
+    }
+    if len(cached_values) > 1:
+        errors.append(
+            "stream usage reported conflicting cached-token aliases")
     for path in REASONING_TOKEN_PATHS:
         reasoning = count(path)
         if reasoning is not None and completion is not None \
@@ -395,6 +402,13 @@ def _usage_invariant_errors(usage: dict) -> list[str]:
             errors.append(
                 "stream usage reasoning tokens exceed completion_tokens at "
                 + ".".join(path))
+    reasoning_values = {
+        value for path in REASONING_TOKEN_PATHS
+        if (value := count(path)) is not None
+    }
+    if len(reasoning_values) > 1:
+        errors.append(
+            "stream usage reported conflicting reasoning-token aliases")
     if prompt is not None and completion is not None and total is not None \
             and total != prompt + completion:
         errors.append(

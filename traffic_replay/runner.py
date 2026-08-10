@@ -54,8 +54,13 @@ from .artifacts import (
     sha256_bytes,
     snapshot_source_state,
 )
+from .adapters import (
+    DEFAULT_ENDPOINT_ADAPTER,
+    endpoint_adapter_contract,
+    get_endpoint_adapter,
+)
 from .client import (EndpointClient, EndpointConfig, RequestResult,
-                     normalized_origin,
+                     normalized_origin, serialize_request_body,
                      validate_bearer_token, validate_bearer_transport)
 from .config_validation import (validate_acceptance_targets,
                                 validate_pricing, validate_rate_limits)
@@ -604,6 +609,8 @@ def _resolved_workload_id(rc: RunConfig, inputs: dict) -> str:
                 "qps_max", "rate_scale", "sizing_concurrency")
         },
         "request_shape": {
+            "endpoint_adapter": endpoint_adapter_contract(
+                rc.endpoint.get("adapter", DEFAULT_ENDPOINT_ADAPTER)),
             "model": rc.endpoint.get("model"),
             "temperature": rc.endpoint.get("temperature", 0.0),
             "extra_body": rc.endpoint.get("extra_body") or {},
@@ -670,6 +677,8 @@ def _resolved_run_id(rc: RunConfig) -> str:
         "prompts": _file_identity(rc.prompts_file, input_kind="prompts"),
         "endpoint_path": rc.endpoint.get("path"),
         "endpoint_model": rc.endpoint.get("model"),
+        "endpoint_adapter": endpoint_adapter_contract(
+            rc.endpoint.get("adapter", DEFAULT_ENDPOINT_ADAPTER)),
         "extra_body": rc.endpoint.get("extra_body") or {},
         "cpt": rc.cpt,
         "pool_docs_per_bucket": rc.pool_docs_per_bucket,
@@ -685,18 +694,224 @@ def _stable_request_id(run_id: str, global_index: int,
         f"{run_id}:{namespace}:{global_index}".encode()).hexdigest()[:16]
 
 
+_SETUP_REQUEST_BINDING_SCHEMA = "setup-request-binding/v1"
+_PREFLIGHT_BINDING_SCHEMA = "carried-preflight-binding/v1"
+_SETUP_ARTIFACT_REFERENCE_SCHEMA = "setup-artifact-reference/v1"
+_HEX_SHA256 = frozenset("0123456789abcdef")
+
+
+def _binding_sha256(value: object) -> str:
+    """Hash JSON semantics deterministically, independent of dict insertion."""
+    raw = json.dumps(
+        value, sort_keys=True, ensure_ascii=True, allow_nan=False,
+        separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 \
+        and all(char in _HEX_SHA256 for char in value)
+
+
+def _json_value_binding(value: object, *, field_present: bool) -> dict:
+    """Bind a request value without copying customer/model content."""
+    return {
+        "field_present": bool(field_present),
+        "value_sha256": _binding_sha256(value),
+    }
+
+
+def _endpoint_request_binding(endpoint: dict, max_output_tokens_cap: int) \
+        -> dict:
+    """Content-safe identity of every endpoint field affecting wire bytes."""
+    if not isinstance(endpoint, dict):
+        raise ValueError("endpoint request binding needs an endpoint object")
+    ecfg = EndpointConfig(**copy.deepcopy(endpoint))
+    scheme, host, port = normalized_origin(ecfg.base_url)
+    adapter_contract = endpoint_adapter_contract(ecfg.adapter)
+    return {
+        "normalized_origin": {
+            "scheme": scheme, "host": host, "port": port,
+        },
+        "path": ecfg.path,
+        "adapter_id": ecfg.adapter,
+        "adapter_contract_sha256": _binding_sha256(adapter_contract),
+        "adapter_implementation_sha256": adapter_contract.get(
+            "implementation_sha256"),
+        "model": _json_value_binding(
+            ecfg.model, field_present="model" in endpoint),
+        "temperature": {
+            "field_present": "temperature" in endpoint,
+            "value": ecfg.temperature,
+        },
+        "include_usage": {
+            "field_present": "include_usage" in endpoint,
+            "value": ecfg.include_usage,
+        },
+        "extra_body": _json_value_binding(
+            ecfg.extra_body or {}, field_present="extra_body" in endpoint),
+        "max_output_tokens_cap": int(max_output_tokens_cap),
+    }
+
+
+def _representative_plan_binding(ecfg: EndpointConfig, plan: dict, *,
+                                 position: int) -> dict:
+    """Bind one deterministic representative without persisting its text."""
+    max_tokens = int(plan["max_output"])
+    logical = _payload_hash(ecfg, plan["messages"], max_tokens)
+    return {
+        "position": int(position),
+        "representative_sha256": _binding_sha256(
+            plan.get("representative")),
+        "global_index": plan.get("global_index"),
+        "sample_index": plan.get("sample_index"),
+        "prompt_index": plan.get("prompt_index"),
+        "body_request_id": plan.get("body_request_id"),
+        "max_tokens": max_tokens,
+        "logical_request_body_sha256": logical,
+    }
+
+
+def _preflight_execution_binding(rc: RunConfig,
+                                 representative_plans: list[dict]) -> dict:
+    """Bind the exact measured config/workload authorized by preflight."""
+    ecfg = EndpointConfig(**copy.deepcopy(rc.endpoint))
+    inputs = copy.deepcopy(rc.input_expectations or {})
+    workload = {
+        "input_mode": "prompts" if rc.prompts_file else "profile",
+        "input_expectations_sha256": _binding_sha256(inputs),
+        "seed": rc.seed,
+        "cpt": rc.cpt,
+        "pool_docs_per_bucket": rc.pool_docs_per_bucket,
+        "pool_zipf_s": rc.pool_zipf_s,
+    }
+    return {
+        "endpoint_request": _endpoint_request_binding(
+            rc.endpoint, rc.max_output_tokens_cap),
+        "workload": workload,
+        "representatives": [
+            _representative_plan_binding(ecfg, plan, position=position)
+            for position, plan in enumerate(representative_plans, start=1)
+        ],
+    }
+
+
+def _setup_request_binding(*, endpoint: dict,
+                           max_output_tokens_cap: int, plan: dict,
+                           phase: str, position: int, request_id: str,
+                           row: dict) -> dict:
+    """Build one row-level endpoint/body/trace binding after its attempts."""
+    if phase not in {"preflight", "probe"}:
+        raise ValueError("setup request binding phase is invalid")
+    if not isinstance(request_id, str) or not request_id \
+            or len(request_id) > 128 \
+            or any(char not in "0123456789abcdef" for char in request_id):
+        raise ValueError(
+            "setup request trace IDs must be 1-128 lowercase hex characters")
+    ecfg = EndpointConfig(**copy.deepcopy(endpoint))
+    plan_binding = _representative_plan_binding(
+        ecfg, {**plan, "max_output": int(plan["max_output"])},
+        position=position)
+    physical = list(row.get("physical_request_body_sha256s") or [])
+    if not all(_is_sha256(item) for item in physical):
+        raise ValueError("setup request physical body hashes are invalid")
+    attempts = row.get("request_attempts")
+    if attempts is not None and (
+            isinstance(attempts, bool) or not isinstance(attempts, int)
+            or attempts < 0 or len(physical) != attempts):
+        raise ValueError(
+            "setup request physical hashes disagree with request attempts")
+    possible = {
+        hashlib.sha256(serialize_request_body(
+            ecfg, plan["messages"], int(plan["max_output"]),
+            include_usage=include_usage)).hexdigest()
+        for include_usage in ({False, True} if ecfg.include_usage else {False})
+    }
+    if any(item not in possible for item in physical):
+        raise ValueError(
+            "setup request physical body hash does not match the exact "
+            "endpoint configuration and representative")
+    binding = {
+        "schema_version": _SETUP_REQUEST_BINDING_SCHEMA,
+        "phase": phase,
+        "position": int(position),
+        "trace_request_id": request_id,
+        "endpoint_request": _endpoint_request_binding(
+            endpoint, max_output_tokens_cap),
+        "representative": plan_binding,
+        "physical_request_body_sha256s": physical,
+        "physical_hash_status": (
+            "exact" if attempts is not None else "outcome_unknown"),
+    }
+    if row.get("request_body_sha256") != \
+            plan_binding["logical_request_body_sha256"]:
+        raise ValueError(
+            "setup row logical body hash disagrees with its exact request")
+    return binding
+
+
+def _attach_setup_request_binding(row: dict, *, endpoint: dict,
+                                  max_output_tokens_cap: int, plan: dict,
+                                  phase: str, position: int) -> dict:
+    binding = _setup_request_binding(
+        endpoint=endpoint, max_output_tokens_cap=max_output_tokens_cap,
+        plan=plan, phase=phase, position=position,
+        request_id=row.get("request_id"), row=row)
+    row["setup_request_binding"] = binding
+    row["setup_request_binding_sha256"] = _binding_sha256(binding)
+    return row
+
+
+def _rescope_representative_plans(plans: list[dict],
+                                  execution_scope_id: str) -> list[dict]:
+    """Give deterministic bodies fresh execution-scoped transport IDs."""
+    if not isinstance(execution_scope_id, str) or not execution_scope_id \
+            or len(execution_scope_id) > 128 \
+            or any(ord(char) < 0x21 or ord(char) > 0x7e
+                   for char in execution_scope_id):
+        raise ValueError("execution request scope is invalid")
+    scoped = []
+    for position, original in enumerate(plans):
+        plan = copy.deepcopy(original)
+        # The synthetic text was constructed with the stable body ID. The
+        # transport/journal ID is deliberately not embedded in that text.
+        body_id = plan.get("body_request_id") or plan.get("request_id")
+        plan["body_request_id"] = body_id
+        plan["request_id"] = _stable_request_id(
+            execution_scope_id, position, "preflight")
+        plan["execution_scope_id"] = execution_scope_id
+        scoped.append(plan)
+    return scoped
+
+
 def _payload_hash(ecfg: EndpointConfig, messages: list[dict],
-                  max_tokens: int) -> str:
+                  max_tokens: int, *, adapter_execution=None) -> str:
     """Hash the deterministic logical body, excluding learned wire fallback."""
-    owned = {"messages", "max_tokens", "temperature", "stream", "model",
-             "stream_options"}
-    body = {k: v for k, v in (ecfg.extra_body or {}).items() if k not in owned}
-    body.update(messages=messages, max_tokens=int(max_tokens),
-                temperature=ecfg.temperature, stream=True)
-    if ecfg.model:
-        body["model"] = ecfg.model
-    raw = json.dumps(body, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
+    if adapter_execution is None:
+        # Standalone planning/binding calls retain full registry attestation.
+        raw = serialize_request_body(
+            ecfg, messages, int(max_tokens), include_usage=False)
+    else:
+        # A live EndpointClient already performed full start attestation and
+        # rechecks at evidence sealing. Avoid distorting dispatcher pacing by
+        # repeating the expensive implementation walk for every request.
+        raw = adapter_execution.serialize_request(
+            ecfg, messages, int(max_tokens), include_usage=False)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _client_payload_hash(client, fallback_ecfg: EndpointConfig,
+                         messages: list[dict], max_tokens: int) -> str:
+    """Use a real client's lease, retaining lightweight transport support."""
+    adapter_execution = getattr(client, "adapter_execution", None)
+    ecfg = getattr(client, "cfg", fallback_ecfg)
+    if adapter_execution is None:
+        # Injected transports used by embedding callers and tests predate the
+        # execution lease. Keep their fully-attested standalone behavior.
+        return _payload_hash(ecfg, messages, max_tokens)
+    return _payload_hash(
+        ecfg, messages, max_tokens,
+        adapter_execution=adapter_execution)
 
 
 class _PreparedWorkload:
@@ -813,6 +1028,7 @@ def _representative_plans(
         for i in range(2):
             prompt_index = i % len(messages)
             msgs = messages[prompt_index]
+            body_rid = _stable_request_id(run_id, i, "preflight-body")
             plans.append({
                 "messages": msgs, "max_output": rc.max_output_tokens_cap,
                 "intended": (0, 0, None, prompt_index),
@@ -820,6 +1036,7 @@ def _representative_plans(
                 "global_index": i, "prompt_index": prompt_index,
                 "sample_index": None, "construction": None,
                 "request_id": _stable_request_id(run_id, i, "preflight"),
+                "body_request_id": body_rid,
                 "representative": f"prompt {prompt_index}",
             })
         return plans
@@ -846,11 +1063,11 @@ def _representative_plans(
     assignment = pool.assign(wanted_prefix)
     plans = []
     for i, quantile in enumerate(("p50", "p95")):
-        rid = _stable_request_id(run_id, i, "preflight")
+        body_rid = _stable_request_id(run_id, i, "preflight-body")
         prefix = int(assignment.prefix_tokens[i])
         suffix = int(inputs[i]) - prefix
         doc_id = int(assignment.doc_id[i])
-        msgs = mat.messages(rid, doc_id, prefix,
+        msgs = mat.messages(body_rid, doc_id, prefix,
                             pool.doc_len.get(doc_id, 0), suffix)
         plans.append({
             "messages": msgs,
@@ -860,7 +1077,9 @@ def _representative_plans(
             "chars": sum(len(x["content"]) for x in msgs),
             "global_index": i, "prompt_index": None, "sample_index": i,
             "construction": mat.construction_report(msgs, int(inputs[i])),
-            "request_id": rid, "representative": quantile,
+            "request_id": _stable_request_id(run_id, i, "preflight"),
+            "body_request_id": body_rid,
+            "representative": quantile,
         })
     return plans
 
@@ -958,6 +1177,8 @@ def _loaded_source_run_id(
         "prompts": loaded_prompts,
         "endpoint_path": rc.endpoint.get("path"),
         "endpoint_model": rc.endpoint.get("model"),
+        "endpoint_adapter": endpoint_adapter_contract(
+            rc.endpoint.get("adapter", DEFAULT_ENDPOINT_ADAPTER)),
         "extra_body": rc.endpoint.get("extra_body") or {},
         "cpt": rc.cpt,
         "pool_docs_per_bucket": rc.pool_docs_per_bucket,
@@ -988,7 +1209,8 @@ def _representative_settings_match(previous: PrevalidatedRunInputs,
     if any(getattr(old, name) != getattr(current, name)
            for name in scalar_fields):
         return False
-    body_endpoint_fields = ("path", "model", "temperature", "extra_body")
+    body_endpoint_fields = (
+        "path", "model", "adapter", "temperature", "extra_body")
     return all(old.endpoint.get(name) == current.endpoint.get(name)
                for name in body_endpoint_fields)
 
@@ -1185,14 +1407,17 @@ def _exception_result(request_id: str, phase: str, plan: dict,
                       body_hash: str, error: str,
                       scheduled_s: float = 0.0,
                       dispatch_lag_ms: float = 0.0, *,
-                      known_not_sent: bool = False) -> dict:
+                      known_not_sent: bool = False,
+                      endpoint_adapter: str = DEFAULT_ENDPOINT_ADAPTER) -> dict:
     intended = plan["intended"]
     row = {
         "request_id": request_id, "scheduled_s": scheduled_s,
         "dispatch_lag_ms": dispatch_lag_ms, "t_send_unix": None,
-        "first_send_unix": None, "ttfb_ms": None, "ttft_ms": None,
+        "first_send_unix": None, "ttfb_ms": None, "ttse_ms": None,
+        "ttft_ms": None,
         "ttfr_ms": None, "ttfv_ms": None, "e2e_ms": None,
         "queue_wait_ms": None, "caller_ttfb_ms": None,
+        "caller_ttse_ms": None,
         "caller_ttft_ms": None, "caller_ttfr_ms": None,
         "caller_ttfv_ms": None, "caller_ttf_tool_call_ms": None,
         "caller_send_ms": None,
@@ -1218,6 +1443,10 @@ def _exception_result(request_id: str, phase: str, plan: dict,
         "retry_reasons": [],
         "tool_call_seen": False, "tool_call_chunks": 0,
         "ttf_tool_call_ms": None, "valid_tool_calls": 0,
+        "endpoint_adapter": endpoint_adapter,
+        "response_mode": get_endpoint_adapter(
+            endpoint_adapter).response_mode,
+        "physical_request_body_sha256s": [],
     }
     row.update(phase=phase, global_index=plan["global_index"],
                sample_index=plan["sample_index"],
@@ -1230,6 +1459,31 @@ def _exception_result(request_id: str, phase: str, plan: dict,
             constructed_actual_chars=plan["construction"]["actual_chars"],
             constructed_error_chars=plan["construction"]["error_chars"])
     return row
+
+
+def _assert_row_adapter_contract(rows: list[dict], ecfg: EndpointConfig) -> None:
+    """Require every request row to claim the configured wire contract.
+
+    Carried setup rows were emitted by the same command immediately before
+    measured execution.  Missing identity is therefore not a harmless legacy
+    case: accepting it would let a preflight performed with a different wire
+    dialect authorize paid traffic.  Historical artifacts remain readable by
+    their versioned verifier, but they cannot be imported as current setup
+    evidence without an exact adapter and response-mode claim.
+    """
+    expected_adapter = ecfg.adapter
+    expected_mode = get_endpoint_adapter(expected_adapter).response_mode
+    for index, row in enumerate(rows):
+        recorded_adapter = row.get("endpoint_adapter")
+        recorded_mode = row.get("response_mode")
+        if recorded_adapter != expected_adapter:
+            raise ValueError(
+                f"request row {index} endpoint_adapter does not match the "
+                "configured endpoint adapter")
+        if recorded_mode != expected_mode:
+            raise ValueError(
+                f"request row {index} response_mode does not match the "
+                "configured endpoint adapter")
 
 
 def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
@@ -1260,7 +1514,8 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
         body_rid = _stable_request_id(workload_id, i, "sizing-body")
         rid = _stable_request_id(execution_id, i, "sizing")
         plan = workload.plan(i, body_rid)
-        body_hash = _payload_hash(ecfg, plan["messages"], plan["max_output"])
+        body_hash = _client_payload_hash(
+            client, ecfg, plan["messages"], plan["max_output"])
         try:
             res = _send_request(
                 client,
@@ -1271,7 +1526,8 @@ def _size_for_concurrency(rc: "RunConfig", ecfg, client, record,
         except Exception as exc:
             d = _exception_result(
                 rid, "sizing", plan, body_hash,
-                f"unexpected worker exception: {type(exc).__name__}: {exc}")
+                f"unexpected worker exception: {type(exc).__name__}: {exc}",
+                endpoint_adapter=ecfg.adapter)
         record(d)
         if _clean_measurement_row(d) and d.get("e2e_ms"):
             e2e.append(d["e2e_ms"])
@@ -1796,6 +2052,155 @@ def _token(cfg: EndpointConfig) -> str | None:
     return None
 
 
+_REASONING_PROBE_SCHEMA = "reasoning-control-probe-evidence/v1"
+_REASONING_PROBE_REQUIRED_FIELDS = {
+    "schema_version", "candidate_index", "candidate_redacted",
+    "candidate_canonical_sha256", "disposition", "evidence_method",
+    "effective_status", "effective_value", "request_id",
+    "logical_request_body_sha256", "physical_request_body_sha256s",
+}
+_REASONING_PROBE_METHODS = {
+    "accepted": {"single_request_behavior_observation"},
+    "rejected": {"request_validation_response"},
+    "unknown": {"non_validation_http_failure", "transport_outcome_unknown"},
+}
+
+
+def _reasoning_probe_candidate_sha256(value: dict) -> str:
+    raw = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validated_reasoning_probe_candidate(value: object, *, label: str) -> dict:
+    """Independently bound persisted candidates without revealing content."""
+    from .client import validate_extra_body_safety
+
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{label}.candidate_redacted must be a non-empty object")
+    try:
+        validate_extra_body_safety(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{label}.candidate_redacted contains unsafe material") from exc
+    nodes = 0
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > 256 or depth > 8:
+            raise ValueError(f"{label}.candidate_redacted exceeds v1 limits")
+        if item is None or isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            if not -(2 ** 63) <= item <= 2 ** 63 - 1:
+                raise ValueError(
+                    f"{label}.candidate_redacted integer exceeds int64")
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError(
+                    f"{label}.candidate_redacted number is not finite")
+            continue
+        if isinstance(item, str):
+            if len(item.encode("utf-8")) > 4096 \
+                    or any(ord(char) < 0x20 or ord(char) == 0x7f
+                           for char in item):
+                raise ValueError(
+                    f"{label}.candidate_redacted string is invalid")
+            continue
+        if isinstance(item, list):
+            if len(item) > 64:
+                raise ValueError(
+                    f"{label}.candidate_redacted array exceeds v1 limits")
+            stack.extend((child, depth + 1) for child in item)
+            continue
+        if isinstance(item, dict):
+            if len(item) > 64:
+                raise ValueError(
+                    f"{label}.candidate_redacted object exceeds v1 limits")
+            for key, child in item.items():
+                if not isinstance(key, str) or not key \
+                        or len(key.encode("utf-8")) > 128 \
+                        or any(ord(char) < 0x20 or ord(char) == 0x7f
+                               for char in key):
+                    raise ValueError(
+                        f"{label}.candidate_redacted key is invalid")
+                stack.append((child, depth + 1))
+            continue
+        raise ValueError(
+            f"{label}.candidate_redacted contains a non-JSON value")
+    raw = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    if len(raw) > 16 * 1024:
+        raise ValueError(
+            f"{label}.candidate_redacted exceeds v1 byte limit")
+    return copy.deepcopy(value)
+
+
+def _validated_reasoning_control_probe_evidence(
+        value: object, *, row: dict | None = None,
+        label: str = "reasoning_control_probe") -> dict:
+    """Validate a v1 probe envelope and its logical/physical body links."""
+    if not isinstance(value, dict) \
+            or set(value) != _REASONING_PROBE_REQUIRED_FIELDS:
+        raise ValueError(f"{label} has unknown or missing fields")
+    if value.get("schema_version") != _REASONING_PROBE_SCHEMA:
+        raise ValueError(f"{label}.schema_version is unsupported")
+    index = value.get("candidate_index")
+    if isinstance(index, bool) or not isinstance(index, int) \
+            or not 1 <= index <= 16:
+        raise ValueError(f"{label}.candidate_index is invalid")
+    candidate = _validated_reasoning_probe_candidate(value.get(
+        "candidate_redacted"), label=label)
+    digest = value.get("candidate_canonical_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 \
+            or any(char not in "0123456789abcdef" for char in digest) \
+            or digest != _reasoning_probe_candidate_sha256(candidate):
+        raise ValueError(f"{label}.candidate_canonical_sha256 is invalid")
+    disposition = value.get("disposition")
+    method = value.get("evidence_method")
+    if disposition not in _REASONING_PROBE_METHODS \
+            or method not in _REASONING_PROBE_METHODS[disposition]:
+        raise ValueError(f"{label} disposition/evidence_method is invalid")
+    expected_effective = (
+        "not_applied_request_rejected"
+        if disposition == "rejected" else "unknown")
+    if value.get("effective_status") != expected_effective \
+            or value.get("effective_value") is not None:
+        raise ValueError(f"{label} makes an unsupported effective-value claim")
+    request_id = value.get("request_id")
+    if not isinstance(request_id, str) or not request_id \
+            or len(request_id.encode("utf-8")) > 256 \
+            or any(ord(char) < 0x21 or ord(char) > 0x7e
+                   for char in request_id):
+        raise ValueError(f"{label}.request_id is invalid")
+
+    def digest_ok(item: object) -> bool:
+        return isinstance(item, str) and len(item) == 64 \
+            and all(char in "0123456789abcdef" for char in item)
+
+    logical = value.get("logical_request_body_sha256")
+    physical = value.get("physical_request_body_sha256s")
+    if not digest_ok(logical) or not isinstance(physical, list) \
+            or len(physical) > 5 or not all(digest_ok(item) for item in physical):
+        raise ValueError(f"{label} body SHA-256 evidence is invalid")
+    if row is not None:
+        if row.get("phase") != "probe" \
+                or row.get("request_id") != request_id \
+                or row.get("request_body_sha256") != logical \
+                or row.get("physical_request_body_sha256s", []) != physical:
+            raise ValueError(f"{label} body/request links disagree with row")
+        attempts = row.get("request_attempts")
+        if attempts is not None and (
+                isinstance(attempts, bool) or not isinstance(attempts, int)
+                or attempts < 0 or len(physical) != attempts):
+            raise ValueError(f"{label} physical hashes disagree with attempts")
+    return copy.deepcopy(value)
+
+
 def _prepare_prior_request_rows(value) -> list[dict]:
     """Validate metadata-only request rows produced by CLI preflight.
 
@@ -1811,7 +2216,8 @@ def _prepare_prior_request_rows(value) -> list[dict]:
         "phase", "global_index", "sample_index", "prompt_index",
         "body_request_id", "request_body_sha256",
         "constructed_target_chars", "constructed_actual_chars",
-        "constructed_error_chars",
+        "constructed_error_chars", "reasoning_control_probe",
+        "setup_request_binding", "setup_request_binding_sha256",
     }
     timestamp_fields = {
         "first_send_unix", "t_send_unix", "first_attempt_unix",
@@ -1842,6 +2248,15 @@ def _prepare_prior_request_rows(value) -> list[dict]:
             raise ValueError(
                 f"prior_request_rows[{index}] has unknown metadata field: "
                 + ", ".join(unknown))
+        probe_evidence = row.get("reasoning_control_probe")
+        if probe_evidence is not None:
+            if row.get("phase") != "probe":
+                raise ValueError(
+                    f"prior_request_rows[{index}].reasoning_control_probe "
+                    "is only valid for a probe row")
+            _validated_reasoning_control_probe_evidence(
+                probe_evidence, row=row,
+                label=f"prior_request_rows[{index}]")
         for name in timestamp_fields:
             item = row.get(name)
             if item is None:
@@ -1913,6 +2328,23 @@ def _prepare_prior_request_rows(value) -> list[dict]:
             raise ValueError(
                 f"prior_request_rows[{index}].retries must equal the number "
                 "of retry_reasons")
+        body_hashes = row.get("physical_request_body_sha256s")
+        if body_hashes is not None and (
+                not isinstance(body_hashes, list)
+                or any(not isinstance(digest, str) or len(digest) != 64
+                       or any(char not in "0123456789abcdef"
+                              for char in digest)
+                       for digest in body_hashes)):
+            raise ValueError(
+                f"prior_request_rows[{index}]."
+                "physical_request_body_sha256s must be a list of lowercase "
+                "SHA-256 hex digests")
+        if attempts is not None and body_hashes is not None \
+                and len(body_hashes) != attempts:
+            raise ValueError(
+                f"prior_request_rows[{index}]."
+                "physical_request_body_sha256s count must equal "
+                "request_attempts")
         if attempts == 0:
             sent_only = {
                 name: row.get(name) for name in (
@@ -1977,6 +2409,40 @@ def _prepare_prior_request_rows(value) -> list[dict]:
             raise ValueError(
                 f"prior_request_rows[{index}].finished_unix cannot precede "
                 "first_send_unix")
+        # Validate the row's own scalar and cross-field invariants before its
+        # envelope.  The binding still fails closed, but malformed rows retain
+        # precise and deterministic diagnostics instead of every error being
+        # hidden behind a missing-binding message.
+        binding = row.get("setup_request_binding")
+        binding_digest = row.get("setup_request_binding_sha256")
+        if not isinstance(binding, dict) or not _is_sha256(binding_digest) \
+                or _binding_sha256(binding) != binding_digest:
+            raise ValueError(
+                f"prior_request_rows[{index}] lacks a valid exact setup "
+                "request binding; legacy carried rows fail closed")
+        required_binding = {
+            "schema_version", "phase", "position", "trace_request_id",
+            "endpoint_request", "representative",
+            "physical_request_body_sha256s", "physical_hash_status",
+        }
+        if set(binding) != required_binding \
+                or binding.get("schema_version") != \
+                _SETUP_REQUEST_BINDING_SCHEMA \
+                or binding.get("phase") != row.get("phase") \
+                or binding.get("trace_request_id") != row.get("request_id") \
+                or binding.get("physical_request_body_sha256s") != \
+                list(row.get("physical_request_body_sha256s") or []) \
+                or not isinstance(binding.get("endpoint_request"), dict) \
+                or not isinstance(binding.get("representative"), dict):
+            raise ValueError(
+                f"prior_request_rows[{index}] setup request binding "
+                "disagrees with its row")
+        if binding["representative"].get(
+                "logical_request_body_sha256") != \
+                row.get("request_body_sha256"):
+            raise ValueError(
+                f"prior_request_rows[{index}] setup request binding has a "
+                "different logical body hash")
         try:
             json.dumps(row, allow_nan=False)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -1990,18 +2456,33 @@ def _prepare_prior_request_rows(value) -> list[dict]:
 def _validated_preflight_gate(value, prior_rows: list[dict]) -> dict | None:
     """Validate command-level preflight state carried into a measured run."""
     if value is None:
+        if prior_rows:
+            raise ValueError(
+                "carried setup rows require their exact preflight gate")
         return None
     if not isinstance(value, dict):
         raise ValueError("preflight_gate must be an object")
-    expected = {
+    required = {
         "skipped", "attempted", "reachable", "readable",
         "reasoning_probe_requests", "outcome", "force_requested",
-        "gate_satisfied",
+        "gate_satisfied", "evidence_mode", "binding", "binding_sha256",
     }
-    if set(value) != expected:
+    optional = {"reasoning_control_probes"}
+    if not required.issubset(value) or set(value) - required - optional:
         raise ValueError("preflight_gate has unknown or missing fields")
     if value.get("skipped") is not False:
         raise ValueError("a carried preflight_gate cannot be skipped")
+    if value.get("evidence_mode") not in {
+            "carried_setup_rows", "inherited_setup_artifact"}:
+        raise ValueError("preflight_gate evidence_mode is invalid")
+    binding = value.get("binding")
+    if not isinstance(binding, dict) \
+            or binding.get("schema_version") != _PREFLIGHT_BINDING_SCHEMA \
+            or not _is_sha256(value.get("binding_sha256")) \
+            or _binding_sha256(binding) != value.get("binding_sha256"):
+        raise ValueError(
+            "preflight_gate lacks a valid cryptographic request binding; "
+            "legacy carried gates fail closed")
     if not isinstance(value.get("force_requested"), bool) \
             or not isinstance(value.get("gate_satisfied"), bool):
         raise ValueError("preflight_gate boolean fields are invalid")
@@ -2019,10 +2500,43 @@ def _validated_preflight_gate(value, prior_rows: list[dict]) -> dict | None:
     preflight_rows = sum(row.get("phase") == "preflight"
                          for row in prior_rows)
     probe_rows = sum(row.get("phase") == "probe" for row in prior_rows)
-    if preflight_rows != counts["attempted"] \
-            or probe_rows != counts["reasoning_probe_requests"]:
+    carried = value["evidence_mode"] == "carried_setup_rows"
+    if carried and (
+            preflight_rows != counts["attempted"]
+            or probe_rows != counts["reasoning_probe_requests"]):
         raise ValueError(
             "preflight_gate counts disagree with prior_request_rows")
+    if not carried and prior_rows:
+        raise ValueError(
+            "an inherited preflight gate cannot duplicate setup rows")
+    has_probe_evidence = "reasoning_control_probes" in value
+    row_probe_evidence = [
+        row.get("reasoning_control_probe")
+        for row in prior_rows if row.get("phase") == "probe"
+    ]
+    if has_probe_evidence and carried:
+        supplied = value.get("reasoning_control_probes")
+        if not isinstance(supplied, list) \
+                or len(supplied) != counts["reasoning_probe_requests"]:
+            raise ValueError(
+                "preflight_gate reasoning-control evidence count disagrees")
+        validated = [
+            _validated_reasoning_control_probe_evidence(
+                item, row=row,
+                label=f"preflight_gate.reasoning_control_probes[{index}]")
+            for index, (item, row) in enumerate(
+                zip(supplied,
+                    [row for row in prior_rows
+                     if row.get("phase") == "probe"], strict=True))
+        ]
+        if supplied != validated or row_probe_evidence != validated \
+                or [item["candidate_index"] for item in validated] != \
+                list(range(1, len(validated) + 1)):
+            raise ValueError(
+                "preflight_gate reasoning-control evidence is inconsistent")
+    elif carried and any(item is not None for item in row_probe_evidence):
+        raise ValueError(
+            "preflight_gate is missing carried reasoning-control evidence")
     outcome = value.get("outcome")
     if outcome == "preflight_passed":
         valid = (counts["reachable"] == counts["attempted"]
@@ -2043,9 +2557,167 @@ def _validated_preflight_gate(value, prior_rows: list[dict]) -> dict | None:
     return copy.deepcopy(value)
 
 
+def _preflight_binding_for_rows(rc: RunConfig,
+                                representative_plans: list[dict],
+                                rows: list[dict]) -> tuple[dict, str]:
+    """Create the gate-level digest over execution intent and setup rows."""
+    setup_requests = []
+    for row in rows:
+        setup_requests.append({
+            "phase": row.get("phase"),
+            "trace_request_id": row.get("request_id"),
+            "setup_request_binding_sha256": row.get(
+                "setup_request_binding_sha256"),
+            "logical_request_body_sha256": row.get(
+                "request_body_sha256"),
+            "physical_request_body_sha256s": list(
+                row.get("physical_request_body_sha256s") or []),
+        })
+    binding = {
+        "schema_version": _PREFLIGHT_BINDING_SCHEMA,
+        "execution": _preflight_execution_binding(
+            rc, representative_plans),
+        "setup_requests": setup_requests,
+    }
+    return binding, _binding_sha256(binding)
+
+
+def _validated_setup_artifact_reference(value: object,
+                                        preflight_gate: dict | None) \
+        -> dict | None:
+    if value is None:
+        if isinstance(preflight_gate, dict) and preflight_gate.get(
+                "evidence_mode") == "inherited_setup_artifact":
+            raise ValueError(
+                "inherited preflight evidence requires a setup artifact "
+                "reference")
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("setup_artifact_reference must be an object")
+    required = {
+        "schema_version", "artifact_id", "execution_id", "workload_id",
+        "manifest_sha256", "manifest_bytes", "preflight_binding_sha256",
+    }
+    if set(value) != required \
+            or value.get("schema_version") != \
+            _SETUP_ARTIFACT_REFERENCE_SCHEMA \
+            or any(not isinstance(value.get(field), str)
+                   or not value[field]
+                   or len(value[field]) > 160
+                   or any(ord(char) < 0x21 or ord(char) > 0x7e
+                          for char in value[field])
+                   for field in ("artifact_id", "execution_id",
+                                 "workload_id")) \
+            or not _is_sha256(value.get("manifest_sha256")) \
+            or not _is_sha256(value.get("preflight_binding_sha256")) \
+            or not isinstance(value.get("manifest_bytes"), int) \
+            or isinstance(value.get("manifest_bytes"), bool) \
+            or value["manifest_bytes"] <= 0:
+        raise ValueError("setup_artifact_reference is invalid")
+    if not isinstance(preflight_gate, dict) \
+            or value["preflight_binding_sha256"] != \
+            preflight_gate.get("binding_sha256"):
+        raise ValueError(
+            "setup artifact reference does not bind this preflight gate")
+    return copy.deepcopy(value)
+
+
+def _merge_binding_candidate(base: dict, overlay: dict) -> dict:
+    result = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = _merge_binding_candidate(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _assert_carried_preflight_binding(
+        rc: RunConfig, representative_plans: list[dict],
+        prior_rows: list[dict], gate: dict | None) -> None:
+    """Recompute the exact setup authorization before credentials or POSTs."""
+    if gate is None:
+        if prior_rows:
+            raise ValueError("carried setup rows have no preflight binding")
+        return
+    binding = gate["binding"]
+    expected_execution = _preflight_execution_binding(
+        rc, representative_plans)
+    if binding.get("execution") != expected_execution:
+        raise ValueError(
+            "carried preflight binding does not match this exact endpoint, "
+            "request configuration, output cap, or workload")
+    if gate["evidence_mode"] == "inherited_setup_artifact":
+        return
+    linked = binding.get("setup_requests")
+    if not isinstance(linked, list) or len(linked) != len(prior_rows):
+        raise ValueError(
+            "carried preflight binding row population is inconsistent")
+    plans_by_index = {
+        (plan.get("global_index"), plan.get("sample_index"),
+         plan.get("prompt_index")): plan
+        for plan in representative_plans
+    }
+    base_endpoint = copy.deepcopy(rc.endpoint)
+    for index, (row, link) in enumerate(zip(prior_rows, linked, strict=True)):
+        expected_link = {
+            "phase": row.get("phase"),
+            "trace_request_id": row.get("request_id"),
+            "setup_request_binding_sha256": row.get(
+                "setup_request_binding_sha256"),
+            "logical_request_body_sha256": row.get(
+                "request_body_sha256"),
+            "physical_request_body_sha256s": list(
+                row.get("physical_request_body_sha256s") or []),
+        }
+        if link != expected_link:
+            raise ValueError(
+                f"carried preflight binding row {index} link disagrees")
+        row_binding = row["setup_request_binding"]
+        rep = row_binding["representative"]
+        key = (rep.get("global_index"), rep.get("sample_index"),
+               rep.get("prompt_index"))
+        plan = plans_by_index.get(key)
+        if plan is None:
+            raise ValueError(
+                f"carried preflight row {index} is not one of this "
+                "workload's representatives")
+        exact_endpoint = copy.deepcopy(base_endpoint)
+        if row.get("phase") == "probe":
+            evidence = row.get("reasoning_control_probe")
+            if not isinstance(evidence, dict):
+                raise ValueError(
+                    f"carried probe row {index} has no candidate evidence")
+            exact_endpoint["extra_body"] = _merge_binding_candidate(
+                exact_endpoint.get("extra_body") or {},
+                evidence["candidate_redacted"])
+        elif row_binding["endpoint_request"].get("include_usage", {}).get(
+                "value") is True and EndpointConfig(
+                    **exact_endpoint).include_usage is False:
+            # The only accepted setup-to-execution request transform is the
+            # adapter-observed include_usage rejection: the setup row binds
+            # the attempted true value and the gate binds execution false.
+            exact_endpoint["include_usage"] = True
+        plan_for_row = copy.deepcopy(plan)
+        plan_for_row["max_output"] = int(rep.get("max_tokens"))
+        rebuilt = _setup_request_binding(
+            endpoint=exact_endpoint,
+            max_output_tokens_cap=rc.max_output_tokens_cap,
+            plan=plan_for_row, phase=row["phase"],
+            position=int(row_binding.get("position")),
+            request_id=row["request_id"], row=row)
+        if rebuilt != row_binding \
+                or _binding_sha256(rebuilt) != \
+                row["setup_request_binding_sha256"]:
+            raise ValueError(
+                f"carried preflight row {index} does not match the exact "
+                "endpoint/config/workload binding")
+
+
 def run(rc: RunConfig, token_override: str | None = None,
         quiet: bool = False, prior_request_rows=None,
-        runtime_quota_guard=None, preflight_gate=None) -> dict:
+        runtime_quota_guard=None, preflight_gate=None,
+        setup_artifact_reference=None) -> dict:
     # Freeze all nested request/policy configuration and re-run validation in
     # case a caller mutated the dataclass after constructing it.
     rc = dataclasses.replace(
@@ -2057,6 +2729,8 @@ def run(rc: RunConfig, token_override: str | None = None,
         input_expectations=copy.deepcopy(rc.input_expectations))
     prior_rows = _prepare_prior_request_rows(prior_request_rows)
     preflight_gate = _validated_preflight_gate(preflight_gate, prior_rows)
+    setup_artifact_reference = _validated_setup_artifact_reference(
+        setup_artifact_reference, preflight_gate)
     prompts_mode = bool(rc.prompts_file)
     if prompts_mode and rc.profile_path:
         raise ValueError("set profile_path or prompts_file, not both")
@@ -2069,6 +2743,10 @@ def run(rc: RunConfig, token_override: str | None = None,
             f"start_at_unix is stale by {time.time() - rc.start_at_unix:.3f}s; "
             "use a future shared start and synchronize shard clocks")
     ecfg = EndpointConfig(**rc.endpoint)
+    # Carried CLI preflight/probe evidence must authorize this exact wire
+    # contract.  Reject it before source snapshots, credential lookup,
+    # metadata discovery, quota reservation, or any measured request.
+    _assert_row_adapter_contract(prior_rows, ecfg)
     if token_override is not None and ecfg.auth_profile:
         raise AuthProfileError(
             "token_override cannot be combined with a named auth_profile")
@@ -2094,6 +2772,12 @@ def run(rc: RunConfig, token_override: str | None = None,
         # authorize a different schedule or workload realization from the one
         # that is eventually sent.
         prevalidated = prevalidate_run_inputs(work_rc)
+        # Recompute the complete setup authorization from the exact private
+        # workload snapshot. This is deliberately before token lookup,
+        # metadata/network probes, artifact creation, or measured inference.
+        _assert_carried_preflight_binding(
+            work_rc, prevalidated.representative_plans,
+            prior_rows, preflight_gate)
         enforce_exact_analysis_envelope(
             prevalidated, setup_rows=len(prior_rows),
             context="run including carried setup traffic")
@@ -2165,6 +2849,8 @@ def run(rc: RunConfig, token_override: str | None = None,
             "runtime_quota_guard_baseline": (
                 copy.deepcopy(runtime_quota_guard_baseline)),
             "preflight_gate": copy.deepcopy(preflight_gate),
+            "setup_artifact_reference": copy.deepcopy(
+                setup_artifact_reference),
             "schedule_configuration": {
                 key: getattr(original_rc, key) for key in (
                     "duration_s", "qps_base", "qps_burst", "qps_min",
@@ -2213,6 +2899,20 @@ def run(rc: RunConfig, token_override: str | None = None,
                 ecfg, token, refresh=refresh,
                 runtime_quota_guard=runtime_quota_guard)
             req_params = {
+                "endpoint_adapter": ecfg.adapter,
+                # Use the same start-attested execution snapshot as request
+                # serialization. transport_contract() re-attests this exact
+                # adapter before the result package is sealed.
+                "endpoint_adapter_contract": (
+                    client.adapter_execution.contract
+                    if getattr(client, "adapter_execution", None) is not None
+                    else endpoint_adapter_contract(ecfg.adapter)),
+                "response_mode": (
+                    client.adapter.response_mode
+                    if getattr(client, "adapter", None) is not None
+                    else get_endpoint_adapter(ecfg.adapter).response_mode),
+                "model": ecfg.model,
+                "include_usage": ecfg.include_usage,
                 "temperature": ecfg.temperature,
                 "max_output_tokens_cap": original_rc.max_output_tokens_cap,
                 "extra_body": ecfg.extra_body or {},
@@ -2368,15 +3068,16 @@ def run(rc: RunConfig, token_override: str | None = None,
                     execution_id, i,
                     f"calibration-shard-{effective_rc.shard_index}")
                 plan = workload.plan(i, body_rid)
-                body_hash = _payload_hash(
-                    ecfg, plan["messages"], plan["max_output"])
+                body_hash = _client_payload_hash(
+                    client, ecfg, plan["messages"], plan["max_output"])
                 if (runtime_quota_guard is not None
                         and runtime_quota_guard.tripped):
                     row = _exception_result(
                         rid, "calibration", plan, body_hash,
                         "request omitted after runtime quota admission "
                         "refusal; no HTTP POST was attempted",
-                        known_not_sent=True)
+                        known_not_sent=True,
+                        endpoint_adapter=ecfg.adapter)
                     row.update(
                         quota_guard_id=runtime_quota_guard.guard_id,
                         quota_guard_denied=True,
@@ -2392,7 +3093,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                         row = _exception_result(
                             rid, "calibration", plan, body_hash,
                             "unexpected worker exception: "
-                            f"{type(exc).__name__}: {exc}")
+                            f"{type(exc).__name__}: {exc}",
+                            endpoint_adapter=ecfg.adapter)
                 artifact.append(row)
                 calibration_rows.append(row)
                 if (_clean_measurement_row(row)
@@ -2482,7 +3184,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                         rid, "replay", plan, body_hash,
                         "unexpected worker exception: "
                         f"{type(exc).__name__}: {exc}",
-                        scheduled_s=scheduled_s, dispatch_lag_ms=lag_ms)
+                        scheduled_s=scheduled_s, dispatch_lag_ms=lag_ms,
+                        endpoint_adapter=ecfg.adapter)
 
             try:
                 parameters = tuple(inspect.signature(
@@ -2524,8 +3227,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                     rid = _stable_request_id(
                         execution_id, global_i, "replay")
                     plan = workload.plan(global_i, body_rid)
-                    body_hash = _payload_hash(
-                        ecfg, plan["messages"], plan["max_output"])
+                    body_hash = _client_payload_hash(
+                        client, ecfg, plan["messages"], plan["max_output"])
                     # Dispatch lateness includes all synchronous dispatcher
                     # work required to make this request submit-ready.  A
                     # timestamp taken before plan construction/body hashing
@@ -2542,7 +3245,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                             "refusal; no HTTP POST was attempted",
                             scheduled_s=float(ts[local_i]),
                             dispatch_lag_ms=lag_ms,
-                            known_not_sent=True)
+                            known_not_sent=True,
+                            endpoint_adapter=ecfg.adapter)
                         row.update(
                             quota_guard_id=runtime_quota_guard.guard_id,
                             quota_guard_denied=True,
@@ -2558,7 +3262,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                             "request was not sent",
                             scheduled_s=float(ts[local_i]),
                             dispatch_lag_ms=lag_ms,
-                            known_not_sent=True))
+                            known_not_sent=True,
+                            endpoint_adapter=ecfg.adapter))
                         prog.done(None)
                         prog.paint()
                         continue
@@ -2612,7 +3317,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                                 "operator cancellation before request send",
                                 scheduled_s=scheduled_s,
                                 dispatch_lag_ms=lag_ms,
-                                known_not_sent=True))
+                                known_not_sent=True,
+                                endpoint_adapter=ecfg.adapter))
                         except Exception:
                             # Preserve the original BaseException. start.json
                             # and the append-only journal remain recoverable.
@@ -2642,7 +3348,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                             "the running worker may have emitted an HTTP POST",
                             scheduled_s=scheduled_s,
                             dispatch_lag_ms=lag_ms,
-                            known_not_sent=False))
+                            known_not_sent=False,
+                            endpoint_adapter=ecfg.adapter))
                     except Exception:
                         pass
                 ex.shutdown(wait=False, cancel_futures=True)
@@ -2740,6 +3447,8 @@ def run(rc: RunConfig, token_override: str | None = None,
                 "runtime_quota_guard_baseline": (
                     copy.deepcopy(runtime_quota_guard_baseline)),
                 "preflight_gate": copy.deepcopy(preflight_gate),
+                "setup_artifact_reference": copy.deepcopy(
+                    setup_artifact_reference),
                 "shard": (f"{effective_rc.shard_index + 1}/"
                           f"{effective_rc.shard_total}"),
                 "endpoint_base_url": ecfg.base_url,
@@ -2784,6 +3493,7 @@ def run(rc: RunConfig, token_override: str | None = None,
             # generation memory is bounded by max_pending_requests; the final
             # exact percentile calculation uses the persisted replay rows.
             journal_rows = list(artifact.read_rows())
+            _assert_row_adapter_contract(journal_rows, ecfg)
             replay_rows = [
                 row for row in journal_rows if row.get("phase") == "replay"]
             summary = summarize(

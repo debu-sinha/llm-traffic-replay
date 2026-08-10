@@ -56,6 +56,16 @@ def _summary(met_p95, label="run", n=250):
             for w in (0, 1, 2)]},
         "run": {"input_mode": "profile", "endpoint_path": "/e",
                 "label": label,
+                "preflight_gate": {
+                    "skipped": False,
+                    "attempted": 2,
+                    "reachable": 2,
+                    "readable": 2,
+                    "reasoning_probe_requests": 0,
+                    "outcome": "preflight_passed",
+                    "force_requested": False,
+                    "gate_satisfied": True,
+                },
                 "transport": {
                     "connection_policy_id":
                         "fresh_http1_per_physical_attempt",
@@ -66,7 +76,11 @@ def _summary(met_p95, label="run", n=250):
                         "operator asserted an exact production policy match",
                     "production_comparability_warning": None,
                 },
-                "request_params": {"temperature": 0.0,
+                "request_params": {
+                                   "endpoint_adapter":
+                                       "openai.chat_completions.sse/v1",
+                                   "response_mode": "streaming",
+                                   "temperature": 0.0,
                                    "max_output_tokens_cap": 40,
                                    "extra_body": {}}},
         "sla": {"ttft_definition": "first_content",
@@ -87,6 +101,8 @@ def test_html_is_self_contained_and_has_units():
     # no external assets, safe to open or attach anywhere
     assert "http://" not in h and "https://" not in h
     assert "<link" not in h and "<script" not in h
+    assert "openai.chat_completions.sse/v1" in h
+    assert "mode streaming" in h
     # units are spelled out for every metric family
     for unit in ("milliseconds", "(ms)", "fraction (0-1)",
                  "requests/second (QPS)", "tok/min", "(count)",

@@ -327,6 +327,8 @@ def test_exact_caller_latency_is_primary_and_zero_throughput_is_visible():
         row["caller_ttft_ms"] = 500.0
         row["caller_e2e_ms"] = 700.0
     summary = summarize(rows)
+    summary["throughput"]["completion_tokens_per_min"] = 0.0
+    summary["throughput"]["all_completion_tokens_per_min"] = 0.0
     summary["throughput"]["output_tokens_per_min"] = 0.0
 
     body = render_html(summary, "caller-first report")
@@ -337,8 +339,8 @@ def test_exact_caller_latency_is_primary_and_zero_throughput_is_visible():
         and ">700 <span class='u'>ms" in body
     assert body.index("Exact caller TTFT p50") < body.index(
         "Final-attempt request-path latency")
-    assert "output throughput" in body
-    assert ">0 <span class='u'>tok/min</span>" in body
+    assert "all-completion throughput" in body
+    assert ">0 <span class='u'>completion tok/min</span>" in body
 
 
 def test_stability_chart_has_units_alt_text_and_preserves_missing_gaps():

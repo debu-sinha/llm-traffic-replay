@@ -244,6 +244,57 @@ def _decision_pair_display(
     return (format(target_number, ".17g"), format(actual_number, ".17g"))
 
 
+_REPORT_FIELD_GLOSSARY = (
+    ("Calibration request", "A real, paid, unloaded request sent before the "
+     "measured replay only to estimate the synthetic text generator's "
+     "characters-per-token ratio from endpoint-reported prompt_tokens. It is "
+     "not a warm-up exclusion, quality check, latency sample, capacity sample, "
+     "or provider-quota reservation. It is excluded from replay performance "
+     "metrics but included in cost/quota traffic evidence. Any positive count "
+     "can warm routing, workers, model state, and caches; calibrate_n=0 disables "
+     "this harness phase. Actual count is min(calibrate_n, replay rows)."),
+    ("Measured replay request", "One logical workload row scheduled inside "
+     "the offered-load window. Setup, probe, sizing, and calibration rows are "
+     "not measured replay rows."),
+    ("Logical request vs physical attempt", "A logical row is one scheduled "
+     "operation. Retries can create multiple physical POST attempts. Request-"
+     "path latency for the final attempt excludes earlier attempts; caller "
+     "latency includes the caller's total wait."),
+    ("p50 / p90 / p95 / p99 / n", "Observed percentile of the named eligible "
+     "population; n is that population's row count. A printed percentile can "
+     "be marked indicative when n is below the evidence threshold."),
+    ("TTFB", "Time from immediately before the final HTTP request send to the "
+     "first response byte; fresh connection setup is recorded separately."),
+    ("TTSE", "Time to first successfully parsed server-sent-event. It is a "
+     "protocol diagnostic, not necessarily visible content."),
+    ("TTFT", "Configured response-start metric. first_content accepts visible "
+     "content, reasoning, or refusal onset; first_visible waits for visible "
+     "assistant content."),
+    ("TTFV", "Time to first visible assistant content. Reasoning-only stream "
+     "events do not satisfy it."),
+    ("TTFG / E2E", "Time from final request send to terminal response/stream "
+     "completion for the eligible final attempt."),
+    ("TPOT", "Time per endpoint-reported completion token after response "
+     "start. Completion tokens can include hidden reasoning; this is not "
+     "visible-output TPOT without exact visible-token accounting."),
+    ("QPS / RPS", "Requests per second. Scheduled rate is offered demand; "
+     "achieved rate is based on client request-start events, not provider "
+     "receipt rate."),
+    ("Dispatch lag / request-start lateness", "Client-side delay relative to "
+     "the open-loop schedule. Neither is endpoint processing latency."),
+    ("Harness-successful", "The client completed the request/stream contract. "
+     "It does not alone prove a readable, complete, or acceptable answer."),
+    ("Cached tokens", "Endpoint-reported cached prompt tokens. Missing means "
+     "unknown, never zero. Intended cache fraction describes constructed input "
+     "shape; achieved cache fraction is reported usage."),
+    ("Reasoning tokens / reasoning deltas", "Reasoning tokens require a "
+     "recognized endpoint usage field. Reasoning SSE deltas are event counts, "
+     "not token estimates."),
+    ("NOT REPORTED / unknown / null", "Evidence was absent or unusable. These "
+     "values never mean zero and must not be imputed as success."),
+)
+
+
 def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
     """How many requests were actually in flight, by exact interval overlap.
 
@@ -1243,6 +1294,8 @@ def _verdict(s: dict) -> tuple[str, str]:
                       "to this provider/model/product/tier run")
     if (s.get("cache_fidelity") or {}).get("warning"):
         doubts.append((s.get("cache_fidelity") or {})["warning"])
+    if (s.get("calibration_warmth") or {}).get("warning"):
+        doubts.append((s.get("calibration_warmth") or {})["warning"])
     if (s.get("token_targeting") or {}).get("warning"):
         doubts.append((s.get("token_targeting") or {})["warning"])
     if (s.get("latency_population") or {}).get("warning"):
@@ -1560,10 +1613,6 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
     if models["distinct_values_at_least"] > 1:
         invalid_reasons.append(
             "multiple response model values were observed in one benchmark")
-    if unexpected_models:
-        invalid_reasons.append(
-            "response model did not match the bound request-body "
-            "identity: " + ", ".join(unexpected_models))
     if unexpected_served_models:
         invalid_reasons.append(
             "served-model-name response header did not match any active "
@@ -1574,12 +1623,44 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
             "response model cardinality exceeded the bounded evidence table")
 
     warning = None
+    request_model_match = "not_configured"
+    if expected_models:
+        if not models["reported_rows"]:
+            request_model_match = "not_reported"
+        elif models["distinct_values_at_least"] > 1:
+            request_model_match = "mixed"
+        elif unexpected_models:
+            # Provider APIs commonly accept a stable alias in the request and
+            # return a resolved/revisioned identifier.  Without a trusted,
+            # captured alias map, one consistent difference proves neither a
+            # mismatch nor a match.  Keep it out of the invalidity gate, but
+            # also never upgrade it to bound merely because it was stable.
+            request_model_match = "consistent_difference_unverified"
+        else:
+            request_model_match = "exact"
     if not invalid_reasons and eligible:
         if models["reported_rows"] < len(eligible):
             warning = (
                 f"response model was reported for only "
                 f"{models['reported_rows']} of {len(eligible)} eligible HTTP "
                 "200 response rows")
+        elif request_model_match == "consistent_difference_unverified":
+            route_bound = bool(
+                expected_served_models
+                and served_models["reported_rows"] == len(eligible)
+                and not unexpected_served_models)
+            route_detail = (
+                " The served-model-name headers did match captured active "
+                "served entities, which binds the route but does not prove "
+                "the response-model alias mapping."
+                if route_bound else
+                " No complete control-plane route binding or trusted alias "
+                "map proves that this is the requested model.")
+            warning = (
+                "one consistent response model was observed, but it differed "
+                "from the request-body model (requested "
+                + ", ".join(expected_models) + "; observed "
+                + ", ".join(sorted(observed_models)) + ")." + route_detail)
         elif not expected_models and not (
                 expected_served_models
                 and served_models["reported_rows"] == len(eligible)):
@@ -1609,6 +1690,7 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
         "identity_schema_rows": schema_rows,
         "expected_models": expected_models,
         "expected_model_sources": expected_sources,
+        "request_model_match": request_model_match,
         "models": models,
         "served_model_names": served_models,
         "expected_served_model_names": expected_served_models,
@@ -1623,8 +1705,202 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
             "serving endpoint name is not treated as an expected OpenAI model "
             "value; Databricks served-model-name headers are instead bound to "
             "the active served entities captured from the control plane. "
+            "A stable request/response model-name difference is unverified, "
+            "not invalid or bound, unless a trusted alias map is captured. "
             "system fingerprints are retained as deployment context and may "
             "rotate without implying a different requested model."),
+    }
+
+
+def _calibration_warmth_block(rows: list[dict]) -> dict:
+    """Describe calibration payload overlap without inferring cache state.
+
+    Calibration is setup traffic sent before the measured replay. Even when
+    its logical request bodies do not exactly overlap replay bodies, it can
+    warm model workers, kernels, prefix caches, networking, and route state.
+    Hash overlap is therefore diagnostic evidence, never a cold/warm oracle.
+    """
+    calibration = [row for row in rows if row.get("phase") == "calibration"]
+    replay = [row for row in rows if row.get("phase") == "replay"]
+
+    def body_hash(row: dict) -> str | None:
+        value = row.get("request_body_sha256")
+        if not isinstance(value, str) or len(value) != 64 \
+                or any(char not in "0123456789abcdefABCDEF" for char in value):
+            return None
+        return value.lower()
+
+    calibration_hashes = [body_hash(row) for row in calibration]
+    replay_hashes = [body_hash(row) for row in replay]
+    calibration_reported = sum(value is not None
+                               for value in calibration_hashes)
+    replay_reported = sum(value is not None for value in replay_hashes)
+    complete = bool(calibration) \
+        and calibration_reported == len(calibration) \
+        and replay_reported == len(replay)
+
+    overlap_hashes = None
+    replay_rows_overlapping = None
+    replay_overlap_share = None
+    if complete:
+        calibration_set = set(calibration_hashes)
+        replay_set = set(replay_hashes)
+        overlap_hashes = len(calibration_set.intersection(replay_set))
+        replay_rows_overlapping = sum(
+            value in calibration_set for value in replay_hashes)
+        replay_overlap_share = (
+            replay_rows_overlapping / len(replay) if replay else 0.0)
+
+    if not calibration:
+        status = "not_run"
+        overlap_status = "not_applicable"
+        warning = None
+    elif not complete:
+        status = "caution"
+        overlap_status = "unavailable"
+        warning = (
+            f"{len(calibration)} calibration request row(s) ran before the "
+            "measured replay. Exact payload overlap is unavailable because "
+            f"request_body_sha256 was present for {calibration_reported}/"
+            f"{len(calibration)} calibration and {replay_reported}/"
+            f"{len(replay)} replay rows. Calibration can warm endpoint, "
+            "model-worker, route, and cache state, so this run does not "
+            "establish cold-cache performance.")
+    elif replay_rows_overlapping:
+        status = "caution"
+        overlap_status = "available"
+        warning = (
+            f"{len(calibration)} calibration request row(s) ran before the "
+            f"measured replay; {replay_rows_overlapping}/{len(replay)} replay "
+            "rows used a request body whose SHA-256 exactly matched a "
+            "calibration body. Calibration warmed endpoint/cache state, so "
+            "this run must not be described as cold-cache performance.")
+    else:
+        status = "caution"
+        overlap_status = "available"
+        warning = (
+            f"{len(calibration)} calibration request row(s) ran before the "
+            "measured replay. No exact request-body SHA-256 overlap was "
+            "observed, but calibration still warms endpoint, model-worker, "
+            "route, and potentially cache state; this run does not establish "
+            "cold-cache performance.")
+
+    return {
+        "status": status,
+        "calibration_requests": len(calibration),
+        "replay_requests": len(replay),
+        "calibration_body_hashes_reported": calibration_reported,
+        "replay_body_hashes_reported": replay_reported,
+        "calibration_body_hash_coverage": (
+            calibration_reported / len(calibration) if calibration else None),
+        "replay_body_hash_coverage": (
+            replay_reported / len(replay) if replay else None),
+        "exact_overlap_status": overlap_status,
+        "overlapping_request_body_sha256_count": overlap_hashes,
+        "replay_rows_with_calibrated_payload": replay_rows_overlapping,
+        "replay_share_with_calibrated_payload": replay_overlap_share,
+        "warning": warning,
+        "note": (
+            "Exact overlap compares deterministic logical request-body "
+            "SHA-256 values. Non-overlap does not prove a cold endpoint or "
+            "cold cache; no cache state is inferred from latency."),
+    }
+
+
+def _prompt_repeat_population(rows: list[dict], prompts_count: int,
+                              *, population_complete: bool = True,
+                              unknown_population_rows: int = 0) -> dict:
+    """Count exact prompt-index reuse for one explicitly named population."""
+    indexes = []
+    missing = 0
+    invalid = 0
+    for row in rows:
+        value = row.get("prompt_index")
+        if value is None:
+            missing += 1
+        elif isinstance(value, bool) or not isinstance(value, int) \
+                or not 0 <= value < prompts_count:
+            invalid += 1
+        else:
+            indexes.append(value)
+    complete = population_complete and not missing and not invalid
+    repeat_requests = None
+    repeat_share = None
+    unique_prompts = None
+    if complete:
+        unique_prompts = len(set(indexes))
+        repeat_requests = len(indexes) - unique_prompts
+        repeat_share = (repeat_requests / len(rows)) if rows else 0.0
+    return {
+        "status": "available" if complete else "unavailable",
+        "requests": len(rows) if population_complete else None,
+        "observed_rows": len(rows),
+        "unknown_population_rows": unknown_population_rows,
+        "indexed_requests": len(indexes),
+        "missing_prompt_index_rows": missing,
+        "invalid_prompt_index_rows": invalid,
+        "unique_prompts": unique_prompts,
+        "repeat_requests": repeat_requests,
+        "repeat_share": repeat_share,
+    }
+
+
+def _prompt_replay_block(results: list[dict], successful: list[dict],
+                         prompts_count: int) -> dict:
+    """Separate scheduled, on-wire, and successful prompt reuse evidence."""
+    sent = [row for row in results if _sent_at(row) is not None]
+    unknown_send = [
+        row for row in results
+        if _sent_at(row) is None
+        and "caller_send_ms" not in row
+        and "first_send_unix" not in row
+        and "known_not_sent" not in row]
+    attempted_block = _prompt_repeat_population(results, prompts_count)
+    sent_block = _prompt_repeat_population(
+        sent, prompts_count,
+        population_complete=not unknown_send,
+        unknown_population_rows=len(unknown_send))
+    successful_block = _prompt_repeat_population(successful, prompts_count)
+
+    if sent_block["status"] != "available":
+        warning = (
+            "prompt-repeat and prompt-cache eligibility are unavailable: "
+            f"{sent_block['indexed_requests']} on-wire rows had valid "
+            "prompt_index evidence, "
+            f"{sent_block['missing_prompt_index_rows']} were missing it, "
+            f"{sent_block['invalid_prompt_index_rows']} were invalid, and "
+            f"{sent_block['unknown_population_rows']} rows had unknown send "
+            "status. No repeat count was inferred from request totals.")
+    elif sent_block["repeat_requests"]:
+        repeated = sent_block["repeat_requests"]
+        sent_n = sent_block["requests"]
+        warning = (
+            f"{repeated} of {sent_n} requests that reached the wire "
+            f"({sent_block['repeat_share'] * 100:.0f} percent) repeated a "
+            "persisted prompt_index already sent and were eligible for "
+            "endpoint prompt cache reuse. Treat the reported cached "
+            "prompt-token fraction and TTFT as replay behavior, not your "
+            "production prompt mix.")
+    else:
+        warning = None
+
+    # Keep the original flat keys for existing JSON consumers. They now alias
+    # the exact on-wire population, which is the relevant cache population;
+    # unavailable evidence is represented as null, never inferred from totals.
+    sent_requests = sent_block["requests"]
+    return {
+        "distinct_prompts": prompts_count,
+        "requests": successful_block["requests"],
+        "avg_sends_per_prompt": (
+            sent_requests / prompts_count
+            if sent_requests is not None else None),
+        "repeat_requests": sent_block["repeat_requests"],
+        "repeat_share": sent_block["repeat_share"],
+        "legacy_flat_fields_basis": "requests_that_reached_the_wire",
+        "attempted": attempted_block,
+        "sent": sent_block,
+        "successful": successful_block,
+        "warning": warning,
     }
 
 
@@ -2382,11 +2658,29 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         throughput_duration_basis = \
             "max(logical_schedule_seconds,response_drain)"
 
-    # throughput in the customer's own vocabulary (tokens per minute)
+    # Provider ``completion_tokens`` is the complete billed/generated token
+    # accounting bucket. On reasoning models it can include hidden reasoning,
+    # so it is never presented as visible answer throughput. Visible-token
+    # throughput requires a separately sourced exact field on every eligible
+    # row; content chunks and character counts are not token counts.
     usage_rows = [r for r in results if _usage_is_trustworthy(r)]
     in_tok = sum(float(r["prompt_tokens"]) for r in usage_rows)
-    out_tok = sum(float(r["completion_tokens"]) for r in usage_rows)
+    completion_tok = sum(float(r["completion_tokens"]) for r in usage_rows)
     cached_tok = sum(float(r.get("cached_tokens") or 0) for r in usage_rows)
+    visible_usage_rows = [
+        r for r in usage_rows
+        if _nonnegative_finite(r.get("visible_output_tokens"))
+        and float(r["visible_output_tokens"]) <= float(r["completion_tokens"])
+        and isinstance(r.get("visible_output_tokens_source"), str)
+        and bool(r["visible_output_tokens_source"].strip())]
+    visible_usage_complete = bool(usage_rows) \
+        and len(visible_usage_rows) == len(usage_rows)
+    visible_tok = (sum(float(r["visible_output_tokens"])
+                       for r in visible_usage_rows)
+                   if visible_usage_complete else None)
+    visible_sources = sorted({
+        str(r["visible_output_tokens_source"])
+        for r in visible_usage_rows})
     dur_min = (dur / 60.0) if dur else None
     # how many successful responses actually reported usage. a run where
     # only a tenth of them do would otherwise understate token throughput
@@ -2404,6 +2698,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     token_windows, rate_limit_block = _rate_limit_evidence(
         complete_request_evidence, rate_limits, safe_run_meta)
 
+    ttse_schema_present = any("ttse_ms" in row for row in results)
     summary = {
         "requests_total": len(results),
         "requests_ok": len(ok),
@@ -2422,26 +2717,64 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "http_429": http_429,
         "quota_limited": http_429["quota_limited"],
         "runtime_quota_admission": runtime_quota_admission,
+        "calibration_warmth": _calibration_warmth_block(
+            complete_request_evidence),
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in latency_ok]),
         "ttf_tool_call_ms": _pct_table(
             [r.get("ttf_tool_call_ms") for r in latency_ok]),
         "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in latency_ok]),
+        **({"ttse_ms": _pct_table(
+            [r.get("ttse_ms") for r in latency_ok])}
+           if ttse_schema_present else {}),
         "connect_ms": _pct_table([r.get("connect_ms") for r in ok]),
         "e2e_ms": _pct_table([r.get("e2e_ms") for r in latency_ok]),
         "interchunk_max_ms": _pct_table(
             [r.get("interchunk_max_ms") for r in latency_ok]),
         "throughput": {
             "input_tokens_per_min": in_tok / dur_min if dur_min else None,
-            "output_tokens_per_min": out_tok / dur_min if dur_min else None,
+            "completion_tokens_per_min": (
+                completion_tok / dur_min if dur_min else None),
+            "all_completion_tokens_per_min": (
+                completion_tok / dur_min if dur_min else None),
+            # Backward-readable alias. Reports intentionally do not call this
+            # visible output throughput.
+            "output_tokens_per_min": (
+                completion_tok / dur_min if dur_min else None),
+            "output_tokens_per_min_legacy_alias_of": (
+                "completion_tokens_per_min"),
+            **({"visible_output_tokens_per_min": visible_tok / dur_min}
+               if visible_tok is not None and dur_min else {}),
+            "visible_output_token_accounting": {
+                "status": (
+                    "available" if visible_usage_complete else
+                    "unavailable"),
+                "reported_for": len(visible_usage_rows),
+                "eligible_usage_rows": len(usage_rows),
+                "coverage": (
+                    len(visible_usage_rows) / len(usage_rows)
+                    if usage_rows else None),
+                "sources": visible_sources,
+                "limitation": (
+                    None if visible_usage_complete else
+                    "visible output token throughput is withheld because "
+                    "exact, source-labeled visible_output_tokens accounting "
+                    "was not available for every eligible usage row; "
+                    "completion_tokens may include hidden reasoning or other "
+                    "non-visible completion tokens"),
+            },
             "observation_seconds": dur,
             "duration_basis": throughput_duration_basis,
             "usage_coverage": usage_coverage,
             "completion_time_coverage": (
                 len(done) / len(sent) if sent else None),
-            "note": ("endpoint-reported token counts over the complete "
+            "note": ("endpoint-reported prompt and completion token counts "
+                     "over the complete "
                      "logical load window plus response drain when a logical "
                      "schedule is available; legacy evidence without that "
-                     "window uses first send through last completion"),
+                     "window uses first send through last completion. "
+                     "completion-token throughput is all-completion "
+                     "throughput and may include hidden reasoning; it is not "
+                     "visible answer throughput"),
             "coverage_warning": (
                 (f"completion time was available for only {len(done)} of "
                  f"{len(sent)} requests that reached the wire, so token "
@@ -2543,13 +2876,29 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "schedule": schedule_meta or {},
         "run": safe_run_meta,
         "ttft_definition": ttft_definition,
+        **({"stream_event_definition": {
+            "metric": "ttse_ms",
+            "meaning": (
+                "elapsed time to the first complete framed event emitted by "
+                "the selected response adapter parser"),
+            "excludes_claims": [
+                "model_token", "reasoning_content", "visible_content",
+                "successful_response",
+            ],
+            "note": (
+                "the first parsed stream event can be usage-only, terminal, "
+                "or a content-free parse diagnostic; TTFB measures the "
+                "earlier first bounded nonempty response-body read"),
+        }} if ttse_schema_present else {}),
         "response_identity": _response_identity_block(results, safe_run_meta),
     }
     if rate_limit_block is not None:
         summary["rate_limits"] = rate_limit_block
     if runtime_quota_admission["status"] == "denied":
         summary["quota_limited"] = True
-    for field in ("ttft_ms", "ttf_tool_call_ms"):
+    for field in ("ttse_ms", "ttft_ms", "ttf_tool_call_ms"):
+        if field not in summary:
+            continue
         values = [r.get(field) for r in latency_ok]
         summary[field]["missing"] = sum(v is None for v in values)
         summary[field]["of"] = len(values)
@@ -2610,25 +2959,60 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "measurement and must not be subtracted from TTFT.")
         summary["network_path"] = _np
 
-    # Time per output token after the first. Keep this as an observed per-row
-    # distribution. Combining an independently selected TTFT percentile with
-    # a TPOT percentile to project a hypothetical answer length is not a
-    # statistically defensible result, so reports deliberately do not do it.
-    tpot = []
+    # Time per endpoint-reported completion token after the first. This is
+    # explicitly all-completion pacing: completion_tokens can include hidden
+    # reasoning. A separately named visible TPOT is emitted only when exact,
+    # source-labeled visible token counts and TTFV are available.
+    completion_tpot = []
     for r in latency_ok:
-        n_out = r.get("completion_tokens")
+        n_completion = r.get("completion_tokens")
         t, e = r.get("ttft_ms"), r.get("e2e_ms")
-        if n_out and n_out > 1 and t is not None and e is not None and e >= t:
-            tpot.append((e - t) / (n_out - 1))
-    if tpot:
-        summary["tpot_ms"] = _pct_table(tpot)
+        if n_completion and n_completion > 1 and t is not None \
+                and e is not None and e >= t:
+            completion_tpot.append((e - t) / (n_completion - 1))
+    if completion_tpot:
+        completion_table = _pct_table(completion_tpot)
+        summary["completion_tpot_ms"] = completion_table
+        # Backward-readable alias with an explicit scope marker.
+        summary["tpot_ms"] = completion_table
+        summary["tpot_scope"] = "all_endpoint_reported_completion_tokens"
         summary["tpot_note"] = (
-            "time per output token after the first, (e2e - ttft) / "
-            "(output_tokens - 1), computed independently for each eligible "
-            f"request. p50 and p95 summarize {len(tpot)} observed requests "
-            "that produced more than one token; do not combine these "
-            "percentiles with a TTFT percentile to project an unobserved "
-            "generation length")
+            "time per endpoint-reported completion token after the first, "
+            "(e2e - ttft) / (completion_tokens - 1), computed independently "
+            f"for each eligible request. p50 and p95 summarize "
+            f"{len(completion_tpot)} observed requests that reported more "
+            "than one completion token. completion_tokens can include hidden "
+            "reasoning, so this is all-completion pacing, not visible-output "
+            "TPOT. do not combine these percentiles with a TTFT percentile "
+            "to project an unobserved generation length")
+
+    visible_tpot = []
+    visible_tpot_accounted = 0
+    visible_tpot_eligible = 0
+    for r in latency_ok:
+        n_visible = r.get("visible_output_tokens")
+        source = r.get("visible_output_tokens_source")
+        first_visible, e = r.get("ttfv_ms"), r.get("e2e_ms")
+        exact_count = (
+            _nonnegative_finite(n_visible)
+            and _nonnegative_finite(r.get("completion_tokens"))
+            and float(n_visible) <= float(r["completion_tokens"])
+            and isinstance(source, str) and bool(source.strip()))
+        if exact_count:
+            visible_tpot_accounted += 1
+            if n_visible > 1:
+                visible_tpot_eligible += 1
+        if exact_count and n_visible > 1 and first_visible is not None \
+                and e is not None and e >= first_visible:
+            visible_tpot.append((e - first_visible) / (n_visible - 1))
+    if visible_tpot and visible_tpot_accounted == len(latency_ok) \
+            and len(visible_tpot) == visible_tpot_eligible:
+        summary["visible_tpot_ms"] = _pct_table(visible_tpot)
+        summary["visible_tpot_note"] = (
+            "time per explicitly accounted visible output token after the "
+            "first visible token, (e2e - ttfv) / "
+            "(visible_output_tokens - 1); emitted only for rows carrying a "
+            "source-labeled visible_output_tokens count")
 
     answers = _answer_block(results)
     if answers:
@@ -2648,6 +3032,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # tables; final-attempt request-path tables remain available for diagnosis.
     # TTFV must be corrected too when first_visible is the configured TTFT.
     caller_fields = (
+        ("ttse_ms", "caller_ttse_ms", "ttse_corrected_ms"),
         ("ttft_ms", "caller_ttft_ms", "ttft_corrected_ms"),
         ("ttfv_ms", "caller_ttfv_ms", "ttfv_corrected_ms"),
         ("ttf_tool_call_ms", "caller_ttf_tool_call_ms",
@@ -2669,7 +3054,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 reconstructed_caller_n += 1
         if vals:
             summary[corr_f] = _pct_table(vals)
-    if any(k in summary for k in ("ttft_corrected_ms", "ttfv_corrected_ms",
+    if any(k in summary for k in ("ttse_corrected_ms", "ttft_corrected_ms",
+                                  "ttfv_corrected_ms",
                                   "ttf_tool_call_corrected_ms",
                                   "e2e_corrected_ms")):
         summary["latency_correction_note"] = (
@@ -2889,32 +3275,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "included. changed in 0.3.0: 0.2.x and earlier included connection "
         "setup in these numbers.")
 
-    # prompts mode cycles the supplied prompts (runner: prompt_msgs[i % m]).
-    # once the set has been through once, every later request is a verbatim
-    # repeat, which makes them eligible for endpoint prompt-cache reuse. the
-    # fraction then describes the replay, not the caller's production mix.
+    # Prompt-cache eligibility is a property of exact prompt indexes that
+    # reached the wire, not of the number of successful responses. Preserve
+    # separate attempted/sent/successful populations so failures and
+    # interleaving cannot erase repeats.
     rm = safe_run_meta
     pc = rm.get("prompts_count")
     if rm.get("input_mode") == "prompts" and pc:
-        repeats = (n_ok / pc) if pc else 0.0
-        summary["replay"] = {
-            "distinct_prompts": pc,
-            "requests": n_ok,
-            "avg_sends_per_prompt": repeats,
-            "repeat_requests": max(0, n_ok - pc),
-            "repeat_share": (max(0, n_ok - pc) / n_ok) if n_ok else 0.0,
-            "warning": (
-                f"{pc} distinct prompts covered {n_ok} requests, so "
-                f"{max(0, n_ok - pc)} of them "
-                f"({max(0, n_ok - pc) / n_ok * 100:.0f} percent) repeat a "
-                f"prompt already sent and are eligible for endpoint prompt "
-                f"cache reuse. treat the reported cached prompt-token fraction "
-                f"and TTFT as replay "
-                f"behavior, not your production prompt mix. supply at least "
-                f"as many distinct prompts as requests, or read only the "
-                f"first {pc} requests, to see cold behavior."
-                if n_ok > pc else None),
-        }
+        summary["replay"] = _prompt_replay_block(
+            results, latency_ok, int(pc))
     if pricing:
         # Capacity is paid across the logical replay window even when the
         # client fails to send its tail. Use whichever ends later: the planned
@@ -2939,7 +3308,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
              if isinstance(value, (int, float)) and value > 0],
             default=None)
         summary["cost"] = _cost_block(
-            results, cost_dur, in_tok, out_tok, cached_tok, pricing,
+            results, cost_dur, in_tok, completion_tok, cached_tok, pricing,
             duration_basis=duration_basis)
     if acceptance:
         summary["sla"] = _evaluate_sla(results, ok, summary, acceptance,
@@ -3921,10 +4290,138 @@ def _first_event_contract(summary: dict) -> dict[str, str]:
     }
 
 
+def _reasoning_control_probe_display(summary: dict) -> list[dict]:
+    """Return a safe, non-inferential view of sealed probe envelopes.
+
+    The runner and verifier enforce the complete v1 schema. Renderers still
+    fail closed because they are also used on hand-built or legacy summaries:
+    malformed evidence is labeled invalid and never promoted to an effective
+    model behavior.
+    """
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    gate = run.get("preflight_gate")
+    gate = gate if isinstance(gate, dict) else {}
+    raw_probes = gate.get("reasoning_control_probes")
+    if not isinstance(raw_probes, list):
+        return []
+
+    def digest_ok(value: object) -> bool:
+        return isinstance(value, str) and len(value) == 64 \
+            and all(char in "0123456789abcdef" for char in value)
+
+    allowed_methods = {
+        "accepted": {"single_request_behavior_observation"},
+        "rejected": {"request_validation_response"},
+        "unknown": {
+            "non_validation_http_failure", "transport_outcome_unknown"},
+    }
+    out = []
+    for ordinal, raw in enumerate(raw_probes[:16], start=1):
+        faults = []
+        probe = raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            faults.append("probe envelope was not an object")
+
+        candidate = probe.get("candidate_redacted")
+        requested_json = "UNAVAILABLE (invalid candidate evidence)"
+        computed_digest = None
+        if isinstance(candidate, dict):
+            try:
+                canonical = json.dumps(
+                    candidate, ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"))
+                computed_digest = sha256_bytes(canonical.encode("utf-8"))
+                safe_candidate = _redact_secrets(candidate)
+                requested_json = json.dumps(
+                    safe_candidate, ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"))
+                if safe_candidate != candidate:
+                    faults.append("candidate required report-time redaction")
+                if len(canonical.encode("utf-8")) > 16 * 1024:
+                    faults.append("candidate exceeded the v1 byte limit")
+                    requested_json = requested_json[:4096] + "… [truncated]"
+            except (TypeError, ValueError, OverflowError):
+                faults.append("candidate was not finite JSON")
+        else:
+            faults.append("candidate_redacted was not an object")
+
+        declared_digest = probe.get("candidate_canonical_sha256")
+        if not digest_ok(declared_digest) \
+                or declared_digest != computed_digest:
+            faults.append("candidate digest did not match requested JSON")
+        candidate_digest = (
+            declared_digest if digest_ok(declared_digest) else "UNAVAILABLE")
+
+        index = probe.get("candidate_index")
+        if isinstance(index, bool) or not isinstance(index, int) \
+                or not 1 <= index <= 16:
+            faults.append("candidate index was invalid")
+            index = ordinal
+
+        disposition = probe.get("disposition")
+        method = probe.get("evidence_method")
+        if disposition not in allowed_methods \
+                or method not in allowed_methods.get(disposition, set()):
+            faults.append("classification evidence was invalid")
+            disposition = "unknown"
+            method = "invalid_or_unavailable"
+
+        effective_status = probe.get("effective_status")
+        effective_value = probe.get("effective_value")
+        if disposition == "rejected" \
+                and effective_status == "not_applied_request_rejected" \
+                and effective_value is None:
+            effective_behavior = "not applied — request rejected"
+        else:
+            effective_behavior = (
+                "unknown — this probe does not establish that the provider "
+                "applied the requested control or changed model behavior")
+            if effective_status != "unknown" or effective_value is not None:
+                faults.append("unsupported effective-behavior claim withheld")
+
+        request_id = probe.get("request_id")
+        if not isinstance(request_id, str) or not request_id \
+                or len(request_id.encode("utf-8")) > 256 \
+                or any(ord(char) < 0x21 or ord(char) > 0x7e
+                       for char in request_id):
+            faults.append("request ID was unavailable")
+            request_id = "UNAVAILABLE"
+        logical_hash = probe.get("logical_request_body_sha256")
+        if not digest_ok(logical_hash):
+            faults.append("logical request-body digest was unavailable")
+            logical_hash = "UNAVAILABLE"
+        physical = probe.get("physical_request_body_sha256s")
+        if not isinstance(physical, list) or len(physical) > 5 \
+                or not all(digest_ok(item) for item in physical):
+            faults.append("physical request-body digest evidence was invalid")
+            physical = []
+
+        schema = probe.get("schema_version")
+        if schema != "reasoning-control-probe-evidence/v1":
+            faults.append("probe evidence schema was unsupported")
+        out.append({
+            "candidate_index": index,
+            "candidate_digest": candidate_digest,
+            "requested_json": requested_json,
+            "disposition": disposition,
+            "evidence_method": method,
+            "effective_behavior": effective_behavior,
+            "request_id": request_id,
+            "logical_request_body_sha256": logical_hash,
+            "physical_request_body_sha256s": physical,
+            "evidence_status": (
+                "sealed v1 envelope" if not faults else
+                "INVALID/INCOMPLETE: " + "; ".join(faults)),
+        })
+    return out
+
+
 def render_markdown(summary: dict, title: str, *,
                     verification_context: dict | None = None) -> str:
     s = summary
     first_event = _first_event_contract(s)
+    reasoning_probes = _reasoning_control_probe_display(s)
     from .markdown import markdown_plain_text
     from .report_decision import build_report_decision
     verified_view = _external_report_context(s, verification_context)
@@ -4024,6 +4521,9 @@ def render_markdown(summary: dict, title: str, *,
     _cachew = (s.get("cache_fidelity") or {}).get("warning")
     if _cachew:
         cautions += [f"CAUTION (cache fidelity): {inline(_cachew)}", ""]
+    _calw = (s.get("calibration_warmth") or {}).get("warning")
+    if _calw:
+        cautions += [f"CAUTION (calibration warm state): {inline(_calw)}", ""]
     _identityw = (s.get("response_identity") or {}).get("warning")
     if _identityw:
         cautions += [
@@ -4157,6 +4657,14 @@ def render_markdown(summary: dict, title: str, *,
         "Claim boundary: observed tested-load facts do not establish an "
         "endpoint ceiling or provider quota headroom.",
         "",
+        "## Field glossary (how to read every displayed value)",
+        "",
+        "Every displayed field uses the definitions below. Missing, unknown, "
+        "and null are evidence states—not zeros.",
+        "",
+        *[f"- **{name}:** {definition}"
+          for name, definition in _REPORT_FIELD_GLOSSARY],
+        "",
         f"measured replay: {s['requests_total']} requests, "
         f"{s['requests_ok']} harness-successful, "
         f"{s['requests_failed']} failed "
@@ -4176,6 +4684,8 @@ def render_markdown(summary: dict, title: str, *,
             s.get(first_event["diagnostic_key"])),
         row("TTF valid tool call", s.get("ttf_tool_call_ms")),
         row("TTFB", s["ttfb_ms"]),
+        row("TTSE (first parsed stream event; diagnostic)",
+            s.get("ttse_ms")),
         row("TTFG (E2E)", s["e2e_ms"]),
         row("interchunk max", s["interchunk_max_ms"]),
         "",
@@ -4194,6 +4704,12 @@ def render_markdown(summary: dict, title: str, *,
          f"- constructed (intended) cache fraction: "
          f"p50 {intent['p50']:.3f} / p95 {intent['p95']:.3f}"
          if intent.get("n") else "- constructed cache fraction: n/a"),
+        ("- calibration warm-state evidence: "
+         f"{(s.get('calibration_warmth') or {}).get('calibration_requests', 0)} "
+         "calibration request rows; exact payload overlap "
+         f"{(s.get('calibration_warmth') or {}).get('exact_overlap_status', 'not recorded')}; "
+         "replay rows with an exact calibrated payload "
+         f"{(s.get('calibration_warmth') or {}).get('replay_rows_with_calibrated_payload')}"),
         ("- token targeting: n/a for real prompts (no synthetic size to hit)"
          if mode == "prompts" else
          f"- token targeting: reported/intended p50 = "
@@ -4281,16 +4797,25 @@ def render_markdown(summary: dict, title: str, *,
             f"p95 {cc['in_flight_p95']:.0f}, peak "
             f"{cc['in_flight_max']:.0f}{sized} "
             f"({cc['measured_over']})")
-    tp = s.get("tpot_ms") or {}
+    tp = s.get("completion_tpot_ms") or s.get("tpot_ms") or {}
     if tp.get("n"):
         lines.append(
-            f"- time per output token (TPOT): p50 {tp['p50']:.1f} / p95 "
+            f"- time per endpoint-reported completion token "
+            f"(all-completion TPOT): p50 {tp['p50']:.1f} / p95 "
             f"{tp['p95']:.1f} ms across {tp['n']} observed requests. each "
             "row is (e2e - ttft) / (completion_tokens - 1); do not combine "
             "independently selected TPOT and TTFT percentiles to project an "
-            "unobserved answer length")
+            "unobserved answer length. completion_tokens can include hidden "
+            "reasoning; this is not visible-output TPOT")
+    visible_tp = s.get("visible_tpot_ms") or {}
+    if visible_tp.get("n"):
+        lines.append(
+            f"- time per explicitly accounted visible output token: p50 "
+            f"{visible_tp['p50']:.1f} / p95 {visible_tp['p95']:.1f} ms "
+            f"across {visible_tp['n']} observed requests")
 
     if s.get("e2e_corrected_ms"):
+        cse = s.get("ttse_corrected_ms") or {}
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
         ct = s.get("ttf_tool_call_corrected_ms") or {}
@@ -4328,6 +4853,11 @@ def render_markdown(summary: dict, title: str, *,
             lines.append(f"| {caller_row_prefix} TTF valid tool call | "
                          f"{ct['p50']:.0f} | {ct['p95']:.0f} | "
                          f"{ct['p99']:.0f} |")
+        if cse.get("p50") is not None:
+            lines.append(
+                f"| {caller_row_prefix} TTSE (first parsed stream event; "
+                f"diagnostic) | {cse['p50']:.0f} | {cse['p95']:.0f} | "
+                f"{cse['p99']:.0f} |")
         lines.append(f"| {caller_row_prefix} end-to-end | {c2['p50']:.0f} | "
                      f"{c2['p95']:.0f} | {c2['p99']:.0f} |")
         lines += ["", s["latency_correction_note"]]
@@ -4367,6 +4897,39 @@ def render_markdown(summary: dict, title: str, *,
             "these are SSE "
             "chunks, not tokens")
 
+    if reasoning_probes:
+        lines += [
+            "",
+            "## Reasoning-control probes",
+            "",
+            "These rows come from the sealed preflight gate. Disposition "
+            "classifies request/response evidence only: `accepted` does not "
+            "prove the provider applied the requested control or changed "
+            "reasoning behavior. Effective behavior remains **unknown** "
+            "unless the evidence supports only the narrower fact that a "
+            "rejected request was not applied.",
+            "",
+            "| candidate and requested JSON | classification | effective "
+            "behavior | request/body evidence |",
+            "|---|---|---|---|",
+        ]
+        for probe in reasoning_probes:
+            physical = probe["physical_request_body_sha256s"]
+            physical_text = (
+                ", ".join(physical) if physical else "none recorded")
+            lines.append(
+                f"| #{probe['candidate_index']} / candidate SHA-256 "
+                f"{inline(probe['candidate_digest'])}<br>"
+                f"requested {inline(probe['requested_json'])} | "
+                f"{inline(probe['disposition'])} via "
+                f"{inline(probe['evidence_method'])}<br>"
+                f"{inline(probe['evidence_status'])} | "
+                f"{inline(probe['effective_behavior'])} | "
+                f"[requests.jsonl](requests.jsonl) request ID "
+                f"{inline(probe['request_id'])}<br>logical body SHA-256 "
+                f"{inline(probe['logical_request_body_sha256'])}<br>"
+                f"physical body SHA-256 {inline(physical_text)} |")
+
     tp = s.get("throughput") or {}
     if tp.get("input_tokens_per_min"):
         usage_coverage = tp.get("usage_coverage")
@@ -4374,9 +4937,23 @@ def render_markdown(summary: dict, title: str, *,
             f"; clean usage coverage {usage_coverage:.1%}"
             if isinstance(usage_coverage, (int, float))
             and not isinstance(usage_coverage, bool) else "")
+        completion_rate = tp.get("completion_tokens_per_min")
+        if completion_rate is None:
+            completion_rate = tp.get("output_tokens_per_min")
+        completion_text = (
+            f"{completion_rate:,.0f}"
+            if isinstance(completion_rate, (int, float))
+            and not isinstance(completion_rate, bool) else "NOT REPORTED")
+        visible_rate = tp.get("visible_output_tokens_per_min")
+        visible_text = (
+            f", {visible_rate:,.0f} explicitly accounted visible output "
+            "tokens/min"
+            if isinstance(visible_rate, (int, float))
+            and not isinstance(visible_rate, bool) else "")
         lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
-                      f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
-                      "tokens/min (endpoint-reported counts over wall time"
+                      f"tokens/min, {completion_text} endpoint-reported "
+                      "completion tokens/min (all-completion; may include "
+                      f"hidden reasoning){visible_text} (counts over wall time"
                       f"{coverage_text})"]
     windows = s.get("observed_rate_windows") or {}
     win_input = windows.get("input_tokens_by_first_send") or {}
@@ -4538,7 +5115,10 @@ def render_markdown(summary: dict, title: str, *,
     rp = (s.get("run") or {}).get("request_params")
     if rp:
         eb = rp.get("extra_body") or {}
-        line = (f"request params: temperature {rp.get('temperature')}, "
+        line = (f"request params: adapter "
+                f"{rp.get('endpoint_adapter', 'legacy-unrecorded')}, "
+                f"mode {rp.get('response_mode', 'legacy-unrecorded')}, "
+                f"temperature {rp.get('temperature')}, "
                 "global max_tokens safety cap "
                 f"{rp.get('max_output_tokens_cap')}")
         if eb:
@@ -5643,6 +6223,7 @@ def render_html(summary: dict, title: str, *,
     or attach to a deck."""
     s = summary
     first_event = _first_event_contract(s)
+    reasoning_probes = _reasoning_control_probe_display(s)
     verified_view = _external_report_context(s, verification_context)
     def esc(value: object) -> str:
         return html.escape(sanitize_display_text(value), quote=True)
@@ -5778,7 +6359,7 @@ def render_html(summary: dict, title: str, *,
         + "</div></header>")
     nav_links = [
         ("overview", "Decision"), ("workload", "Workload"),
-        ("validity", "Cautions"),
+        ("validity", "Cautions"), ("field-glossary", "Field glossary"),
     ]
     if s.get("sla"):
         nav_links.append(("sla", "Acceptance"))
@@ -5930,10 +6511,20 @@ def render_html(summary: dict, title: str, *,
                      "<div class='v'><span class='pill neutral' "
                      "style='font-size:12px'>not reported</span></div></div>")
     tp = s.get("throughput") or {}
-    if isinstance(tp.get("output_tokens_per_min"), (int, float)) \
-            and not isinstance(tp.get("output_tokens_per_min"), bool):
-        cards.append(_html_stat("output throughput",
-                                num(tp["output_tokens_per_min"]), "tok/min"))
+    completion_rate = tp.get("completion_tokens_per_min")
+    if completion_rate is None:
+        completion_rate = tp.get("output_tokens_per_min")
+    if isinstance(completion_rate, (int, float)) \
+            and not isinstance(completion_rate, bool):
+        cards.append(_html_stat(
+            "all-completion throughput", num(completion_rate),
+            "completion tok/min"))
+    visible_rate = tp.get("visible_output_tokens_per_min")
+    if isinstance(visible_rate, (int, float)) \
+            and not isinstance(visible_rate, bool):
+        cards.append(_html_stat(
+            "visible output throughput", num(visible_rate),
+            "visible tok/min"))
     stats = f"<div class='stats'>{''.join(cards)}</div>"
 
     # ---- SLA banner + scorecard ----
@@ -6128,6 +6719,8 @@ def render_html(summary: dict, title: str, *,
                         first_event["diagnostic_key"]),
                        ("TTF valid tool call", "ttf_tool_call_ms"),
                        ("TTFB (first bounded response-body chunk)", "ttfb_ms"),
+                       ("TTSE (first parsed stream event; diagnostic)",
+                        "ttse_ms"),
                        ("TTFG (end to end)", "e2e_ms"),
                        ("interchunk max", "interchunk_max_ms"),
                        ("TTFR (first reasoning)", "ttfr_ms")):
@@ -6211,6 +6804,16 @@ def render_html(summary: dict, title: str, *,
             bel.append(f"<li><b>Token targeting</b>: reported/intended p50 "
                        f"{num(tt['reported_over_intended_p50'], 3)} "
                        f"(abs error {num(tt['abs_error_pct_p50'], 1)}%)</li>")
+    calibration = s.get("calibration_warmth") or {}
+    if calibration:
+        bel.append(
+            "<li><b>Calibration warm-state evidence</b>: "
+            f"{esc(str(calibration.get('calibration_requests', 0)))} "
+            "calibration request rows; exact payload overlap "
+            f"{esc(str(calibration.get('exact_overlap_status') or 'not recorded'))}; "
+            "replay rows with an exact calibrated payload "
+            f"{esc(str(calibration.get('replay_rows_with_calibrated_payload')))}. "
+            f"{esc(str(calibration.get('note') or ''))}</li>")
     _reason_source = str(s.get("reasoning_tokens_source") or "")
     _legacy_reasoning_deltas = (
         s.get("reasoning_tokens_total")
@@ -6357,7 +6960,11 @@ def render_html(summary: dict, title: str, *,
     if rp:
         eb = rp.get("extra_body") or {}
         extra = f", extra_body {esc(json.dumps(eb))}" if eb else ""
-        bel.append(f"<li><b>Request params</b>: temperature "
+        bel.append(f"<li><b>Request params</b>: adapter "
+                   f"{esc(str(rp.get('endpoint_adapter', 'legacy-unrecorded')))}, "
+                   "mode "
+                   f"{esc(str(rp.get('response_mode', 'legacy-unrecorded')))}, "
+                   "temperature "
                    f"{esc(str(rp.get('temperature')))}, global max_tokens "
                    "safety cap "
                    f"{esc(str(rp.get('max_output_tokens_cap')))}{extra}</li>")
@@ -6401,16 +7008,90 @@ def render_html(summary: dict, title: str, *,
         throughput_warning = (
             f"<div class='banner warn'>{esc(tp['coverage_warning'])}</div>"
             if incomplete_usage and tp.get("coverage_warning") else "")
+        visible_row = (
+            "<tr><th scope='row' class='lbl'>explicitly accounted visible "
+            "output tokens per minute</th>"
+            f"<td>{num(visible_rate)} visible tok/min</td></tr>"
+            if isinstance(visible_rate, (int, float))
+            and not isinstance(visible_rate, bool) else "")
+        visible_limitation = ((tp.get("visible_output_token_accounting")
+                               or {}).get("limitation"))
         extra_cards = (
             f"<div class='card'><h2>{throughput_heading}</h2>"
-            f"{throughput_warning}<table>"
+            f"{throughput_warning}"
+            + (f"<div class='cap'>{esc(visible_limitation)}</div>"
+               if visible_limitation else "")
+            + "<table>"
             "<caption class='sr-only'>Endpoint-reported token throughput"
             "</caption><tbody>"
             f"<tr><th scope='row' class='lbl'>input tokens per minute</th>"
             f"<td>{num(tp['input_tokens_per_min'])} tok/min</td></tr>"
-            f"<tr><th scope='row' class='lbl'>output tokens per minute</th>"
-            f"<td>{num(tp['output_tokens_per_min'])} tok/min</td></tr>"
+            "<tr><th scope='row' class='lbl'>endpoint-reported completion "
+            "tokens per minute (all-completion)</th>"
+            f"<td>{num(completion_rate)} completion tok/min</td></tr>"
+            f"{visible_row}"
             f"</tbody></table></div>")
+    calibration = s.get("calibration_warmth") or {}
+    if calibration.get("calibration_requests"):
+        overlap = calibration.get("replay_rows_with_calibrated_payload")
+        overlap_text = (
+            f"{overlap} of {calibration.get('replay_requests')} replay rows"
+            if overlap is not None else "unavailable")
+        extra_cards += (
+            "<div class='card'><h2>Calibration and warm state</h2>"
+            f"<div class='banner warn'>{esc(calibration.get('warning') or '')}"
+            "</div><table><tbody>"
+            "<tr><th scope='row' class='lbl'>calibration request rows</th>"
+            f"<td>{esc(str(calibration.get('calibration_requests')))}</td></tr>"
+            "<tr><th scope='row' class='lbl'>exact payload-hash overlap</th>"
+            f"<td>{esc(overlap_text)}</td></tr>"
+            "<tr><th scope='row' class='lbl'>hash evidence status</th>"
+            f"<td>{esc(str(calibration.get('exact_overlap_status')))}</td></tr>"
+            "</tbody></table></div>")
+    if reasoning_probes:
+        probe_rows = []
+        for probe in reasoning_probes:
+            physical = probe["physical_request_body_sha256s"]
+            physical_html = (
+                "<br>".join(f"<code>{esc(item)}</code>" for item in physical)
+                if physical else "none recorded")
+            evidence_status = probe["evidence_status"]
+            status_html = (
+                f"<div class='banner warn'>{esc(evidence_status)}</div>"
+                if evidence_status.startswith("INVALID/") else
+                f"<div class='cap'>{esc(evidence_status)}</div>")
+            probe_rows.append(
+                "<tr>"
+                f"<th scope='row' class='lbl'>candidate "
+                f"#{probe['candidate_index']}<br><code>"
+                f"{esc(probe['candidate_digest'])}</code></th>"
+                f"<td><code>{esc(probe['requested_json'])}</code></td>"
+                f"<td><b>{esc(probe['disposition'])}</b><br>via "
+                f"<code>{esc(probe['evidence_method'])}</code>"
+                f"{status_html}</td>"
+                f"<td>{esc(probe['effective_behavior'])}</td>"
+                "<td><a href='requests.jsonl'>requests.jsonl</a><br>"
+                f"request ID <code>{esc(probe['request_id'])}</code><br>"
+                "logical body SHA-256<br><code>"
+                f"{esc(probe['logical_request_body_sha256'])}</code><br>"
+                f"physical body SHA-256<br>{physical_html}</td>"
+                "</tr>")
+        extra_cards += (
+            "<div class='card'><h2>Reasoning-control probes</h2>"
+            "<div class='banner warn'>Disposition classifies request/response "
+            "evidence only. Accepted does not prove that the provider applied "
+            "the requested control or changed reasoning behavior. Effective "
+            "behavior remains unknown unless the narrower rejected-request "
+            "evidence establishes that it was not applied.</div>"
+            "<table class='dense-table'><caption class='sr-only'>Sealed "
+            "reasoning-control preflight evidence</caption><thead><tr>"
+            "<th scope='col'>candidate / digest</th>"
+            "<th scope='col'>requested JSON</th>"
+            "<th scope='col'>classification</th>"
+            "<th scope='col'>effective behavior</th>"
+            "<th scope='col'>request/body linkage</th>"
+            "</tr></thead><tbody>" + "".join(probe_rows)
+            + "</tbody></table></div>")
     windows = s.get("observed_rate_windows") or {}
     win_input = windows.get("input_tokens_by_first_send") or {}
     win_reserved = (
@@ -6658,6 +7339,8 @@ def render_html(summary: dict, title: str, *,
     add_issue("Pricing applicability",
               (s.get("cost") or {}).get("applicability_warning"))
     add_issue("Cache fidelity", (s.get("cache_fidelity") or {}).get("warning"))
+    add_issue("Calibration warm state",
+              (s.get("calibration_warmth") or {}).get("warning"))
     add_issue("Token-shape fidelity",
               (s.get("token_targeting") or {}).get("warning"))
     add_issue("Latency population",
@@ -6865,6 +7548,7 @@ def render_html(summary: dict, title: str, *,
 
     corr_html = ""
     if s.get("e2e_corrected_ms"):
+        cse = s.get("ttse_corrected_ms") or {}
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
         ct = s.get("ttf_tool_call_corrected_ms") or {}
@@ -6890,6 +7574,10 @@ def render_html(summary: dict, title: str, *,
                        "(diagnostic, ms)", diagnostic_corrected))
         if ct.get("p50") is not None:
             r_.append((f"{caller_row_prefix} TTF valid tool call (ms)", ct))
+        if cse.get("p50") is not None:
+            r_.append((
+                f"{caller_row_prefix} TTSE (first parsed stream event; "
+                "diagnostic, ms)", cse))
         r_.append((f"{caller_row_prefix} end-to-end (ms)", c2))
         corr_html = (
             "<div class='card'><h2 id='caller-latency-heading'>"
@@ -6921,6 +7609,16 @@ def render_html(summary: dict, title: str, *,
     decision = (verified_view["decision"] if verified_view
                 else build_report_decision(s))
     decision_html = _html_decision_hero(decision, banner)
+    glossary_html = (
+        "<section class='card' id='field-glossary' "
+        "aria-labelledby='field-glossary-heading'>"
+        "<h2 id='field-glossary-heading'>Field glossary: how to read every "
+        "displayed value</h2>"
+        "<div class='banner warn'>Missing, unknown, NOT REPORTED, and null "
+        "are evidence states—not zeros and not successes.</div>"
+        "<dl>" + "".join(
+            f"<dt><b>{esc(name)}</b></dt><dd>{esc(definition)}</dd>"
+            for name, definition in _REPORT_FIELD_GLOSSARY) + "</dl></section>")
     artifact_label = display_text(
         (s.get("run") or {}).get("artifact_id") or "NOT RECORDED", 120)
     if verified_view:
@@ -6952,7 +7650,7 @@ def render_html(summary: dict, title: str, *,
             "requires manifest verification</div>")
     body = (
         f"<main class='wrap'>{verified_banner_html}{header_html}{print_stamp}"
-        f"{nav_html}{decision_html}{provenance_html}"
+        f"{nav_html}{decision_html}{glossary_html}{provenance_html}"
         f"{facts_html}{sample_banner}{stats}{believe}"
         f"{em_html}{ans_html}{sla_html}{corr_html}{lat_html}"
         f"{drift_html}{extra_cards}{cost_html}"

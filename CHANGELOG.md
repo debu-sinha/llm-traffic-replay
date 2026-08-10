@@ -4,6 +4,86 @@ This file records behavior changes. It does not certify benchmark numbers from
 older artifacts. Compare only sealed runs whose manifests prove compatible
 code, workload, request, schedule, and timing definitions.
 
+## 0.7.0 - 2026-08-10
+
+### Versioned endpoint adapter foundation
+
+- Extract the streamed Chat Completions wire behavior behind the versioned
+  `openai.chat_completions.sse/v1` endpoint adapter while preserving request
+  bytes for configurations that were already valid. The client now delegates
+  serialization, media types, framing, event folding, finalization, usage
+  normalization, and usage-control fallback to the selected adapter.
+- Add a fail-closed adapter registry and `traffic-replay adapters` catalog.
+  Adapter IDs, response modes, media contracts, usage modes, implementation
+  identities, and runtime-derived implementation SHA-256 fingerprints are
+  inspectable and mutation-checked within the current Python runtime;
+  duplicate, mutable, malformed, or post-registration-modified contracts are
+  rejected.
+- Bind adapter identity into workload and run identities, request comparison
+  parameters, every request result, and transport evidence. Record the exact
+  serialized SHA-256 of every physical POST body so an adapter fallback cannot
+  diverge invisibly from logical request evidence.
+- Reject adapter-owned fields in `extra_body` instead of silently discarding
+  conflicting values. The Chat/SSE adapter owns `messages`, `max_tokens`,
+  `temperature`, `stream`, `model`, and `stream_options`. Allow
+  `temperature=null` in a run config to omit that field deliberately.
+- Add an integrity-checked, immutable capability-profile/catalog library with
+  exact provider/model/route/API resolution. It is a data-contract foundation,
+  not yet a CLI-loaded or runtime-enforced capability control plane, and its
+  digest proves byte consistency rather than source trust.
+- Stop labeling a single accepted reasoning-control probe as `ignored` when it
+  does not produce a visible answer. HTTP 200 now proves only acceptance; the
+  effective behavior remains unknown until stronger paired evidence exists.
+- Do not classify HTTP 400 or 422 alone as proof that a probe candidate was
+  rejected. Rejection requires the selected adapter's status contract and a
+  bounded response sample that explicitly identifies the candidate field or
+  path. Persist only the sample byte count, full-body SHA-256, and
+  classification; never persist the response text.
+- Fail closed when multiple recognized cache-token or reasoning-token aliases
+  appear in one usage object with conflicting values.
+
+### Measurement and evidence corrections
+
+- Add `ttse_ms` and exact caller `caller_ttse_ms` for the first complete
+  framed event emitted by the selected response adapter parser. Keep this
+  protocol diagnostic separate from TTFB, reasoning, visible content, tool
+  calls, and end-to-end time; reports and verification explicitly forbid
+  interpreting an SSE event or response-body chunk as a model token.
+- Treat a missing or deliberately skipped preflight as exploratory caution,
+  never a held benchmark or capacity result. Bind every carried preflight to
+  the exact origin, route, adapter implementation, model, request controls,
+  workload, representative logical/physical body hashes, and sealed setup
+  artifact; every sweep rung inherits that proof without duplicating setup
+  traffic.
+- Reclassify one stable request/response model alias mismatch as unverified
+  caution. Mixed response-model values or a contradiction with the bound
+  Databricks served-model/control-plane identity remain invalid.
+- Separate attempted, on-wire, and successful prompt populations, and label
+  completion throughput and TPOT as all-completion measurements. Hidden
+  reasoning can be included; visible-output rates remain unavailable without
+  exact, source-labeled visible-token accounting and complete clean coverage.
+- Make unloaded calibration count explicit and persist warm-state and exact
+  payload-overlap limitations. Disabling harness calibration does not prove a
+  globally cold endpoint or cache.
+
+### Customer workflow and field clarity
+
+- Add `benchmark --requests N` for an exact deterministic measured replay
+  population, with a durable content-addressed timestamp trace and separate
+  pretraffic disclosure of replay, setup/preflight, calibration, and logical
+  total counts.
+- Add `init-databricks --auth-profile PROFILE` to resolve the profile-bound
+  workspace host, discover READY chat/foundation endpoints through the
+  Databricks CLI, and write a bounded three-request starter configuration.
+- Add `--verify-after-run` to preserve the immutable source run, create a
+  sibling verification receipt, and print authoritative HTML/Markdown paths,
+  captured traffic counts, and all five canonical decision codes.
+- Embed a report field glossary in both HTML and Markdown. Define calibration
+  explicitly as real paid unloaded traffic used only for synthetic
+  characters-per-token estimation—not warm-up exclusion, quality, latency,
+  capacity, or quota-reservation evidence—and add a complete output data
+  dictionary for summaries, request rows, manifests, and receipts.
+
 ## 0.6.0 - 2026-08-08
 
 ### Pre-traffic production safety
@@ -138,15 +218,18 @@ code, workload, request, schedule, and timing definitions.
   client bounds but no built-in provider-capacity or quota guard. Make the
   bundled smoke, provisioned, and prompts templates score visible answer onset
   explicitly rather than inheriting reasoning-inclusive `first_content`.
-- Record the owner-confirmed managed Databricks GLM 5.2 request contract:
+- Record the serving-engineering-confirmed managed Databricks GLM 5.2 request contract:
   top-level `{"reasoning_effort":"none"}` disables reasoning, while omission
   selects maximum reasoning. The public Databricks guide classifies the model
   as reasoning-only and names the field but does not enumerate GLM-specific
   accepted values. Keep this managed control distinct from direct SGLang's
   nested `{"chat_template_kwargs":{"enable_thinking":false}}` switch and
-  Z.ai's hosted API request shape. The managed field applies on Unity AI
-  Gateway and direct endpoint requests, but production qualification remains
-  direct-only until Gateway routing, identity, and combined quotas are bound.
+  Z.ai's hosted API request shape. Serving-engineering confirmation covers the
+  engagement's discussed managed direct route and `system.ai.glm-5-2` Gateway
+  service. Conformance and behavioral validation remain route- and
+  revision-specific, and HTTP acceptance alone does not prove effect;
+  production qualification remains direct-only until Gateway routing,
+  identity, and combined quotas are bound.
 
 ## 0.5.1 - 2026-08-07
 

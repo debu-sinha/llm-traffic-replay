@@ -130,8 +130,10 @@ unless the production workload has the same repeat pattern.
 
 The synthetic scheduler is a two-state modulated Poisson process followed by
 seeded thinning. A timestamp trace replaces it, is sorted, shifted to zero,
-and capped by `duration_s`. The runner creates all global indices before shard
-selection so schedule and coverage identities are auditable.
+and capped by `duration_s`. It is arrival-only and accepts no payload or
+workflow fields; this prevents sorting from silently breaking request pairing.
+The runner creates all global indices before shard selection so schedule and
+coverage identities are auditable.
 
 ## Request sequence and clocks
 
@@ -151,10 +153,14 @@ For one logical replay row:
 5. The final-attempt request-path clock begins immediately before the blocking
    `conn.request` call. It includes request upload; it does not claim to begin
    when the first or last request byte reaches the socket or provider.
-6. Streaming events update TTFB, first content, first reasoning, first visible
-   content, first tool-call fragment, interchunk gaps, and end-to-end time.
+6. Streaming reads and parsed events update TTFB, TTSE, first content, first
+   reasoning, first visible content, first tool-call fragment, interchunk
+   gaps, and end-to-end time.
    TTFB ends at the first nonempty bounded response-body chunk returned by the
-   client read, not the first socket byte or first parsed SSE line. TTFT under
+   client read, not the first socket byte or first parsed SSE line. TTSE ends
+   at the first complete framed event emitted by the selected adapter parser;
+   it can be usage-only, terminal, or a content-free parse diagnostic, so it
+   is not a token, reasoning, visible-content, or success clock. TTFT under
    `first_content` ends at a nonempty visible, reasoning, or refusal delta,
    never a tool-call fragment. End-to-end stops at
    `[DONE]`, or at response EOF when `[DONE]` is absent; a `finish_reason`
@@ -221,14 +227,17 @@ cheaper.
 Tool-call-only outcomes can be acceptable without first-visible-content
 timing. Their first tool-call timing is reported separately.
 
-The SSE parser retains bounded response `model`, `object`, and
+The built-in Chat/SSE adapter retains bounded response `model`, `object`, and
 `system_fingerprint` fields and SHA-256 of the response ID; the HTTP layer also
 retains bounded Databricks `served-model-name`. Conflicting values inside one
 stream are protocol errors. Across eligible HTTP 200 rows, multiple response
-models or a response model outside an explicit request-body model invalidates a
-single-model benchmark. Endpoint names are not expected OpenAI model values.
-Instead, `served-model-name` is bound to active control-plane served entities;
-an unexpected entity invalidates the result and incomplete binding is caution.
+models invalidate a single-model benchmark. One stable response-model name
+that differs from an explicit request-body model is unverified identity and
+produces a caution; alias or revision naming can differ, so that string
+mismatch alone is not proof that another model served the request. Endpoint
+names are not expected OpenAI model values. Instead, `served-model-name` is
+bound to active control-plane served entities; an unexpected entity or route
+contradiction invalidates the result and incomplete binding is caution.
 
 After response drain, stability windows are computed from persisted replay
 rows using the same acceptable-outcome population as headline latency.
@@ -535,9 +544,51 @@ the dispatcher lag alone cannot detect executor queueing.
 
 ## Portability boundary
 
-The client implements a tested subset of streamed Chat Completions behavior.
-An endpoint described as compatible can still differ in route, authentication,
-model selection, request controls, SSE framing, tool-call deltas, usage fields,
-tokenizer, cache semantics, retry safety, and quotas. Provider comparison
-requires conformance testing and achieved-workload evidence; changing only the
-URL is not a portability proof.
+The load engine now calls a versioned `EndpointAdapter` for the exact request
+envelope, request and accepted response media types, response framing, event
+folding, end-of-response validation, usage normalization, and documented
+usage-option fallback. The built-in
+`openai.chat_completions.sse/v1` adapter preserves the previously tested wire
+behavior exactly. `EndpointClient` retains transport, deadlines, cancellation,
+retry, credential refresh, and per-POST quota admission; the runner uses the
+same adapter serializer for both wire bytes and logical request hashing.
+
+An adapter produces the existing content-free canonical `StreamState`, so the
+scheduler, metrics, reports, and verification code do not branch on a model
+name. Every physical POST body is SHA-256 recorded in attempt order. The
+adapter ID and response mode are present in each request result and in the run's
+direct request-parameter comparison identity. A registered adapter is
+stateless, has a terminal positive numeric version, declares normalized media
+types and usage behavior, cannot replace an existing ID, and is guarded by a
+stable implementation fingerprint. Mutating its declared contract or method
+implementation after registration fails closed.
+
+These dimensions remain independent:
+
+1. transport policy, currently fresh HTTP/1.1 per physical attempt;
+2. provider/route identity and authentication;
+3. request/response protocol adapter;
+4. model identity and explicitly supplied provider controls;
+5. observed model/route capability evidence.
+
+A future text/chat model whose exact route implements this already-supported
+contract can require only model ID and reviewed provider-control configuration.
+The harness accepts nonempty model IDs and finite, credential-free controls
+subject to secret, output-budget, adapter-owned-field, and quota-policy checks;
+it never infers behavior from the model name. A new wire dialect needs a new
+adapter and may also need engine work if its input modality or canonical events
+do not fit the current message/stream state. Provider or model claims still
+require captured, scrubbed fixtures and a live preflight for the exact route
+and revision; registering an adapter proves only that the harness can execute
+its declared contract.
+
+The currently implemented and regression-tested adapter is a streamed text
+Chat Completions/SSE subset. Non-streaming Chat, Responses, multimodal inputs,
+provider-native auth, target inspection, and provider-specific quota policies
+are separate extension milestones. `register_endpoint_adapter()` is currently
+an embedding-library seam; the standalone CLI has no third-party entry-point
+discovery. The capability catalog is also data-only and is not yet enforced by
+CLI planning or execution. Until those paths have adapters, fixtures, and
+runtime binding, changing only the URL is not portability proof, and an
+unrecognized provider/route remains unbound and inconclusive for capacity
+conclusions.

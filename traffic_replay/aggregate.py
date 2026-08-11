@@ -3051,7 +3051,8 @@ def _render_comparison_html(
         issue_blocks.append(
             "<section class='callout invalid-callout' aria-labelledby='issues-heading'>"
             "<h2 id='issues-heading'>Why this comparison is invalid</h2>"
-            f"<ol>{items}</ol></section>"
+            f"<details><summary>Show {len(compatibility_issues)} technical "
+            f"compatibility issues</summary><ol>{items}</ol></details></section>"
         )
     if warnings:
         items = "".join(
@@ -3063,7 +3064,8 @@ def _render_comparison_html(
             "diagnostic-only</h2>"
             f"<p>{len(warnings)} measurement warning(s) block arithmetic "
             "preference labels and relative performance claims:</p>"
-            f"<ol>{items}</ol>"
+            f"<details><summary>Show {len(warnings)} measurement warnings"
+            f"</summary><ol>{items}</ol></details>"
             "</section>"
         )
     issue_block = "".join(issue_blocks)
@@ -3304,6 +3306,8 @@ footer{{padding:22px 42px;background:var(--navy);color:#dce7f8}}footer code{{col
 .print-stamp{{display:none}}
 @media(max-width:720px){{header,main{{padding-left:18px;padding-right:18px}}header{{padding-top:22px}}nav{{padding-left:18px;padding-right:18px}}.hero{{grid-template-columns:1fr;padding:18px}}h1{{font-size:34px}}section{{padding:24px 0}}.source-grid{{grid-template-columns:1fr}}.source-meta{{grid-template-columns:1fr;gap:2px;font-size:13px}}.source-meta dt{{margin-top:7px}}.source-meta dd,.source-meta code{{font-size:12px}}.scroll-hint{{display:flex;align-items:center;gap:7px;margin:0 0 7px;padding:7px 9px;border-radius:8px;background:#eef4ff;color:#174ea6;font-size:12px;font-weight:750}}.table-wrap{{box-shadow:inset -12px 0 12px -14px #122033;-webkit-overflow-scrolling:touch}}.table-wrap:focus-visible{{outline:3px solid #155eef;outline-offset:3px}}.table-wrap .sticky-col{{position:sticky;inset-inline-start:0;z-index:2;box-shadow:5px 0 7px -7px #122033}}.table-wrap thead .sticky-col{{z-index:4;background:var(--navy)}}.table-wrap tbody .sticky-col{{background:#f8fafc}}th,td{{padding:9px 10px}}footer{{padding:20px 18px}}}}
 @media print{{@page{{size:landscape;margin:10mm}}body{{background:#fff;font-size:10px}}.shell{{box-shadow:none;max-width:none}}nav{{display:none}}header,main{{padding-left:0;padding-right:0}}section{{break-inside:auto;padding:14px 0}}.hero,.source-card,.callout,.method-card{{break-inside:avoid;print-color-adjust:exact;-webkit-print-color-adjust:exact}}#method{{break-inside:avoid-page;break-after:avoid-page;margin-bottom:6px}}.source-meta{{font-size:9px;gap:3px 7px}}.source-link{{margin-top:6px}}.print-stamp{{display:block;border:1px solid #98a2b3;padding:2.5mm 3mm;margin:4mm 0 2mm;background:#fff;color:#344054;text-align:center;font-size:8pt;line-height:1.25;break-inside:avoid}}.scroll-hint{{display:none}}.table-wrap{{overflow:visible;box-shadow:none}}.table-wrap .sticky-col{{position:static;box-shadow:none}}table{{min-width:0}}th,td{{padding:5px 6px}}thead{{display:table-header-group}}tr{{break-inside:avoid}}a::after{{content:" (" attr(href) ")";font-size:9px}}footer{{display:none}}}}
+.callout{{min-width:0}}.callout li{{overflow-wrap:anywhere;word-break:break-word}}
+.callout details summary{{cursor:pointer;font-weight:800;margin-top:9px}}
 </style>
 </head>
 <body><div class='shell'>

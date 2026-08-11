@@ -1,0 +1,8 @@
+{
+  "name": "decagon_diagnostic_small",
+  "input_tokens": {"p50": 64, "p95": 64},
+  "output_tokens": {"p50": 16, "p95": 16},
+  "cache_fraction": {"p50": 0, "p95": 0},
+  "provenance": "Synthetic bounded diagnostic selected to exercise the customer workflow at modest cost; not derived from customer traffic.",
+  "label": "DIAGNOSTIC ONLY: do not treat latency, throughput, cache behavior, demand, or capacity as representative of production traffic."
+}

@@ -1,0 +1,16 @@
+{
+  "name": "glm52_customer_smoke",
+  "input_tokens": {"p50": 128, "p95": 256},
+  "output_tokens": {"p50": 32, "p95": 48},
+  "cache_fraction": {"p50": 0.0, "p95": 0.0},
+  "provenance": "Small synthetic profile for testing every customer workflow against managed Databricks GLM 5.2 at modest cost. Replace it with a profile derived from your own logs before making a production decision.",
+  "label": "CUSTOMER WORKFLOW SMOKE TEST ONLY: validates authentication, scheduling, streaming, reporting, SLA scoring, and quota evidence. It is not representative customer demand or a production capacity test.",
+  "acceptance_targets": {
+    "targets_are": "SAMPLE customer requirements for workflow validation; replace with requirements agreed by the customer",
+    "ttft_ms": {"p50": 3000, "p95": 5000, "p99": 8000},
+    "ttfg_ms": {"p50": 5000, "p95": 10000, "p99": 15000},
+    "success_rate": 0.95,
+    "hard_timeouts": {"ttft_s": 15, "ttfg_s": 30, "note": "Sample abandonment limits"},
+    "note": "These targets demonstrate the scorecard. They are not Databricks guarantees or recommendations."
+  }
+}

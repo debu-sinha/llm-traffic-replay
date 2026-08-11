@@ -1,0 +1,3 @@
+{"messages":[{"role":"system","content":"You are a concise customer-support assistant."},{"role":"user","content":"A package arrived two days late. Write a one-sentence apology and next step."}]}
+{"messages":[{"role":"system","content":"You are a concise customer-support assistant."},{"role":"user","content":"Classify this ticket as billing, technical, or account: I was charged twice this month."}]}
+{"messages":[{"role":"system","content":"You are a concise customer-support assistant."},{"role":"user","content":"Give two short troubleshooting steps for a user who cannot reset a password."}]}

@@ -424,6 +424,74 @@ def test_stability_chart_has_units_alt_text_and_preserves_missing_gaps():
     assert "E2E p95</span>" in body
 
 
+def test_customer_summary_separates_latency_charts_and_never_implies_free_cost():
+    summary = _summary()
+    summary["latency_correction_provenance"] = {
+        "exact_values": 720,
+        "legacy_reconstructed_values": 0,
+    }
+    summary["ttft_corrected_ms"] = {
+        "p50": 180.0, "p90": 240.0, "p95": 275.0, "p99": 410.0,
+        "n": 240,
+    }
+    summary["e2e_corrected_ms"] = {
+        "p50": 300.0, "p90": 390.0, "p95": 440.0, "p99": 620.0,
+        "n": 240,
+    }
+    summary["achieved_cache_fraction"] = {
+        "p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0,
+        "n": 240, "mean": 0.0, "reported_for_n": 240,
+        "eligible_requests": 240, "coverage": 1.0,
+    }
+    body = render_html(summary, "customer summary")
+
+    assert "Results at a glance" in body
+    assert "User-experienced latency" in body
+    assert "Both charts use the same scale" in body
+    assert "Time until visible content first appeared" in body
+    assert "Response finished" in body
+    assert body.count("<article class='latency-plot'>") == 2
+    assert "adjacent chart" in body
+    assert "Exact latency values" in body
+    assert "stroke-dasharray:7 5" in body
+    assert "Cost not calculated" in body
+    assert "This does not mean the test was free" in body
+    assert "Prompt cache used: No" in body
+    assert "token-level cache evidence, not a request hit rate" in body
+    assert "test-endpoint" in body
+    assert body.count("tok/s") >= 2
+    assert body.index("Results at a glance") < body.index("What was tested")
+    assert "@media(max-width:900px)" in body
+    assert ".customer-grid{grid-template-columns:1fr}" in body
+
+
+def test_customer_summary_shows_estimated_total_and_average_when_priced():
+    rows = _rows(10)
+    for row in rows:
+        row.update({
+            "connection_attempts": 1,
+            "request_attempts": 1,
+            "retries": 0,
+            "retry_reasons": [],
+            "cached_tokens": 0,
+        })
+    summary = summarize(
+        rows,
+        pricing={
+            "mode": "per_token",
+            "input_dbu_per_m": 20.0,
+            "output_dbu_per_m": 60.0,
+            "usd_per_dbu": 0.07,
+        },
+    )
+    body = render_html(summary, "priced customer summary")
+
+    assert "Estimated replay cost" in body
+    assert "Average per request" in body
+    assert "Provider billing remains authoritative" in body
+    assert "Cost not calculated" not in body
+
+
 def test_quota_gauge_never_labels_projection_as_observed():
     body = _html_quota_gauges({
         "comparisons": {

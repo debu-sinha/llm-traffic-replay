@@ -483,6 +483,229 @@ def test_requested_model_and_served_backend_are_source_qualified():
     assert "Foundation model foundation-model-name" in scope
 
 
+def test_customer_scope_separates_burst_peak_from_window_average():
+    summary = _summary(200)
+    summary["schedule"].update({
+        "seconds": 400,
+        "requests": 200,
+        "rate_min": 0.0,
+        "rate_p50": 0.0,
+        "rate_p95": 0.0,
+        "rate_max": 50.0,
+        "spiky": True,
+        "source": "burst timestamps fixture",
+    })
+    summary["arrivals"].update({
+        "achieved_qps_overall": 0.5,
+        "scheduled_qps": 0.5,
+        "logical_schedule_seconds": 400.0,
+    })
+    summary["observed_rate_windows"] = {
+        "physical_queries_per_one_second_by_request_start": {
+            "max": 50,
+            "window_seconds": 1.0,
+            "events_total": 200,
+            "attempt_counts_exact": True,
+            "all_attempt_timestamps_exact": True,
+        },
+    }
+
+    scope = _plain(_Document(render_html(
+        summary, "bursty customer scope")).by_id("test-scope").text())
+    assert re.search(r"Average over logical window\s+0\.50\s+(?:req/s|RPS)",
+                     scope)
+    assert "Configured rate-curve peak 50 logical requests/s" in scope
+    assert "Scheduled 1-second peak" not in scope
+    assert "Observed 1-second peak 50 all-phase physical HTTP POST starts/s" \
+        in scope
+    assert "Bursty schedule" in scope
+    assert "not a sustained rate" in scope.casefold()
+    assert "200 logical requests over 400 s" in scope
+    assert "200 all-phase physical HTTP POST attempts across replay plus " \
+        "setup phases" in scope
+
+
+def test_flat_logical_schedule_does_not_infer_burstiness_from_post_attempts():
+    summary = _summary(200)
+    summary["schedule"].update({
+        "seconds": 20,
+        "requests": 200,
+        "rate_min": 10.0,
+        "rate_p50": 10.0,
+        "rate_p95": 10.0,
+        "rate_max": 10.0,
+        "spiky": False,
+        "source": "flat logical schedule fixture",
+    })
+    summary["arrivals"].update({
+        "achieved_qps_overall": 10.0,
+        "scheduled_qps": 10.0,
+        "logical_schedule_seconds": 20.0,
+    })
+    summary["physical_post_attempts"] = {
+        "logical_rows_with_additional_attempts": 200,
+        "additional_attempts": 400,
+        "recorded_retry_triggers": {"transport": 400},
+        "distinct_retry_triggers_at_least": 1,
+        "retry_trigger_categories_truncated": False,
+        "retry_trigger_coverage_rows": 200,
+        "legacy_retry_marked_rows_without_attempt_count": 0,
+    }
+    summary["observed_rate_windows"] = {
+        "traffic_scope": {
+            "rows": 200,
+            "sent_rows": 200,
+            "physical_attempts_estimate": 600,
+        },
+        "physical_queries_per_one_second_by_request_start": {
+            "max": 30,
+            "window_seconds": 1.0,
+            "events_total": 600,
+            "logical_rows": 200,
+            "attempt_counts_exact": True,
+            "all_attempt_timestamps_exact": True,
+        },
+    }
+
+    scope = _plain(_Document(render_html(
+        summary, "flat logical schedule")).by_id("test-scope").text())
+    assert "Bursty schedule" not in scope
+    assert "Not classified as bursty" in scope
+    assert "Flat schedule" not in scope
+    assert "200 logical requests over 20 s" in scope
+    assert "Configured rate-curve peak 10 logical requests/s" in scope
+    assert "Scheduled 1-second peak" not in scope
+    assert "Observed 1-second peak 30 all-phase physical HTTP POST starts/s" \
+        in scope
+    assert "600 all-phase physical HTTP POST attempts across replay plus " \
+        "setup phases" in scope
+    assert not re.search(r"Observed 1-second peak\s+30\s+requests/s",
+                         scope)
+
+
+def test_token_fidelity_mismatch_is_visible_before_engineering_details():
+    rows = _rows(200)
+    for index, row in enumerate(rows):
+        row.update({
+            "prompt_tokens": 40 + index % 12,
+            "intended_input_tokens": 40,
+            "completion_tokens": 5,
+            "intended_output_tokens": 5,
+            "max_tokens_requested": 5,
+            "finish_reason": "length",
+            "truncated": True,
+        })
+    summary = summarize(rows)
+    targeting = summary["token_targeting"]
+    assert targeting["status"] == "mismatch"
+    assert targeting["warning"]
+
+    document = _Document(render_html(summary, "token mismatch"))
+    customer_text = " ".join((
+        _plain(document.by_id("summary").text()),
+        _plain(document.by_id("limitations").text()),
+        _plain(document.by_id("test-scope").text()),
+    ))
+    assert "Token-shape mismatch" in customer_text
+    assert re.search(r"intended(?: prompt)?\s+40(?:–40)? tokens",
+                     customer_text, re.IGNORECASE)
+    assert re.search(r"observed(?: prompt)?\s+40–51 tokens",
+                     customer_text, re.IGNORECASE)
+    assert targeting["warning"] in customer_text
+
+
+def test_legacy_token_warning_is_customer_visible_without_status_or_tables():
+    summary = _summary(200)
+    warning = (
+        "legacy token evidence says the measured prompt shape did not "
+        "reproduce the declared workload")
+    targeting = summary["token_targeting"]
+    targeting.pop("status", None)
+    targeting.pop("intended_prompt_tokens", None)
+    targeting.pop("intended_completion_tokens", None)
+    targeting["warning"] = warning
+
+    document = _Document(render_html(summary, "legacy token warning"))
+    before_engineering = " ".join((
+        _plain(document.by_id("summary").text()),
+        _plain(document.by_id("limitations").text()),
+        _plain(document.by_id("test-scope").text()),
+    ))
+    assert "Token-shape mismatch" in before_engineering
+    assert warning in before_engineering
+
+
+def test_999_eligible_rows_support_p95_but_never_publish_a_p99_number():
+    summary = _summary(999)
+    assert summary["sample"]["supports"] == ["p50", "p90", "p95"]
+    assert summary["sample"]["indicative_only"] == ["p99"]
+
+    document = _Document(render_html(summary, "999 eligible observations"))
+    customer_latency = " ".join((
+        _plain(document.by_id("summary").text()),
+        _plain(document.by_id("latency").text()),
+    ))
+    next_test = _plain(document.by_id("next-test").text())
+    assert re.search(r"p95 supported(?:\s*\(n=999\))?", customer_latency,
+                     re.IGNORECASE)
+    assert "p99 requires 1,000 eligible successful observations; have 999" \
+        in customer_latency
+    assert not re.search(r"p99\s+[\d,]+(?:\.\d+)?\s*ms", customer_latency,
+                         re.IGNORECASE)
+    assert "1,000 eligible successful observations for p99" in next_test
+
+
+def test_customer_spike_wording_reports_observation_without_backend_cause():
+    summary = _summary(200)
+    summary["drift"] = {
+        "drift_kind": "spike",
+        "drift_flag": True,
+        "drift_headline": (
+            "a middle window is much worse than the ends: something "
+            "transient hit the endpoint mid-run"),
+        "latency_p95_best": 1_244.0,
+        "latency_p95_worst": 6_515.0,
+        "latency_p95_spread_ratio": 5.24,
+        "counted_windows": 20,
+        "window_seconds": 60,
+    }
+
+    document = _Document(render_html(summary, "spike attribution boundary"))
+    limitations = document.by_id("limitations")
+    stability = [node for node in limitations.walk()
+                 if "limitation" in _class_tokens(node)
+                 and "Stability" in _plain(node.text())]
+    assert stability
+    stability_text = _plain(stability[0].text())
+    assert "hit the endpoint" not in stability_text.casefold()
+    assert re.search(r"latency spike observed in the measured (?:path|run)",
+                     stability_text, re.IGNORECASE)
+    assert "unable to attribute without backend correlation" \
+        in stability_text.casefold()
+
+
+def test_legacy_failing_drift_causal_text_is_sanitized_for_customers():
+    summary = _summary(200)
+    summary["drift"] = {
+        "drift_kind": "failing",
+        "drift_flag": True,
+        "drift_headline": "the endpoint collapsed during the final window",
+        "counted_windows": 3,
+        "window_seconds": 60,
+    }
+
+    document = _Document(render_html(summary, "legacy failing drift"))
+    limitations = document.by_id("limitations")
+    stability = [node for node in limitations.walk()
+                 if "limitation" in _class_tokens(node)
+                 and "Stability" in _plain(node.text())]
+    assert stability
+    stability_text = _plain(stability[0].text())
+    assert "endpoint collapsed" not in stability_text.casefold()
+    assert "measured path/run" in stability_text.casefold()
+    assert "unable to attribute" in stability_text.casefold()
+
+
 def test_retry_observation_is_total_only_without_fake_attempt_breakdown():
     rows = _rows(
         1,

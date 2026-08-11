@@ -129,7 +129,7 @@ def test_customer_takeaway_leads_with_caller_latency_and_plain_caveats():
     assert "Answer quality was not evaluated" in body
     assert "do not establish correctness" in body
     assert "Synthetic workload shape" in body
-    assert "240 requests over 240 s" in body
+    assert "240 logical requests over 240 s" in body
     assert body.index("What was tested") < body.index(
         "Field definitions and raw evidence")
     assert "does not establish quota headroom" in body

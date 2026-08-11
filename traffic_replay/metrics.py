@@ -2858,8 +2858,14 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "intended_cache_fraction": _pct_table(intended_cache),
         "latency_population": latency_population,
         "token_targeting": {
+            "intended_prompt_tokens": _pct_table([
+                r.get("intended_input_tokens")
+                for r in input_intended_rows]),
             "observed_prompt_tokens": _pct_table(
                 [r.get("prompt_tokens") for r in usage_rows]),
+            "intended_completion_token_budgets": _pct_table([
+                r.get("intended_output_tokens")
+                for r in output_intended_rows]),
             "observed_completion_tokens": _pct_table(
                 [r.get("completion_tokens") for r in usage_rows]),
             "usage_reported_n": usage_n,
@@ -3706,9 +3712,9 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
                 f"window {bad_w['window']} failed "
                 f"{bad_w['error_rate'] * 100:.0f} percent of its requests. "
                 "latency percentiles only cover requests that came back, so "
-                "the surviving numbers in that window describe what the "
-                "endpoint could still serve, not what it was asked for. read "
-                "this as a breaking point, not a latency result." + also
+                "the surviving numbers in that window describe the returned "
+                "subset, not the full offered workload. read this as a "
+                "failure boundary, not a latency result." + also
                 + " the window-to-window latency comparison is not reported "
                 "for a failing run"),
             "note": note,
@@ -3743,18 +3749,22 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     elif rising and worst == vals[-1]:
         kind = "degrading"
         headline = (f"{latency_label} p95 rises across every counted window: "
-                    "the endpoint "
-                    "got slower as the run went on")
+                    "the measured caller path slowed as the run went on. "
+                    "without correlated backend telemetry, this artifact "
+                    "cannot attribute the cause")
     elif falling and worst == vals[0]:
         kind = "warming"
         headline = (f"{latency_label} p95 is worst in the first window and "
-                    "falls from "
-                    "there: early requests are cold start, not steady state. "
-                    "quote the later windows or warm up before measuring")
+                    "falls from there. early and later windows represent "
+                    "different measured-path conditions; without correlated "
+                    "backend telemetry, this artifact cannot attribute the "
+                    "cause")
     elif worst not in (vals[0], vals[-1]):
         kind = "spike"
-        headline = ("a middle window is much worse than the ends: something "
-                    "transient hit the endpoint mid-run")
+        headline = ("a middle window is much worse than the ends. a transient "
+                    "affected the measured caller path; without correlated "
+                    "backend telemetry, this artifact cannot attribute it to "
+                    "the client, network, gateway, or endpoint")
     else:
         kind = "variable"
         headline = ("windows move up and down without a clear trend. the run "
@@ -3777,6 +3787,40 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     result[f"{latency_event}_p95_best"] = best
     result[f"{latency_event}_p95_worst"] = worst
     return result
+
+
+def _attribution_safe_drift_message(drift: dict) -> str:
+    """Describe caller-path variation without inventing a backend cause."""
+    kind = drift.get("drift_kind")
+    if kind == "spike":
+        return (
+            "Latency spike observed in the measured path/run. A middle "
+            "window was much worse than the ends; unable to attribute "
+            "without backend correlation.")
+    if kind == "degrading":
+        return (
+            "Latency increased across the measured path/run. The artifact "
+            "is unable to attribute the cause without backend correlation.")
+    if kind == "warming":
+        return (
+            "Early and later latency windows differed in the measured "
+            "path/run. The artifact is unable to attribute the cause without "
+            "backend correlation.")
+    if kind == "failing":
+        message = str(drift.get("drift_headline") or drift.get("note") or "")
+        if "endpoint" in message.casefold():
+            return (
+                "Request failures varied across the measured path/run. "
+                "Survivor latency covers only the returned subset, not the "
+                "full offered workload; the artifact is unable to attribute "
+                "the cause without backend correlation.")
+        return message
+    message = str(drift.get("drift_headline") or drift.get("note") or "")
+    if "endpoint" in message.casefold():
+        return (
+            "Latency varied across the measured path/run. The artifact is "
+            "unable to attribute the cause without backend correlation.")
+    return message
 
 
 def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
@@ -5555,7 +5599,7 @@ def render_markdown(summary: dict, title: str, *,
         sp = (f" worst window is {spread:.1f}x the best."
               if spread else "")
         lines += ["", f"stability over time ({inline(flag)})."
-                  f"{sp} {inline(drift.get('drift_headline') or drift.get('note', ''))}"]
+                  f"{sp} {inline(_attribution_safe_drift_message(drift))}"]
         if drift.get("windows"):
             latency_label = drift.get("latency_metric_label") or "TTFT"
             lines += ["", f"per-{drift.get('window_seconds', 60)}s windows, p95 in ms:",
@@ -7829,8 +7873,7 @@ def render_html(summary: dict, title: str, *,
     if stability_kind != "stable":
         add_issue(
             "Stability",
-            stability_state.get("drift_headline")
-            or stability_state.get("note")
+            _attribution_safe_drift_message(stability_state)
             or "stability over the run was not established")
     runtime_status = runtime_quota.get("status")
     if runtime_status != "enforced":
@@ -7896,7 +7939,7 @@ def render_html(summary: dict, title: str, *,
             f"<div class='cap'>"
             f"{'per-' + str(drift.get('window_seconds', 60)) + 's windows, counts and p95 in ms. ' if drift.get('windows') else ''}"
             f"{sp}"
-            f"{esc(drift.get('drift_headline') or drift.get('note', ''))}"
+            f"{esc(_attribution_safe_drift_message(drift))}"
             f"{('<br>' + esc(drift.get('note', ''))) if drift.get('drift_headline') else ''}"
             f"</div>"
             + _html_stability_chart(drift)
@@ -8071,6 +8114,9 @@ def render_html(summary: dict, title: str, *,
         customer_first_exact and customer_e2e_exact)
     customer_answers = s.get("answers") or {}
     truncated = customer_answers.get("truncated")
+    output_cap_denominator = (
+        okc if isinstance(okc, int) and not isinstance(okc, bool)
+        and okc >= 0 else None)
 
     def known_count(value: object) -> int | None:
         return (value if isinstance(value, int) and not isinstance(value, bool)
@@ -8089,6 +8135,30 @@ def render_html(summary: dict, title: str, *,
     tested = decision.get("tested_load") or {}
     tested_requests = tested.get("scheduled_requests")
     tested_seconds = tested.get("scheduled_seconds")
+    schedule_state = s.get("schedule") or {}
+    schedule_peak_rate = schedule_state.get("rate_max")
+    if isinstance(schedule_peak_rate, bool) or not isinstance(
+            schedule_peak_rate, (int, float)):
+        schedule_peak_rate = None
+    observed_one_second = (
+        (s.get("observed_rate_windows") or {}).get(
+            "physical_queries_per_one_second_by_request_start") or {})
+    observed_peak_starts = observed_one_second.get("max")
+    if observed_one_second.get("all_attempt_timestamps_exact") is not True \
+            or isinstance(observed_peak_starts, bool) or not isinstance(
+                observed_peak_starts, (int, float)):
+        observed_peak_starts = None
+    all_phase_physical_attempts = observed_one_second.get("events_total")
+    if observed_peak_starts is None \
+            or isinstance(all_phase_physical_attempts, bool) \
+            or not isinstance(all_phase_physical_attempts, int) \
+            or all_phase_physical_attempts < 0:
+        all_phase_physical_attempts = None
+    # Burstiness is a property of the logical replay schedule.  The observed
+    # one-second table counts all captured physical POST starts (including
+    # setup phases and retries), so comparing it with logical replay RPS would
+    # mix populations and falsely label retry-heavy flat traffic as bursty.
+    is_bursty_load = schedule_state.get("spiky") is True
     sla_state = decision.get("customer_sla") or {}
     customer_acceptance_validated = bool(
         sla_state.get("code") == "PASS"
@@ -8170,11 +8240,12 @@ def render_html(summary: dict, title: str, *,
             "Insufficient sample for p95"
             + (f" (need 200; n={n_value})" if n_value is not None else ""))
         output_limit_notice = (
-            f"<span class='tail-status caution-text'>{truncated}/{total} "
-            "reached output limit; natural full-response latency not measured"
+            f"<span class='tail-status caution-text'>{truncated}/"
+            f"{output_cap_denominator} completed responses reached output "
+            "limit; natural full-response latency not measured"
             "</span>"
             if label == "Complete response" and isinstance(truncated, int)
-            and total is not None and truncated > 0 else "")
+            and output_cap_denominator is not None and truncated > 0 else "")
         return (
             "<div class='kpi-card'>"
             f"<div class='k'>{esc(label)} · {esc(code)}</div>"
@@ -8208,9 +8279,33 @@ def render_html(summary: dict, title: str, *,
     reliability_note = (
         f"{failed_text} failed · "
         f"{retry_count if retry_count is not None else 'unknown'} retries")
-    load_note = (
-        f"peak {peak_display} in flight · "
-        f"{tested_seconds if tested_seconds is not None else 'unknown'} s")
+    if schedule_peak_rate is not None:
+        schedule_peak_text = (
+            f"Configured rate-curve peak {schedule_peak_rate:,.0f} logical "
+            "requests/s")
+    else:
+        schedule_peak_text = "Configured rate-curve peak not recorded"
+    if observed_peak_starts is not None:
+        physical_peak_text = (
+            f"Observed 1-second peak {observed_peak_starts:,.0f} all-phase "
+            "physical HTTP POST starts/s")
+    else:
+        physical_peak_text = (
+            "All-phase 1-second physical POST peak not available from exact "
+            "attempt-start timestamps")
+    if is_bursty_load:
+        load_primary = peak_display
+        load_unit = "peak in flight"
+        load_note = (
+            f"{schedule_peak_text} · {physical_peak_text} · "
+            f"{achieved_display} logical-window avg req/s · peaks are not a "
+            "sustained rate")
+    else:
+        load_primary = achieved_display
+        load_unit = "avg req/s"
+        load_note = (
+            f"{physical_peak_text} · peak {peak_display} in flight · "
+            f"{tested_seconds if tested_seconds is not None else 'unknown'} s")
     kpis = (
         latency_kpi("Time to first response", first_event["short_label"],
                     customer_first)
@@ -8224,8 +8319,8 @@ def render_html(summary: dict, title: str, *,
              "</span>")
           + "</div>"
         + "<div class='kpi-card'><div class='k'>Tested load</div>"
-          f"<div class='v'>{esc(achieved_display)} "
-          "<span class='unit'>req/s</span></div>"
+          f"<div class='v'>{esc(load_primary)} "
+          f"<span class='unit'>{esc(load_unit)}</span></div>"
           f"<div class='note'>{esc(load_note)}</div>"
           "<span class='tail-status'>Observed load, not endpoint capacity"
           "</span></div>")
@@ -8241,9 +8336,14 @@ def render_html(summary: dict, title: str, *,
         "This was a very light single-concurrency test. "
         if peak_in_flight == 1 else "")
     output_limit_lead = (
-        f"{truncated}/{total} responses reached the output limit, so natural "
+        f"{truncated}/{output_cap_denominator} completed responses reached "
+        "the output limit, so "
+        "natural full-response latency was not measured. "
+        if isinstance(truncated, int) and truncated > 0
+        and output_cap_denominator is not None
+        else f"{truncated} responses reached the output limit, so natural "
         "full-response latency was not measured. "
-        if isinstance(truncated, int) and total is not None and truncated > 0
+        if isinstance(truncated, int) and truncated > 0
         else "")
     transport_state = run.get("transport") or {}
     transport_lead = (
@@ -8271,8 +8371,9 @@ def render_html(summary: dict, title: str, *,
         decision_lead = ""
     if sla_state.get("code") == "NOT_EVALUATED":
         acceptance_lead = (
-            "No SLA was supplied. Tail latency, stability, quota headroom, "
-            "and capacity were not established.")
+            "No SLA was supplied. Supported percentiles are descriptive; "
+            "acceptance, stability, quota headroom, and capacity were not "
+            "established.")
     elif sla_state.get("code") == "PASS" \
             and not customer_acceptance_validated:
         acceptance_lead = (
@@ -8301,6 +8402,11 @@ def render_html(summary: dict, title: str, *,
             "Tail latency: insufficient sample",
             f"p95 needs at least 200 eligible requests; this metric has "
             f"{first_n if first_n is not None else 'unknown'}."))
+    elif first_n < PERCENTILE_MIN_SAMPLES["p99"]:
+        limitations.append((
+            "Tail latency: p95 supported; p99 not shown",
+            f"p95 supported (n={first_n}). p99 requires 1,000 eligible "
+            f"successful observations; have {first_n}."))
     if sla_state.get("code") == "NOT_EVALUATED":
         limitations.append((
             "SLA: not tested",
@@ -8308,7 +8414,7 @@ def render_html(summary: dict, title: str, *,
     drift_state = s.get("drift") or {}
     if drift_state.get("drift_kind") != "stable":
         drift_message = (
-            drift_state.get("drift_headline") or drift_state.get("note")
+            _attribution_safe_drift_message(drift_state)
             or "The run was too short to demonstrate sustained behavior.")
         drift_message = drift_message[:1].upper() + drift_message[1:]
         limitations.append((
@@ -8321,8 +8427,52 @@ def render_html(summary: dict, title: str, *,
     if isinstance(truncated, int) and total is not None and truncated > 0:
         limitations.append((
             "Natural completion: not tested",
-            f"{truncated}/{total} responses reached the requested output limit; "
+            (f"{truncated}/{output_cap_denominator} completed responses "
+             if output_cap_denominator is not None else
+             f"{truncated} responses ")
+            + "reached the requested output limit; "
             "end-to-end latency describes capped outputs."))
+    token_targeting_state = s.get("token_targeting") or {}
+    token_targeting_status = token_targeting_state.get("status")
+    token_targeting_warning = token_targeting_state.get("warning")
+    token_shape_mismatch = bool(
+        token_targeting_status == "mismatch"
+        or (not token_targeting_status and token_targeting_warning))
+    if token_shape_mismatch:
+        intended_prompt = token_targeting_state.get(
+            "intended_prompt_tokens") or {}
+        observed_prompt = token_targeting_state.get(
+            "observed_prompt_tokens") or {}
+        prompt_ratio = token_targeting_state.get(
+            "input_reported_over_intended") or {}
+        intended_p50 = intended_prompt.get("p50")
+        intended_p95 = intended_prompt.get("p95")
+        declared_profile = str(run.get("profile_label") or "").strip()
+        intended_text = (
+            f"intended prompt {num(intended_p50)} tokens; "
+            if intended_p50 is not None and intended_p50 == intended_p95 else
+            f"intended prompt p50 {num(intended_p50)}, p95 "
+            f"{num(intended_p95)} tokens; "
+            if intended_p50 is not None else
+            f"declared workload: {declared_profile} "
+            if mode == "profile" and declared_profile else "")
+        observed_text = (
+            f"observed prompt {num(observed_prompt.get('min'))}–"
+            f"{num(observed_prompt.get('max'))} tokens (p50 "
+            f"{num(observed_prompt.get('p50'))}, p95 "
+            f"{num(observed_prompt.get('p95'))}); "
+            if observed_prompt.get("p50") is not None else "")
+        ratio_text = (
+            f"reported/intended ratio p50 "
+            f"{num(prompt_ratio.get('p50'), 3)} and p95 "
+            f"{num(prompt_ratio.get('p95'), 3)}. "
+            if prompt_ratio.get("p50") is not None else "")
+        limitations.append((
+            "Token-shape mismatch",
+            intended_text + observed_text + ratio_text
+            + str(token_targeting_warning or
+                  "The measured prompt shape did not match the declared "
+                  "profile.")))
     transport = run.get("transport") or {}
     if transport.get("production_connection_policy_match") is not True:
         limitations.append((
@@ -8370,6 +8520,12 @@ def render_html(summary: dict, title: str, *,
               and n_value >= PERCENTILE_MIN_SAMPLES["p50"] else "")
              + "Insufficient sample for tail latency")
             + (f" - need 200, have {n_value}" if n_value is not None else ""))
+        if n_value is not None \
+                and PERCENTILE_MIN_SAMPLES["p95"] <= n_value \
+                < PERCENTILE_MIN_SAMPLES["p99"]:
+            tail_text += (
+                f" · p95 supported (n={n_value}); p99 requires 1,000 "
+                f"eligible successful observations; have {n_value}")
         for quantile in ("p90", "p99"):
             if quantile in requested_quantiles and n_value is not None \
                     and n_value >= PERCENTILE_MIN_SAMPLES[quantile]:
@@ -8587,7 +8743,7 @@ def render_html(summary: dict, title: str, *,
         "failure, retry, timeout, and output-limit counts describe measured "
         "replay requests. HTTP 429 covers all captured inference phases, "
         "including setup traffic. Zero means no rejection was seen "
-        "at this light load; it does not establish quota headroom. "
+        "at the tested load; it does not establish quota headroom. "
         f"{esc(timeout_note)}</p>"
         "<div class='reliability-grid'>"
         + "".join(reliability_item(value, label, css)
@@ -8651,18 +8807,42 @@ def render_html(summary: dict, title: str, *,
     if measured_window.get("warning"):
         window_evidence_parts.append(str(measured_window["warning"]))
     window_evidence_text = "; ".join(window_evidence_parts) or "not recorded"
+    logical_request_count = (
+        tested_requests if isinstance(tested_requests, int)
+        and not isinstance(tested_requests, bool) else total)
+    logical_population_text = (
+        f"{logical_request_count:,} logical requests over "
+        f"{tested_seconds if tested_seconds is not None else 'unknown'} s"
+        if isinstance(logical_request_count, int)
+        and not isinstance(logical_request_count, bool) else
+        "logical request count or duration not recorded")
+    physical_population_text = ""
+    if all_phase_physical_attempts is not None:
+        physical_population_text = (
+            f"; {all_phase_physical_attempts:,} all-phase physical HTTP POST "
+            "attempts across replay plus setup phases")
+    traffic_scope = (
+        f"Bursty schedule; {schedule_peak_text} (not a sustained rate); "
+        f"{physical_peak_text} (not a sustained rate); Average over logical "
+        f"window {achieved_display} req/s; {logical_population_text}"
+        f"{physical_population_text}"
+        if is_bursty_load else
+        f"{'Not classified as bursty' if schedule_state.get('spiky') is False else 'Schedule shape not recorded'}; "
+        f"{schedule_peak_text}; {physical_peak_text}; "
+        f"{logical_population_text}{physical_population_text}; "
+        f"{achieved_display} achieved logical req/s")
     scope_rows = [
         ("Workload", "Synthetic workload shape" if mode == "profile"
          else "Supplied customer prompts" if mode == "prompts"
          else "Input mode not recorded"),
+        *(([("Declared workload", str(run.get("profile_label")))])
+          if mode == "profile" and run.get("profile_label") else []),
         ("Endpoint", str(endpoint_meta.get("name")
                          or run.get("endpoint_path") or "not recorded")),
         ("Requested model", str(run.get("endpoint_model") or "not recorded")),
         ("Active served entity", ", ".join(entity_names) or "not recorded"),
         ("Foundation model", ", ".join(foundation_names) or "not recorded"),
-        ("Traffic", f"{tested_requests if tested_requests is not None else total_text} "
-         f"requests over {tested_seconds if tested_seconds is not None else 'unknown'} s; "
-         f"{achieved_display} achieved req/s"),
+        ("Traffic", traffic_scope),
         ("UTC correlation window", window_text),
         ("Window evidence", window_evidence_text),
         ("Concurrency", f"peak {peak_display} in flight"),
@@ -8670,6 +8850,8 @@ def render_html(summary: dict, title: str, *,
             token_targeting.get("observed_prompt_tokens") or {})),
         ("Output size", token_span(
             token_targeting.get("observed_completion_tokens") or {})),
+        *(([("Prompt fidelity", str(token_targeting.get("warning")))])
+          if token_shape_mismatch else []),
         ("Cache profile", cache_scope),
         ("Generation controls", f"temperature {request_params.get('temperature', 'not recorded')}; "
          f"reasoning effort {extra_body.get('reasoning_effort', 'not recorded')}; "
@@ -8706,7 +8888,8 @@ def render_html(summary: dict, title: str, *,
         "<li><b>Match production transport:</b> run from the production region "
         "with its keep-alive, pooling, HTTP version, retry, and timeout policy.</li>"
         "<li><b>Collect enough evidence:</b> at least 200 eligible requests for "
-        "p95 and multiple sustained windows; use 1,000 for p99.</li>"
+        "p95 and multiple sustained windows; use at least 1,000 eligible "
+        "successful observations for p99.</li>"
         "<li><b>Sweep load deliberately:</b> increase RPS/concurrency in frozen "
         "rungs until the first acceptance, quota, or stability boundary.</li>"
         "<li><b>Enable backend attribution:</b> retain provider correlation IDs "

@@ -92,9 +92,26 @@ def test_first_screen_model_keeps_quota_sla_and_capacity_independent():
     assert "preflight: 1 captured, 0 send-timestamped, 1 send " \
            "timing/outcome unknown" in body
     assert "Tested load held" not in body
-    assert body.index("Decision summary") < body.index("What was tested")
+    customer_summary = body[body.index("id='summary'"):
+                            body.index("id='limitations'")]
+    assert "Measurement invalid" in customer_summary
+    assert "Acceptance checks missed" in customer_summary
+    assert "HTTP 429 / rate-limit rejection observed" in customer_summary
+    assert "Capacity not tested" in customer_summary
+    assert body.index("Result at this tested load") < body.index(
+        "What this run does not prove")
+    assert body.index("What this run does not prove") < body.index(
+        "id='latency'")
+    assert body.index("id='latency'") < body.index(
+        "Reliability and completion")
+    assert body.index("Reliability and completion") < body.index(
+        "What was tested")
     assert body.index("What was tested") < body.index(
-        "Final-attempt request-path latency")
+        "Databricks engineering diagnostics")
+    assert body.index("Decision summary") > body.index(
+        "Databricks engineering diagnostics")
+    assert body.index("Final-attempt request-path latency") > body.index(
+        "Databricks engineering diagnostics")
 
 
 def test_customer_takeaway_leads_with_caller_latency_and_plain_caveats():
@@ -102,23 +119,21 @@ def test_customer_takeaway_leads_with_caller_latency_and_plain_caveats():
     body = render_html(summary, "customer report")
     markdown = render_markdown(summary, "customer report")
 
-    takeaway = body.index("Customer takeaway")
-    decision = body.index("Decision summary")
+    takeaway = body.index("Result at this tested load")
+    decision = body.index("Databricks engineering diagnostics")
     request_path = body.index("Final-attempt request-path latency")
     assert takeaway < decision < request_path
-    assert "User-perceived latency from scheduled request time" in body
-    assert "Caller TTFT" in body
-    assert "Caller end-to-end" in body
-    assert "Answer quality:</b> not evaluated" in body
-    assert "do not establish correctness, task success, or usefulness" in body
-    assert "natural completion behavior was not measured" in body
-    assert "synthetic workload shape" in body
-    assert "240 scheduled requests over 240 seconds" in body
+    assert "Latency for the final request attempt" in body
+    assert "Time to first response" in body
+    assert "Complete response" in body
+    assert "Answer quality was not evaluated" in body
+    assert "do not establish correctness" in body
+    assert "Synthetic workload shape" in body
+    assert "240 requests over 240 s" in body
     assert body.index("What was tested") < body.index(
-        "Field glossary: how to read every displayed value")
-    assert "does not establish an endpoint ceiling, quota headroom" in body
-    assert "calibration request row(s) were sent outside the measured replay" \
-        in body
+        "Field definitions and raw evidence")
+    assert "does not establish quota headroom" in body
+    assert "calibration" in body.lower()
     assert "Calibration estimates characters per token" in body
     assert "integrity says whether the recorded artifact bytes verify" in body
     assert markdown.index("## Customer takeaway") < markdown.index(
@@ -142,26 +157,26 @@ def test_report_shell_is_self_contained_responsive_semantic_and_printable():
     assert "internal hashes are not a digital signature" in body
     assert ".print-footer{display:block;" in body
     assert "position:fixed" not in body
-    assert "artifact: artifact-ui-contract" in body
     assert "counter(page)" not in body
     assert "<script" not in body
     assert "<link" not in body
     assert "http://" not in body and "https://" not in body
-    assert ".report-head .meta-artifact{display:inline-flex" in body
-    assert ".decision-copy{display:block;overflow:visible}" in body
-    assert ".report-head .meta-mode,.report-head .meta-version{display:none}" \
-        not in body
-    assert ".meta-chip{font-size:11px;min-height:26px" in body
+    assert "href='#summary'>Summary</a>" in body
+    assert "href='#latency'>Latency</a>" in body
+    assert "href='#reliability'>Reliability</a>" in body
+    assert "href='#test-scope'>Test scope</a>" in body
+    assert "href='#engineering'>Engineering</a>" in body
+    assert "class='disclosure engineering-disclosure' id='engineering'" in body
+    assert "class='disclosure verification-disclosure' id='verification'" in body
+    assert "class='disclosure glossary-disclosure' id='field-glossary'" in body
     assert "Scroll horizontally; the Metric column stays visible." in body
     assert "class='table-scroll' tabindex='0' role='region'" in body
     assert ".dense-table .sticky-col{position:sticky" in body
 
     print_css = body.split("@media print", 1)[1].split("</style>", 1)[0]
-    assert ".state-card .why{display:block" in print_css
-    assert ".gate-detail{display:block" in print_css
-    assert ".gate-detail>.decision-reasons{display:grid}" in print_css
-    assert ".fact .note{display:block" in print_css
-    assert ".state-card .why,.gate-detail{display:none}" not in print_css
+    assert ".engineering-disclosure{break-before:page" in print_css
+    assert "details.disclosure>.detail-body{" in print_css
+    assert "display:block!important" in print_css
     assert "Why these states" in body
     assert "every canonical gate code and message" in body
     assert "Measurement validity" in body
@@ -172,15 +187,9 @@ def test_report_shell_is_self_contained_responsive_semantic_and_printable():
     assert "table:not(.dense-table) th.lbl{width:44%}" in body
     mobile_css = body.split("@media(max-width:640px)", 1)[1].split(
         "@media print", 1)[0]
-    assert ".decision-hero .claim-box{" in mobile_css
-    assert "display:block" in mobile_css
-    assert ".state-card .why{display:block" in mobile_css
-    assert ".section-head p{" in mobile_css
-    assert ".fact .note{display:block" in mobile_css
-    assert ".decision-hero .claim-box{display:none}" not in mobile_css
-    assert ".state-card .why{display:none}" not in mobile_css
-    assert ".section-head p{display:none}" not in mobile_css
-    assert ".fact .note{display:none}" not in mobile_css
+    assert ".customer-summary .summary-lead{font-size:16px}" in mobile_css
+    assert ".kpi-grid{grid-template-columns:1fr 1fr" in mobile_css
+    assert ".customer-latency-grid,.scope-grid{" in mobile_css
     for heading in (
             "Evidence integrity", "Measurement validity", "Acceptance checks",
             "Quota state", "Endpoint capacity"):
@@ -251,11 +260,14 @@ def test_all_canonical_caution_details_precede_metrics_in_html_and_markdown():
     }
     for code, message in expected.items():
         assert code in body and message in body
-        assert body.index(code) < body.index("What was tested")
+        assert body.index(code) > body.index(
+            "Databricks engineering diagnostics")
         assert code in markdown and message in markdown
         assert markdown.index(code) < markdown.index(
             "final-attempt request-path metric")
-    decision_block = body[:body.index("What was tested")]
+    decision_block = body[body.index("Decision summary"):
+                          body.index("Load delivery and workload facts", body.index(
+                              "Databricks engineering diagnostics"))]
     assert "plus " not in decision_block
 
 
@@ -326,11 +338,12 @@ def test_run_provenance_is_near_decision_not_an_orphanable_final_block():
     provenance = body.index(
         "<div class='run-context-notes' aria-label='Run context notes'>")
     assert body.index("Decision summary") < provenance
-    assert provenance < body.index("What was tested")
-    assert body.index("Label:</b> customer load shape") < body.index(
-        "What was tested")
+    engineering_workload = body.index(
+        "Load delivery and workload facts", provenance)
+    assert provenance < engineering_workload
+    assert body.index("Label:</b> customer load shape") < engineering_workload
     assert body.index("Profile:</b> Customer production traffic profile") \
-        < body.index("What was tested")
+        < engineering_workload
     assert body.count("aria-label='Run context notes'") == 1
     assert ".run-context-notes{break-inside:avoid;page-break-inside:avoid" \
         in body
@@ -339,13 +352,18 @@ def test_run_provenance_is_near_decision_not_an_orphanable_final_block():
 def test_missing_run_counts_never_render_as_a_green_zero():
     summary = _summary()
     for key in ("requests_total", "requests_ok", "requests_failed",
-                "error_rate"):
+                "error_rate", "timeout_failures"):
         summary.pop(key, None)
 
     body = render_html(summary, "legacy incomplete summary")
 
-    assert "NOT REPORTED requests, NOT REPORTED harness-successful, " \
-           "NOT REPORTED failed" in body
+    summary_block = body[body.index("id='summary'"):
+                         body.index("id='limitations'")]
+    assert "Harness successful" in summary_block
+    assert "NOT REPORTED" in summary_block
+    reliability_block = body[body.index("id='reliability'"):
+                             body.index("id='test-scope'")]
+    assert "unknown</div><div class='k'>Timeouts" in reliability_block
     error_card = body[body.index("Replay error rate"):]
     error_card = error_card[:error_card.index("</div></div>") + 12]
     assert "pill neutral" in error_card

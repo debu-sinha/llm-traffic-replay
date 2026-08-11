@@ -339,6 +339,8 @@ def test_receipt_is_external_self_sealed_and_source_is_unchanged(tmp_path):
     assert "Source reproducibility: **PASS**" in markdown
     assert "Verifier reproducibility: **PASS**" in markdown
     assert html.count("status-pass") >= 3
+    assert "<details class='verification-details'>" in html
+    assert "Verification details" in html
     assert "PRINT/PDF DERIVATIVE" in html
     assert "EXTERNAL VERIFIED VIEW" not in (run / "report.md").read_text()
     assert "EXTERNAL VERIFIED VIEW" not in (run / "report.html").read_text()

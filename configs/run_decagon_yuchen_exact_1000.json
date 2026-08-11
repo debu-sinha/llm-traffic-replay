@@ -1,0 +1,17 @@
+{
+  "endpoint": {
+    "base_url": "https://dbc-9dcd6158-e299.cloud.databricks.com",
+    "path": "/serving-endpoints/databricks-gpt-5-4-mini/invocations",
+    "auth_profile": "yuchen-test"
+  },
+  "profile_path": "configs/profile_decagon_diagnostic_small.json",
+  "timestamps_file": "configs/decagon_1000_timestamps.txt",
+  "duration_s": 100,
+  "max_concurrency": 128,
+  "max_pending_requests": 256,
+  "max_output_tokens_cap": 24,
+  "ttft_definition": "first_visible",
+  "out_dir": "results/yuchen-test-exact-1000",
+  "title": "Independent customer onboarding: exact 1000-request diagnostic",
+  "label": "DIAGNOSTIC synthetic workload: exactly 1000 scheduled replay requests; 64 input tokens, 16 output tokens, zero intended cache reuse. Not derived from customer traffic and not a production capacity claim."
+}

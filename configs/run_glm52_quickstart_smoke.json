@@ -1,0 +1,42 @@
+{
+  "profile_path": "configs/profile_glm52_customer_smoke.json",
+  "endpoint": {
+    "base_url": "https://dbc-9dcd6158-e299.cloud.databricks.com",
+    "path": "/serving-endpoints/databricks-glm-5-2/invocations",
+    "auth_profile": "yuchen-test",
+    "extra_body": {
+      "reasoning_effort": "none"
+    }
+  },
+  "sizing_concurrency": null,
+  "duration_s": 12,
+  "out_dir": "results/customer-readiness/glm52-quickstart",
+  "title": "GLM 5.2 quickstart path smoke test",
+  "label": "QUICKSTART WORKFLOW TEST ONLY - NOT CAPACITY",
+  "max_output_tokens_cap": 24,
+  "qps_base": 0.2,
+  "qps_burst": 0.2,
+  "qps_min": 0.2,
+  "qps_max": 0.2,
+  "rate_scale": 1.0,
+  "ttft_definition": "first_visible",
+  "rate_limits": {
+    "input_tokens_per_minute": 200000,
+    "output_tokens_per_minute": 20000,
+    "queries_per_hour": 7200,
+    "queries_per_second": 200,
+    "request_bytes_max": 4000000,
+    "warning_utilization": 0.8,
+    "source": "https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits",
+    "as_of": "2026-08-07",
+    "verified_at": "2026-08-11",
+    "max_age_days": 7,
+    "scope": "Published Enterprise workspace pay-per-token endpoint quota row plus Foundation Model API workspace QPS and per-request payload limits; this snapshot does not model other traffic that may consume the same limits",
+    "provider": "databricks",
+    "deployment_mode": "pay_per_token",
+    "workspace_tier": "Enterprise",
+    "model": "databricks-glm-5-2",
+    "accounting_model": "databricks_fmapi_pay_per_token",
+    "note": "Published default snapshot, not measured headroom. The source states a 4 MB payload limit without specifying a binary byte convention; the harness uses the conservative decimal ceiling of 4,000,000 serialized request bytes. Rechecked directly against the live AWS source on 2026-08-11; the GLM 5.2 row remained 200,000 ITPM, 20,000 OTPM, and 7,200 QPH, with workspace limits of 200 QPS and 4 MB per request. Recheck the live source, workspace tier, endpoint mode, and unrelated workspace traffic immediately before every paid run."
+  }
+}

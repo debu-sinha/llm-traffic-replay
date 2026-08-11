@@ -1881,7 +1881,7 @@ def cmd_sweep(args) -> int:
                 "wall_s": _time.monotonic() - rung_started,
                 **accounting,
             })
-            print(f"[sweep] rung {i + 1}: {kind.upper()} {verdict_text[:90]}")
+            print(f"[sweep] rung {i + 1}: {kind.upper()} {verdict_text}")
             print()
             state = decision["state"]
             if state in {"INVALID", "QUOTA_LIMITED"}:
@@ -2125,12 +2125,26 @@ def cmd_quickstart(args) -> int:
         ep["auth_token_env"] = args.token_env
     if args.model:
         ep["model"] = args.model
+    if args.extra_body:
+        try:
+            from .json_input import loads_strict
+            ep["extra_body"] = loads_strict(args.extra_body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(f"--extra-body is not valid JSON: {exc}") from exc
+        if not isinstance(ep["extra_body"], dict):
+            raise SystemExit("--extra-body must be a JSON object")
+        try:
+            from .client import validate_extra_body_safety
+            validate_extra_body_safety(ep["extra_body"])
+        except ValueError as exc:
+            raise SystemExit(f"invalid --extra-body: {exc}") from exc
     production_policy = getattr(
         args, "production_connection_policy", None)
     if production_policy is not None:
         ep["production_connection_policy"] = production_policy
 
     sizing = getattr(args, "sizing_concurrency", None)
+    fixed_rate = getattr(args, "fixed_rate", None)
     legacy = getattr(args, "legacy_concurrency", None)
     if legacy is not None:
         print("warning: --concurrency is now --sizing-concurrency. it derives "
@@ -2144,15 +2158,42 @@ def cmd_quickstart(args) -> int:
         "duration_s": args.duration,
         "out_dir": args.out_dir,
         "title": args.title or (
-            f"open-loop rate sized from {sizing} concurrent, {args.endpoint}"),
+            f"fixed-rate workload, {args.endpoint}" if fixed_rate is not None
+            else f"open-loop rate sized from {sizing} concurrent, "
+                 f"{args.endpoint}"),
         "label": args.label or (
             "Describe the capacity this ran on. Shared pay-per-token is not a "
             "performance claim for a dedicated endpoint."),
     }
     if args.max_output_tokens is not None:
         cfg["max_output_tokens_cap"] = args.max_output_tokens
+    if fixed_rate is not None:
+        cfg.update(qps_base=fixed_rate, qps_burst=fixed_rate,
+                   qps_min=fixed_rate, qps_max=fixed_rate, rate_scale=1.0)
     if getattr(args, "ttft_definition", None) is not None:
         cfg["ttft_definition"] = args.ttft_definition
+
+    rate_limits_path = getattr(args, "rate_limits_file", None)
+    if rate_limits_path:
+        from .config_validation import validate_rate_limits
+        from .json_input import loads_strict
+        try:
+            rate_limits = loads_strict(
+                Path(rate_limits_path).read_text(encoding="utf-8"))
+            if not isinstance(rate_limits, dict):
+                raise ValueError("top-level value must be an object")
+            validate_rate_limits(rate_limits)
+        except (OSError, UnicodeError, ValueError,
+                json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"invalid --rate-limits file {rate_limits_path!r}: {exc}") \
+                from exc
+        cfg["rate_limits"] = rate_limits
+    if sizing is not None and cfg.get("rate_limits") is not None:
+        raise SystemExit(
+            "invalid quickstart configuration: --rate-limits needs "
+            "--fixed-rate because a sizing-derived schedule is unknown "
+            "before paid traffic starts")
 
     # SLA targets. the whole reason to run this is "do we meet ours", so it
     # has to be expressible here. without them the report falls back to the
@@ -2200,9 +2241,13 @@ def cmd_quickstart(args) -> int:
     print("run it with:")
     print(f"  python3 -m traffic_replay run --config {out}")
     print()
-    print("a fixed open-loop arrival rate and pool size are derived at run "
-          "time from a short unloaded sizing pass. concurrency is measured, "
-          "not held.")
+    if fixed_rate is not None:
+        print(f"the run will offer {fixed_rate:g} requests/second as a fixed "
+              "open-loop rate. concurrency is measured, not held.")
+    else:
+        print("a fixed open-loop arrival rate and pool size are derived at run "
+              "time from a short unloaded sizing pass. concurrency is "
+              "measured, not held.")
     if not args.auth_profile:
         print(f"export {args.token_env} first, or pass --auth-profile to read "
               "a ~/.databrickscfg profile instead.")
@@ -2447,8 +2492,8 @@ def main(argv=None) -> int:
     s.add_argument("--format", choices=("text", "json"), default="text")
     s.set_defaults(fn=cmd_verify_sweep)
 
-    s = sub.add_parser("quickstart",
-                       help="write a run config from endpoint + concurrency")
+    s = sub.add_parser(
+        "quickstart", help="write a run config from endpoint + load")
     s.add_argument("--host", required=True,
                    help="workspace URL, e.g. https://my-ws.cloud.databricks.com")
     s.add_argument("--endpoint", required=True,
@@ -2458,6 +2503,9 @@ def main(argv=None) -> int:
     cg = s.add_mutually_exclusive_group(required=True)
     cg.add_argument("--sizing-concurrency", type=int,
                     help="unloaded concurrency used to derive a fixed rate")
+    cg.add_argument("--fixed-rate", type=float,
+                    help="known open-loop requests/second; use this with a "
+                         "rate-limit snapshot")
     cg.add_argument("--concurrency", dest="legacy_concurrency", type=int,
                     help=argparse.SUPPRESS)
     s.add_argument("--duration", type=int, default=240,
@@ -2470,12 +2518,21 @@ def main(argv=None) -> int:
                    help="env var holding a bearer token, if not using a profile")
     s.add_argument("--model", default=None,
                    help="only for shared /chat/completions routes")
+    s.add_argument("--extra-body", default=None,
+                   help='JSON merged into each request. Managed Databricks '
+                        'GLM 5.2 thinking off: '
+                        '\'{"reasoning_effort":"none"}\'')
     s.add_argument(
         "--production-connection-policy",
         choices=("fresh_http1_per_physical_attempt",), default=None,
         help="declare the real application's exact fresh-HTTP/1.1-per-attempt "
              "behavior; omit when unknown")
     s.add_argument("--max-output-tokens", type=int, default=None)
+    s.add_argument(
+        "--rate-limits", dest="rate_limits_file", default=None,
+        metavar="JSON_FILE",
+        help="dated provider quota snapshot; enables conservative planning "
+             "and command-scoped runtime admission")
     s.add_argument("--out-dir", default="results/quickstart")
     s.add_argument("--title", default=None)
     s.add_argument("--label", default=None)

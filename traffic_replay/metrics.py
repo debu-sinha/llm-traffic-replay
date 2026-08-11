@@ -9,6 +9,7 @@ module makes the pairing unavoidable.
 """
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 import html
 import json
@@ -4967,7 +4968,12 @@ def write_outputs(results, summary: dict, out_dir: str | Path,
     from .report_decision import build_report_decision
 
     safe_summary["decision"] = build_report_decision(safe_summary)
-    summary["decision"] = safe_summary["decision"]
+    # Callers such as the sweep binder compare the returned in-memory summary
+    # with the exact summary bytes sealed below. Return the redacted canonical
+    # view, not a near-copy that can still contain a provider field recognized
+    # as secret only during persistence.
+    summary.clear()
+    summary.update(copy.deepcopy(safe_summary))
     try:
         artifact_run.finalize_requests()
         artifact_run.atomic_text(
@@ -5035,6 +5041,8 @@ a:focus-visible,summary:focus-visible{outline:3px solid #155eef;outline-offset:3
  letter-spacing:.04em}.verification-state .status-pass{color:var(--green);
  background:var(--green-soft)}.verification-state .status-failed{color:var(--red);
  background:var(--red-soft)}.repro-codes{color:var(--muted);font-size:10px}
+.verification-details{margin-top:8px}.verification-details summary{cursor:pointer;
+ font-size:11px;font-weight:800;color:#344054}.verification-details[open] summary{margin-bottom:7px}
 .report-head{background:#0c1729;color:#fff;border-radius:18px;padding:28px 30px 24px;
  box-shadow:0 18px 44px rgba(12,23,41,.16)}
 .eyebrow{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
@@ -5100,7 +5108,7 @@ h1{font-size:clamp(25px,3vw,38px);line-height:1.14;letter-spacing:-.025em;
  margin:30px 2px 10px}
 .section-head h2{font-size:18px;line-height:1.25;margin:0;letter-spacing:-.01em}
 .section-head p{font-size:12px;color:var(--muted);margin:0;max-width:650px;text-align:right}
-.fact-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:14px 0}
+.fact-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:14px 0}
 .fact{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:12px 13px;
  min-width:0}
 .fact .k{font-size:10px;color:var(--quiet);font-weight:800;letter-spacing:.06em;
@@ -5162,7 +5170,49 @@ td.n{color:var(--muted)}
  stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}.chart-area{fill:#dfeeff;opacity:.7}
 .chart-dot{fill:var(--surface);stroke:var(--blue);stroke-width:2}.chart-label{fill:#475467;
  font-size:9px;font-family:inherit}.chart-bad{stroke:var(--red)}
-.chart-secondary{stroke:#6b55c5}.chart-dot-secondary{stroke:#6b55c5}
+.chart-secondary{stroke:#6b55c5;stroke-dasharray:7 5}.chart-dot-secondary{stroke:#6b55c5}
+.customer-grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.8fr);
+ gap:12px;margin:12px 0}.customer-card{background:var(--surface);border:1px solid var(--line);
+ border-radius:14px;padding:18px 20px;box-shadow:var(--shadow);min-width:0}
+.customer-card h2{font-size:17px;margin:0;letter-spacing:-.01em}.customer-card .cap{margin-top:4px}
+.latency-legend{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;
+ margin:10px 0 4px}.legend-key{display:grid;grid-template-columns:auto minmax(0,1fr);
+ align-items:center;gap:8px;border:1px solid var(--line);border-radius:9px;padding:8px 10px;
+ background:var(--surface-2)}.legend-key b{display:block;font-size:11px;color:var(--ink)}
+.legend-key small{display:block;font-size:9px;color:var(--muted);line-height:1.3}
+.legend-swatch{width:22px;height:4px;border-radius:99px;background:var(--blue)}
+.legend-swatch.secondary{background:#6b55c5}.latency-chart{width:100%;height:auto;display:block;
+ overflow:visible}.chart-gridline{stroke:#dfe5ed;stroke-width:1;stroke-dasharray:3 4}
+.latency-values{display:grid;grid-template-columns:minmax(116px,1.35fr) repeat(4,minmax(54px,1fr));
+ gap:1px;margin-top:5px;border:1px solid var(--line);border-radius:9px;overflow:hidden;
+ background:var(--line);font-variant-numeric:tabular-nums}.latency-values div{background:var(--surface);
+ padding:7px 8px;text-align:right;font-size:10px}.latency-values .head{background:var(--surface-2);
+ color:var(--quiet);font-size:9px;font-weight:800;text-transform:uppercase}
+.latency-values .series-name{text-align:left;font-weight:800;color:var(--ink)}
+.series-mark{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;
+ background:var(--blue)}.series-mark.secondary{background:#6b55c5}
+.chart-direct-label{font:800 10px/1.2 inherit}.chart-direct-label.primary{fill:var(--blue)}
+.chart-direct-label.secondary{fill:#6b55c5}
+.latency-scale-note{margin:9px 0 6px;padding:6px 9px;border-radius:7px;background:#eef4ff;
+ color:#174ea6;font-size:10px;font-weight:800}.latency-small-multiples{display:grid;
+ grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.latency-plot{border:1px solid var(--line);
+ border-radius:10px;padding:9px;background:var(--surface-2);min-width:0}.latency-plot h3{
+ display:flex;align-items:center;margin:0;font-size:11px}.latency-plot p{margin:2px 0 4px;
+ min-height:26px;color:var(--muted);font-size:9px;line-height:1.3}.cache-summary{border-top:1px solid var(--line);
+ margin-top:14px;padding-top:12px}.cache-summary b{display:block;font-size:12px}.cache-summary span{
+ display:block;margin-top:3px;color:var(--muted);font-size:10px;line-height:1.35}
+.cost-status{display:flex;align-items:flex-start;gap:11px;border-radius:11px;padding:12px;
+ margin-top:12px;background:var(--amber-soft);color:var(--amber)}
+.cost-status.available{background:var(--green-soft);color:var(--green)}
+.cost-icon{display:grid;place-items:center;flex:0 0 28px;height:28px;border-radius:50%;
+ background:rgba(255,255,255,.72);font-weight:900}.cost-status strong{display:block;font-size:13px}
+.cost-status p{margin:3px 0 0;font-size:11px;line-height:1.4;color:var(--muted)}
+.cost-number{font-size:30px;font-weight:850;letter-spacing:-.035em;margin:14px 0 2px;
+ font-variant-numeric:tabular-nums}.cost-breakdown{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+ gap:7px;margin-top:12px}.cost-breakdown div{border:1px solid var(--line);border-radius:9px;
+ padding:9px;background:var(--surface-2)}.cost-breakdown span{display:block;font-size:9px;
+ text-transform:uppercase;letter-spacing:.05em;color:var(--quiet);font-weight:800}
+.cost-breakdown b{display:block;margin-top:3px;font-size:13px;font-variant-numeric:tabular-nums}
 .quota-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .gauge{border:1px solid var(--line);border-radius:10px;padding:13px;background:#fbfcfe}
 .gauge-head{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:700}
@@ -5187,7 +5237,7 @@ td.na{color:var(--muted);font-weight:650}
 @media(max-width:900px){.state-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
  .fact-strip,.stats{grid-template-columns:repeat(3,minmax(0,1fr))}
  .decision-lead{grid-template-columns:1fr}.chart-grid{grid-template-columns:1fr}
- .quota-grid{grid-template-columns:1fr}.section-head{align-items:start;flex-direction:column;gap:4px}
+ .quota-grid{grid-template-columns:1fr}.customer-grid{grid-template-columns:1fr}.section-head{align-items:start;flex-direction:column;gap:4px}
  .section-head p{text-align:left}}
 @media(max-width:640px){.wrap{padding:14px 12px 36px}.report-head{border-radius:14px;
  padding:16px}.external-verified .verified-grid{grid-template-columns:1fr;gap:2px}
@@ -5226,6 +5276,10 @@ td.na{color:var(--muted);font-weight:650}
  table:not(.dense-table){display:table;width:100%;max-width:100%;table-layout:fixed;
  white-space:normal}table:not(.dense-table) th,table:not(.dense-table) td{
  overflow-wrap:anywhere;vertical-align:top}table:not(.dense-table) th.lbl{width:44%}
+ .customer-card{padding:14px}.customer-card h2{font-size:15px}.latency-chart{min-width:0}
+ .latency-legend{grid-template-columns:1fr}.latency-small-multiples{grid-template-columns:1fr}
+ .latency-values{grid-template-columns:minmax(88px,1.25fr) repeat(4,minmax(46px,1fr))}
+ .latency-values div{padding:6px 4px;font-size:9px}.cost-number{font-size:26px}.cost-breakdown{grid-template-columns:1fr}
  th,td{padding:8px;font-size:12px}.believe li{font-size:12px}.sub{font-size:12px}}
 @media print{@page{size:auto;margin:14mm 12mm 16mm}html{scroll-padding-top:0}
  body{background:#fff;font-size:10pt}.wrap{max-width:none;padding:0}.report-head{box-shadow:none;
@@ -5238,6 +5292,7 @@ td.na{color:var(--muted);font-weight:650}
  .verification-states{gap:3px;margin-top:5px}.verification-state{padding:3px 5px;
  font-size:7.5pt}.verification-state strong{font-size:7pt}
  .external-verified.repro-warning{border-color:#d19042;background:#fff}
+ .verification-details .verified-grid{display:grid!important}
  .report-head h1{font-size:21px}
  .eyebrow,.sub{color:#344054}.meta-row{margin-top:8px}.meta-chip{background:#fff;color:#111;
  border-color:#aeb8c6;min-height:22px;padding:2px 7px;font-size:9px}.report-nav{display:none}
@@ -5267,6 +5322,8 @@ td.na{color:var(--muted);font-weight:650}
  margin:5px 0}
  .print-evidence h2{break-after:avoid;page-break-after:avoid}
  .chart svg{max-height:160px}.foot{display:none}.print-footer{display:block;
+ .customer-grid{grid-template-columns:1.55fr .8fr;gap:5px}.customer-card{box-shadow:none;
+ padding:8px}.latency-chart{max-height:150px}.cost-number{font-size:20px}
  border:1px solid #98a2b3;padding:2.5mm 3mm;margin:4mm 0 2mm;background:#fff;
  color:#344054;text-align:center;font-size:8pt;line-height:1.25;break-inside:avoid}
  .run-context-notes{break-inside:avoid;page-break-inside:avoid;margin:3mm 0}
@@ -5387,6 +5444,136 @@ def _html_stability_chart(drift: dict) -> str:
         + f"<text class='chart-label' text-anchor='end' x='{left + width}' "
           f"y='166'>{len(windows) * float(window_seconds) / 60:g} min</text>"
         + "</svg></div>")
+
+
+def _html_customer_latency_chart(first: dict, e2e: dict,
+                                 first_label: str) -> str:
+    """Separate, same-scale percentile charts for the customer summary."""
+    quantiles = ("p50", "p90", "p95", "p99")
+    series = []
+    for label, values, css in (
+            (f"Response started ({first_label})", first, "chart-line"),
+            ("Response finished", e2e, "chart-line chart-secondary")):
+        points = []
+        for position, quantile in enumerate(quantiles):
+            value = values.get(quantile) if isinstance(values, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and math.isfinite(float(value)) and float(value) >= 0:
+                points.append((position, float(value)))
+        if points:
+            series.append((label, css, points))
+    if not series:
+        return ""
+    ceiling = max(value for _label, _css, points in series
+                  for _position, value in points) or 1.0
+    left, top, width, height = 42.0, 22.0, 238.0, 108.0
+
+    def chart(label: str, css: str, points: list[tuple[int, float]],
+              index: int) -> str:
+        def xy(position: int, value: float) -> tuple[float, float]:
+            return (left + position * width / 3.0,
+                    top + height - value * height / ceiling)
+        coords = " ".join(f"{x:.1f},{y:.1f}"
+                          for x, y in (xy(*point) for point in points))
+        dot_css = ("chart-dot chart-dot-secondary"
+                   if "chart-secondary" in css else "chart-dot")
+        plain_label = "Response finished" if index else "Response started"
+        explanation = ("Time until the complete capped response arrived"
+                       if index else "Time until visible content first appeared")
+        shapes = [f"<polyline class='{css}' points='{coords}'/>"]
+        for position, value in points:
+            x, y = xy(position, value)
+            shapes.append(
+                f"<circle class='{dot_css}' cx='{x:.1f}' cy='{y:.1f}' r='4'>"
+                f"<title>{html.escape(label)} {quantiles[position]}: "
+                f"{value:,.0f} milliseconds</title></circle>")
+        chart_id = f"customer-latency-{index}"
+        return (
+            "<article class='latency-plot'>"
+            f"<h3><span class='series-mark{' secondary' if index else ''}'>"
+            f"</span>{html.escape(plain_label)}</h3>"
+            f"<p>{html.escape(explanation)}</p>"
+            f"<svg class='latency-chart' viewBox='0 0 300 158' role='img' "
+            f"aria-labelledby='{chart_id}-title {chart_id}-desc'>"
+            f"<title id='{chart_id}-title'>{html.escape(plain_label)} latency</title>"
+            f"<desc id='{chart_id}-desc'>{html.escape(explanation)} by percentile, "
+            f"on the same zero-to-{ceiling:,.0f}-millisecond scale as the adjacent chart.</desc>"
+            + "".join(
+                f"<line class='chart-gridline' x1='{left}' "
+                f"y1='{top + height * i / 2:.1f}' x2='{left + width}' "
+                f"y2='{top + height * i / 2:.1f}'/>" for i in range(3))
+            + f"<text class='chart-label' x='0' y='{top + 4:.1f}'>{ceiling:,.0f}</text>"
+              f"<text class='chart-label' x='25' y='{top + height + 4:.1f}'>0</text>"
+            + "".join(shapes)
+            + "".join(
+                f"<text class='chart-label' text-anchor='middle' "
+                f"x='{left + i * width / 3:.1f}' y='151'>{quantile}</text>"
+                for i, quantile in enumerate(quantiles))
+            + "</svg></article>")
+
+    value_rows = []
+    for index, (label, _css, points) in enumerate(series):
+        secondary = " secondary" if index else ""
+        plain_label = "Response finished" if index else "Response started"
+        by_position = {position: value for position, value in points}
+        value_rows.append(
+            f"<div class='series-name'><span class='series-mark{secondary}'>"
+            f"</span>{html.escape(plain_label)}</div>"
+            + "".join(
+                f"<div>{by_position[position]:,.0f} ms</div>"
+                if position in by_position else "<div>—</div>"
+                for position in range(len(quantiles))))
+    return (
+        "<div class='latency-scale-note'>Both charts use the same scale · "
+        "higher means a longer wait</div><div class='latency-small-multiples'>"
+        + "".join(chart(label, css, points, index)
+                  for index, (label, css, points) in enumerate(series))
+        + "</div><div class='latency-values' aria-label='Exact latency values'>"
+        "<div class='head series-name'>Metric</div>"
+        + "".join(f"<div class='head'>{quantile}</div>" for quantile in quantiles)
+        + "".join(value_rows) + "</div>")
+
+
+def _html_customer_cost_card(cost: dict | None, requests_total: int | None) -> str:
+    """Render a plain-language cost state without ever implying missing is zero."""
+    if not isinstance(cost, dict) or not cost:
+        return (
+            "<div class='cost-status'><span class='cost-icon' aria-hidden='true'>!</span>"
+            "<div><strong>Cost not calculated</strong><p>Pricing evidence was not "
+            "provided. This does not mean the test was free.</p></div></div>"
+            "<div class='cost-number'>Not available</div>"
+            "<div class='cap'>Add an applicable pricing configuration to show total "
+            "cost and cost per request. Provider billing remains authoritative.</div>")
+    if cost.get("error") or cost.get("coverage_warning") \
+            or cost.get("dbu_total") is None:
+        reason = cost.get("error") or cost.get("coverage_warning") or \
+            "Complete priceable usage was not available."
+        return (
+            "<div class='cost-status'><span class='cost-icon' aria-hidden='true'>!</span>"
+            "<div><strong>Cost could not be calculated reliably</strong>"
+            f"<p>{html.escape(str(reason))}</p></div></div>"
+            "<div class='cost-number'>Not available</div>")
+    total_dbu = float(cost["dbu_total"])
+    usd = cost.get("usd_total")
+    per_request_dbu = total_dbu / requests_total if requests_total else None
+    headline = f"${float(usd):,.4f}" if isinstance(usd, (int, float)) \
+        and not isinstance(usd, bool) else f"{total_dbu:,.4f} DBU"
+    total_detail = f"{total_dbu:,.4f} DBU"
+    per_request = (
+        f"${float(usd) / requests_total:,.6f}"
+        if isinstance(usd, (int, float)) and not isinstance(usd, bool)
+        and requests_total else
+        f"{per_request_dbu:,.6f} DBU" if per_request_dbu is not None else "n/a")
+    return (
+        "<div class='cost-status available'><span class='cost-icon' "
+        "aria-hidden='true'>$</span><div><strong>Estimated replay cost</strong>"
+        "<p>Calculated from measured replay usage and operator-supplied rates. "
+        "Provider billing remains authoritative.</p></div></div>"
+        f"<div class='cost-number'>{headline}</div>"
+        "<div class='cost-breakdown'>"
+        f"<div><span>Total measured replay</span><b>{total_detail}</b></div>"
+        f"<div><span>Average per request</span><b>{per_request}</b></div>"
+        "</div>")
 
 
 def _html_quota_gauges(rate: dict) -> str:
@@ -5749,7 +5936,8 @@ def render_html(summary: dict, title: str, *,
             + verification_state("Source reproducibility", source_repro["code"])
             + verification_state(
                 "Verifier reproducibility", verifier_repro["code"])
-            + "</div><dl class='verified-grid'>"
+            + "</div><details class='verification-details'><summary>"
+              "Verification details</summary><dl class='verified-grid'>"
             f"<dt>Source reproducibility</dt><dd>"
             f"{reproducibility_detail(source_repro)}</dd>"
             f"<dt>Verifier reproducibility</dt><dd>"
@@ -5764,7 +5952,7 @@ def render_html(summary: dict, title: str, *,
             f"<dt>Receipt</dt><dd><code>{esc(verified_view['receipt_id'])}"
             "</code></dd>"
             f"<dd class='assurance'>{esc(verified_view['assurance'])}</dd>"
-            "</dl></aside>")
+            "</dl></details></aside>")
     eyebrow = ("Benchmark evidence · external verification receipt"
                if verified_view else "Benchmark evidence · verify the manifest")
     header_html = (
@@ -5777,7 +5965,8 @@ def render_html(summary: dict, title: str, *,
                   f"{esc(str(chip))}</span>" for kind, chip in header_chips)
         + "</div></header>")
     nav_links = [
-        ("overview", "Decision"), ("workload", "Workload"),
+        ("customer-summary", "At a glance"), ("workload", "Workload"),
+        ("overview", "Decision"),
         ("validity", "Cautions"),
     ]
     if s.get("sla"):
@@ -5817,7 +6006,21 @@ def render_html(summary: dict, title: str, *,
             and throughput_coverage < 1.0:
         throughput_note = (
             f"clean usage subset; {throughput_coverage:.1%} row coverage")
+    endpoint_name = ((run.get("endpoint_metadata") or {}).get("name")
+                     or run.get("endpoint_path") or "NOT RECORDED")
+    input_tps = (throughput.get("input_tokens_per_min") / 60.0
+                 if isinstance(throughput.get("input_tokens_per_min"),
+                               (int, float))
+                 and not isinstance(throughput.get("input_tokens_per_min"),
+                                    bool) else None)
+    output_tps = (throughput.get("output_tokens_per_min") / 60.0
+                  if isinstance(throughput.get("output_tokens_per_min"),
+                                (int, float))
+                  and not isinstance(throughput.get("output_tokens_per_min"),
+                                     bool) else None)
     fact_items = [
+        _html_fact("Endpoint", str(endpoint_name), "",
+                   "exact serving route captured at run time"),
         _html_fact("Scheduled average",
                    f"{scheduled_avg:,.2f}" if scheduled_avg is not None
                    else "NOT RECORDED", "RPS",
@@ -5842,12 +6045,11 @@ def render_html(summary: dict, title: str, *,
                    else "NOT MEASURED", "requests",
                    f"peak {conc.get('in_flight_max', 'unknown')}"),
         _html_fact("Input throughput",
-                   f"{throughput['input_tokens_per_min']:,.0f}"
-                   if isinstance(throughput.get("input_tokens_per_min"),
-                                 (int, float))
-                   and not isinstance(throughput.get("input_tokens_per_min"),
-                                      bool) else "NOT REPORTED", "tok/min",
-                   throughput_note),
+                   f"{input_tps:,.1f}" if input_tps is not None
+                   else "NOT REPORTED", "tok/s", throughput_note),
+        _html_fact("Output throughput",
+                   f"{output_tps:,.1f}" if output_tps is not None
+                   else "NOT REPORTED", "tok/s", throughput_note),
     ]
     facts_html = (
         "<section id='workload' aria-labelledby='workload-heading'>"
@@ -5935,6 +6137,44 @@ def render_html(summary: dict, title: str, *,
         cards.append(_html_stat("output throughput",
                                 num(tp["output_tokens_per_min"]), "tok/min"))
     stats = f"<div class='stats'>{''.join(cards)}</div>"
+    latency_basis_copy = (
+        "Includes scheduling, queueing, connection setup, retries, and response time."
+        if first_caller and e2e_caller else
+        "Caller-experienced timing was unavailable; these are final-attempt request-path measurements."
+    )
+    cache_mean = ach.get("mean") if isinstance(ach, dict) else None
+    cache_coverage = ach.get("coverage") if isinstance(ach, dict) else None
+    cache_reported = ach.get("reported_for_n") if isinstance(ach, dict) else None
+    cache_eligible = ach.get("eligible_requests") if isinstance(ach, dict) else None
+    if isinstance(cache_mean, (int, float)) and not isinstance(cache_mean, bool):
+        cache_used = float(cache_mean) > 0
+        cache_heading = "Prompt cache used: Yes" if cache_used else "Prompt cache used: No"
+        cache_detail = f"{float(cache_mean):.1%} average cached share of prompt tokens"
+        if isinstance(cache_reported, int) and isinstance(cache_eligible, int):
+            cache_detail += f" · reported for {cache_reported:,}/{cache_eligible:,} requests"
+        if isinstance(cache_coverage, (int, float)) and not isinstance(cache_coverage, bool):
+            cache_detail += f" · {float(cache_coverage):.0%} coverage"
+    else:
+        cache_heading = "Prompt cache use: Not reported"
+        cache_detail = "The endpoint did not provide enough cached-token evidence."
+    cache_html = (
+        f"<div class='cache-summary'><b>{esc(cache_heading)}</b>"
+        f"<span>{esc(cache_detail)}. This is token-level cache evidence, not a "
+        "request hit rate.</span></div>")
+    customer_html = (
+        "<section id='customer-summary' aria-labelledby='customer-summary-heading'>"
+        "<div class='section-head'><h2 id='customer-summary-heading'>"
+        "Results at a glance</h2><p>The two numbers most people need: how long "
+        "a user waited and what the measured replay cost.</p></div>"
+        "<div class='customer-grid'><article class='customer-card'>"
+        "<h2>User-experienced latency</h2>"
+        f"<p class='cap'>{esc(latency_basis_copy)} Values are milliseconds; "
+        "lower is better.</p>"
+        + _html_customer_latency_chart(first_table, e2e,
+                                       first_event["short_label"])
+        + "</article><article class='customer-card'><h2>Cost</h2>"
+        + _html_customer_cost_card(s.get("cost"), total)
+        + cache_html + "</article></div></section>")
 
     # ---- SLA banner + scorecard ----
     sla_html = ""
@@ -6952,8 +7192,8 @@ def render_html(summary: dict, title: str, *,
             "requires manifest verification</div>")
     body = (
         f"<main class='wrap'>{verified_banner_html}{header_html}{print_stamp}"
-        f"{nav_html}{decision_html}{provenance_html}"
-        f"{facts_html}{sample_banner}{stats}{believe}"
+        f"{nav_html}{customer_html}{facts_html}{decision_html}{provenance_html}"
+        f"{sample_banner}{stats}{believe}"
         f"{em_html}{ans_html}{sla_html}{corr_html}{lat_html}"
         f"{drift_html}{extra_cards}{cost_html}"
         f"{foot_html}</main>")

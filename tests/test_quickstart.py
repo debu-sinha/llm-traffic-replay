@@ -63,6 +63,53 @@ def test_quickstart_persists_the_configured_first_event_definition():
     assert cfg["ttft_definition"] == "first_visible"
 
 
+def test_quickstart_accepts_request_controls_without_hand_editing():
+    cfg = _run_quickstart(
+        _tmp() / "q.json", "--extra-body", '{"reasoning_effort":"none"}')
+    assert cfg["endpoint"]["extra_body"] == {"reasoning_effort": "none"}
+
+
+def test_quickstart_accepts_a_dated_rate_limit_snapshot(tmp_path):
+    snapshot = tmp_path / "limits.json"
+    snapshot.write_text(json.dumps({
+        "input_tokens_per_minute": 200000,
+        "output_tokens_per_minute": 20000,
+        "queries_per_hour": 7200,
+        "queries_per_second": 200,
+        "request_bytes_max": 4000000,
+        "warning_utilization": 0.8,
+        "source": "https://docs.example.test/limits",
+        "as_of": "2026-08-11",
+        "verified_at": "2026-08-11",
+        "max_age_days": 7,
+        "scope": "test fixture",
+        "provider": "databricks",
+        "deployment_mode": "pay_per_token",
+        "workspace_tier": "Enterprise",
+        "model": "my-endpoint",
+        "accounting_model": "databricks_fmapi_pay_per_token",
+    }))
+    out = tmp_path / "q.json"
+    argv = ["quickstart", "--host", "https://ws.cloud.databricks.com",
+            "--endpoint", "my-endpoint", "--profile",
+            "configs/profile_validation_small.json", "--fixed-rate", "0.5",
+            "--rate-limits", str(snapshot), "--out", str(out)]
+    assert main(argv) == 0
+    cfg = json.loads(out.read_text())
+    assert cfg["rate_limits"]["queries_per_second"] == 200
+    assert cfg["qps_base"] == 0.5
+    assert cfg["sizing_concurrency"] is None
+
+
+def test_quickstart_explains_why_sizing_and_rate_limits_cannot_mix(tmp_path):
+    snapshot = tmp_path / "limits.json"
+    snapshot.write_text(Path(
+        "configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json"
+    ).read_text())
+    with pytest.raises(SystemExit, match="needs --fixed-rate"):
+        _run_quickstart(tmp_path / "q.json", "--rate-limits", str(snapshot))
+
+
 def test_no_targets_means_no_acceptance_block_rather_than_a_guess():
     cfg = _run_quickstart(_tmp() / "q.json")
     assert "acceptance_targets" not in cfg

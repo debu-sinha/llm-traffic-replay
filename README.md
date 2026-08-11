@@ -11,6 +11,11 @@ The tool measures a configured experiment. It does not prove that synthetic
 text behaves like production text, that two provider dialects are equivalent,
 or that an HTTP 200 response is semantically correct.
 
+New here? Start with the plain-language [Customer load-testing guide](docs/CUSTOMER_GUIDE.md).
+It covers every supported workflow, what each result means, automatic report
+generation, cost and cache evidence, and copy/paste prompts for Claude Code or
+Codex in [AI-assisted load testing](docs/AI_ASSISTED_LOAD_TESTING.md).
+
 ## Start safely
 
 Requirements:
@@ -34,7 +39,7 @@ Prove the timing instrument against the bundled localhost oracle before using
 an endpoint:
 
 ```bash
-python3 -m traffic_replay validate --port 0 --format json
+python3 -m traffic_replay validate --port 0
 ```
 
 `validate` exercises sampling, scheduling, streaming, journaling, reporting,

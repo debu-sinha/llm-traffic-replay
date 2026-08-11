@@ -113,6 +113,9 @@ def test_customer_takeaway_leads_with_caller_latency_and_plain_caveats():
     assert "do not establish correctness, task success, or usefulness" in body
     assert "natural completion behavior was not measured" in body
     assert "synthetic workload shape" in body
+    assert "240 scheduled requests over 240 seconds" in body
+    assert body.index("What was tested") < body.index(
+        "Field glossary: how to read every displayed value")
     assert "does not establish an endpoint ceiling, quota headroom" in body
     assert "calibration request row(s) were sent outside the measured replay" \
         in body

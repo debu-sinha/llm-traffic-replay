@@ -65,6 +65,7 @@ row count, and optional coverage/note fields to name the population and source.
 | `cache_fidelity` | Paired achieved-versus-intended cache fraction comparison, coverage, error, and warning. |
 | `token_targeting` | Endpoint-reported prompt/completion tokens versus intended synthetic targets, usage coverage, errors, and finish reasons. `max_tokens` is only a cap. |
 | `calibration_warmth` | Calibration row count, body-hash coverage, exact calibration/replay payload overlap, replay overlap share, and warm-state warning. It does not assert a cache hit. |
+| `sla` | Customer-owned target configuration and scored evidence. Latency rows contain the required and observed meeting fractions, nearest-rank point estimate, one-sided 95% Wilson lower bound, and `statistically_demonstrated`; a point-estimate hit without confidence is `NOT PROVEN`, not an acceptance pass. Success-rate evidence uses the same confidence rule. |
 
 ## `run` identity and provenance
 

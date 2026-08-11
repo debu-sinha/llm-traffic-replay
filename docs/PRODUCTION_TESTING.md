@@ -673,9 +673,9 @@ Accept a result only if all of the following are true:
 - exact caller timing covers the scored population;
 - the quoted quantile meets its sample floor: p50 20, p90 100, p95 200, p99
   1000 acceptable outcomes;
-- the observed success fraction meets its target and the one-sided 95 percent
-  Wilson lower confidence bound also meets it, under the stated independent
-  outcome assumption;
+- observed success and latency-target compliance fractions meet their targets,
+  and their one-sided 95 percent Wilson lower confidence bounds also meet them,
+  under the stated independent-outcome assumption;
 - stability is established over the acceptable-outcome population while
   window error rate and event coverage remain healthy;
 - cost is explicitly labeled unverified operator-supplied arithmetic over

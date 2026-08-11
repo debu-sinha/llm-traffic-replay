@@ -2,6 +2,16 @@
 
 ## Guided customer configuration
 
+- Default guided telemetry recovery to correlation-preserving empirical-joint
+  sampling; the independent p50/p95 model is now an explicit lossy fallback.
+- Make `check-config` reuse the exact frozen workload draw, clearly define
+  calibration, and print one quoted real-endpoint command plus report-opening
+  guidance.
+- Require one-sided 95% Wilson confidence for latency-target compliance as
+  well as success-rate acceptance, and render point-estimate passes without
+  enough evidence as `NOT PROVEN`.
+- Move the field glossary to the report appendix and put the exact request
+  count and load window in the first customer-facing scope statement.
 - Add interactive and noninteractive `init-config` setup for common
   Databricks/OpenAI telemetry exports, custom column mappings, customer-owned
   SLA files, exact schedules, and referenced run configs.

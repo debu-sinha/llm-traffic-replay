@@ -6682,7 +6682,7 @@ def render_html(summary: dict, title: str, *,
     quota_code = (decision.get("quota_state") or {}).get("code")
     sla_code = (decision.get("customer_sla") or {}).get("code")
     if integrity_code == "TAMPERED":
-        result_type = "Do not use — integrity failed"
+        result_type = "Do not use: integrity failed"
     elif quota_code in {"EXCEEDED", "LOCAL_GUARD_REFUSED"}:
         result_type = "Quota-limited result"
     elif measurement_code == "INVALID":
@@ -8112,7 +8112,7 @@ def render_html(summary: dict, title: str, *,
             label, tone = "NOT PROVEN", "state-warn"
         elif key == "customer_sla" and code == "PASS" \
                 and not customer_acceptance_validated:
-            label, tone = "OBSERVED MET — NOT PROVEN", "state-warn"
+            label, tone = "OBSERVED MET - NOT PROVEN", "state-warn"
         elif key == "endpoint_capacity" and code in {
                 "INCONCLUSIVE", "NOT_EVALUATED"}:
             label, tone = "Capacity not tested", "state-warn"
@@ -8369,7 +8369,7 @@ def render_html(summary: dict, title: str, *,
             (("p95: " if n_value is not None
               and n_value >= PERCENTILE_MIN_SAMPLES["p50"] else "")
              + "Insufficient sample for tail latency")
-            + (f" — need 200, have {n_value}" if n_value is not None else ""))
+            + (f" - need 200, have {n_value}" if n_value is not None else ""))
         for quantile in ("p90", "p99"):
             if quantile in requested_quantiles and n_value is not None \
                     and n_value >= PERCENTILE_MIN_SAMPLES[quantile]:
@@ -8401,7 +8401,7 @@ def render_html(summary: dict, title: str, *,
                     and canonical_sla_pass:
                 result_label, result_class = "PASS", "target-pass"
             elif row.get("statistically_demonstrated") is True:
-                result_label = "NOT PROVEN — OBSERVED MET"
+                result_label = "NOT PROVEN - OBSERVED MET"
                 result_class = "target-unproven"
             elif row.get("actual_ms") is None:
                 result_label, result_class = "NOT MEASURED", "target-unproven"
@@ -8416,7 +8416,7 @@ def render_html(summary: dict, title: str, *,
             actual_text = (
                 f"observed {observed_text} ms"
                 if sample_supported and row.get("actual_ms") is not None else
-                f"Insufficient sample — need {required}, have {n_value}"
+                f"Insufficient sample - need {required}, have {n_value}"
                 if required is not None and n_value is not None else
                 "observed value unavailable")
             target_html.append(
@@ -8740,7 +8740,7 @@ def render_html(summary: dict, title: str, *,
         "</tbody></table></div>")
     backend_attribution_html = (
         "<div class='card'><h2>Backend attribution boundary</h2>"
-        "<div class='not-captured'><b>Not captured — required for backend "
+        "<div class='not-captured'><b>Not captured: required for backend "
         "attribution:</b> provider/server correlation ID, ingress queue duration, "
         "model scheduling/start, worker or replica identity, batch size, server "
         "cache hit, autoscaling/cold-start events, and server throttle decision. "
@@ -8793,7 +8793,7 @@ def render_html(summary: dict, title: str, *,
         "</span><span class='summary-note'>Plain-language definitions for every "
         "technical field and missing-evidence state.</span></summary>"
         "<div class='detail-body'><div class='banner warn'>Missing, unknown, "
-        "NOT REPORTED, and null are evidence states — not zeros and not "
+        "NOT REPORTED, and null are evidence states; not zeros and not "
         "successes.</div><dl class='glossary-list'>" + "".join(
             f"<dt><b>{esc(name)}</b></dt><dd>{esc(definition)}</dd>"
             for name, definition in _REPORT_FIELD_GLOSSARY)

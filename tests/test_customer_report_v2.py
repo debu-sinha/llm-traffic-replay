@@ -329,7 +329,7 @@ def test_unsupported_customer_target_is_not_rendered_as_pass():
     latency = _plain(document.by_id("latency").text())
 
     assert "Customer target p50" in latency
-    assert "Insufficient sample — need 20, have 10" in latency
+    assert "Insufficient sample - need 20, have 10" in latency
     assert "NOT PROVEN" in customer_summary
     assert "NOT PROVEN" in latency
     assert not re.search(r"Acceptance.{0,100}\bPASS\b", customer_summary)

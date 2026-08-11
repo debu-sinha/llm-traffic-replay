@@ -18,6 +18,16 @@
 - Add zero-traffic `check-config` validation with plain-language workload,
   SLA, request-count, token, cost, dropped-row, modeling, and assumption
   output.
+- Make customer reports distinguish configured rate-curve intensity, logical
+  replay-window average, exact all-phase physical POST peaks, and peak
+  in-flight concurrency so quota-spaced bursts cannot be presented as steady
+  traffic.
+- Surface declared-versus-observed token-shape mismatch, output-cap coverage,
+  and percentile sample floors before the engineering appendix; p99 is never
+  published as supported below 1,000 eligible successful observations.
+- Keep stability language attribution-neutral when the artifact has only
+  caller-path evidence; client, network, gateway, and backend causes require
+  correlated telemetry.
 
 This file records behavior changes. It does not certify benchmark numbers from
 older artifacts. Compare only sealed runs whose manifests prove compatible

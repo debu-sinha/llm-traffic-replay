@@ -367,10 +367,13 @@ def test_stability_card_present_for_long_run():
 
 
 def test_warmup_is_not_reported_as_stable():
-    """A cold endpoint: window 0 is 15x slower than the last window
-    because the endpoint was cold. Comparing only first to last calls that
-    an improvement and passes it as stable, which would let a caller quote a
-    blended p95 from a run that never reached steady state."""
+    """Window 0 is 15x slower than the last window.
+
+    Comparing only first to last calls that an improvement and passes it as
+    stable, which would let a caller quote a blended p95 from a run whose
+    measured path changed materially. Client evidence must not assign the
+    cause to a cold endpoint without correlated backend telemetry.
+    """
     cold = _rows(25, base_ttft=31000.0, t0=0.0, dt=1.0)
     mid = _rows(25, base_ttft=3500.0, t0=70.0, dt=1.0)
     warm = _rows(25, base_ttft=2000.0, t0=140.0, dt=1.0)
@@ -379,7 +382,9 @@ def test_warmup_is_not_reported_as_stable():
     assert d["drift_kind"] == "warming"
     assert d["ttft_p95_spread_ratio"] > 1.3
     assert d["ttft_p95_drift_ratio"] < 1.0      # end/end alone looks like a win
-    assert "cold start" in d["drift_headline"]
+    assert "worst in the first window" in d["drift_headline"]
+    assert "cannot attribute the cause" in d["drift_headline"]
+    assert "cold start" not in d["drift_headline"]
 
 
 def test_midrun_spike_is_not_reported_as_stable():
@@ -410,7 +415,8 @@ def test_degrading_run_is_labeled_degrading():
     late = _rows(25, base_ttft=400.0, t0=140.0, dt=1.0)
     d = _drift_block(early + mid + late)
     assert d["drift_kind"] == "degrading"
-    assert "slower" in d["drift_headline"]
+    assert "measured caller path slowed" in d["drift_headline"]
+    assert "cannot attribute the cause" in d["drift_headline"]
 
 
 def test_first_visible_stability_scores_visible_latency_not_reasoning_start():
@@ -936,7 +942,9 @@ def test_endpoint_collapsing_into_errors_is_not_stable():
     assert d["drift_kind"] == "failing"
     assert d["drift_flag"] is True
     assert "84 percent" in d["drift_headline"]
-    assert "not what it was asked" in d["drift_headline"]
+    assert "surviving numbers" in d["drift_headline"]
+    assert "latency comparison is not reported for a failing run" \
+        in d["drift_headline"]
     # the named window is the biggest failure, so the clause reconciling it
     # against the highest RATE has to be there too, or the two disagree
     assert "highest loss rate was window 3" in d["drift_headline"]

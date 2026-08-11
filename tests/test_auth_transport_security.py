@@ -869,10 +869,12 @@ def test_absolute_deadline_also_covers_connection_setup():
         def __init__(self):
             self.timeout = None
             self.closed = False
+            self.connect_calls = 0
 
         def connect(self):
             # A fake transport can ignore the requested socket timeout; the
             # client still checks the absolute clock immediately afterwards.
+            self.connect_calls += 1
             time.sleep(0.025)
 
         def close(self):
@@ -901,7 +903,14 @@ def test_absolute_deadline_also_covers_connection_setup():
     assert result.first_attempt_unix is not None
     assert result.first_send_unix is None
     assert result.finished_unix is not None
-    assert conn.timeout <= 0.01
+    if conn.connect_calls:
+        assert 0 < conn.timeout <= 0.01
+    else:
+        # Under scheduler contention the absolute 10 ms budget can expire
+        # after the connection object is registered but before connect setup
+        # begins. That is still a correct no-send timeout outcome, and no
+        # socket timeout needs to be installed on an unused connection.
+        assert conn.timeout is None
     assert conn.closed is True
 
 

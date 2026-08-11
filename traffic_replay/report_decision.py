@@ -24,6 +24,9 @@ from .artifacts import sanitize_display_text
 
 
 DECISION_SCHEMA_VERSION = 1
+PERCENTILE_MIN_SAMPLES = {
+    "p50": 20, "p90": 100, "p95": 200, "p99": 1000,
+}
 
 
 @dataclass(frozen=True)
@@ -319,7 +322,7 @@ def _quota_state(facts: dict) -> dict:
             "NOT_OBSERVED", "No quota rejection observed",
             f"No HTTP 429 was observed in {rows}/{rows} captured request "
             "rows. This does not establish provider quota headroom.",
-            ["HTTP_429_NOT_OBSERVED"], severity="pass")
+            ["HTTP_429_NOT_OBSERVED"], severity="neutral")
     out["http_429"] = evidence
     out["runtime_quota_admission"] = local_evidence
     out["provider_headroom_established"] = False
@@ -376,13 +379,21 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
     run = summary.get("run")
     run = run if isinstance(run, Mapping) else {}
     preflight_gate = run.get("preflight_gate")
-    if isinstance(preflight_gate, Mapping) \
-            and preflight_gate.get("outcome") == \
-            "preflight_forced_unreadable":
+    preflight_outcome = (
+        preflight_gate.get("outcome")
+        if isinstance(preflight_gate, Mapping) else None)
+    if preflight_outcome == "preflight_forced_unreadable":
         invalid_codes.append("FORCED_UNREADABLE_PREFLIGHT")
         invalid_reasons.append(
             "measured load was explicitly forced after the representative "
             "preflight produced an incomplete answer")
+    elif preflight_gate is not None and (
+            not isinstance(preflight_gate, Mapping)
+            or preflight_outcome not in {"preflight_passed", "skipped"}):
+        invalid_codes.append("PREFLIGHT_GATE_NOT_SATISFIED")
+        invalid_reasons.append(
+            "the recorded representative preflight state did not establish "
+            "a valid load gate")
     if run.get("endpoint_metadata_stability") == "changed":
         invalid_codes.append("ENDPOINT_METADATA_CHANGED_DURING_RUN")
         invalid_reasons.append(
@@ -426,6 +437,16 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
             reason_details=list(zip(invalid_codes, invalid_reasons)))
 
     cautions: list[tuple[str, str]] = []
+    if preflight_gate is None:
+        cautions.append((
+            "PREFLIGHT_NOT_ESTABLISHED",
+            "no representative capability preflight is bound to this run; "
+            "treat the measurements as exploratory"))
+    elif preflight_outcome == "skipped":
+        cautions.append((
+            "PREFLIGHT_SKIPPED",
+            "the representative capability preflight was explicitly "
+            "skipped; treat the measurements as exploratory"))
     quota_rows = quota_facts["request_rows_examined"]
     quota_observed = quota_facts["http_status_observed_for"]
     if quota_rows is None:
@@ -454,6 +475,7 @@ def _measurement_state(summary: Mapping, quota_facts: dict) -> dict:
         ("PRICING_APPLICABILITY_UNVERIFIED",
          ("cost", "applicability_warning")),
         ("CACHE_FIDELITY_UNVERIFIED", ("cache_fidelity", "warning")),
+        ("CALIBRATION_WARM_STATE", ("calibration_warmth", "warning")),
         ("TOKEN_FIDELITY_UNVERIFIED", ("token_targeting", "warning")),
         ("LOAD_DELIVERY_UNVERIFIED", ("client", "warning")),
         ("CONCURRENCY_FIDELITY_UNVERIFIED", ("concurrency", "warning")),
@@ -550,6 +572,9 @@ def _sla_state(summary: Mapping) -> dict:
     misses = 0
     unmeasured = 0
     confidence_not_demonstrated = 0
+    latency_confidence_not_demonstrated = 0
+    success_confidence_not_demonstrated = 0
+    latency_sample_not_supported = 0
     for key in ("ttft_vs_target", "ttfg_vs_target"):
         rows = sla.get(key)
         if not isinstance(rows, list):
@@ -560,7 +585,23 @@ def _sla_state(summary: Mapping) -> dict:
             checks += 1
             if row.get("met") is False:
                 misses += 1
-            elif row.get("met") is not True:
+            elif row.get("met") is True:
+                quantile = row.get("quantile")
+                minimum = PERCENTILE_MIN_SAMPLES.get(str(quantile))
+                eligible = _nonnegative_int(row.get("eligible_outcomes"))
+                sample_supported = row.get("sample_supported")
+                if sample_supported is None and minimum is not None \
+                        and eligible is not None:
+                    sample_supported = (
+                        eligible >= minimum)
+                if sample_supported is False:
+                    unmeasured += 1
+                    latency_sample_not_supported += 1
+                elif row.get("statistically_demonstrated") is False:
+                    unmeasured += 1
+                    confidence_not_demonstrated += 1
+                    latency_confidence_not_demonstrated += 1
+            else:
                 unmeasured += 1
 
     acceptance = sla.get("acceptance_config")
@@ -619,6 +660,7 @@ def _sla_state(summary: Mapping) -> dict:
             if success.get("statistically_demonstrated") is False:
                 unmeasured += 1
                 confidence_not_demonstrated += 1
+                success_confidence_not_demonstrated += 1
         else:
             unmeasured += 1
 
@@ -635,7 +677,10 @@ def _sla_state(summary: Mapping) -> dict:
         "misses": misses,
         "unmeasured": unmeasured,
         "success_rate_confidence_not_demonstrated": (
-            confidence_not_demonstrated),
+            success_confidence_not_demonstrated),
+        "latency_confidence_not_demonstrated": (
+            latency_confidence_not_demonstrated),
+        "latency_sample_not_supported": latency_sample_not_supported,
         "targets_source": (_one_line(sla["targets_source"])
                            if isinstance(sla.get("targets_source"), str)
                            else None),
@@ -645,7 +690,11 @@ def _sla_state(summary: Mapping) -> dict:
         miss_codes = ["SLA_TARGET_MISSED"]
         if unmeasured > confidence_not_demonstrated:
             miss_codes.append("SLA_TARGET_UNMEASURED")
-        if confidence_not_demonstrated:
+        if latency_confidence_not_demonstrated:
+            miss_codes.append("LATENCY_CONFIDENCE_NOT_DEMONSTRATED")
+        if latency_sample_not_supported:
+            miss_codes.append("LATENCY_SAMPLE_SIZE_NOT_SUPPORTED")
+        if success_confidence_not_demonstrated:
             miss_codes.append(
                 "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED")
         out = _state(
@@ -655,23 +704,35 @@ def _sla_state(summary: Mapping) -> dict:
             miss_codes, severity="fail")
     elif unmeasured:
         ordinary_unmeasured = unmeasured - confidence_not_demonstrated
-        if confidence_not_demonstrated and not ordinary_unmeasured:
+        if latency_sample_not_supported and (
+                unmeasured == latency_sample_not_supported):
             reason = (
-                "The observed success rate met its target, but its one-sided "
-                "95% Wilson lower confidence bound did not; no acceptance "
-                "pass is claimed.")
+                "The observed latency point estimate met its target, but the "
+                "eligible sample did not meet the report's minimum for that "
+                "percentile; no acceptance pass is claimed.")
+        elif confidence_not_demonstrated and not ordinary_unmeasured:
+            reason = (
+                "The observed point estimate met its target, but its one-sided "
+                "95% Wilson lower confidence bound did not; no acceptance pass "
+                "is claimed.")
         else:
             reason = (
                 f"{unmeasured} of {checks} configured acceptance check(s) "
                 "were "
                 "inconclusive"
-                + (f", including {confidence_not_demonstrated} success-rate "
+                + (f", including {confidence_not_demonstrated} statistical "
                    "confidence check(s)" if confidence_not_demonstrated else "")
                 + "; no acceptance pass is claimed.")
         inconclusive_codes = []
         if ordinary_unmeasured:
             inconclusive_codes.append("SLA_TARGET_UNMEASURED")
-        if confidence_not_demonstrated:
+        if latency_confidence_not_demonstrated:
+            inconclusive_codes.append(
+                "LATENCY_CONFIDENCE_NOT_DEMONSTRATED")
+        if latency_sample_not_supported:
+            inconclusive_codes.append(
+                "LATENCY_SAMPLE_SIZE_NOT_SUPPORTED")
+        if success_confidence_not_demonstrated:
             inconclusive_codes.append(
                 "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED")
         out = _state(
@@ -884,5 +945,6 @@ def build_report_decision(
 __all__ = [
     "DECISION_SCHEMA_VERSION",
     "IntegrityContext",
+    "PERCENTILE_MIN_SAMPLES",
     "build_report_decision",
 ]

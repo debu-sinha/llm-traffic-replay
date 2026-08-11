@@ -35,8 +35,14 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, asdict, field
 
-from .sse import (StreamState, extract_usage, finalize_tool_calls,
-                  iter_sse_events, update_state)
+from .adapters import (
+    DEFAULT_ENDPOINT_ADAPTER,
+    EndpointAdapterExecution,
+    ResponseOutcome,
+    get_endpoint_adapter,
+    resolve_endpoint_adapter,
+)
+from .sse import StreamState
 from .network import bind_deadline_bounded_dns
 
 
@@ -53,13 +59,20 @@ _FRESH_HTTP1_CONNECTION_POLICY = "fresh_http1_per_physical_attempt"
 
 
 def validate_extra_body_safety(value: dict | None) -> None:
-    """Reject credentials from a request-body field persisted as evidence."""
+    """Reject credentials from a request-body field persisted as evidence.
+
+    JSON-Schema property/definition names are declarations, not credential
+    controls.  The scanner therefore permits structurally valid names such as
+    ``properties.password`` while continuing to reject actual ``password`` or
+    ``api_key`` controls, header containers, populated secret-field examples,
+    and credential-shaped strings anywhere in the body.
+    """
     if value is None:
         return
     if not isinstance(value, dict):
         raise ValueError("endpoint extra_body must be an object")
     try:
-        raw = json.dumps(value, allow_nan=False, separators=(",", ":"))
+        json.dumps(value, allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(
             "endpoint extra_body must contain finite JSON values") from exc
@@ -67,10 +80,10 @@ def validate_extra_body_safety(value: dict | None) -> None:
     # The exact request parameters are written to run-config.json, start.json,
     # summary.json, reports, and the manifest so a benchmark can be reproduced.
     # Authentication belongs in auth_profile/auth_token_env, never this body.
-    from .artifacts import redact_secrets
-    safe = json.dumps(
-        redact_secrets(value), allow_nan=False, separators=(",", ":"))
-    if raw != safe:
+    from .artifacts import redact_secrets_with_status
+    _safe, contains_secret = redact_secrets_with_status(
+        value, schema_context=True)
+    if contains_secret:
         raise ValueError(
             "endpoint extra_body must not contain credentials or secret-like "
             "values because request parameters are persisted as evidence; "
@@ -89,11 +102,18 @@ class EndpointConfig:
                                       # Route-optimized endpoint-scoped OAuth
                                       # is not implemented by this resolver.
     model: str | None = None         # set for shared /chat/completions routes
+    # Versioned wire-dialect contract. Model identity and provider controls
+    # stay declarative (model + extra_body); only a genuinely different
+    # request/response protocol needs a new adapter implementation.
+    adapter: str = DEFAULT_ENDPOINT_ADAPTER
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 120.0
     total_timeout_s: float = 180.0   # absolute worker/request deadline; SSE
                                      # traffic cannot extend it
-    temperature: float = 0.0
+    # ``None`` deliberately omits the field. Some otherwise compatible models
+    # reject sampling parameters, so omission and numeric zero must remain
+    # distinct, sealed configurations.
+    temperature: float | None = 0.0
     max_retries: int = 0             # physical inference retries; 0-2 only
     include_usage: bool = True       # request streamed usage when supported
     extra_body: dict | None = None   # passthrough request params (see _body)
@@ -122,6 +142,11 @@ class EndpointConfig:
         if self.model is not None \
                 and (not isinstance(self.model, str) or not self.model.strip()):
             raise ValueError("endpoint model must be a non-empty string")
+        try:
+            adapter = get_endpoint_adapter(self.adapter)
+            adapter.validate_endpoint(self)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid endpoint adapter: {exc}") from exc
         if not isinstance(self.auth_token_env, str) \
                 or not self.auth_token_env \
                 or not (self.auth_token_env[0].isalpha()
@@ -146,10 +171,11 @@ class EndpointConfig:
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
                     or not math.isfinite(float(value)) or value <= 0:
                 raise ValueError(f"endpoint {name} must be positive and finite")
-        if isinstance(self.temperature, bool) \
-                or not isinstance(self.temperature, (int, float)) \
-                or not math.isfinite(float(self.temperature)):
-            raise ValueError("endpoint temperature must be finite")
+        if self.temperature is not None and (
+                isinstance(self.temperature, bool)
+                or not isinstance(self.temperature, (int, float))
+                or not math.isfinite(float(self.temperature))):
+            raise ValueError("endpoint temperature must be finite or null")
         if not isinstance(self.max_retries, int) \
                 or isinstance(self.max_retries, bool) \
                 or not 0 <= self.max_retries <= _MAX_PHYSICAL_RETRIES:
@@ -192,21 +218,13 @@ def serialize_request_body(cfg: EndpointConfig, messages: list[dict],
     tool schemas, provider controls, and JSON framing cannot be omitted from
     its conservative input bound while still appearing on the wire.
     """
-    owned = ("messages", "max_tokens", "temperature", "stream",
-             "model", "stream_options")
-    payload: dict = {k: v for k, v in (cfg.extra_body or {}).items()
-                     if k not in owned}
-    payload["messages"] = messages
-    payload["max_tokens"] = int(max_tokens)
-    payload["temperature"] = cfg.temperature
-    payload["stream"] = True
-    if cfg.model:
-        payload["model"] = cfg.model
-    if include_usage:
-        payload["stream_options"] = {"include_usage": True}
-    return json.dumps(
-        payload, ensure_ascii=False, allow_nan=False,
-        separators=(",", ":")).encode("utf-8")
+    adapter = get_endpoint_adapter(cfg.adapter)
+    # EndpointConfig is deliberately a plain data object and an embedding
+    # caller can mutate it after construction. Revalidate at the serialization
+    # boundary so a late owned-field collision or dialect change cannot be
+    # silently discarded on the wire.
+    adapter.validate_endpoint(cfg)
+    return adapter.serialize_request(cfg, messages, max_tokens, include_usage)
 
 
 @dataclass
@@ -242,6 +260,10 @@ class RequestResult:
     doc_id: int                      # pooled document; -1 = no shared prefix
     chars_sent: int
     retries: int = 0
+    # First framed event emitted by the selected response adapter.  This is
+    # later than (or equal to) the first bounded response-body read, and is
+    # not evidence of a model token, reasoning, visible content, or success.
+    ttse_ms: float | None = None
     service_tier: str | None = None        # exact stable tier from SSE chunks
     reasoning_tokens: int | None = None   # thinking tokens, when reported
     reasoning_tokens_source: str | None = None  # usage field it was read from
@@ -292,6 +314,7 @@ class RequestResult:
     # final-attempt request-path clocks above.
     queue_wait_ms: float | None = None
     caller_ttfb_ms: float | None = None
+    caller_ttse_ms: float | None = None
     caller_ttft_ms: float | None = None
     caller_ttfr_ms: float | None = None
     caller_ttfv_ms: float | None = None
@@ -304,6 +327,18 @@ class RequestResult:
     # transport failures. This closes the interval started by first_send_unix
     # without pretending that a failed request occupied zero time.
     finished_unix: float | None = None
+    endpoint_adapter: str = DEFAULT_ENDPOINT_ADAPTER
+    response_mode: str = "streaming"
+    # One digest per physical POST attempt, in attempt order. The body may
+    # legitimately change when an adapter performs a documented fallback.
+    physical_request_body_sha256s: list[str] = field(default_factory=list)
+    # A bounded HTTP error-body sample is available transiently to adapter
+    # classifiers. Persist only its size and digest, never provider text.
+    http_error_body_sample_bytes: int | None = None
+    http_error_body_sample_sha256: str | None = None
+    # ``False`` means the adapter inspected this candidate and found no
+    # candidate-specific rejection proof; it does not mean acceptance.
+    probe_candidate_rejected: bool | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -452,7 +487,14 @@ class EndpointClient:
         """
         if token is not None:
             token = validate_bearer_token(token, source="initial credential")
-        self.cfg = cfg
+        # Snapshot the caller's configuration. In particular, retain an
+        # isolated copy of nested provider controls so a concurrent mutation
+        # cannot change request bytes midway through a run.
+        self.cfg = copy.deepcopy(cfg)
+        cfg = self.cfg
+        self._adapter_execution = resolve_endpoint_adapter(cfg.adapter)
+        self.adapter = self._adapter_execution.adapter
+        self.adapter.validate_endpoint(cfg)
         self.token = token
         self._refresh = refresh
         if runtime_quota_guard is not None:
@@ -485,10 +527,21 @@ class EndpointClient:
             validate_bearer_transport(cfg.base_url)
         self._ssl = ssl.create_default_context() if self.scheme == "https" else None
         self._include_usage_supported: bool | None = (
-            None if cfg.include_usage else False)  # learned or explicitly off
+            (None if cfg.include_usage else False)
+            if self.adapter.usage_request_mode
+            == "stream_options.include_usage"
+            else None)
+        # This field describes only an optional request control. Adapters with
+        # intrinsic usage do not learn a fictitious include-usage capability
+        # from an ordinary HTTP 200; preflight separately records whether
+        # usage counters were actually present.
 
     def transport_contract(self) -> dict:
         """Public, artifact-safe description of this client's wire behavior."""
+        # This method is called while sealing setup/run evidence. Re-attest at
+        # that boundary so a registry or implementation mutation during live
+        # traffic can never yield a publishable report.
+        self.assert_adapter_integrity()
         with self._lock:
             include_usage_state = self._include_usage_supported
         actual_policy = _FRESH_HTTP1_CONNECTION_POLICY
@@ -522,10 +575,21 @@ class EndpointClient:
             "max_stream_bytes": _MAX_STREAM_BYTES,
             "max_stream_events": _MAX_STREAM_EVENTS,
             "max_stream_validation_errors": _MAX_STREAM_ERRORS,
-            "required_success_content_type": "text/event-stream",
+            "endpoint_adapter": self._adapter_execution.contract,
+            "required_success_content_types": list(
+                self.adapter.accepted_response_media_types),
             "include_usage_configured": self.cfg.include_usage,
             "include_usage_support_state": include_usage_state,
         }
+
+    @property
+    def adapter_execution(self) -> EndpointAdapterExecution:
+        """Start-attested adapter execution used by request hash planning."""
+        return self._adapter_execution
+
+    def assert_adapter_integrity(self) -> None:
+        """Fail closed if adapter behavior changed during this execution."""
+        self._adapter_execution.assert_unchanged()
 
     def _refresh_after_rejection(
             self, rejected_token: str | None,
@@ -696,19 +760,109 @@ class EndpointClient:
               include_usage: bool) -> bytes:
         # extra_body is user passthrough (top_p, stop, response_format, and
         # provider thinking control like reasoning_effort / thinking /
-        # chat_template_kwargs). The harness owns the keys below: they are
-        # popped first so nothing in extra_body can survive, then set from
-        # their dedicated config, so a run stays measurable no matter what
-        # the user put in extra_body.
-        return serialize_request_body(
+        # chat_template_kwargs). Adapter-owned fields are rejected, never
+        # silently removed, so recorded configuration and exact request bytes
+        # cannot disagree.
+        return self._adapter_execution.serialize_request(
             self.cfg, messages, max_tokens, include_usage)
+
+    @staticmethod
+    def _record_adapter_failure(state: StreamState, stage: str,
+                                exc: Exception) -> None:
+        """Persist a content-free adapter failure and keep the run fail-closed."""
+        detail = (
+            f"endpoint adapter {stage} failed ({type(exc).__name__})")
+        if detail not in state.errors:
+            state.errors.append(detail)
+
+    def _finalize_adapter_state(self, state: StreamState) -> None:
+        try:
+            self.adapter.finalize(state)
+        except Exception as exc:
+            self._record_adapter_failure(state, "finalization", exc)
+
+    def _normalized_adapter_usage(self, state: StreamState) -> dict:
+        empty = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cached_tokens": None,
+            "cached_tokens_source": None,
+            "reasoning_tokens": None,
+            "reasoning_tokens_source": None,
+        }
+        try:
+            usage = self.adapter.normalize_usage(state.usage)
+        except Exception as exc:
+            self._record_adapter_failure(state, "usage normalization", exc)
+            return empty
+        if not isinstance(usage, dict) or set(usage) != set(empty):
+            self._record_adapter_failure(
+                state, "usage normalization contract", TypeError())
+            return empty
+        for name in (
+            "prompt_tokens", "completion_tokens", "cached_tokens",
+            "reasoning_tokens",
+        ):
+            value = usage[name]
+            if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0):
+                self._record_adapter_failure(
+                    state, "usage normalization contract", TypeError())
+                return empty
+        for name in ("cached_tokens_source", "reasoning_tokens_source"):
+            value = usage[name]
+            if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                    or len(value) > 512):
+                self._record_adapter_failure(
+                    state, "usage normalization contract", TypeError())
+                return empty
+        return usage
+
+    def _adapter_outcome(self, state: StreamState) -> ResponseOutcome:
+        try:
+            outcome = self.adapter.evaluate_outcome(state)
+        except Exception as exc:
+            self._record_adapter_failure(state, "outcome evaluation", exc)
+            outcome = None
+        valid = (
+            isinstance(outcome, ResponseOutcome)
+            and all(isinstance(value, bool) for value in (
+                outcome.response_complete,
+                outcome.output_observed,
+                outcome.truncated,
+                outcome.ok,
+            ))
+            and (outcome.error is None or (
+                isinstance(outcome.error, str)
+                and bool(outcome.error.strip())
+                and len(outcome.error) <= 512))
+            and (not outcome.ok or (
+                outcome.response_complete
+                and outcome.output_observed
+                and outcome.error is None))
+            and (outcome.ok or outcome.error is not None)
+        )
+        if not valid:
+            self._record_adapter_failure(
+                state, "outcome contract", TypeError())
+            return ResponseOutcome(
+                response_complete=False,
+                output_observed=False,
+                truncated=False,
+                ok=False,
+                error="endpoint adapter returned an invalid outcome",
+            )
+        return outcome
 
     def send(self, messages: list[dict], max_tokens: int, request_id: str,
              scheduled_s: float, dispatch_lag_ms: float,
              intended: tuple[int, int, float, int],
              chars_sent: int, *,
              scheduled_monotonic: float | None = None,
-             cancellation_event: threading.Event | None = None) \
+             cancellation_event: threading.Event | None = None,
+             probe_candidate: dict | None = None) \
             -> RequestResult:
         """One request, fully measured. Never raises; errors land in result."""
         attempt = 0
@@ -726,11 +880,13 @@ class EndpointClient:
         retry_reasons: list[str] = []
         auth_retried = False
         queue_wait_ms = None
-        caller_ttfb_ms = caller_ttft_ms = None
+        ttse_ms = None
+        caller_ttfb_ms = caller_ttse_ms = caller_ttft_ms = None
         caller_ttfr_ms = caller_ttfv_ms = None
         caller_ttf_tool_call_ms = None
         caller_send_ms = None
         quota_guard_events: list[dict] = []
+        physical_request_body_sha256s: list[str] = []
         quota_guard_denied = False
         # These live outside the retry body so result construction can settle
         # the current physical-attempt reservation before copying its event
@@ -811,7 +967,9 @@ class EndpointClient:
             return {
                 "scheduled_monotonic": scheduled_monotonic,
                 "queue_wait_ms": queue_wait_ms,
+                "ttse_ms": ttse_ms,
                 "caller_ttfb_ms": caller_ttfb_ms,
+                "caller_ttse_ms": caller_ttse_ms,
                 "caller_ttft_ms": caller_ttft_ms,
                 "caller_ttfr_ms": caller_ttfr_ms,
                 "caller_ttfv_ms": caller_ttfv_ms,
@@ -824,6 +982,8 @@ class EndpointClient:
                 "quota_guard_events": quota_guard_events,
                 "worker_started_unix": worker_started_unix,
                 "worker_started_monotonic": worker_started_monotonic,
+                "physical_request_body_sha256s":
+                    list(physical_request_body_sha256s),
             }
 
         # send() begins when a worker actually receives this request. Capture
@@ -866,14 +1026,14 @@ class EndpointClient:
             t_send_unix = None
             connect_ms = None
             response_status = None
-            ttfb_ms = ttft_ms = ttfr_ms = ttfv_ms = None
+            ttfb_ms = ttse_ms = ttft_ms = ttfr_ms = ttfv_ms = None
             ttf_tool_call_ms = None
             # These are caller-experienced clocks for the response produced
             # by this physical attempt. Their origin stays the logical
             # request's scheduled target, so retry delay is still included,
             # but an event observed on a failed earlier stream must not be
             # attached to the final response.
-            caller_ttfb_ms = caller_ttft_ms = None
+            caller_ttfb_ms = caller_ttse_ms = caller_ttft_ms = None
             caller_ttfr_ms = caller_ttfv_ms = None
             caller_ttf_tool_call_ms = None
             interchunk_max = None
@@ -883,7 +1043,7 @@ class EndpointClient:
                 remaining_s()
                 try:
                     body = self._body(messages, max_tokens, include_usage)
-                except (TypeError, ValueError, OverflowError) as exc:
+                except Exception as exc:
                     return self._finish(
                         request_id, scheduled_s, dispatch_lag_ms,
                         None, None, None, None, None, False,
@@ -915,11 +1075,7 @@ class EndpointClient:
                 conn.connect()
                 remaining_s()
                 connect_ms = (time.monotonic() - t_conn0) * 1000.0
-                headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "text/event-stream",
-                    "X-Request-Id": request_id,
-                }
+                headers = self.adapter.request_headers(request_id)
                 tok_used = self.token
                 if tok_used:
                     # Constructor validation covers the normal path. Recheck
@@ -1052,6 +1208,8 @@ class EndpointClient:
                     first_send_unix = t_send_unix
                     caller_send_ms = caller_elapsed(t_send)
                 request_attempts += 1
+                physical_request_body_sha256s.append(
+                    hashlib.sha256(body).hexdigest())
                 conn.request("POST", self.cfg.path, body=body, headers=headers)
                 remaining_s()
                 cap_socket_timeout(conn)
@@ -1105,10 +1263,11 @@ class EndpointClient:
                     media_type = (
                         content_type.split(";", 1)[0].strip().lower()
                         if isinstance(content_type, str) else "")
-                    if media_type != "text/event-stream":
+                    if media_type not in \
+                            self.adapter.accepted_response_media_types:
                         state.errors.append(
-                            "HTTP 200 response Content-Type was not "
-                            "text/event-stream")
+                            "HTTP 200 response Content-Type was not accepted "
+                            f"by endpoint adapter {self.adapter.adapter_id}")
                         failed_at = time.monotonic()
                         return self._finish(
                             request_id, scheduled_s, dispatch_lag_ms,
@@ -1125,11 +1284,32 @@ class EndpointClient:
                             **caller_kwargs())
                     state.response_content_type = media_type
 
-                if resp.status == 400 and include_usage:
+                if resp.status != 200:
                     cap_socket_timeout(conn)
                     detail = resp.read(64 * 1024)
                     remaining_s()
-                    if _stream_options_rejected(detail):
+                    detail_bytes = len(detail)
+                    detail_sha256 = hashlib.sha256(detail).hexdigest()
+                    probe_candidate_rejected = None
+                    if probe_candidate is not None:
+                        probe_candidate_rejected = \
+                            self.adapter.probe_control_rejected(
+                                resp.status, detail,
+                                copy.deepcopy(probe_candidate))
+                        if not isinstance(probe_candidate_rejected, bool):
+                            raise TypeError(
+                                "endpoint adapter probe rejection classifier "
+                                "must return boolean")
+                    usage_control_rejected = False
+                    if include_usage:
+                        usage_control_rejected = \
+                            self.adapter.include_usage_option_rejected(
+                                resp.status, detail)
+                        if not isinstance(usage_control_rejected, bool):
+                            raise TypeError(
+                                "endpoint adapter usage rejection classifier "
+                                "must return boolean")
+                    if usage_control_rejected:
                         # This is a real second POST and is recorded as such.
                         with self._lock:
                             self._include_usage_supported = False
@@ -1137,25 +1317,27 @@ class EndpointClient:
                         retry_reasons.append("stream_options_rejected")
                         attempt -= 1
                         continue
-                    return self._finish(
-                        request_id, scheduled_s, dispatch_lag_ms,
-                        t_send_unix, None, None, None, resp.status, False,
-                        _safe_http_error(resp.status, detail), StreamState(),
-                        intended, chars_sent, len(retry_reasons), None, None,
-                        None, connect_ms, first_send_unix, max_tokens,
-                        first_attempt_unix=first_attempt_unix,
-                        connection_attempts=connection_attempts,
-                        request_attempts=request_attempts,
-                        retry_reasons=retry_reasons,
-                        **caller_kwargs())
+                    if resp.status not in (401, 403) or self._refresh is None:
+                        return self._finish(
+                            request_id, scheduled_s, dispatch_lag_ms,
+                            t_send_unix, None, None, None, resp.status, False,
+                            _safe_http_error(resp.status, detail),
+                            StreamState(), intended, chars_sent,
+                            len(retry_reasons), None, None, None, connect_ms,
+                            first_send_unix, max_tokens,
+                            first_attempt_unix=first_attempt_unix,
+                            connection_attempts=connection_attempts,
+                            request_attempts=request_attempts,
+                            retry_reasons=retry_reasons,
+                            http_error_body_sample_bytes=detail_bytes,
+                            http_error_body_sample_sha256=detail_sha256,
+                            probe_candidate_rejected=(
+                                probe_candidate_rejected),
+                            **caller_kwargs())
 
-                if resp.status in (401, 403) and self._refresh:
-                    cap_socket_timeout(conn)
-                    detail = resp.read(64 * 1024)
-                    remaining_s()
-                    # keep the real reason. falling out of the retry loop
-                    # with "exhausted retries" hides an auth problem, which
-                    # is the most common thing to get wrong.
+                    # 401/403 with a refresh provider: keep the real reason.
+                    # Falling out of the retry loop with "exhausted retries"
+                    # hides the authentication failure.
                     last_err = _safe_http_error(resp.status, detail)
                     try:
                         conn.close()
@@ -1191,27 +1373,13 @@ class EndpointClient:
                         connection_attempts=connection_attempts,
                         request_attempts=request_attempts,
                         retry_reasons=retry_reasons,
+                        http_error_body_sample_bytes=detail_bytes,
+                        http_error_body_sample_sha256=detail_sha256,
+                        probe_candidate_rejected=probe_candidate_rejected,
                         **caller_kwargs())
 
-                if resp.status != 200:
-                    cap_socket_timeout(conn)
-                    detail = resp.read(64 * 1024)
-                    remaining_s()
-                    return self._finish(request_id, scheduled_s, dispatch_lag_ms,
-                                        t_send_unix, None, None, None,
-                                        resp.status, False,
-                                        _safe_http_error(resp.status, detail),
-                                        StreamState(), intended, chars_sent,
-                                        len(retry_reasons), None, None, None,
-                                        connect_ms, first_send_unix,
-                                        max_tokens,
-                                        first_attempt_unix=first_attempt_unix,
-                                        connection_attempts=connection_attempts,
-                                        request_attempts=request_attempts,
-                                        retry_reasons=retry_reasons,
-                                        **caller_kwargs())
-
-                if include_usage:
+                if include_usage and self.adapter.usage_request_mode == \
+                        "stream_options.include_usage":
                     with self._lock:
                         if self._include_usage_supported is None:
                             self._include_usage_supported = True
@@ -1259,7 +1427,7 @@ class EndpointClient:
                             yield raw[start:start + _STREAM_READ_CHUNK_BYTES]
 
                 event_count = 0
-                for event in iter_sse_events(timed_lines()):
+                for event in self.adapter.iter_events(timed_lines()):
                     event_count += 1
                     if event_count > _MAX_STREAM_EVENTS:
                         state.errors.append(
@@ -1267,30 +1435,32 @@ class EndpointClient:
                             f"{_MAX_STREAM_EVENTS}-event safety limit")
                         break
                     now = time.monotonic()
-                    chunks_before = state.content_chunks
-                    reasoning_before = state.saw_first_reasoning
-                    visible_before = state.saw_first_visible
-                    tool_before = state.saw_first_tool_call
-                    first = update_state(state, event)
+                    if ttse_ms is None:
+                        # The adapter has emitted one complete framed event.
+                        # Do not call this a token: it can be usage-only,
+                        # terminal, or a content-free parse diagnostic.
+                        ttse_ms = (now - t_send) * 1000.0
+                        caller_ttse_ms = caller_elapsed(now)
+                    milestones = self.adapter.fold_event(state, event)
                     if len(state.errors) >= _MAX_STREAM_ERRORS:
                         state.errors[:] = state.errors[:_MAX_STREAM_ERRORS]
                         state.errors.append(
                             "additional stream validation errors omitted after "
                             f"the {_MAX_STREAM_ERRORS}-error safety limit")
                         break
-                    if first and ttft_ms is None:
+                    if milestones.first_content and ttft_ms is None:
                         ttft_ms = (now - t_send) * 1000.0
                         caller_ttft_ms = caller_elapsed(now)
-                    if state.saw_first_reasoning and not reasoning_before:
+                    if milestones.first_reasoning:
                         ttfr_ms = (now - t_send) * 1000.0
                         caller_ttfr_ms = caller_elapsed(now)
-                    if state.saw_first_visible and not visible_before:
+                    if milestones.first_visible:
                         ttfv_ms = (now - t_send) * 1000.0
                         caller_ttfv_ms = caller_elapsed(now)
-                    if state.saw_first_tool_call and not tool_before:
+                    if milestones.first_tool_call:
                         ttf_tool_call_ms = (now - t_send) * 1000.0
                         caller_ttf_tool_call_ms = caller_elapsed(now)
-                    if state.content_chunks > chunks_before:
+                    if milestones.content_event:
                         if last_content_t is not None:
                             gap = (now - last_content_t) * 1000.0
                             if interchunk_max is None or gap > interchunk_max:
@@ -1301,26 +1471,12 @@ class EndpointClient:
                 finished_stream_at = time.monotonic()
                 remaining_s(finished_stream_at)
                 e2e_ms = (finished_stream_at - t_send) * 1000.0
-                finalize_tool_calls(state)
-                has_output = (
-                    state.saw_first_content or state.valid_tool_calls > 0)
-                stream_complete = bool(state.done or state.finish_reason)
-                if state.errors:
-                    ok = False
-                    err = "stream protocol validation failed"
-                elif not stream_complete:
-                    ok = False
-                    err = (
-                        "stream ended without [DONE] or a finish_reason")
-                elif not has_output:
-                    ok = False
-                    err = "stream ended with no content or valid tool call"
-                else:
-                    ok = True
-                    err = None
+                self._finalize_adapter_state(state)
+                outcome = self._adapter_outcome(state)
                 return self._finish(request_id, scheduled_s, dispatch_lag_ms,
                                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
-                                    200, ok, err, state, intended, chars_sent,
+                                    200, outcome.ok, outcome.error, state,
+                                    intended, chars_sent,
                                     len(retry_reasons), interchunk_max,
                                     ttfr_ms, ttfv_ms, connect_ms,
                                     first_send_unix, max_tokens,
@@ -1385,11 +1541,33 @@ class EndpointClient:
                 e2e_ms = (
                     max((failed_at - t_send) * 1000.0, 0.0)
                     if t_send is not None else None)
-                finalize_tool_calls(state)
+                self._finalize_adapter_state(state)
                 return self._finish(
                     request_id, scheduled_s, dispatch_lag_ms,
                     t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
                     response_status, False, last_err, state, intended,
+                    chars_sent, len(retry_reasons), interchunk_max,
+                    ttfr_ms, ttfv_ms, connect_ms, first_send_unix,
+                    max_tokens,
+                    first_attempt_unix=first_attempt_unix,
+                    connection_attempts=connection_attempts,
+                    request_attempts=request_attempts,
+                    retry_reasons=retry_reasons,
+                    ttf_tool_call_ms=ttf_tool_call_ms,
+                    **caller_kwargs())
+            except Exception as exc:
+                self._record_adapter_failure(
+                    state, "request/response processing", exc)
+                failed_at = time.monotonic()
+                e2e_ms = (
+                    max((failed_at - t_send) * 1000.0, 0.0)
+                    if t_send is not None else None)
+                self._finalize_adapter_state(state)
+                return self._finish(
+                    request_id, scheduled_s, dispatch_lag_ms,
+                    t_send_unix, ttfb_ms, ttft_ms, e2e_ms,
+                    response_status, False,
+                    "endpoint adapter failed closed", state, intended,
                     chars_sent, len(retry_reasons), interchunk_max,
                     ttfr_ms, ttfv_ms, connect_ms, first_send_unix,
                     max_tokens,
@@ -1421,8 +1599,7 @@ class EndpointClient:
                             retry_reasons=retry_reasons,
                             **caller_kwargs())
 
-    @staticmethod
-    def _finish(request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
+    def _finish(self, request_id, scheduled_s, dispatch_lag_ms, t_send_unix,
                 ttfb_ms, ttft_ms, e2e_ms, status, ok, error, state,
                 intended, chars_sent, retries,
                 interchunk_max_ms=None,
@@ -1430,14 +1607,20 @@ class EndpointClient:
                 first_send_unix=None, max_tokens_requested=None, *,
                 first_attempt_unix=None, connection_attempts=0,
                 request_attempts=0, retry_reasons=None,
-                ttf_tool_call_ms=None, scheduled_monotonic=None,
+                ttf_tool_call_ms=None, ttse_ms=None,
+                scheduled_monotonic=None,
                 queue_wait_ms=None, caller_ttfb_ms=None,
+                caller_ttse_ms=None,
                 caller_ttft_ms=None, caller_ttfr_ms=None,
                 caller_ttfv_ms=None, caller_ttf_tool_call_ms=None,
                 caller_send_ms=None,
                 quota_guard_id=None, quota_guard_denied=False,
                 quota_guard_events=None,
-                worker_started_unix=None, worker_started_monotonic=None
+                worker_started_unix=None, worker_started_monotonic=None,
+                physical_request_body_sha256s=None,
+                http_error_body_sample_bytes=None,
+                http_error_body_sample_sha256=None,
+                probe_candidate_rejected=None,
                 ) -> RequestResult:
         finished_monotonic = time.monotonic()
         finished_unix = (
@@ -1446,15 +1629,12 @@ class EndpointClient:
             if worker_started_unix is not None
             and worker_started_monotonic is not None
             else time.time())
-        u = extract_usage(state.usage)
-        stream_complete = bool(state.done or state.finish_reason)
-        if ok and state.errors:
+        u = self._normalized_adapter_usage(state)
+        outcome = self._adapter_outcome(state)
+        stream_complete = outcome.response_complete
+        if ok and not outcome.ok:
             ok = False
-            error = error or "stream protocol validation failed"
-        if ok and not stream_complete:
-            ok = False
-            error = error or (
-                "stream ended without [DONE] or a finish_reason")
+            error = error or outcome.error
         distinct_parse_errors = list(dict.fromkeys(
             str(item)[:240] for item in state.errors))
         parse_error_details = distinct_parse_errors[:16]
@@ -1471,7 +1651,7 @@ class EndpointClient:
             stream_complete=stream_complete,
             visible_content_seen=bool(state.saw_first_visible),
             reasoning_seen=bool(state.saw_first_reasoning),
-            truncated=(state.finish_reason == "length"),
+            truncated=outcome.truncated,
             parse_errors=len(state.errors),
             parse_error_details=parse_error_details,
             max_tokens_requested=max_tokens_requested,
@@ -1499,6 +1679,7 @@ class EndpointClient:
             tool_call_seen=bool(state.saw_first_tool_call),
             tool_call_chunks=state.tool_call_chunks,
             ttf_tool_call_ms=ttf_tool_call_ms,
+            ttse_ms=ttse_ms,
             valid_tool_calls=state.valid_tool_calls,
             refusal_seen=state.saw_refusal,
             refusal_chunks=state.refusal_chunks,
@@ -1515,6 +1696,7 @@ class EndpointClient:
             quota_guard_events=copy.deepcopy(quota_guard_events or []),
             queue_wait_ms=queue_wait_ms,
             caller_ttfb_ms=caller_ttfb_ms,
+            caller_ttse_ms=caller_ttse_ms,
             caller_ttft_ms=caller_ttft_ms,
             caller_ttfr_ms=caller_ttfr_ms,
             caller_ttfv_ms=caller_ttfv_ms,
@@ -1524,6 +1706,13 @@ class EndpointClient:
                 max((finished_monotonic - scheduled_monotonic) * 1000.0, 0.0)
                 if scheduled_monotonic is not None else None),
             finished_unix=finished_unix,
+            endpoint_adapter=self.adapter.adapter_id,
+            response_mode=self.adapter.response_mode,
+            physical_request_body_sha256s=list(
+                physical_request_body_sha256s or []),
+            http_error_body_sample_bytes=http_error_body_sample_bytes,
+            http_error_body_sample_sha256=http_error_body_sample_sha256,
+            probe_candidate_rejected=probe_candidate_rejected,
         )
 
 

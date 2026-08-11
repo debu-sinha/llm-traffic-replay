@@ -10,7 +10,7 @@ module makes the pairing unavoidable.
 from __future__ import annotations
 
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 import html
 import json
 import math
@@ -31,6 +31,7 @@ from .artifacts import (
     snapshot_source_state,
     strict_json_dumps,
 )
+from .report_decision import PERCENTILE_MIN_SAMPLES
 
 PCTS = (50, 90, 95, 99)
 
@@ -243,6 +244,84 @@ def _decision_pair_display(
         if target_number == actual_number or rendered[0] != rendered[1]:
             return rendered
     return (format(target_number, ".17g"), format(actual_number, ".17g"))
+
+
+_REPORT_FIELD_GLOSSARY = (
+    ("Calibration request", "An inference request sent before measured replay "
+     "to estimate the synthetic text generator's characters-per-token ratio "
+     "from endpoint-reported prompt_tokens. It may be billable. No measured "
+     "replay load is scheduled alongside it. It is "
+     "not a warm-up exclusion, quality check, latency sample, capacity sample, "
+     "or provider-quota reservation. It is excluded from replay performance "
+     "metrics but included in complete captured-traffic and quota evidence. "
+     "Any positive count "
+     "can warm routing, workers, model state, and caches; calibrate_n=0 disables "
+     "this harness phase. Actual count is min(calibrate_n, replay rows)."),
+    ("Measured replay request", "One logical workload row scheduled inside "
+     "the offered-load window. Setup, probe, sizing, and calibration rows are "
+     "not measured replay rows."),
+    ("Observed median / observed range", "Descriptive values from the exact "
+     "eligible requests in this run. They describe this sample only; they do "
+     "not estimate a population percentile when the sample gate says "
+     "insufficient sample."),
+    ("Time to first response", "Caller elapsed time from the scheduled request "
+     "target until the configured first response content event. TTFT is the "
+     "secondary technical label. The caller value includes client wait and "
+     "connection setup when exact caller clocks are available."),
+    ("Complete response", "Caller elapsed time from the scheduled request "
+     "target until the response or stream terminates. E2E is the secondary "
+     "technical label. A response that reaches its output limit is complete "
+     "at the protocol level but not a natural-length answer."),
+    ("Requests completed", "Measured replay requests that completed the "
+     "client/stream protocol cleanly. Completion does not prove answer "
+     "correctness, task success, or usefulness."),
+    ("Tested load / capacity not tested", "Tested load is the request rate, "
+     "duration, and peak in-flight concurrency actually observed. Capacity "
+     "requires a controlled load or concurrency sweep; a clean light run does "
+     "not establish a ceiling or quota headroom."),
+    ("Evidence integrity / reproducibility", "Evidence integrity says whether "
+     "the recorded artifact bytes verify against their manifest. Source "
+     "reproducibility separately says whether the exact source checkout can be "
+     "reconstructed; verifier reproducibility applies the same test to the "
+     "code that generated the external view. Hash consistency is not a digital "
+     "signature."),
+    ("Logical request vs physical attempt", "A logical row is one scheduled "
+     "operation. Retries can create multiple physical POST attempts. Request-"
+     "path latency for the final attempt excludes earlier attempts; caller "
+     "latency includes the caller's total wait."),
+    ("p50 / p90 / p95 / p99 / n", "Observed percentile of the named eligible "
+     "population; n is that population's row count. A printed percentile can "
+     "be marked indicative when n is below the evidence threshold."),
+    ("TTFB", "Time from immediately before the final HTTP request send to the "
+     "first response byte; fresh connection setup is recorded separately."),
+    ("TTSE", "Time to first successfully parsed server-sent-event. It is a "
+     "protocol diagnostic, not necessarily visible content."),
+    ("TTFT", "Configured response-start metric. first_content accepts visible "
+     "content, reasoning, or refusal onset; first_visible waits for visible "
+     "assistant content."),
+    ("TTFV", "Time to first visible assistant content. Reasoning-only stream "
+     "events do not satisfy it."),
+    ("TTFG / E2E", "Time from final request send to terminal response/stream "
+     "completion for the eligible final attempt."),
+    ("TPOT", "Time per endpoint-reported completion token after response "
+     "start. Completion tokens can include hidden reasoning; this is not "
+     "visible-output TPOT without exact visible-token accounting."),
+    ("QPS / RPS", "Requests per second. Scheduled rate is offered demand; "
+     "achieved rate is based on client request-start events, not provider "
+     "receipt rate."),
+    ("Dispatch lag / request-start lateness", "Client-side delay relative to "
+     "the open-loop schedule. Neither is endpoint processing latency."),
+    ("Harness-successful", "The client completed the request/stream contract. "
+     "It does not alone prove a readable, complete, or acceptable answer."),
+    ("Cached tokens", "Endpoint-reported cached prompt tokens. Missing means "
+     "unknown, never zero. Intended cache fraction describes constructed input "
+     "shape; achieved cache fraction is reported usage."),
+    ("Reasoning tokens / reasoning deltas", "Reasoning tokens require a "
+     "recognized endpoint usage field. Reasoning SSE deltas are event counts, "
+     "not token estimates."),
+    ("NOT REPORTED / unknown / null", "Evidence was absent or unusable. These "
+     "values never mean zero and must not be imputed as success."),
+)
 
 
 def _concurrency_block(results: list[dict], asked: int | None) -> dict | None:
@@ -1038,10 +1117,14 @@ def _rate_limit_evidence(results: list[dict], limits: dict | None,
 def _pct_table(values: list[float | None]) -> dict:
     xs = np.array([v for v in values if v is not None], dtype=float)
     if xs.size == 0:
-        return {f"p{p}": None for p in PCTS} | {"n": 0}
+        return {f"p{p}": None for p in PCTS} | {
+            "n": 0, "min": None, "max": None,
+        }
     out = {f"p{p}": float(np.percentile(xs, p)) for p in PCTS}
     out["n"] = int(xs.size)
     out["mean"] = float(xs.mean())
+    out["min"] = float(xs.min())
+    out["max"] = float(xs.max())
     return out
 
 
@@ -1244,6 +1327,8 @@ def _verdict(s: dict) -> tuple[str, str]:
                       "to this provider/model/product/tier run")
     if (s.get("cache_fidelity") or {}).get("warning"):
         doubts.append((s.get("cache_fidelity") or {})["warning"])
+    if (s.get("calibration_warmth") or {}).get("warning"):
+        doubts.append((s.get("calibration_warmth") or {})["warning"])
     if (s.get("token_targeting") or {}).get("warning"):
         doubts.append((s.get("token_targeting") or {})["warning"])
     if (s.get("latency_population") or {}).get("warning"):
@@ -1282,7 +1367,7 @@ def _verdict(s: dict) -> tuple[str, str]:
     # the sample gate counts successful requests, but the SCORED metric can
     # be missing on some of them. re-derive the floor from the number of
     # values actually behind the table this target reads.
-    _need = {"p50": 20, "p90": 100, "p95": 200, "p99": 1000}
+    _need = PERCENTILE_MIN_SAMPLES
     _defn = sla.get("ttft_definition") or "first_content"
     _key = "ttft_ms" if _defn == "first_content" else "ttfv_ms"
     _n_scored = (s.get(_key) or {}).get("n") or 0
@@ -1561,10 +1646,6 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
     if models["distinct_values_at_least"] > 1:
         invalid_reasons.append(
             "multiple response model values were observed in one benchmark")
-    if unexpected_models:
-        invalid_reasons.append(
-            "response model did not match the bound request-body "
-            "identity: " + ", ".join(unexpected_models))
     if unexpected_served_models:
         invalid_reasons.append(
             "served-model-name response header did not match any active "
@@ -1575,12 +1656,44 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
             "response model cardinality exceeded the bounded evidence table")
 
     warning = None
+    request_model_match = "not_configured"
+    if expected_models:
+        if not models["reported_rows"]:
+            request_model_match = "not_reported"
+        elif models["distinct_values_at_least"] > 1:
+            request_model_match = "mixed"
+        elif unexpected_models:
+            # Provider APIs commonly accept a stable alias in the request and
+            # return a resolved/revisioned identifier.  Without a trusted,
+            # captured alias map, one consistent difference proves neither a
+            # mismatch nor a match.  Keep it out of the invalidity gate, but
+            # also never upgrade it to bound merely because it was stable.
+            request_model_match = "consistent_difference_unverified"
+        else:
+            request_model_match = "exact"
     if not invalid_reasons and eligible:
         if models["reported_rows"] < len(eligible):
             warning = (
                 f"response model was reported for only "
                 f"{models['reported_rows']} of {len(eligible)} eligible HTTP "
                 "200 response rows")
+        elif request_model_match == "consistent_difference_unverified":
+            route_bound = bool(
+                expected_served_models
+                and served_models["reported_rows"] == len(eligible)
+                and not unexpected_served_models)
+            route_detail = (
+                " The served-model-name headers did match captured active "
+                "served entities, which binds the route but does not prove "
+                "the response-model alias mapping."
+                if route_bound else
+                " No complete control-plane route binding or trusted alias "
+                "map proves that this is the requested model.")
+            warning = (
+                "one consistent response model was observed, but it differed "
+                "from the request-body model (requested "
+                + ", ".join(expected_models) + "; observed "
+                + ", ".join(sorted(observed_models)) + ")." + route_detail)
         elif not expected_models and not (
                 expected_served_models
                 and served_models["reported_rows"] == len(eligible)):
@@ -1610,6 +1723,7 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
         "identity_schema_rows": schema_rows,
         "expected_models": expected_models,
         "expected_model_sources": expected_sources,
+        "request_model_match": request_model_match,
         "models": models,
         "served_model_names": served_models,
         "expected_served_model_names": expected_served_models,
@@ -1624,8 +1738,202 @@ def _response_identity_block(rows: list[dict], run_meta: dict) -> dict:
             "serving endpoint name is not treated as an expected OpenAI model "
             "value; Databricks served-model-name headers are instead bound to "
             "the active served entities captured from the control plane. "
+            "A stable request/response model-name difference is unverified, "
+            "not invalid or bound, unless a trusted alias map is captured. "
             "system fingerprints are retained as deployment context and may "
             "rotate without implying a different requested model."),
+    }
+
+
+def _calibration_warmth_block(rows: list[dict]) -> dict:
+    """Describe calibration payload overlap without inferring cache state.
+
+    Calibration is setup traffic sent before the measured replay. Even when
+    its logical request bodies do not exactly overlap replay bodies, it can
+    warm model workers, kernels, prefix caches, networking, and route state.
+    Hash overlap is therefore diagnostic evidence, never a cold/warm oracle.
+    """
+    calibration = [row for row in rows if row.get("phase") == "calibration"]
+    replay = [row for row in rows if row.get("phase") == "replay"]
+
+    def body_hash(row: dict) -> str | None:
+        value = row.get("request_body_sha256")
+        if not isinstance(value, str) or len(value) != 64 \
+                or any(char not in "0123456789abcdefABCDEF" for char in value):
+            return None
+        return value.lower()
+
+    calibration_hashes = [body_hash(row) for row in calibration]
+    replay_hashes = [body_hash(row) for row in replay]
+    calibration_reported = sum(value is not None
+                               for value in calibration_hashes)
+    replay_reported = sum(value is not None for value in replay_hashes)
+    complete = bool(calibration) \
+        and calibration_reported == len(calibration) \
+        and replay_reported == len(replay)
+
+    overlap_hashes = None
+    replay_rows_overlapping = None
+    replay_overlap_share = None
+    if complete:
+        calibration_set = set(calibration_hashes)
+        replay_set = set(replay_hashes)
+        overlap_hashes = len(calibration_set.intersection(replay_set))
+        replay_rows_overlapping = sum(
+            value in calibration_set for value in replay_hashes)
+        replay_overlap_share = (
+            replay_rows_overlapping / len(replay) if replay else 0.0)
+
+    if not calibration:
+        status = "not_run"
+        overlap_status = "not_applicable"
+        warning = None
+    elif not complete:
+        status = "caution"
+        overlap_status = "unavailable"
+        warning = (
+            f"{len(calibration)} calibration request row(s) ran before the "
+            "measured replay. Exact payload overlap is unavailable because "
+            f"request_body_sha256 was present for {calibration_reported}/"
+            f"{len(calibration)} calibration and {replay_reported}/"
+            f"{len(replay)} replay rows. Calibration can warm endpoint, "
+            "model-worker, route, and cache state, so this run does not "
+            "establish cold-cache performance.")
+    elif replay_rows_overlapping:
+        status = "caution"
+        overlap_status = "available"
+        warning = (
+            f"{len(calibration)} calibration request row(s) ran before the "
+            f"measured replay; {replay_rows_overlapping}/{len(replay)} replay "
+            "rows used a request body whose SHA-256 exactly matched a "
+            "calibration body. Calibration warmed endpoint/cache state, so "
+            "this run must not be described as cold-cache performance.")
+    else:
+        status = "caution"
+        overlap_status = "available"
+        warning = (
+            f"{len(calibration)} calibration request row(s) ran before the "
+            "measured replay. No exact request-body SHA-256 overlap was "
+            "observed, but calibration still warms endpoint, model-worker, "
+            "route, and potentially cache state; this run does not establish "
+            "cold-cache performance.")
+
+    return {
+        "status": status,
+        "calibration_requests": len(calibration),
+        "replay_requests": len(replay),
+        "calibration_body_hashes_reported": calibration_reported,
+        "replay_body_hashes_reported": replay_reported,
+        "calibration_body_hash_coverage": (
+            calibration_reported / len(calibration) if calibration else None),
+        "replay_body_hash_coverage": (
+            replay_reported / len(replay) if replay else None),
+        "exact_overlap_status": overlap_status,
+        "overlapping_request_body_sha256_count": overlap_hashes,
+        "replay_rows_with_calibrated_payload": replay_rows_overlapping,
+        "replay_share_with_calibrated_payload": replay_overlap_share,
+        "warning": warning,
+        "note": (
+            "Exact overlap compares deterministic logical request-body "
+            "SHA-256 values. Non-overlap does not prove a cold endpoint or "
+            "cold cache; no cache state is inferred from latency."),
+    }
+
+
+def _prompt_repeat_population(rows: list[dict], prompts_count: int,
+                              *, population_complete: bool = True,
+                              unknown_population_rows: int = 0) -> dict:
+    """Count exact prompt-index reuse for one explicitly named population."""
+    indexes = []
+    missing = 0
+    invalid = 0
+    for row in rows:
+        value = row.get("prompt_index")
+        if value is None:
+            missing += 1
+        elif isinstance(value, bool) or not isinstance(value, int) \
+                or not 0 <= value < prompts_count:
+            invalid += 1
+        else:
+            indexes.append(value)
+    complete = population_complete and not missing and not invalid
+    repeat_requests = None
+    repeat_share = None
+    unique_prompts = None
+    if complete:
+        unique_prompts = len(set(indexes))
+        repeat_requests = len(indexes) - unique_prompts
+        repeat_share = (repeat_requests / len(rows)) if rows else 0.0
+    return {
+        "status": "available" if complete else "unavailable",
+        "requests": len(rows) if population_complete else None,
+        "observed_rows": len(rows),
+        "unknown_population_rows": unknown_population_rows,
+        "indexed_requests": len(indexes),
+        "missing_prompt_index_rows": missing,
+        "invalid_prompt_index_rows": invalid,
+        "unique_prompts": unique_prompts,
+        "repeat_requests": repeat_requests,
+        "repeat_share": repeat_share,
+    }
+
+
+def _prompt_replay_block(results: list[dict], successful: list[dict],
+                         prompts_count: int) -> dict:
+    """Separate scheduled, on-wire, and successful prompt reuse evidence."""
+    sent = [row for row in results if _sent_at(row) is not None]
+    unknown_send = [
+        row for row in results
+        if _sent_at(row) is None
+        and "caller_send_ms" not in row
+        and "first_send_unix" not in row
+        and "known_not_sent" not in row]
+    attempted_block = _prompt_repeat_population(results, prompts_count)
+    sent_block = _prompt_repeat_population(
+        sent, prompts_count,
+        population_complete=not unknown_send,
+        unknown_population_rows=len(unknown_send))
+    successful_block = _prompt_repeat_population(successful, prompts_count)
+
+    if sent_block["status"] != "available":
+        warning = (
+            "prompt-repeat and prompt-cache eligibility are unavailable: "
+            f"{sent_block['indexed_requests']} on-wire rows had valid "
+            "prompt_index evidence, "
+            f"{sent_block['missing_prompt_index_rows']} were missing it, "
+            f"{sent_block['invalid_prompt_index_rows']} were invalid, and "
+            f"{sent_block['unknown_population_rows']} rows had unknown send "
+            "status. No repeat count was inferred from request totals.")
+    elif sent_block["repeat_requests"]:
+        repeated = sent_block["repeat_requests"]
+        sent_n = sent_block["requests"]
+        warning = (
+            f"{repeated} of {sent_n} requests that reached the wire "
+            f"({sent_block['repeat_share'] * 100:.0f} percent) repeated a "
+            "persisted prompt_index already sent and were eligible for "
+            "endpoint prompt cache reuse. Treat the reported cached "
+            "prompt-token fraction and TTFT as replay behavior, not your "
+            "production prompt mix.")
+    else:
+        warning = None
+
+    # Keep the original flat keys for existing JSON consumers. They now alias
+    # the exact on-wire population, which is the relevant cache population;
+    # unavailable evidence is represented as null, never inferred from totals.
+    sent_requests = sent_block["requests"]
+    return {
+        "distinct_prompts": prompts_count,
+        "requests": successful_block["requests"],
+        "avg_sends_per_prompt": (
+            sent_requests / prompts_count
+            if sent_requests is not None else None),
+        "repeat_requests": sent_block["repeat_requests"],
+        "repeat_share": sent_block["repeat_share"],
+        "legacy_flat_fields_basis": "requests_that_reached_the_wire",
+        "attempted": attempted_block,
+        "sent": sent_block,
+        "successful": successful_block,
+        "warning": warning,
     }
 
 
@@ -2257,6 +2565,31 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             # observation interval above would charge it for the drain and
             # understate the load that was actually offered.
             send_span = max(max(sent) - min(sent), 1e-9)
+    measured_window = None
+    if sent:
+        try:
+            started_at = datetime.fromtimestamp(
+                min(sent), timezone.utc).isoformat()
+            ended_at = datetime.fromtimestamp(
+                max([*done, *sent]), timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            pass
+        else:
+            completion_coverage = len(done) / len(sent)
+            measured_window = {
+                "started_at_utc": started_at,
+                "ended_at_utc": ended_at,
+                "completion_time_coverage": completion_coverage,
+                "end_basis": (
+                    "later of last recorded request start and completion"
+                    if done else
+                    "last recorded request start; completion unavailable"),
+                "warning": (
+                    None if completion_coverage == 1.0 else
+                    f"completion time was retained for {len(done)}/{len(sent)} "
+                    "requests; the UTC end does not prove that every response "
+                    "had completed"),
+            }
 
     # Delivery is judged against the complete logical schedule, including
     # rows that never reached conn.request. Measuring only the sent prefix
@@ -2383,11 +2716,29 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         throughput_duration_basis = \
             "max(logical_schedule_seconds,response_drain)"
 
-    # throughput in the customer's own vocabulary (tokens per minute)
+    # Provider ``completion_tokens`` is the complete billed/generated token
+    # accounting bucket. On reasoning models it can include hidden reasoning,
+    # so it is never presented as visible answer throughput. Visible-token
+    # throughput requires a separately sourced exact field on every eligible
+    # row; content chunks and character counts are not token counts.
     usage_rows = [r for r in results if _usage_is_trustworthy(r)]
     in_tok = sum(float(r["prompt_tokens"]) for r in usage_rows)
-    out_tok = sum(float(r["completion_tokens"]) for r in usage_rows)
+    completion_tok = sum(float(r["completion_tokens"]) for r in usage_rows)
     cached_tok = sum(float(r.get("cached_tokens") or 0) for r in usage_rows)
+    visible_usage_rows = [
+        r for r in usage_rows
+        if _nonnegative_finite(r.get("visible_output_tokens"))
+        and float(r["visible_output_tokens"]) <= float(r["completion_tokens"])
+        and isinstance(r.get("visible_output_tokens_source"), str)
+        and bool(r["visible_output_tokens_source"].strip())]
+    visible_usage_complete = bool(usage_rows) \
+        and len(visible_usage_rows) == len(usage_rows)
+    visible_tok = (sum(float(r["visible_output_tokens"])
+                       for r in visible_usage_rows)
+                   if visible_usage_complete else None)
+    visible_sources = sorted({
+        str(r["visible_output_tokens_source"])
+        for r in visible_usage_rows})
     dur_min = (dur / 60.0) if dur else None
     # how many successful responses actually reported usage. a run where
     # only a tenth of them do would otherwise understate token throughput
@@ -2405,6 +2756,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     token_windows, rate_limit_block = _rate_limit_evidence(
         complete_request_evidence, rate_limits, safe_run_meta)
 
+    ttse_schema_present = any("ttse_ms" in row for row in results)
     summary = {
         "requests_total": len(results),
         "requests_ok": len(ok),
@@ -2414,6 +2766,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "error_rate": len(failed) / len(results) if results else None,
         "failures_by_error": _top_errors(failed),
         "failures_by_http_status": _failures_by_http_status(failed),
+        "timeout_failures": _timeout_failure_evidence(failed),
         # Top-level aliases keep simple report/automation consumers from
         # having to understand the richer evidence block. The count/rate can
         # include preflight, probe, sizing, and calibration requests when the
@@ -2423,26 +2776,64 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "http_429": http_429,
         "quota_limited": http_429["quota_limited"],
         "runtime_quota_admission": runtime_quota_admission,
+        "calibration_warmth": _calibration_warmth_block(
+            complete_request_evidence),
         "ttft_ms": _pct_table([r.get("ttft_ms") for r in latency_ok]),
         "ttf_tool_call_ms": _pct_table(
             [r.get("ttf_tool_call_ms") for r in latency_ok]),
         "ttfb_ms": _pct_table([r.get("ttfb_ms") for r in latency_ok]),
+        **({"ttse_ms": _pct_table(
+            [r.get("ttse_ms") for r in latency_ok])}
+           if ttse_schema_present else {}),
         "connect_ms": _pct_table([r.get("connect_ms") for r in ok]),
         "e2e_ms": _pct_table([r.get("e2e_ms") for r in latency_ok]),
         "interchunk_max_ms": _pct_table(
             [r.get("interchunk_max_ms") for r in latency_ok]),
         "throughput": {
             "input_tokens_per_min": in_tok / dur_min if dur_min else None,
-            "output_tokens_per_min": out_tok / dur_min if dur_min else None,
+            "completion_tokens_per_min": (
+                completion_tok / dur_min if dur_min else None),
+            "all_completion_tokens_per_min": (
+                completion_tok / dur_min if dur_min else None),
+            # Backward-readable alias. Reports intentionally do not call this
+            # visible output throughput.
+            "output_tokens_per_min": (
+                completion_tok / dur_min if dur_min else None),
+            "output_tokens_per_min_legacy_alias_of": (
+                "completion_tokens_per_min"),
+            **({"visible_output_tokens_per_min": visible_tok / dur_min}
+               if visible_tok is not None and dur_min else {}),
+            "visible_output_token_accounting": {
+                "status": (
+                    "available" if visible_usage_complete else
+                    "unavailable"),
+                "reported_for": len(visible_usage_rows),
+                "eligible_usage_rows": len(usage_rows),
+                "coverage": (
+                    len(visible_usage_rows) / len(usage_rows)
+                    if usage_rows else None),
+                "sources": visible_sources,
+                "limitation": (
+                    None if visible_usage_complete else
+                    "visible output token throughput is withheld because "
+                    "exact, source-labeled visible_output_tokens accounting "
+                    "was not available for every eligible usage row; "
+                    "completion_tokens may include hidden reasoning or other "
+                    "non-visible completion tokens"),
+            },
             "observation_seconds": dur,
             "duration_basis": throughput_duration_basis,
             "usage_coverage": usage_coverage,
             "completion_time_coverage": (
                 len(done) / len(sent) if sent else None),
-            "note": ("endpoint-reported token counts over the complete "
+            "note": ("endpoint-reported prompt and completion token counts "
+                     "over the complete "
                      "logical load window plus response drain when a logical "
                      "schedule is available; legacy evidence without that "
-                     "window uses first send through last completion"),
+                     "window uses first send through last completion. "
+                     "completion-token throughput is all-completion "
+                     "throughput and may include hidden reasoning; it is not "
+                     "visible answer throughput"),
             "coverage_warning": (
                 (f"completion time was available for only {len(done)} of "
                  f"{len(sent)} requests that reached the wire, so token "
@@ -2468,6 +2859,19 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "intended_cache_fraction": _pct_table(intended_cache),
         "latency_population": latency_population,
         "token_targeting": {
+            "intended_prompt_tokens": _pct_table([
+                r.get("intended_input_tokens")
+                for r in input_intended_rows]),
+            "observed_prompt_tokens": _pct_table(
+                [r.get("prompt_tokens") for r in usage_rows]),
+            "intended_completion_token_budgets": _pct_table([
+                r.get("intended_output_tokens")
+                for r in output_intended_rows]),
+            "observed_completion_tokens": _pct_table(
+                [r.get("completion_tokens") for r in usage_rows]),
+            "usage_reported_n": usage_n,
+            "usage_eligible_requests": len(results),
+            "usage_coverage": usage_coverage,
             "input_intended_requests": len(input_intended_rows),
             "input_eligible_successes": len(input_eligible),
             "input_reported_n": len(input_pairs),
@@ -2543,14 +2947,32 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         },
         "schedule": schedule_meta or {},
         "run": safe_run_meta,
+        **({"measured_window": measured_window}
+           if measured_window is not None else {}),
         "ttft_definition": ttft_definition,
+        **({"stream_event_definition": {
+            "metric": "ttse_ms",
+            "meaning": (
+                "elapsed time to the first complete framed event emitted by "
+                "the selected response adapter parser"),
+            "excludes_claims": [
+                "model_token", "reasoning_content", "visible_content",
+                "successful_response",
+            ],
+            "note": (
+                "the first parsed stream event can be usage-only, terminal, "
+                "or a content-free parse diagnostic; TTFB measures the "
+                "earlier first bounded nonempty response-body read"),
+        }} if ttse_schema_present else {}),
         "response_identity": _response_identity_block(results, safe_run_meta),
     }
     if rate_limit_block is not None:
         summary["rate_limits"] = rate_limit_block
     if runtime_quota_admission["status"] == "denied":
         summary["quota_limited"] = True
-    for field in ("ttft_ms", "ttf_tool_call_ms"):
+    for field in ("ttse_ms", "ttft_ms", "ttf_tool_call_ms"):
+        if field not in summary:
+            continue
         values = [r.get(field) for r in latency_ok]
         summary[field]["missing"] = sum(v is None for v in values)
         summary[field]["of"] = len(values)
@@ -2611,25 +3033,60 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
             "measurement and must not be subtracted from TTFT.")
         summary["network_path"] = _np
 
-    # Time per output token after the first. Keep this as an observed per-row
-    # distribution. Combining an independently selected TTFT percentile with
-    # a TPOT percentile to project a hypothetical answer length is not a
-    # statistically defensible result, so reports deliberately do not do it.
-    tpot = []
+    # Time per endpoint-reported completion token after the first. This is
+    # explicitly all-completion pacing: completion_tokens can include hidden
+    # reasoning. A separately named visible TPOT is emitted only when exact,
+    # source-labeled visible token counts and TTFV are available.
+    completion_tpot = []
     for r in latency_ok:
-        n_out = r.get("completion_tokens")
+        n_completion = r.get("completion_tokens")
         t, e = r.get("ttft_ms"), r.get("e2e_ms")
-        if n_out and n_out > 1 and t is not None and e is not None and e >= t:
-            tpot.append((e - t) / (n_out - 1))
-    if tpot:
-        summary["tpot_ms"] = _pct_table(tpot)
+        if n_completion and n_completion > 1 and t is not None \
+                and e is not None and e >= t:
+            completion_tpot.append((e - t) / (n_completion - 1))
+    if completion_tpot:
+        completion_table = _pct_table(completion_tpot)
+        summary["completion_tpot_ms"] = completion_table
+        # Backward-readable alias with an explicit scope marker.
+        summary["tpot_ms"] = completion_table
+        summary["tpot_scope"] = "all_endpoint_reported_completion_tokens"
         summary["tpot_note"] = (
-            "time per output token after the first, (e2e - ttft) / "
-            "(output_tokens - 1), computed independently for each eligible "
-            f"request. p50 and p95 summarize {len(tpot)} observed requests "
-            "that produced more than one token; do not combine these "
-            "percentiles with a TTFT percentile to project an unobserved "
-            "generation length")
+            "time per endpoint-reported completion token after the first, "
+            "(e2e - ttft) / (completion_tokens - 1), computed independently "
+            f"for each eligible request. p50 and p95 summarize "
+            f"{len(completion_tpot)} observed requests that reported more "
+            "than one completion token. completion_tokens can include hidden "
+            "reasoning, so this is all-completion pacing, not visible-output "
+            "TPOT. do not combine these percentiles with a TTFT percentile "
+            "to project an unobserved generation length")
+
+    visible_tpot = []
+    visible_tpot_accounted = 0
+    visible_tpot_eligible = 0
+    for r in latency_ok:
+        n_visible = r.get("visible_output_tokens")
+        source = r.get("visible_output_tokens_source")
+        first_visible, e = r.get("ttfv_ms"), r.get("e2e_ms")
+        exact_count = (
+            _nonnegative_finite(n_visible)
+            and _nonnegative_finite(r.get("completion_tokens"))
+            and float(n_visible) <= float(r["completion_tokens"])
+            and isinstance(source, str) and bool(source.strip()))
+        if exact_count:
+            visible_tpot_accounted += 1
+            if n_visible > 1:
+                visible_tpot_eligible += 1
+        if exact_count and n_visible > 1 and first_visible is not None \
+                and e is not None and e >= first_visible:
+            visible_tpot.append((e - first_visible) / (n_visible - 1))
+    if visible_tpot and visible_tpot_accounted == len(latency_ok) \
+            and len(visible_tpot) == visible_tpot_eligible:
+        summary["visible_tpot_ms"] = _pct_table(visible_tpot)
+        summary["visible_tpot_note"] = (
+            "time per explicitly accounted visible output token after the "
+            "first visible token, (e2e - ttfv) / "
+            "(visible_output_tokens - 1); emitted only for rows carrying a "
+            "source-labeled visible_output_tokens count")
 
     answers = _answer_block(results)
     if answers:
@@ -2649,6 +3106,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # tables; final-attempt request-path tables remain available for diagnosis.
     # TTFV must be corrected too when first_visible is the configured TTFT.
     caller_fields = (
+        ("ttse_ms", "caller_ttse_ms", "ttse_corrected_ms"),
         ("ttft_ms", "caller_ttft_ms", "ttft_corrected_ms"),
         ("ttfv_ms", "caller_ttfv_ms", "ttfv_corrected_ms"),
         ("ttf_tool_call_ms", "caller_ttf_tool_call_ms",
@@ -2670,7 +3128,8 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
                 reconstructed_caller_n += 1
         if vals:
             summary[corr_f] = _pct_table(vals)
-    if any(k in summary for k in ("ttft_corrected_ms", "ttfv_corrected_ms",
+    if any(k in summary for k in ("ttse_corrected_ms", "ttft_corrected_ms",
+                                  "ttfv_corrected_ms",
                                   "ttf_tool_call_corrected_ms",
                                   "e2e_corrected_ms")):
         summary["latency_correction_note"] = (
@@ -2683,6 +3142,104 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         summary["latency_correction_provenance"] = {
             "exact_values": exact_caller_n,
             "legacy_reconstructed_values": reconstructed_caller_n,
+        }
+    # A small sample is best explained with its actual observations, not
+    # interpolated tail percentiles. Keep only bounded numeric/enum evidence;
+    # request IDs, prompts, bodies, headers, and hashes never enter this view.
+    # Larger runs retain aggregate tables only so summary artifacts stay small.
+    if 0 < len(latency_ok) <= 20:
+        service_first_key = (
+            "ttft_ms" if ttft_definition == "first_content" else "ttfv_ms")
+        caller_first_key = (
+            "caller_ttft_ms" if ttft_definition == "first_content"
+            else "caller_ttfv_ms")
+
+        def latency_number(row: dict, key: str) -> float | None:
+            value = row.get(key)
+            return float(value) if _nonnegative_finite(value) else None
+
+        observations = []
+        for position, row in enumerate(latency_ok, 1):
+            service_first = latency_number(row, service_first_key)
+            service_complete = latency_number(row, "e2e_ms")
+            caller_first = latency_number(row, caller_first_key)
+            caller_complete = latency_number(row, "caller_e2e_ms")
+            queue_wait = latency_number(row, "queue_wait_ms")
+            if caller_first is None and service_first is not None \
+                    and queue_wait is not None:
+                caller_first = service_first + queue_wait
+            if caller_complete is None and service_complete is not None \
+                    and queue_wait is not None:
+                caller_complete = service_complete + queue_wait
+            caller_send = latency_number(row, "caller_send_ms")
+            connect = latency_number(row, "connect_ms")
+            before_connection = (
+                max(caller_send - connect, 0.0)
+                if caller_send is not None and connect is not None else None)
+            after_first = (
+                max(service_complete - service_first, 0.0)
+                if service_complete is not None and service_first is not None
+                else None)
+            attempts = row.get("request_attempts")
+            retries = (
+                max(attempts - 1, 0)
+                if isinstance(attempts, int) and not isinstance(attempts, bool)
+                and attempts >= 1 else
+                int(row["retries"])
+                if isinstance(row.get("retries"), int)
+                and not isinstance(row.get("retries"), bool)
+                and row["retries"] >= 0 else None)
+            components = (
+                before_connection, connect, service_first, after_first)
+            decomposition_status = "total_only_missing_component"
+            retry_or_unattributed = None
+            caller_total_only = caller_complete
+            if retries is not None and retries > 0:
+                decomposition_status = "total_only_after_retry"
+            elif retries == 0 and caller_complete is not None \
+                    and all(value is not None for value in components):
+                component_total = sum(float(value) for value in components
+                                      if value is not None)
+                delta = caller_complete - component_total
+                # Independent monotonic differences can disagree by a tiny
+                # floating-point residue. Reconcile that residue in the last
+                # segment; a material negative delta makes the breakdown
+                # unsafe and falls back to the exact caller total.
+                if delta >= -0.5 and after_first is not None \
+                        and after_first + min(delta, 0.0) >= 0:
+                    after_first += min(delta, 0.0)
+                    retry_or_unattributed = max(delta, 0.0)
+                    caller_total_only = None
+                    decomposition_status = "complete"
+            if decomposition_status != "complete":
+                before_connection = connect = service_first = after_first = None
+            observations.append({
+                "request": position,
+                "decomposition_status": decomposition_status,
+                "client_before_connection_ms": before_connection,
+                "connection_setup_ms": connect,
+                "request_to_first_response_ms": service_first,
+                "first_response_to_complete_ms": after_first,
+                "retry_or_unattributed_ms": retry_or_unattributed,
+                "caller_total_only_ms": caller_total_only,
+                "caller_first_response_ms": caller_first,
+                "caller_complete_ms": caller_complete,
+                "prompt_tokens": row.get("prompt_tokens"),
+                "completion_tokens": row.get("completion_tokens"),
+                "status": row.get("status"),
+                "finish_reason": row.get("finish_reason"),
+                "retries": retries,
+            })
+        summary["latency_observations"] = {
+            "n": len(observations),
+            "first_response_definition": ttft_definition,
+            "rows": observations,
+            "note": (
+                "bounded request-level latency observations for descriptive "
+                "small-sample reporting; retrying rows and rows missing an "
+                "exact component retain caller total only rather than mixing "
+                "incompatible attempt clocks; no request identity or payload "
+                "data is included"),
         }
     reason_vals = [r.get("reasoning_tokens") for r in usage_rows]
     if any(v is not None for v in reason_vals):
@@ -2715,7 +3272,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
     # sample at all beyond the true p99, so the old "100 is fine for p99"
     # threshold was not defensible. the rule here is roughly ten
     # observations past the quantile: n >= 10/(1-q).
-    _need = {"p50": 20, "p90": 100, "p95": 200, "p99": 1000}
+    _need = PERCENTILE_MIN_SAMPLES
     _unsupported = [q for q, need in _need.items() if n_ok < need]
     if n_ok == 0:
         sample_warning = ("no successful requests, so there are no latency "
@@ -2890,32 +3447,15 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
         "included. changed in 0.3.0: 0.2.x and earlier included connection "
         "setup in these numbers.")
 
-    # prompts mode cycles the supplied prompts (runner: prompt_msgs[i % m]).
-    # once the set has been through once, every later request is a verbatim
-    # repeat, which makes them eligible for endpoint prompt-cache reuse. the
-    # fraction then describes the replay, not the caller's production mix.
+    # Prompt-cache eligibility is a property of exact prompt indexes that
+    # reached the wire, not of the number of successful responses. Preserve
+    # separate attempted/sent/successful populations so failures and
+    # interleaving cannot erase repeats.
     rm = safe_run_meta
     pc = rm.get("prompts_count")
     if rm.get("input_mode") == "prompts" and pc:
-        repeats = (n_ok / pc) if pc else 0.0
-        summary["replay"] = {
-            "distinct_prompts": pc,
-            "requests": n_ok,
-            "avg_sends_per_prompt": repeats,
-            "repeat_requests": max(0, n_ok - pc),
-            "repeat_share": (max(0, n_ok - pc) / n_ok) if n_ok else 0.0,
-            "warning": (
-                f"{pc} distinct prompts covered {n_ok} requests, so "
-                f"{max(0, n_ok - pc)} of them "
-                f"({max(0, n_ok - pc) / n_ok * 100:.0f} percent) repeat a "
-                f"prompt already sent and are eligible for endpoint prompt "
-                f"cache reuse. treat the reported cached prompt-token fraction "
-                f"and TTFT as replay "
-                f"behavior, not your production prompt mix. supply at least "
-                f"as many distinct prompts as requests, or read only the "
-                f"first {pc} requests, to see cold behavior."
-                if n_ok > pc else None),
-        }
+        summary["replay"] = _prompt_replay_block(
+            results, latency_ok, int(pc))
     if pricing:
         # Capacity is paid across the logical replay window even when the
         # client fails to send its tail. Use whichever ends later: the planned
@@ -2940,7 +3480,7 @@ def summarize(results: list[dict], schedule_meta: dict | None = None,
              if isinstance(value, (int, float)) and value > 0],
             default=None)
         summary["cost"] = _cost_block(
-            results, cost_dur, in_tok, out_tok, cached_tok, pricing,
+            results, cost_dur, in_tok, completion_tok, cached_tok, pricing,
             duration_basis=duration_basis)
     if acceptance:
         summary["sla"] = _evaluate_sla(results, ok, summary, acceptance,
@@ -3173,9 +3713,9 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
                 f"window {bad_w['window']} failed "
                 f"{bad_w['error_rate'] * 100:.0f} percent of its requests. "
                 "latency percentiles only cover requests that came back, so "
-                "the surviving numbers in that window describe what the "
-                "endpoint could still serve, not what it was asked for. read "
-                "this as a breaking point, not a latency result." + also
+                "the surviving numbers in that window describe the returned "
+                "subset, not the full offered workload. read this as a "
+                "failure boundary, not a latency result." + also
                 + " the window-to-window latency comparison is not reported "
                 "for a failing run"),
             "note": note,
@@ -3210,18 +3750,22 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     elif rising and worst == vals[-1]:
         kind = "degrading"
         headline = (f"{latency_label} p95 rises across every counted window: "
-                    "the endpoint "
-                    "got slower as the run went on")
+                    "the measured caller path slowed as the run went on. "
+                    "without correlated backend telemetry, this artifact "
+                    "cannot attribute the cause")
     elif falling and worst == vals[0]:
         kind = "warming"
         headline = (f"{latency_label} p95 is worst in the first window and "
-                    "falls from "
-                    "there: early requests are cold start, not steady state. "
-                    "quote the later windows or warm up before measuring")
+                    "falls from there. early and later windows represent "
+                    "different measured-path conditions; without correlated "
+                    "backend telemetry, this artifact cannot attribute the "
+                    "cause")
     elif worst not in (vals[0], vals[-1]):
         kind = "spike"
-        headline = ("a middle window is much worse than the ends: something "
-                    "transient hit the endpoint mid-run")
+        headline = ("a middle window is much worse than the ends. a transient "
+                    "affected the measured caller path; without correlated "
+                    "backend telemetry, this artifact cannot attribute it to "
+                    "the client, network, gateway, or endpoint")
     else:
         kind = "variable"
         headline = ("windows move up and down without a clear trend. the run "
@@ -3244,6 +3788,40 @@ def _drift_block(ok: list[dict], failed: list[dict] | None = None,
     result[f"{latency_event}_p95_best"] = best
     result[f"{latency_event}_p95_worst"] = worst
     return result
+
+
+def _attribution_safe_drift_message(drift: dict) -> str:
+    """Describe caller-path variation without inventing a backend cause."""
+    kind = drift.get("drift_kind")
+    if kind == "spike":
+        return (
+            "Latency spike observed in the measured path/run. A middle "
+            "window was much worse than the ends; unable to attribute "
+            "without backend correlation.")
+    if kind == "degrading":
+        return (
+            "Latency increased across the measured path/run. The artifact "
+            "is unable to attribute the cause without backend correlation.")
+    if kind == "warming":
+        return (
+            "Early and later latency windows differed in the measured "
+            "path/run. The artifact is unable to attribute the cause without "
+            "backend correlation.")
+    if kind == "failing":
+        message = str(drift.get("drift_headline") or drift.get("note") or "")
+        if "endpoint" in message.casefold():
+            return (
+                "Request failures varied across the measured path/run. "
+                "Survivor latency covers only the returned subset, not the "
+                "full offered workload; the artifact is unable to attribute "
+                "the cause without backend correlation.")
+        return message
+    message = str(drift.get("drift_headline") or drift.get("note") or "")
+    if "endpoint" in message.casefold():
+        return (
+            "Latency varied across the measured path/run. The artifact is "
+            "unable to attribute the cause without backend correlation.")
+    return message
 
 
 def _cost_block(rows: list[dict], dur, in_tok: int, out_tok: int,
@@ -3562,9 +4140,14 @@ def _evaluate_sla(results: list[dict], ok: list[dict], summary: dict,
         for q, target in (targets or {}).items():
             survivor_actual = (summary.get(table_key) or {}).get(q)
             required = quantile_fraction.get(q)
+            sample_minimum = PERCENTILE_MIN_SAMPLES.get(str(q))
+            sample_supported = (
+                eligible >= sample_minimum
+                if sample_minimum is not None else None)
             meeting = sum(value is not None and value <= target
                           for value in values)
             observed = (meeting / eligible) if eligible else None
+            lower_95 = _wilson_lower_95(meeting, eligible)
             acceptance_actual = None
             acceptance_actual_kind = "not_measured"
             if eligible and required is not None:
@@ -3599,14 +4182,24 @@ def _evaluate_sla(results: list[dict], ok: list[dict], summary: dict,
                 "scored_metric": table_key,
                 "service_metric": service_key,
                 "eligible_outcomes": eligible,
+                "sample_minimum": sample_minimum,
+                "sample_supported": sample_supported,
                 "meeting_outcomes": meeting,
                 "observed_meeting_fraction": (
                     observed if observed is not None else None),
                 "required_meeting_fraction": required,
+                "one_sided_95pct_wilson_lower": lower_95,
+                "statistically_demonstrated": (
+                    lower_95 >= required
+                    if lower_95 is not None and required is not None else None),
                 "scoring_rule": (
                     "nearest-rank empirical quantile over every "
                     "protocol-clean outcome; missing events sort after all "
-                    "measured latencies and do not meet the target"),
+                    "measured latencies and do not meet the target; a clean "
+                    "acceptance pass also requires the one-sided 95% Wilson "
+                    "lower confidence bound on the meeting fraction to clear "
+                    "the requested percentile, assuming independent outcomes, "
+                    "and the report's percentile-specific minimum sample"),
             })
         out[name] = rows
 
@@ -3786,6 +4379,40 @@ def _top_errors(failed: list[dict], k: int = 5) -> dict:
     return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:k])
 
 
+def _timeout_failure_evidence(failed: list[dict]) -> dict:
+    """Count timeout-classified failures over the full failed population.
+
+    ``failures_by_error`` is intentionally display-bounded to its five most
+    common values, so it cannot support an exact timeout total.  Classify the
+    untruncated rows here and retain error-field coverage.  A missing error is
+    unknown evidence, never an observed non-timeout.
+    """
+    markers = ("timeout", "timed out", "deadline exceeded")
+    error_rows = [
+        row for row in failed
+        if isinstance(row.get("error"), str) and row["error"].strip()
+    ]
+    count = sum(
+        1 for row in error_rows
+        if any(marker in row["error"].casefold() for marker in markers)
+    )
+    complete = len(error_rows) == len(failed)
+    return {
+        "count": count,
+        "failed_rows": len(failed),
+        "error_text_reported_for": len(error_rows),
+        "classification_complete": complete,
+        "classification": (
+            "case-insensitive error text contains timeout, timed out, or "
+            "deadline exceeded"),
+        "note": (
+            "timeout classification covers every failed row"
+            if complete else
+            "one or more failed rows lacked error text; the timeout count is "
+            "a lower bound"),
+    }
+
+
 def _http_status(row: dict) -> int | None:
     """Return a real HTTP status code, rejecting bools and loose coercion."""
     value = row.get("status")
@@ -3922,10 +4549,138 @@ def _first_event_contract(summary: dict) -> dict[str, str]:
     }
 
 
+def _reasoning_control_probe_display(summary: dict) -> list[dict]:
+    """Return a safe, non-inferential view of sealed probe envelopes.
+
+    The runner and verifier enforce the complete v1 schema. Renderers still
+    fail closed because they are also used on hand-built or legacy summaries:
+    malformed evidence is labeled invalid and never promoted to an effective
+    model behavior.
+    """
+    run = summary.get("run")
+    run = run if isinstance(run, dict) else {}
+    gate = run.get("preflight_gate")
+    gate = gate if isinstance(gate, dict) else {}
+    raw_probes = gate.get("reasoning_control_probes")
+    if not isinstance(raw_probes, list):
+        return []
+
+    def digest_ok(value: object) -> bool:
+        return isinstance(value, str) and len(value) == 64 \
+            and all(char in "0123456789abcdef" for char in value)
+
+    allowed_methods = {
+        "accepted": {"single_request_behavior_observation"},
+        "rejected": {"request_validation_response"},
+        "unknown": {
+            "non_validation_http_failure", "transport_outcome_unknown"},
+    }
+    out = []
+    for ordinal, raw in enumerate(raw_probes[:16], start=1):
+        faults = []
+        probe = raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            faults.append("probe envelope was not an object")
+
+        candidate = probe.get("candidate_redacted")
+        requested_json = "UNAVAILABLE (invalid candidate evidence)"
+        computed_digest = None
+        if isinstance(candidate, dict):
+            try:
+                canonical = json.dumps(
+                    candidate, ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"))
+                computed_digest = sha256_bytes(canonical.encode("utf-8"))
+                safe_candidate = _redact_secrets(candidate)
+                requested_json = json.dumps(
+                    safe_candidate, ensure_ascii=False, allow_nan=False,
+                    sort_keys=True, separators=(",", ":"))
+                if safe_candidate != candidate:
+                    faults.append("candidate required report-time redaction")
+                if len(canonical.encode("utf-8")) > 16 * 1024:
+                    faults.append("candidate exceeded the v1 byte limit")
+                    requested_json = requested_json[:4096] + "… [truncated]"
+            except (TypeError, ValueError, OverflowError):
+                faults.append("candidate was not finite JSON")
+        else:
+            faults.append("candidate_redacted was not an object")
+
+        declared_digest = probe.get("candidate_canonical_sha256")
+        if not digest_ok(declared_digest) \
+                or declared_digest != computed_digest:
+            faults.append("candidate digest did not match requested JSON")
+        candidate_digest = (
+            declared_digest if digest_ok(declared_digest) else "UNAVAILABLE")
+
+        index = probe.get("candidate_index")
+        if isinstance(index, bool) or not isinstance(index, int) \
+                or not 1 <= index <= 16:
+            faults.append("candidate index was invalid")
+            index = ordinal
+
+        disposition = probe.get("disposition")
+        method = probe.get("evidence_method")
+        if disposition not in allowed_methods \
+                or method not in allowed_methods.get(disposition, set()):
+            faults.append("classification evidence was invalid")
+            disposition = "unknown"
+            method = "invalid_or_unavailable"
+
+        effective_status = probe.get("effective_status")
+        effective_value = probe.get("effective_value")
+        if disposition == "rejected" \
+                and effective_status == "not_applied_request_rejected" \
+                and effective_value is None:
+            effective_behavior = "not applied - request rejected"
+        else:
+            effective_behavior = (
+                "unknown - this probe does not establish that the provider "
+                "applied the requested control or changed model behavior")
+            if effective_status != "unknown" or effective_value is not None:
+                faults.append("unsupported effective-behavior claim withheld")
+
+        request_id = probe.get("request_id")
+        if not isinstance(request_id, str) or not request_id \
+                or len(request_id.encode("utf-8")) > 256 \
+                or any(ord(char) < 0x21 or ord(char) > 0x7e
+                       for char in request_id):
+            faults.append("request ID was unavailable")
+            request_id = "UNAVAILABLE"
+        logical_hash = probe.get("logical_request_body_sha256")
+        if not digest_ok(logical_hash):
+            faults.append("logical request-body digest was unavailable")
+            logical_hash = "UNAVAILABLE"
+        physical = probe.get("physical_request_body_sha256s")
+        if not isinstance(physical, list) or len(physical) > 5 \
+                or not all(digest_ok(item) for item in physical):
+            faults.append("physical request-body digest evidence was invalid")
+            physical = []
+
+        schema = probe.get("schema_version")
+        if schema != "reasoning-control-probe-evidence/v1":
+            faults.append("probe evidence schema was unsupported")
+        out.append({
+            "candidate_index": index,
+            "candidate_digest": candidate_digest,
+            "requested_json": requested_json,
+            "disposition": disposition,
+            "evidence_method": method,
+            "effective_behavior": effective_behavior,
+            "request_id": request_id,
+            "logical_request_body_sha256": logical_hash,
+            "physical_request_body_sha256s": physical,
+            "evidence_status": (
+                "sealed v1 envelope" if not faults else
+                "INVALID/INCOMPLETE: " + "; ".join(faults)),
+        })
+    return out
+
+
 def render_markdown(summary: dict, title: str, *,
                     verification_context: dict | None = None) -> str:
     s = summary
     first_event = _first_event_contract(s)
+    reasoning_probes = _reasoning_control_probe_display(s)
     from .markdown import markdown_plain_text
     from .report_decision import build_report_decision
     verified_view = _external_report_context(s, verification_context)
@@ -4025,6 +4780,9 @@ def render_markdown(summary: dict, title: str, *,
     _cachew = (s.get("cache_fidelity") or {}).get("warning")
     if _cachew:
         cautions += [f"CAUTION (cache fidelity): {inline(_cachew)}", ""]
+    _calw = (s.get("calibration_warmth") or {}).get("warning")
+    if _calw:
+        cautions += [f"CAUTION (calibration warm state): {inline(_calw)}", ""]
     _identityw = (s.get("response_identity") or {}).get("warning")
     if _identityw:
         cautions += [
@@ -4140,10 +4898,46 @@ def render_markdown(summary: dict, title: str, *,
             f"> {inline(verified_view['assurance'])}",
             "",
         ]
+    customer_first = s.get(first_event["corrected_key"]) or {}
+    customer_e2e = s.get("e2e_corrected_ms") or {}
+    customer_answers = s.get("answers") or {}
+    calibration_count = (s.get("calibration_warmth") or {}).get(
+        "calibration_requests", 0)
+    customer_lines = [
+        "## Customer takeaway",
+        "",
+        f"- **At this tested load:** {s['requests_ok']}/{s['requests_total']} "
+        f"measured replay requests were harness-successful; "
+        f"{s['requests_failed']} failed and "
+        f"{s.get('requests_retried', 'an unknown number')} were retried.",
+        "- **Answer quality:** not evaluated. Harness success and structural "
+        "readability do not establish correctness, task success, or usefulness.",
+        f"- **Completion caveat:** {customer_answers.get('truncated', 'unknown')}"
+        f"/{s['requests_total']} responses stopped at the requested output "
+        "length; natural completion behavior was not measured for those "
+        "responses.",
+        "- **Scope:** results apply only to this recorded workload and tested "
+        "load. They do not establish an endpoint ceiling, quota headroom, or "
+        "a production SLA.",
+        f"- **Extra traffic:** {calibration_count} calibration request row(s) "
+        "were outside the measured replay population. Calibration estimates "
+        "characters per token; it is not a latency or capacity sample.",
+        "- **Evidence terms:** integrity says whether the recorded artifact "
+        "bytes verify; source reproducibility separately says whether the exact "
+        "source checkout can be reconstructed.",
+        "",
+        "| user-perceived latency from scheduled request time (ms) | p50 | "
+        "p90 | p95 | p99 | n |",
+        "|---|---|---|---|---|---|",
+        row(f"Caller {first_event['short_label']}", customer_first),
+        row("Caller end-to-end", customer_e2e),
+        "",
+    ]
     lines = [
         f"# {inline(title)}",
         "",
         *verified_intro,
+        *customer_lines,
         "## Decision states",
         "",
         "These states are independent. A quota-limited run can still retain "
@@ -4177,6 +4971,8 @@ def render_markdown(summary: dict, title: str, *,
             s.get(first_event["diagnostic_key"])),
         row("TTF valid tool call", s.get("ttf_tool_call_ms")),
         row("TTFB", s["ttfb_ms"]),
+        row("TTSE (first parsed stream event; diagnostic)",
+            s.get("ttse_ms")),
         row("TTFG (E2E)", s["e2e_ms"]),
         row("interchunk max", s["interchunk_max_ms"]),
         "",
@@ -4195,6 +4991,12 @@ def render_markdown(summary: dict, title: str, *,
          f"- constructed (intended) cache fraction: "
          f"p50 {intent['p50']:.3f} / p95 {intent['p95']:.3f}"
          if intent.get("n") else "- constructed cache fraction: n/a"),
+        ("- calibration warm-state evidence: "
+         f"{(s.get('calibration_warmth') or {}).get('calibration_requests', 0)} "
+         "calibration request rows; exact payload overlap "
+         f"{(s.get('calibration_warmth') or {}).get('exact_overlap_status', 'not recorded')}; "
+         "replay rows with an exact calibrated payload "
+         f"{(s.get('calibration_warmth') or {}).get('replay_rows_with_calibrated_payload')}"),
         ("- token targeting: n/a for real prompts (no synthetic size to hit)"
          if mode == "prompts" else
          f"- token targeting: reported/intended p50 = "
@@ -4282,16 +5084,25 @@ def render_markdown(summary: dict, title: str, *,
             f"p95 {cc['in_flight_p95']:.0f}, peak "
             f"{cc['in_flight_max']:.0f}{sized} "
             f"({cc['measured_over']})")
-    tp = s.get("tpot_ms") or {}
+    tp = s.get("completion_tpot_ms") or s.get("tpot_ms") or {}
     if tp.get("n"):
         lines.append(
-            f"- time per output token (TPOT): p50 {tp['p50']:.1f} / p95 "
+            f"- time per endpoint-reported completion token "
+            f"(all-completion TPOT): p50 {tp['p50']:.1f} / p95 "
             f"{tp['p95']:.1f} ms across {tp['n']} observed requests. each "
             "row is (e2e - ttft) / (completion_tokens - 1); do not combine "
             "independently selected TPOT and TTFT percentiles to project an "
-            "unobserved answer length")
+            "unobserved answer length. completion_tokens can include hidden "
+            "reasoning; this is not visible-output TPOT")
+    visible_tp = s.get("visible_tpot_ms") or {}
+    if visible_tp.get("n"):
+        lines.append(
+            f"- time per explicitly accounted visible output token: p50 "
+            f"{visible_tp['p50']:.1f} / p95 {visible_tp['p95']:.1f} ms "
+            f"across {visible_tp['n']} observed requests")
 
     if s.get("e2e_corrected_ms"):
+        cse = s.get("ttse_corrected_ms") or {}
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
         ct = s.get("ttf_tool_call_corrected_ms") or {}
@@ -4329,6 +5140,11 @@ def render_markdown(summary: dict, title: str, *,
             lines.append(f"| {caller_row_prefix} TTF valid tool call | "
                          f"{ct['p50']:.0f} | {ct['p95']:.0f} | "
                          f"{ct['p99']:.0f} |")
+        if cse.get("p50") is not None:
+            lines.append(
+                f"| {caller_row_prefix} TTSE (first parsed stream event; "
+                f"diagnostic) | {cse['p50']:.0f} | {cse['p95']:.0f} | "
+                f"{cse['p99']:.0f} |")
         lines.append(f"| {caller_row_prefix} end-to-end | {c2['p50']:.0f} | "
                      f"{c2['p95']:.0f} | {c2['p99']:.0f} |")
         lines += ["", s["latency_correction_note"]]
@@ -4368,6 +5184,39 @@ def render_markdown(summary: dict, title: str, *,
             "these are SSE "
             "chunks, not tokens")
 
+    if reasoning_probes:
+        lines += [
+            "",
+            "## Reasoning-control probes",
+            "",
+            "These rows come from the sealed preflight gate. Disposition "
+            "classifies request/response evidence only: `accepted` does not "
+            "prove the provider applied the requested control or changed "
+            "reasoning behavior. Effective behavior remains **unknown** "
+            "unless the evidence supports only the narrower fact that a "
+            "rejected request was not applied.",
+            "",
+            "| candidate and requested JSON | classification | effective "
+            "behavior | request/body evidence |",
+            "|---|---|---|---|",
+        ]
+        for probe in reasoning_probes:
+            physical = probe["physical_request_body_sha256s"]
+            physical_text = (
+                ", ".join(physical) if physical else "none recorded")
+            lines.append(
+                f"| #{probe['candidate_index']} / candidate SHA-256 "
+                f"{inline(probe['candidate_digest'])}<br>"
+                f"requested {inline(probe['requested_json'])} | "
+                f"{inline(probe['disposition'])} via "
+                f"{inline(probe['evidence_method'])}<br>"
+                f"{inline(probe['evidence_status'])} | "
+                f"{inline(probe['effective_behavior'])} | "
+                f"[requests.jsonl](requests.jsonl) request ID "
+                f"{inline(probe['request_id'])}<br>logical body SHA-256 "
+                f"{inline(probe['logical_request_body_sha256'])}<br>"
+                f"physical body SHA-256 {inline(physical_text)} |")
+
     tp = s.get("throughput") or {}
     if tp.get("input_tokens_per_min"):
         usage_coverage = tp.get("usage_coverage")
@@ -4375,9 +5224,23 @@ def render_markdown(summary: dict, title: str, *,
             f"; clean usage coverage {usage_coverage:.1%}"
             if isinstance(usage_coverage, (int, float))
             and not isinstance(usage_coverage, bool) else "")
+        completion_rate = tp.get("completion_tokens_per_min")
+        if completion_rate is None:
+            completion_rate = tp.get("output_tokens_per_min")
+        completion_text = (
+            f"{completion_rate:,.0f}"
+            if isinstance(completion_rate, (int, float))
+            and not isinstance(completion_rate, bool) else "NOT REPORTED")
+        visible_rate = tp.get("visible_output_tokens_per_min")
+        visible_text = (
+            f", {visible_rate:,.0f} explicitly accounted visible output "
+            "tokens/min"
+            if isinstance(visible_rate, (int, float))
+            and not isinstance(visible_rate, bool) else "")
         lines += ["", f"throughput: {tp['input_tokens_per_min']:,.0f} input "
-                      f"tokens/min, {tp['output_tokens_per_min']:,.0f} output "
-                      "tokens/min (endpoint-reported counts over wall time"
+                      f"tokens/min, {completion_text} endpoint-reported "
+                      "completion tokens/min (all-completion; may include "
+                      f"hidden reasoning){visible_text} (counts over wall time"
                       f"{coverage_text})"]
     windows = s.get("observed_rate_windows") or {}
     win_input = windows.get("input_tokens_by_first_send") or {}
@@ -4539,7 +5402,10 @@ def render_markdown(summary: dict, title: str, *,
     rp = (s.get("run") or {}).get("request_params")
     if rp:
         eb = rp.get("extra_body") or {}
-        line = (f"request params: temperature {rp.get('temperature')}, "
+        line = (f"request params: adapter "
+                f"{rp.get('endpoint_adapter', 'legacy-unrecorded')}, "
+                f"mode {rp.get('response_mode', 'legacy-unrecorded')}, "
+                f"temperature {rp.get('temperature')}, "
                 "global max_tokens safety cap "
                 f"{rp.get('max_output_tokens_cap')}")
         if eb:
@@ -4624,7 +5490,10 @@ def render_markdown(summary: dict, title: str, *,
         for name, key in ((first_event["short_label"], "ttft_vs_target"),
                           ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
-                met = {True: "yes", False: "NO", None: "-"}[r["met"]]
+                demonstrated = r.get("statistically_demonstrated")
+                met = ("NOT PROVEN" if r["met"] is True
+                       and demonstrated is False else
+                       {True: "yes", False: "NO", None: "-"}[r["met"]])
                 if r["actual_ms"] is not None:
                     target_text, act = _decision_pair_display(
                         r["target_ms"], r["actual_ms"],
@@ -4641,12 +5510,17 @@ def render_markdown(summary: dict, title: str, *,
             lines += ["", "latency-target compliance (missing configured "
                       "events do not meet the target):"]
             for r in scored_rows:
+                lower = r.get("one_sided_95pct_wilson_lower")
+                confidence = (
+                    f"; one-sided 95% lower bound {lower:.1%} "
+                    f"({'proves' if r.get('statistically_demonstrated') else 'does not prove'}) acceptance"
+                    if lower is not None else "")
                 lines.append(
                     f"- {r['scored_metric']} {r['quantile']}: "
                     f"{r['meeting_outcomes']} of {r['eligible_outcomes']} "
                     f"({r['observed_meeting_fraction']:.1%}) met "
                     f"{r['target_ms']} ms; requires "
-                    f"{r['required_meeting_fraction']:.0%}")
+                    f"{r['required_meeting_fraction']:.0%}{confidence}")
         hard_basis = sla.get("hard_timeout_basis") or {}
         hard_timeout_configured = any(
             hard_basis.get(key) is not None
@@ -4726,7 +5600,7 @@ def render_markdown(summary: dict, title: str, *,
         sp = (f" worst window is {spread:.1f}x the best."
               if spread else "")
         lines += ["", f"stability over time ({inline(flag)})."
-                  f"{sp} {inline(drift.get('drift_headline') or drift.get('note', ''))}"]
+                  f"{sp} {inline(_attribution_safe_drift_message(drift))}"]
         if drift.get("windows"):
             latency_label = drift.get("latency_metric_label") or "TTFT"
             lines += ["", f"per-{drift.get('window_seconds', 60)}s windows, p95 in ms:",
@@ -4779,6 +5653,16 @@ def render_markdown(summary: dict, title: str, *,
             f"reproducibility {verifier_repro['code']} · "
             f"{inline(verified_view['assurance'])}",
         ]
+    lines += [
+        "",
+        "## Field glossary (reference)",
+        "",
+        "Every displayed field uses the definitions below. Missing, unknown, "
+        "and null are evidence states - not zeros.",
+        "",
+        *[f"- **{name}:** {definition}"
+          for name, definition in _REPORT_FIELD_GLOSSARY],
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -5017,7 +5901,7 @@ _HTML_STYLE = """<style>
 html{scroll-behavior:smooth;scroll-padding-top:76px}
 body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,
  sans-serif;color:var(--ink);background:var(--canvas);margin:0;line-height:1.48;
- -webkit-font-smoothing:antialiased}
+ -webkit-font-smoothing:antialiased;font-size:15px}
 a{color:var(--blue);text-underline-offset:3px}
 a:focus-visible,summary:focus-visible{outline:3px solid #155eef;outline-offset:3px;
  border-radius:4px}
@@ -5038,13 +5922,19 @@ a:focus-visible,summary:focus-visible{outline:3px solid #155eef;outline-offset:3
  padding:7px 9px;display:flex;justify-content:space-between;align-items:center;gap:8px;
  font-size:11px}.verification-state span{font-weight:750;color:var(--muted)}
 .verification-state strong{font-size:10px;border-radius:999px;padding:2px 7px;
- letter-spacing:.04em}.verification-state .status-pass{color:var(--green);
- background:var(--green-soft)}.verification-state .status-failed{color:var(--red);
+ letter-spacing:.04em}.verification-state .status-pass{color:#344054;
+ background:#eef1f5}.verification-state .status-failed{color:var(--red);
  background:var(--red-soft)}.repro-codes{color:var(--muted);font-size:10px}
 .verification-details{margin-top:8px}.verification-details summary{cursor:pointer;
  font-size:11px;font-weight:800;color:#344054}.verification-details[open] summary{margin-bottom:7px}
 .report-head{background:#0c1729;color:#fff;border-radius:18px;padding:28px 30px 24px;
  box-shadow:0 18px 44px rgba(12,23,41,.16)}
+.head-top{display:flex;align-items:center;justify-content:space-between;gap:16px;
+ margin-bottom:9px}.head-top .eyebrow{margin-bottom:0}
+.trust-badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #65758b;
+ border-radius:999px;padding:5px 10px;color:#eef4fc;background:#24334a;font-size:11px;
+ font-weight:800;white-space:nowrap}.trust-badge.warning{border-color:#e8b46b;
+ color:#fff2d6;background:#543716}.trust-badge.unverified{color:#e4e9f0;background:#2c394c}
 .eyebrow{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
  color:#b9d3ff;margin-bottom:8px}
 h1{font-size:clamp(25px,3vw,38px);line-height:1.14;letter-spacing:-.025em;
@@ -5234,20 +6124,113 @@ td.na{color:var(--muted);font-weight:650}
 .sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;
  margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;
  white-space:nowrap!important;border:0!important}
+.customer-summary{background:var(--surface);border:1px solid var(--line);border-left:6px solid
+ var(--blue);border-radius:16px;padding:24px 26px;margin:16px 0;box-shadow:var(--shadow)}
+.customer-summary .result-type{font-size:12px;font-weight:850;letter-spacing:.09em;
+ text-transform:uppercase;color:#0757b5}.customer-summary h2{font-size:clamp(24px,3vw,34px);
+ line-height:1.18;letter-spacing:-.025em;margin:7px 0 10px;color:var(--ink);
+ text-transform:none}.customer-summary .summary-lead{font-size:17px;line-height:1.55;
+ color:#344054;margin:0;max-width:1040px}.customer-summary .summary-lead b{color:var(--ink)}
+.customer-state-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;
+ margin-top:15px}.customer-state{border:1px solid var(--line);border-radius:9px;padding:8px 9px;
+ background:#f8fafc}.customer-state span{display:block;font-size:9px;font-weight:850;
+ letter-spacing:.06em;text-transform:uppercase;color:var(--quiet)}.customer-state b{display:block;
+ margin-top:3px;font-size:12px;line-height:1.3}.customer-state.state-pass{border-color:#a9dbbc;
+ background:var(--green-soft);color:var(--green)}.customer-state.state-miss{border-color:#f1b5ae;
+ background:var(--red-soft);color:var(--red)}.customer-state.state-warn{border-color:#ebca98;
+ background:var(--amber-soft);color:var(--amber)}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:20px 0 0}
+.kpi-card{min-width:0;border:1px solid var(--line);border-radius:12px;background:#fbfcfe;
+ padding:15px}.kpi-card .k{font-size:11px;font-weight:850;letter-spacing:.055em;
+ text-transform:uppercase;color:var(--quiet)}.kpi-card .v{font-size:25px;font-weight:850;
+ letter-spacing:-.025em;margin:5px 0 2px;font-variant-numeric:tabular-nums;
+ overflow-wrap:anywhere}.kpi-card .v .unit{font-size:14px;font-weight:700;color:var(--muted)}
+.kpi-card .note{font-size:12px;color:var(--muted);line-height:1.4}.kpi-card .tail-status{
+ display:inline-block;margin-top:7px;border-radius:6px;padding:3px 6px;background:#eef1f5;
+ color:#475467;font-size:11px;font-weight:750}
+.kpi-card .caution-text{background:#fff1da;color:#7a4508}
+.customer-section{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+ padding:20px 22px;margin:12px 0;box-shadow:var(--shadow)}.customer-section h2{font-size:20px;
+ line-height:1.25;letter-spacing:-.015em;text-transform:none;color:var(--ink);margin:0 0 5px}
+.customer-section>.section-copy{font-size:14px;color:var(--muted);margin:0 0 14px}
+.limitations{border-left:5px solid #d89131}.limitation-grid{display:grid;
+ grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 18px;margin-top:13px}
+.limitation{display:grid;grid-template-columns:10px minmax(0,1fr);gap:9px;
+ font-size:14px;line-height:1.45;color:#364152}.limitation:before{content:"";width:8px;height:8px;
+ border-radius:50%;background:#d89131;margin-top:6px}.limitation b{color:var(--ink)}
+.customer-latency-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.latency-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#fbfcfe}
+.latency-card h3{font-size:14px;margin:0;color:#344054}.latency-card .primary{font-size:29px;
+ font-weight:850;letter-spacing:-.03em;margin:6px 0 2px;font-variant-numeric:tabular-nums}
+.latency-card .primary span{font-size:14px;color:var(--muted);font-weight:700}
+.latency-card .range{font-size:13px;color:var(--muted)}.latency-card .sample-state{
+ margin-top:9px;padding-top:9px;border-top:1px solid var(--line);font-size:12px;
+ color:#475467}.latency-note{margin:13px 0 0;border-radius:9px;padding:11px 13px;
+ background:#f2f6fb;color:#344054;font-size:13px}.latency-note b{color:var(--ink)}
+.target-list{margin-top:10px}.target-row{display:grid;grid-template-columns:minmax(0,1fr) auto;
+ gap:8px;border-top:1px solid var(--line);padding-top:9px;margin-top:9px;font-size:12px}
+.target-row .target-metric{color:#344054}.target-row .target-result{font-weight:850;
+ border-radius:999px;padding:2px 7px;align-self:start}.target-pass{color:var(--green);
+ background:var(--green-soft)}.target-miss{color:var(--red);background:var(--red-soft)}
+.target-unproven{color:var(--amber);background:var(--amber-soft)}
+.request-observations{margin-top:16px}.request-observations h3{font-size:14px;margin:0 0 3px}
+.request-observations .cap{font-size:12px}.waterfall-row{display:grid;
+ grid-template-columns:76px minmax(220px,1fr) 108px;gap:10px;align-items:center;margin:10px 0}
+.waterfall-label{font-size:12px;font-weight:800;color:#344054}.waterfall-track{display:flex;
+ height:18px;overflow:hidden;border-radius:5px;background:#e9edf3}.wf-client{background:#b8c4d4}
+.wf-connect{background:#6f8fb9}.wf-first{background:#1876d2}.wf-complete{background:#63a7e5}
+.wf-unattributed{background:#8b95a5}
+.waterfall-total{text-align:right;font-size:12px;font-weight:800;font-variant-numeric:tabular-nums}
+.waterfall-values{grid-column:2/-1;margin-top:-5px;font-size:10px;line-height:1.45;
+ color:var(--muted)}
+.waterfall-legend{display:flex;flex-wrap:wrap;gap:8px 14px;font-size:11px;color:var(--muted)}
+.waterfall-legend span:before{content:"";display:inline-block;width:9px;height:9px;
+ border-radius:2px;margin-right:5px;background:var(--legend-color)}
+.reliability-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}
+.reliability-item{border:1px solid var(--line);border-radius:10px;padding:12px;background:#fbfcfe}
+.reliability-item .v{font-size:21px;font-weight:850;font-variant-numeric:tabular-nums}
+.reliability-item .k{font-size:11px;color:var(--muted);margin-top:2px}.reliability-item.caution{
+ border-color:#e5bd82;background:#fffaf1}.quota-neutral{color:#344054}
+.scope-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 22px;margin:0}
+.scope-grid>div{border-bottom:1px solid #e9edf3;padding:10px 0}.scope-grid dt{font-size:11px;
+ text-transform:uppercase;letter-spacing:.05em;font-weight:800;color:var(--quiet)}
+.scope-grid dd{margin:3px 0 0;font-size:14px;color:#27364b;overflow-wrap:anywhere}
+.next-actions{margin:9px 0 0;padding-left:22px}.next-actions li{margin:8px 0;color:#344054}
+details.disclosure{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+ margin:14px 0;box-shadow:var(--shadow)}details.disclosure>summary{cursor:pointer;padding:17px 19px;
+ color:#27364b;list-style-position:inside}details.disclosure>summary .summary-title{font-size:15px;
+ font-weight:850}details.disclosure>summary .summary-note{display:block;margin:4px 0 0 24px;
+ font-size:12px;color:var(--muted);font-weight:500}details.disclosure[open]>summary{
+ border-bottom:1px solid var(--line)}details.disclosure>.detail-body{padding:10px 18px 18px}
+.engineering-disclosure{border-top:4px solid #667085!important}.engineering-intro{font-size:14px;
+ color:#475467;margin:4px 2px 14px}.routing-card table th,.routing-card table td{text-align:left}
+.engineering-group{border-top:1px solid var(--line);padding-top:14px;margin-top:18px}
+.engineering-group>h2{font-size:18px;margin:0 2px 3px;letter-spacing:-.01em}
+.engineering-group>.group-copy{color:var(--muted);font-size:13px;margin:0 2px 10px}
+.routing-card table td:last-child{color:#475467}.not-captured{border:1px dashed #98a2b3;
+ border-radius:9px;padding:11px 13px;background:#f8fafc;color:#475467;font-size:13px}
+.verification-disclosure .external-verified{margin:0;box-shadow:none}.glossary-list dt{margin-top:12px}
+.glossary-list dd{margin:3px 0 0;color:#475467}.appendix-label{font-size:11px;font-weight:850;
+ letter-spacing:.09em;text-transform:uppercase;color:var(--quiet);margin:26px 2px 7px}
 @media(max-width:900px){.state-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
  .fact-strip,.stats{grid-template-columns:repeat(3,minmax(0,1fr))}
  .decision-lead{grid-template-columns:1fr}.chart-grid{grid-template-columns:1fr}
  .quota-grid{grid-template-columns:1fr}.customer-grid{grid-template-columns:1fr}.section-head{align-items:start;flex-direction:column;gap:4px}
- .section-head p{text-align:left}}
+ .quota-grid{grid-template-columns:1fr}.customer-grid{grid-template-columns:1fr}.section-head{align-items:start;flex-direction:column;gap:4px}
+ .section-head p{text-align:left}.kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .reliability-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+ .scope-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .customer-state-strip{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:640px){.wrap{padding:14px 12px 36px}.report-head{border-radius:14px;
  padding:16px}.external-verified .verified-grid{grid-template-columns:1fr;gap:2px}
  .verification-states{grid-template-columns:1fr;gap:4px}
  .external-verified .verified-grid dt{margin-top:5px}.external-verified .assurance{grid-column:auto}
- .report-head h1{font-size:22px;margin-bottom:7px}.report-head .sub{font-size:11px}
+ .head-top{align-items:flex-start;flex-direction:column;gap:8px}.trust-badge{font-size:10px}
+ .report-head h1{font-size:22px;margin-bottom:7px}.report-head .sub{font-size:13px}
  .report-head .meta-artifact{display:inline-flex;max-width:100%;overflow-wrap:anywhere}
  .meta-row{margin-top:10px;gap:6px}.meta-chip{font-size:11px;min-height:26px;padding:4px 8px}
- .report-nav{margin:10px 0 14px;border-radius:9px}
- .report-nav a{padding:6px 9px;font-size:11px}.decision-hero{padding:14px 16px;
+ .report-nav{margin:10px 0 14px;border-radius:9px;gap:0;padding:4px}
+ .report-nav a{padding:6px 7px;font-size:10px}.decision-hero{padding:14px 16px;
  margin-top:12px}.decision-hero h2{font-size:19px;margin:5px 0}.decision-hero .claim-box{
  display:block;border-left:0;border-top:2px solid var(--line);padding:9px 0 0;font-size:11px}
  .status-kicker{font-size:10px}.decision-copy{font-size:12px}
@@ -5280,7 +6263,18 @@ td.na{color:var(--muted);font-weight:650}
  .latency-legend{grid-template-columns:1fr}.latency-small-multiples{grid-template-columns:1fr}
  .latency-values{grid-template-columns:minmax(88px,1.25fr) repeat(4,minmax(46px,1fr))}
  .latency-values div{padding:6px 4px;font-size:9px}.cost-number{font-size:26px}.cost-breakdown{grid-template-columns:1fr}
- th,td{padding:8px;font-size:12px}.believe li{font-size:12px}.sub{font-size:12px}}
+ th,td{padding:8px;font-size:12px}.believe li{font-size:12px}.sub{font-size:12px}
+ .customer-summary{padding:18px 16px;border-left-width:4px;display:flex;
+ flex-direction:column}.customer-summary h2{font-size:24px}
+ .customer-summary .summary-lead{font-size:16px}.kpi-grid{grid-template-columns:1fr 1fr;gap:8px}
+ .customer-summary .kpi-grid{order:1}.customer-summary .customer-state-strip{order:2}
+ .customer-state-strip{grid-template-columns:1fr 1fr;gap:6px}
+ .kpi-card{padding:12px}.kpi-card .v{font-size:22px}.customer-section{padding:17px 15px}
+ .customer-section h2{font-size:19px}.limitation-grid,.customer-latency-grid,.scope-grid{
+ grid-template-columns:1fr}.reliability-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .waterfall-row{grid-template-columns:58px minmax(150px,1fr) 78px;gap:6px}
+  details.disclosure>summary{padding:15px}details.disclosure>.detail-body{padding:7px 12px 14px}
+  details.disclosure>summary .summary-note{margin-left:20px;font-size:11px}}
 @media print{@page{size:auto;margin:14mm 12mm 16mm}html{scroll-padding-top:0}
  body{background:#fff;font-size:10pt}.wrap{max-width:none;padding:0}.report-head{box-shadow:none;
  border:1px solid #9aa7b8;background:#fff;color:#111;padding:10px 12px}.external-verified{
@@ -5329,6 +6323,16 @@ td.na{color:var(--muted);font-weight:650}
  .run-context-notes{break-inside:avoid;page-break-inside:avoid;margin:3mm 0}
  .scroll-hint{display:none}.table-scroll{overflow:visible;box-shadow:none}
  .dense-table{min-width:0}.dense-table .sticky-col{position:static;box-shadow:none}
+ .customer-summary,.customer-section,.kpi-card,.latency-card,.reliability-item,
+ details.disclosure{box-shadow:none}.customer-summary{margin-top:4mm;padding:5mm}
+ .engineering-disclosure{break-before:page;page-break-before:always}
+ details.disclosure>summary{padding:3mm 4mm}details.disclosure>.detail-body{
+ display:block!important;padding:2mm 4mm 4mm}details.disclosure>summary .summary-note{display:block}
+ .verification-disclosure,.glossary-disclosure{break-before:page;page-break-before:always}
+ .kpi-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:2mm}.kpi-card{padding:3mm}
+ .kpi-card .v{font-size:16pt}.customer-latency-grid{grid-template-columns:1fr 1fr}
+ .reliability-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:2mm}
+ .reliability-item{padding:2mm}.scope-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
  a{color:#111;text-decoration:none}}
 </style>"""
 
@@ -5736,6 +6740,8 @@ def _html_decision_hero(decision: dict, combined_gate_html: str) -> str:
         severity = str(state.get("severity") or "neutral")
         severities.append(severity)
         tone = tone_by_severity.get(severity, "neutral")
+        if key == "evidence_integrity" and severity == "pass":
+            tone = "neutral"
         state_label = str(state.get("label") or state.get("code") or "UNKNOWN")
         cards.append(
             f"<div class='state-card tone-{tone}'>"
@@ -5830,11 +6836,17 @@ def render_html(summary: dict, title: str, *,
     or attach to a deck."""
     s = summary
     first_event = _first_event_contract(s)
+    reasoning_probes = _reasoning_control_probe_display(s)
     verified_view = _external_report_context(s, verification_context)
+    from .report_decision import build_report_decision
+    decision = (verified_view["decision"] if verified_view
+                else build_report_decision(s))
     def esc(value: object) -> str:
         return html.escape(sanitize_display_text(value), quote=True)
     run = s.get("run") or {}
-    mode = run.get("input_mode", "profile")
+    mode = (run.get("input_mode")
+            if run.get("input_mode") in {"profile", "prompts"}
+            else "unknown")
     caller_provenance = s.get("latency_correction_provenance") or {}
     exact_caller_display = bool(
         caller_provenance.get("exact_values")
@@ -5857,8 +6869,11 @@ def render_html(summary: dict, title: str, *,
 
     # ---- header ----
     display_title = display_text(title, 160)
-    ep = esc(display_text(run.get("endpoint_path") or "", 180))
-    src = ("real prompts" if mode == "prompts" else "synthetic shape")
+    src = {
+        "prompts": "real prompts",
+        "profile": "synthetic shape",
+        "unknown": "not recorded",
+    }[mode]
     def count_or_none(key: str) -> int | None:
         value = s.get(key)
         return (value if isinstance(value, int) and not isinstance(value, bool)
@@ -5878,29 +6893,59 @@ def render_html(summary: dict, title: str, *,
     total_text = f"{total:,}" if total is not None else "NOT REPORTED"
     ok_text = f"{okc:,}" if okc is not None else "NOT REPORTED"
     failed_text = f"{failed:,}" if failed is not None else "NOT REPORTED"
-    sub = (f"Measured replay &middot; {ep} &middot; {src} &middot; "
-           f"{total_text} requests, {ok_text} harness-successful, "
-           f"{failed_text} failed")
-
     endpoint_meta = run.get("endpoint_metadata") or {}
     entity_names = [str(entity.get("name"))
                     for entity in (endpoint_meta.get("served_entities") or [])
                     if isinstance(entity, dict) and entity.get("name")]
-    tested_entity = display_text(
-        run.get("endpoint_model") or
-        (entity_names[0] if entity_names else None) or
-        endpoint_meta.get("name") or "not recorded", 120)
-    header_chips = []
-    if tested_entity != "not recorded":
-        header_chips.append(("entity", f"entity: {tested_entity}"))
-    header_chips.extend([
+    requested_model = display_text(
+        run.get("endpoint_model") or "not recorded", 120)
+    sample_state = s.get("sample") or {}
+    sample_n = sample_state.get("n")
+    concurrency_state = s.get("concurrency") or {}
+    peak_in_flight = concurrency_state.get("in_flight_max")
+    directional = (
+        not isinstance(sample_n, int)
+        or sample_n < PERCENTILE_MIN_SAMPLES["p95"]
+        or not isinstance(peak_in_flight, (int, float))
+        or isinstance(peak_in_flight, bool)
+        or peak_in_flight <= 1)
+    integrity_code = (decision.get("evidence_integrity") or {}).get("code")
+    measurement_code = (decision.get("measurement_validity") or {}).get("code")
+    quota_code = (decision.get("quota_state") or {}).get("code")
+    sla_code = (decision.get("customer_sla") or {}).get("code")
+    if integrity_code == "TAMPERED":
+        result_type = "Do not use: integrity failed"
+    elif quota_code in {"EXCEEDED", "LOCAL_GUARD_REFUSED"}:
+        result_type = "Quota-limited result"
+    elif measurement_code == "INVALID":
+        result_type = "Invalid measurement"
+    elif sla_code == "MISS":
+        result_type = "Acceptance target miss"
+    else:
+        result_type = (
+            "Directional latency smoke test" if directional else
+            "Load-test result")
+    header_chips = [
+        ("type", f"result: {result_type.lower()}"),
         ("mode", f"input: {src}"),
-        ("version", f"harness: {s.get('harness_version') or 'not recorded'}"),
-    ])
-    if run.get("artifact_id"):
+    ]
+    measured_window = s.get("measured_window") or {}
+    run_started_at = measured_window.get("started_at_utc")
+    if isinstance(run_started_at, str) and len(run_started_at) >= 10:
+        header_chips.append(("date", f"run: {run_started_at[:10]} UTC"))
+    configured_rate_limit = (s.get("rate_limits") or {}).get("configured") or {}
+    provider = configured_rate_limit.get("provider")
+    endpoint_base_url = run.get("endpoint_base_url")
+    if isinstance(provider, str) and provider.strip() \
+            and isinstance(endpoint_base_url, str) \
+            and endpoint_base_url.startswith("https://"):
         header_chips.append((
-            "artifact", f"artifact: {display_text(run['artifact_id'], 100)}"))
-    verified_banner_html = ""
+            "provider", f"configured provider: {provider.strip()} · HTTPS"))
+    if requested_model != "not recorded":
+        header_chips.append((
+            "entity", f"requested model: {requested_model}"))
+    verification_badge_html = ""
+    verification_details_html = ""
     if verified_view:
         source_repro = verified_view["source_reproducibility"]
         verifier_repro = verified_view["verifier_reproducibility"]
@@ -5925,11 +6970,16 @@ def render_html(summary: dict, title: str, *,
                 + "</span>" if reason_codes else "")
             return esc(state["reason"]) + codes
 
-        verified_banner_html = (
+        verification_badge_html = (
+            f"<span class='trust-badge{' warning' if repro_warning else ''}' "
+            "role='status'>Evidence verified"
+            + (" · reproducibility warning" if repro_warning else "")
+            + "</span>")
+        verification_panel = (
             f"<aside class='external-verified"
-            f"{' repro-warning' if repro_warning else ''}' role='status' "
+            f"{' repro-warning' if repro_warning else ''}' "
             "aria-label='External verification context'>"
-            f"<span class='verified-badge'>{esc(verified_view['view_label'])}"
+            "<span class='verified-badge'>Evidence verified"
             "</span><div class='verification-states' "
             "aria-label='Independent verification states'>"
             + verification_state("Integrity", "VERIFIED")
@@ -5952,31 +7002,47 @@ def render_html(summary: dict, title: str, *,
             f"<dt>Receipt</dt><dd><code>{esc(verified_view['receipt_id'])}"
             "</code></dd>"
             f"<dd class='assurance'>{esc(verified_view['assurance'])}</dd>"
-            "</dl></details></aside>")
-    eyebrow = ("Benchmark evidence · external verification receipt"
-               if verified_view else "Benchmark evidence · verify the manifest")
+            "</dl></aside>")
+        verification_details_html = (
+            "<details class='disclosure verification-disclosure' "
+            "id='verification'><summary><span class='summary-title'>"
+            "Verification and reproducibility</span><span class='summary-note'>"
+            "Artifact hashes, receipt identity, source reconstruction, and "
+            "verifier reconstruction.</span></summary><div class='detail-body'>"
+            f"{verification_panel}</div></details>")
+    else:
+        verification_badge_html = (
+            "<span class='trust-badge unverified' role='status'>"
+            "Verification required</span>")
+        verification_details_html = (
+            "<details class='disclosure verification-disclosure' "
+            "id='verification'><summary><span class='summary-title'>"
+            "Verification and reproducibility</span><span class='summary-note'>"
+            "This source view has no independent verification receipt."
+            "</span></summary><div class='detail-body'><div class='banner warn'>"
+            "Verify the source manifest or create an external verification "
+            "receipt before relying on artifact integrity.</div></div></details>")
+    header_name = display_text(
+        endpoint_meta.get("name")
+        or (requested_model if requested_model != "not recorded" else None)
+        or display_title, 100)
+    eyebrow = "LLM latency and reliability report"
     header_html = (
         "<header class='report-head'>"
-        f"<div class='eyebrow'>{esc(eyebrow)}</div>"
-        f"<h1 title='{esc(sanitize_title(title))}'>{esc(display_title)}</h1>"
-        f"<p class='sub'>{sub}</p>"
+        "<div class='head-top'>"
+        f"<div class='eyebrow'>{esc(eyebrow)}</div>{verification_badge_html}"
+        "</div>"
+        f"<h1 title='{esc(sanitize_title(title))}'>{esc(header_name)}</h1>"
+        f"<p class='sub'>{esc(display_title)}</p>"
         "<div class='meta-row'>"
         + "".join(f"<span class='meta-chip meta-{kind}'>"
                   f"{esc(str(chip))}</span>" for kind, chip in header_chips)
         + "</div></header>")
     nav_links = [
-        ("customer-summary", "At a glance"), ("workload", "Workload"),
-        ("overview", "Decision"),
-        ("validity", "Cautions"),
+        ("summary", "Summary"), ("latency", "Latency"),
+        ("reliability", "Reliability"), ("test-scope", "Test scope"),
+        ("engineering", "Engineering"),
     ]
-    if s.get("sla"):
-        nav_links.append(("sla", "Acceptance"))
-    nav_links.append(("performance", "Performance"))
-    if s.get("drift"):
-        nav_links.append(("stability", "Stability"))
-    if s.get("observed_rate_windows") or s.get("rate_limits"):
-        nav_links.append(("quota", "Quota"))
-    nav_links.append(("evidence", "Evidence"))
     nav_html = (
         "<nav class='report-nav' aria-label='Report sections'>"
         + "".join(f"<a href='#{target}'>{esc(label)}</a>"
@@ -6053,7 +7119,8 @@ def render_html(summary: dict, title: str, *,
     ]
     facts_html = (
         "<section id='workload' aria-labelledby='workload-heading'>"
-        "<div class='section-head'><h2 id='workload-heading'>What was tested"
+        "<div class='section-head'><h2 id='workload-heading'>Load delivery "
+        "and workload facts"
         "</h2><p>Load and workload facts come before latency so a light or "
         "malformed run cannot look impressive out of context.</p></div>"
         f"<div class='fact-strip'>{''.join(fact_items)}</div></section>")
@@ -6132,10 +7199,20 @@ def render_html(summary: dict, title: str, *,
                      "<div class='v'><span class='pill neutral' "
                      "style='font-size:12px'>not reported</span></div></div>")
     tp = s.get("throughput") or {}
-    if isinstance(tp.get("output_tokens_per_min"), (int, float)) \
-            and not isinstance(tp.get("output_tokens_per_min"), bool):
-        cards.append(_html_stat("output throughput",
-                                num(tp["output_tokens_per_min"]), "tok/min"))
+    completion_rate = tp.get("completion_tokens_per_min")
+    if completion_rate is None:
+        completion_rate = tp.get("output_tokens_per_min")
+    if isinstance(completion_rate, (int, float)) \
+            and not isinstance(completion_rate, bool):
+        cards.append(_html_stat(
+            "all-completion throughput", num(completion_rate),
+            "completion tok/min"))
+    visible_rate = tp.get("visible_output_tokens_per_min")
+    if isinstance(visible_rate, (int, float)) \
+            and not isinstance(visible_rate, bool):
+        cards.append(_html_stat(
+            "visible output throughput", num(visible_rate),
+            "visible tok/min"))
     stats = f"<div class='stats'>{''.join(cards)}</div>"
     latency_basis_copy = (
         "Includes scheduling, queueing, connection setup, retries, and response time."
@@ -6188,12 +7265,17 @@ def render_html(summary: dict, title: str, *,
                           ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
                 met = r["met"]
+                demonstrated = r.get("statistically_demonstrated")
                 if met is False:
                     misses += 1
-                elif met is None and r.get("target_ms") is not None:
+                elif (met is None or demonstrated is False) \
+                        and r.get("target_ms") is not None:
                     unmeasured += 1
-                cls = "yes" if met else ("no" if met is False else "na")
-                cell = {True: "PASS", False: "NO", None: "-"}[met]
+                cls = ("na" if met is True and demonstrated is False else
+                       "yes" if met else "no" if met is False else "na")
+                cell = ("NOT PROVEN" if met is True
+                        and demonstrated is False else
+                        {True: "PASS", False: "NO", None: "-"}[met])
                 if r["actual_ms"] is not None:
                     target_text, actual_text = _decision_pair_display(
                         r["target_ms"], r["actual_ms"],
@@ -6280,7 +7362,10 @@ def render_html(summary: dict, title: str, *,
                 f"{row['scored_metric']} {row['quantile']}: "
                 f"{row['meeting_outcomes']}/{row['eligible_outcomes']} "
                 f"({row['observed_meeting_fraction']:.1%}) met the target, "
-                f"requires {row['required_meeting_fraction']:.0%}"
+                f"requires {row['required_meeting_fraction']:.0%}; one-sided "
+                f"95% Wilson lower bound "
+                f"{row.get('one_sided_95pct_wilson_lower', 0):.1%} "
+                f"({'proves' if row.get('statistically_demonstrated') else 'does not prove'} acceptance)"
                 for row in compliance_rows)
             note_bits.append(
                 "Latency targets use outcome compliance, not a percentile over "
@@ -6293,13 +7378,16 @@ def render_html(summary: dict, title: str, *,
             # someone to raise the cap is advice that cannot work: the
             # sampled value is the smaller one and still wins. name the knob
             # that actually binds for the mode this run used.
-            _mode = ((s.get("run") or {}).get("input_mode") or "profile")
+            _mode = ((s.get("run") or {}).get("input_mode") or "unknown")
             _knob = ("the profile's <code>output_tokens</code> quantiles "
                      "(raising <code>max_output_tokens_cap</code> alone will "
                      "not help, the per-request budget is the smaller of the "
                      "two)"
                      if _mode == "profile" else
-                     "<code>max_output_tokens_cap</code>")
+                     "<code>max_output_tokens_cap</code>"
+                     if _mode == "prompts" else
+                     "the applicable output-budget control after confirming "
+                     "the unrecorded input mode")
             fix = (f" Raise {_knob}, or set <code>ttft_definition</code> to "
                    "<code>first_content</code>, to get a number."
                    if defn != "first_content" else
@@ -6368,6 +7456,8 @@ def render_html(summary: dict, title: str, *,
                         first_event["diagnostic_key"]),
                        ("TTF valid tool call", "ttf_tool_call_ms"),
                        ("TTFB (first bounded response-body chunk)", "ttfb_ms"),
+                       ("TTSE (first parsed stream event; diagnostic)",
+                        "ttse_ms"),
                        ("TTFG (end to end)", "e2e_ms"),
                        ("interchunk max", "interchunk_max_ms"),
                        ("TTFR (first reasoning)", "ttfr_ms")):
@@ -6440,7 +7530,7 @@ def render_html(summary: dict, title: str, *,
     if mode == "prompts":
         bel.append("<li><b>Input</b>: real prompts replayed verbatim, sizes "
                    "and any cache reuse are the prompts' own</li>")
-    else:
+    elif mode == "profile":
         intent = s.get("intended_cache_fraction") or {}
         tt = s.get("token_targeting") or {}
         if intent.get("n"):
@@ -6451,6 +7541,19 @@ def render_html(summary: dict, title: str, *,
             bel.append(f"<li><b>Token targeting</b>: reported/intended p50 "
                        f"{num(tt['reported_over_intended_p50'], 3)} "
                        f"(abs error {num(tt['abs_error_pct_p50'], 1)}%)</li>")
+    else:
+        bel.append("<li><b>Input</b>: input mode was not recorded; the report "
+                   "does not infer synthetic shape or supplied prompts</li>")
+    calibration = s.get("calibration_warmth") or {}
+    if calibration:
+        bel.append(
+            "<li><b>Calibration warm-state evidence</b>: "
+            f"{esc(str(calibration.get('calibration_requests', 0)))} "
+            "calibration request rows; exact payload overlap "
+            f"{esc(str(calibration.get('exact_overlap_status') or 'not recorded'))}; "
+            "replay rows with an exact calibrated payload "
+            f"{esc(str(calibration.get('replay_rows_with_calibrated_payload')))}. "
+            f"{esc(str(calibration.get('note') or ''))}</li>")
     _reason_source = str(s.get("reasoning_tokens_source") or "")
     _legacy_reasoning_deltas = (
         s.get("reasoning_tokens_total")
@@ -6597,7 +7700,11 @@ def render_html(summary: dict, title: str, *,
     if rp:
         eb = rp.get("extra_body") or {}
         extra = f", extra_body {esc(json.dumps(eb))}" if eb else ""
-        bel.append(f"<li><b>Request params</b>: temperature "
+        bel.append(f"<li><b>Request params</b>: adapter "
+                   f"{esc(str(rp.get('endpoint_adapter', 'legacy-unrecorded')))}, "
+                   "mode "
+                   f"{esc(str(rp.get('response_mode', 'legacy-unrecorded')))}, "
+                   "temperature "
                    f"{esc(str(rp.get('temperature')))}, global max_tokens "
                    "safety cap "
                    f"{esc(str(rp.get('max_output_tokens_cap')))}{extra}</li>")
@@ -6616,7 +7723,7 @@ def render_html(summary: dict, title: str, *,
 
     believe_items = "".join(bel)
     believe = (
-        "<details class='evidence believe' id='evidence'>"
+        "<details class='evidence believe' id='measurement-evidence'>"
         "<summary>Measurement evidence: read before quoting a number</summary>"
         "<div class='detail-body'><h2 class='sr-only'>Believability "
         "(read before quoting a number)</h2>"
@@ -6641,16 +7748,90 @@ def render_html(summary: dict, title: str, *,
         throughput_warning = (
             f"<div class='banner warn'>{esc(tp['coverage_warning'])}</div>"
             if incomplete_usage and tp.get("coverage_warning") else "")
+        visible_row = (
+            "<tr><th scope='row' class='lbl'>explicitly accounted visible "
+            "output tokens per minute</th>"
+            f"<td>{num(visible_rate)} visible tok/min</td></tr>"
+            if isinstance(visible_rate, (int, float))
+            and not isinstance(visible_rate, bool) else "")
+        visible_limitation = ((tp.get("visible_output_token_accounting")
+                               or {}).get("limitation"))
         extra_cards = (
             f"<div class='card'><h2>{throughput_heading}</h2>"
-            f"{throughput_warning}<table>"
+            f"{throughput_warning}"
+            + (f"<div class='cap'>{esc(visible_limitation)}</div>"
+               if visible_limitation else "")
+            + "<table>"
             "<caption class='sr-only'>Endpoint-reported token throughput"
             "</caption><tbody>"
             f"<tr><th scope='row' class='lbl'>input tokens per minute</th>"
             f"<td>{num(tp['input_tokens_per_min'])} tok/min</td></tr>"
-            f"<tr><th scope='row' class='lbl'>output tokens per minute</th>"
-            f"<td>{num(tp['output_tokens_per_min'])} tok/min</td></tr>"
+            "<tr><th scope='row' class='lbl'>endpoint-reported completion "
+            "tokens per minute (all-completion)</th>"
+            f"<td>{num(completion_rate)} completion tok/min</td></tr>"
+            f"{visible_row}"
             f"</tbody></table></div>")
+    calibration = s.get("calibration_warmth") or {}
+    if calibration.get("calibration_requests"):
+        overlap = calibration.get("replay_rows_with_calibrated_payload")
+        overlap_text = (
+            f"{overlap} of {calibration.get('replay_requests')} replay rows"
+            if overlap is not None else "unavailable")
+        extra_cards += (
+            "<div class='card'><h2>Calibration and warm state</h2>"
+            f"<div class='banner warn'>{esc(calibration.get('warning') or '')}"
+            "</div><table><tbody>"
+            "<tr><th scope='row' class='lbl'>calibration request rows</th>"
+            f"<td>{esc(str(calibration.get('calibration_requests')))}</td></tr>"
+            "<tr><th scope='row' class='lbl'>exact payload-hash overlap</th>"
+            f"<td>{esc(overlap_text)}</td></tr>"
+            "<tr><th scope='row' class='lbl'>hash evidence status</th>"
+            f"<td>{esc(str(calibration.get('exact_overlap_status')))}</td></tr>"
+            "</tbody></table></div>")
+    if reasoning_probes:
+        probe_rows = []
+        for probe in reasoning_probes:
+            physical = probe["physical_request_body_sha256s"]
+            physical_html = (
+                "<br>".join(f"<code>{esc(item)}</code>" for item in physical)
+                if physical else "none recorded")
+            evidence_status = probe["evidence_status"]
+            status_html = (
+                f"<div class='banner warn'>{esc(evidence_status)}</div>"
+                if evidence_status.startswith("INVALID/") else
+                f"<div class='cap'>{esc(evidence_status)}</div>")
+            probe_rows.append(
+                "<tr>"
+                f"<th scope='row' class='lbl'>candidate "
+                f"#{probe['candidate_index']}<br><code>"
+                f"{esc(probe['candidate_digest'])}</code></th>"
+                f"<td><code>{esc(probe['requested_json'])}</code></td>"
+                f"<td><b>{esc(probe['disposition'])}</b><br>via "
+                f"<code>{esc(probe['evidence_method'])}</code>"
+                f"{status_html}</td>"
+                f"<td>{esc(probe['effective_behavior'])}</td>"
+                "<td><a href='requests.jsonl'>requests.jsonl</a><br>"
+                f"request ID <code>{esc(probe['request_id'])}</code><br>"
+                "logical body SHA-256<br><code>"
+                f"{esc(probe['logical_request_body_sha256'])}</code><br>"
+                f"physical body SHA-256<br>{physical_html}</td>"
+                "</tr>")
+        extra_cards += (
+            "<div class='card'><h2>Reasoning-control probes</h2>"
+            "<div class='banner warn'>Disposition classifies request/response "
+            "evidence only. Accepted does not prove that the provider applied "
+            "the requested control or changed reasoning behavior. Effective "
+            "behavior remains unknown unless the narrower rejected-request "
+            "evidence establishes that it was not applied.</div>"
+            "<table class='dense-table'><caption class='sr-only'>Sealed "
+            "reasoning-control preflight evidence</caption><thead><tr>"
+            "<th scope='col'>candidate / digest</th>"
+            "<th scope='col'>requested JSON</th>"
+            "<th scope='col'>classification</th>"
+            "<th scope='col'>effective behavior</th>"
+            "<th scope='col'>request/body linkage</th>"
+            "</tr></thead><tbody>" + "".join(probe_rows)
+            + "</tbody></table></div>")
     windows = s.get("observed_rate_windows") or {}
     win_input = windows.get("input_tokens_by_first_send") or {}
     win_reserved = (
@@ -6898,6 +8079,8 @@ def render_html(summary: dict, title: str, *,
     add_issue("Pricing applicability",
               (s.get("cost") or {}).get("applicability_warning"))
     add_issue("Cache fidelity", (s.get("cache_fidelity") or {}).get("warning"))
+    add_issue("Calibration warm state",
+              (s.get("calibration_warmth") or {}).get("warning"))
     add_issue("Token-shape fidelity",
               (s.get("token_targeting") or {}).get("warning"))
     add_issue("Latency population",
@@ -6930,8 +8113,7 @@ def render_html(summary: dict, title: str, *,
     if stability_kind != "stable":
         add_issue(
             "Stability",
-            stability_state.get("drift_headline")
-            or stability_state.get("note")
+            _attribution_safe_drift_message(stability_state)
             or "stability over the run was not established")
     runtime_status = runtime_quota.get("status")
     if runtime_status != "enforced":
@@ -6997,7 +8179,7 @@ def render_html(summary: dict, title: str, *,
             f"<div class='cap'>"
             f"{'per-' + str(drift.get('window_seconds', 60)) + 's windows, counts and p95 in ms. ' if drift.get('windows') else ''}"
             f"{sp}"
-            f"{esc(drift.get('drift_headline') or drift.get('note', ''))}"
+            f"{esc(_attribution_safe_drift_message(drift))}"
             f"{('<br>' + esc(drift.get('note', ''))) if drift.get('drift_headline') else ''}"
             f"</div>"
             + _html_stability_chart(drift)
@@ -7105,6 +8287,7 @@ def render_html(summary: dict, title: str, *,
 
     corr_html = ""
     if s.get("e2e_corrected_ms"):
+        cse = s.get("ttse_corrected_ms") or {}
         c1 = s.get("ttft_corrected_ms") or {}
         cv = s.get("ttfv_corrected_ms") or {}
         ct = s.get("ttf_tool_call_corrected_ms") or {}
@@ -7130,6 +8313,10 @@ def render_html(summary: dict, title: str, *,
                        "(diagnostic, ms)", diagnostic_corrected))
         if ct.get("p50") is not None:
             r_.append((f"{caller_row_prefix} TTF valid tool call (ms)", ct))
+        if cse.get("p50") is not None:
+            r_.append((
+                f"{caller_row_prefix} TTSE (first parsed stream event; "
+                "diagnostic, ms)", cse))
         r_.append((f"{caller_row_prefix} end-to-end (ms)", c2))
         corr_html = (
             "<div class='card'><h2 id='caller-latency-heading'>"
@@ -7156,27 +8343,891 @@ def render_html(summary: dict, title: str, *,
             + "</tbody></table></div><div class='cap'>"
             + esc(s.get("latency_correction_note") or "") + "</div></div>")
 
-    from .report_decision import build_report_decision
+    customer_first_exact = exact_caller_table(
+        first_event["corrected_key"], first_event["service_key"])
+    customer_e2e_exact = exact_caller_table(
+        "e2e_corrected_ms", "e2e_ms")
+    customer_first = customer_first_exact or s.get(
+        first_event["service_key"]) or {}
+    customer_e2e = customer_e2e_exact or s.get("e2e_ms") or {}
+    caller_latency_available = bool(
+        customer_first_exact and customer_e2e_exact)
+    customer_answers = s.get("answers") or {}
+    truncated = customer_answers.get("truncated")
+    output_cap_denominator = (
+        okc if isinstance(okc, int) and not isinstance(okc, bool)
+        and okc >= 0 else None)
 
-    decision = (verified_view["decision"] if verified_view
-                else build_report_decision(s))
+    def known_count(value: object) -> int | None:
+        return (value if isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0 else None)
+
+    calibration_count = known_count(
+        (s.get("calibration_warmth") or {}).get("calibration_requests"))
+    preflight_state = run.get("preflight_gate") or {}
+    preflight_count = known_count(preflight_state.get("attempted"))
+    probe_count = known_count(preflight_state.get("reasoning_probe_requests"))
+    if probe_count is None and reasoning_probes:
+        probe_count = len(reasoning_probes)
+    retry_count = s.get("requests_retried")
+    if not isinstance(retry_count, int) or isinstance(retry_count, bool):
+        retry_count = None
+    tested = decision.get("tested_load") or {}
+    tested_requests = tested.get("scheduled_requests")
+    tested_seconds = tested.get("scheduled_seconds")
+    schedule_state = s.get("schedule") or {}
+    schedule_peak_rate = schedule_state.get("rate_max")
+    if isinstance(schedule_peak_rate, bool) or not isinstance(
+            schedule_peak_rate, (int, float)):
+        schedule_peak_rate = None
+    observed_one_second = (
+        (s.get("observed_rate_windows") or {}).get(
+            "physical_queries_per_one_second_by_request_start") or {})
+    observed_peak_starts = observed_one_second.get("max")
+    if observed_one_second.get("all_attempt_timestamps_exact") is not True \
+            or isinstance(observed_peak_starts, bool) or not isinstance(
+                observed_peak_starts, (int, float)):
+        observed_peak_starts = None
+    all_phase_physical_attempts = observed_one_second.get("events_total")
+    if observed_peak_starts is None \
+            or isinstance(all_phase_physical_attempts, bool) \
+            or not isinstance(all_phase_physical_attempts, int) \
+            or all_phase_physical_attempts < 0:
+        all_phase_physical_attempts = None
+    # Burstiness is a property of the logical replay schedule.  The observed
+    # one-second table counts all captured physical POST starts (including
+    # setup phases and retries), so comparing it with logical replay RPS would
+    # mix populations and falsely label retry-heavy flat traffic as bursty.
+    is_bursty_load = schedule_state.get("spiky") is True
+    sla_state = decision.get("customer_sla") or {}
+    customer_acceptance_validated = bool(
+        sla_state.get("code") == "PASS"
+        and sla_state.get("severity") == "pass"
+        and (decision.get("measurement_validity") or {}).get("code") ==
+        "VALID"
+        and (decision.get("evidence_integrity") or {}).get("code") ==
+        "VERIFIED")
+
+    def customer_state(
+            heading: str, key: str, state: dict) -> str:
+        code = str(state.get("code") or "UNKNOWN")
+        label = str(state.get("label") or code)
+        if key == "evidence_integrity" and code == "VERIFIED":
+            label, tone = "Evidence verified", ""
+        elif key == "quota_state" and code == "NOT_OBSERVED":
+            label, tone = "No 429 observed", ""
+        elif key == "customer_sla" and code == "NOT_EVALUATED":
+            label, tone = "No SLA supplied", ""
+        elif key == "customer_sla" and code == "INCONCLUSIVE":
+            label, tone = "NOT PROVEN", "state-warn"
+        elif key == "customer_sla" and code == "PASS" \
+                and not customer_acceptance_validated:
+            label, tone = "OBSERVED MET - NOT PROVEN", "state-warn"
+        elif key == "endpoint_capacity" and code in {
+                "INCONCLUSIVE", "NOT_EVALUATED"}:
+            label, tone = "Capacity not tested", "state-warn"
+        else:
+            severity = str(state.get("severity") or "neutral")
+            tone = {
+                "pass": "state-pass", "fail": "state-miss",
+                "warning": "state-warn", "neutral": "",
+            }.get(severity, "")
+        return (
+            f"<div class='customer-state {tone}'><span>{esc(heading)}</span>"
+            f"<b>{esc(label)}</b></div>")
+
+    state_strip_html = (
+        "<div class='customer-state-strip' aria-label='Independent result states'>"
+        + customer_state(
+            "Evidence", "evidence_integrity",
+            decision.get("evidence_integrity") or {})
+        + customer_state(
+            "Measurement", "measurement_validity",
+            decision.get("measurement_validity") or {})
+        + customer_state("Acceptance", "customer_sla", sla_state)
+        + customer_state(
+            "Quota", "quota_state", decision.get("quota_state") or {})
+        + customer_state(
+            "Capacity", "endpoint_capacity",
+            decision.get("endpoint_capacity") or {})
+        + "</div>")
+
+    def metric_n(table: dict) -> int | None:
+        value = table.get("n")
+        return (value if isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0 else None)
+
+    def metric_range(table: dict) -> str:
+        low, high = table.get("min"), table.get("max")
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+               for value in (low, high)):
+            return f"Observed range {num(low)}–{num(high)} ms"
+        return "Observed range not retained in this legacy artifact"
+
+    def latency_kpi(label: str, code: str, table: dict) -> str:
+        n_value = metric_n(table)
+        median = table.get("p50")
+        median_label = (
+            "p50" if n_value is not None
+            and n_value >= PERCENTILE_MIN_SAMPLES["p50"] else
+            "Observed median")
+        p95_supported = (
+            n_value is not None
+            and n_value >= PERCENTILE_MIN_SAMPLES["p95"])
+        tail = (
+            f"p95 {num(table.get('p95'))} ms"
+            if p95_supported else
+            "Insufficient sample for p95"
+            + (f" (need 200; n={n_value})" if n_value is not None else ""))
+        output_limit_notice = (
+            f"<span class='tail-status caution-text'>{truncated}/"
+            f"{output_cap_denominator} completed responses reached output "
+            "limit; natural full-response latency not measured"
+            "</span>"
+            if label == "Complete response" and isinstance(truncated, int)
+            and output_cap_denominator is not None and truncated > 0 else "")
+        return (
+            "<div class='kpi-card'>"
+            f"<div class='k'>{esc(label)} · {esc(code)}</div>"
+            f"<div class='v'>{num(median)} <span class='unit'>ms</span></div>"
+            f"<div class='note'>{esc(median_label)} · "
+            f"{esc(metric_range(table))}"
+            + (f" · n={n_value}" if n_value is not None else "")
+            + "</div>"
+            f"{output_limit_notice}<span class='tail-status'>{esc(tail)}"
+            "</span></div>")
+
+    achieved_display = (
+        f"{achieved_qps:,.2f}"
+        if isinstance(achieved_qps, (int, float))
+        and not isinstance(achieved_qps, bool) else "NOT MEASURED")
+    peak_display = (
+        f"{peak_in_flight:,.0f}"
+        if isinstance(peak_in_flight, (int, float))
+        and not isinstance(peak_in_flight, bool) else "unknown")
+    completion_display = (
+        f"{ok_text}/{total_text}" if total is not None else "NOT REPORTED")
+    completion_observed = bool(
+        total is not None and okc is not None
+        and customer_answers.get("attempted") == total
+        and customer_answers.get("harness_successful") == okc
+        and customer_answers.get("unclassified_legacy_successes") == 0
+        and isinstance(customer_answers.get("stream_incomplete"), int))
+    completion_label = (
+        "Requests completed" if completion_observed else
+        "Harness successful")
+    reliability_note = (
+        f"{failed_text} failed · "
+        f"{retry_count if retry_count is not None else 'unknown'} retries")
+    if schedule_peak_rate is not None:
+        schedule_peak_text = (
+            f"Configured rate-curve peak {schedule_peak_rate:,.0f} logical "
+            "requests/s")
+    else:
+        schedule_peak_text = "Configured rate-curve peak not recorded"
+    if observed_peak_starts is not None:
+        physical_peak_text = (
+            f"Observed 1-second peak {observed_peak_starts:,.0f} all-phase "
+            "physical HTTP POST starts/s")
+    else:
+        physical_peak_text = (
+            "All-phase 1-second physical POST peak not available from exact "
+            "attempt-start timestamps")
+    if is_bursty_load:
+        load_primary = peak_display
+        load_unit = "peak in flight"
+        load_note = (
+            f"{schedule_peak_text} · {physical_peak_text} · "
+            f"{achieved_display} logical-window avg req/s · peaks are not a "
+            "sustained rate")
+    else:
+        load_primary = achieved_display
+        load_unit = "avg req/s"
+        load_note = (
+            f"{physical_peak_text} · peak {peak_display} in flight · "
+            f"{tested_seconds if tested_seconds is not None else 'unknown'} s")
+    kpis = (
+        latency_kpi("Time to first response", first_event["short_label"],
+                    customer_first)
+        + latency_kpi("Complete response", "E2E", customer_e2e)
+        + f"<div class='kpi-card'><div class='k'>{esc(completion_label)}</div>"
+          f"<div class='v'>{esc(completion_display)}</div>"
+          f"<div class='note'>{esc(reliability_note)}</div>"
+          + ("<span class='tail-status'>Protocol completion; not answer quality"
+             "</span>" if completion_observed else
+             "<span class='tail-status'>Completion observability unavailable"
+             "</span>")
+          + "</div>"
+        + "<div class='kpi-card'><div class='k'>Tested load</div>"
+          f"<div class='v'>{esc(load_primary)} "
+          f"<span class='unit'>{esc(load_unit)}</span></div>"
+          f"<div class='note'>{esc(load_note)}</div>"
+          "<span class='tail-status'>Observed load, not endpoint capacity"
+          "</span></div>")
+    if total is not None and okc is not None and completion_observed:
+        completion_lead = f"{okc}/{total} completed."
+    elif total is not None and okc is not None:
+        completion_lead = (
+            f"{okc}/{total} harness-successful; protocol completion was not "
+            "fully recorded.")
+    else:
+        completion_lead = "Request completion counts were not reported."
+    load_qualifier = (
+        "This was a very light single-concurrency test. "
+        if peak_in_flight == 1 else "")
+    output_limit_lead = (
+        f"{truncated}/{output_cap_denominator} completed responses reached "
+        "the output limit, so "
+        "natural full-response latency was not measured. "
+        if isinstance(truncated, int) and truncated > 0
+        and output_cap_denominator is not None
+        else f"{truncated} responses reached the output limit, so natural "
+        "full-response latency was not measured. "
+        if isinstance(truncated, int) and truncated > 0
+        else "")
+    transport_state = run.get("transport") or {}
+    transport_lead = (
+        "Production transport was not matched. "
+        if transport_state.get("production_connection_policy_match") is not True
+        else "")
+    if integrity_code == "TAMPERED":
+        decision_lead = (
+            "Artifact integrity failed. Do not use any performance result. ")
+    elif quota_code == "EXCEEDED":
+        decision_lead = (
+            "HTTP 429 quota rejection was observed; no endpoint-capacity "
+            "conclusion is allowed. ")
+    elif quota_code == "LOCAL_GUARD_REFUSED":
+        decision_lead = (
+            "The local quota guard refused traffic before send; no endpoint-"
+            "capacity conclusion is allowed. ")
+    elif measurement_code == "INVALID":
+        decision_lead = (
+            "The measurement is invalid; do not use its latency as a "
+            "performance conclusion. ")
+    elif measurement_code == "CAUTION":
+        decision_lead = "Measurement limitations require review. "
+    else:
+        decision_lead = ""
+    if sla_state.get("code") == "NOT_EVALUATED":
+        acceptance_lead = (
+            "No SLA was supplied. Supported percentiles are descriptive; "
+            "acceptance, stability, quota headroom, and capacity were not "
+            "established.")
+    elif sla_state.get("code") == "PASS" \
+            and not customer_acceptance_validated:
+        acceptance_lead = (
+            "Acceptance targets were observed met, but the result is NOT "
+            "PROVEN because the measurement or evidence gate is not clean. "
+            "Read the limitations before treating this as production evidence.")
+    else:
+        acceptance_lead = (
+            f"Acceptance state: {sla_state.get('label') or 'not established'}. "
+            "Read the limitations before treating this as production evidence.")
+    conclusion = (
+        decision_lead + output_limit_lead + transport_lead + acceptance_lead)
+    customer_summary_html = (
+        "<section class='customer-summary' id='summary' "
+        "aria-labelledby='summary-heading'>"
+        f"<div class='result-type'>{esc(result_type)}</div>"
+        f"<h2 id='summary-heading'>Result at this tested load</h2>"
+        f"<p class='summary-lead'><b>{esc(completion_lead)}</b> "
+        f"{esc(load_qualifier)} {esc(conclusion)}</p>"
+        f"{state_strip_html}<div class='kpi-grid'>{kpis}</div></section>")
+
+    limitations = []
+    first_n = metric_n(customer_first)
+    if first_n is None or first_n < PERCENTILE_MIN_SAMPLES["p95"]:
+        limitations.append((
+            "Tail latency: insufficient sample",
+            f"p95 needs at least 200 eligible requests; this metric has "
+            f"{first_n if first_n is not None else 'unknown'}."))
+    elif first_n < PERCENTILE_MIN_SAMPLES["p99"]:
+        limitations.append((
+            "Tail latency: p95 supported; p99 not shown",
+            f"p95 supported (n={first_n}). p99 requires 1,000 eligible "
+            f"successful observations; have {first_n}."))
+    if sla_state.get("code") == "NOT_EVALUATED":
+        limitations.append((
+            "SLA: not tested",
+            "No customer latency or reliability targets were frozen before traffic."))
+    drift_state = s.get("drift") or {}
+    if drift_state.get("drift_kind") != "stable":
+        drift_message = (
+            _attribution_safe_drift_message(drift_state)
+            or "The run was too short to demonstrate sustained behavior.")
+        drift_message = drift_message[:1].upper() + drift_message[1:]
+        limitations.append((
+            "Stability: not established",
+            drift_message))
+    if peak_in_flight is None or peak_in_flight <= 1:
+        limitations.append((
+            "Capacity: not tested",
+            f"Peak concurrency was {peak_display}; no load or concurrency sweep was run."))
+    if isinstance(truncated, int) and total is not None and truncated > 0:
+        limitations.append((
+            "Natural completion: not tested",
+            (f"{truncated}/{output_cap_denominator} completed responses "
+             if output_cap_denominator is not None else
+             f"{truncated} responses ")
+            + "reached the requested output limit; "
+            "end-to-end latency describes capped outputs."))
+    token_targeting_state = s.get("token_targeting") or {}
+    token_targeting_status = token_targeting_state.get("status")
+    token_targeting_warning = token_targeting_state.get("warning")
+    token_shape_mismatch = bool(
+        token_targeting_status == "mismatch"
+        or (not token_targeting_status and token_targeting_warning))
+    if token_shape_mismatch:
+        intended_prompt = token_targeting_state.get(
+            "intended_prompt_tokens") or {}
+        observed_prompt = token_targeting_state.get(
+            "observed_prompt_tokens") or {}
+        prompt_ratio = token_targeting_state.get(
+            "input_reported_over_intended") or {}
+        intended_p50 = intended_prompt.get("p50")
+        intended_p95 = intended_prompt.get("p95")
+        declared_profile = str(run.get("profile_label") or "").strip()
+        intended_text = (
+            f"intended prompt {num(intended_p50)} tokens; "
+            if intended_p50 is not None and intended_p50 == intended_p95 else
+            f"intended prompt p50 {num(intended_p50)}, p95 "
+            f"{num(intended_p95)} tokens; "
+            if intended_p50 is not None else
+            f"declared workload: {declared_profile} "
+            if mode == "profile" and declared_profile else "")
+        observed_text = (
+            f"observed prompt {num(observed_prompt.get('min'))}–"
+            f"{num(observed_prompt.get('max'))} tokens (p50 "
+            f"{num(observed_prompt.get('p50'))}, p95 "
+            f"{num(observed_prompt.get('p95'))}); "
+            if observed_prompt.get("p50") is not None else "")
+        ratio_text = (
+            f"reported/intended ratio p50 "
+            f"{num(prompt_ratio.get('p50'), 3)} and p95 "
+            f"{num(prompt_ratio.get('p95'), 3)}. "
+            if prompt_ratio.get("p50") is not None else "")
+        limitations.append((
+            "Token-shape mismatch",
+            intended_text + observed_text + ratio_text
+            + str(token_targeting_warning or
+                  "The measured prompt shape did not match the declared "
+                  "profile.")))
+    transport = run.get("transport") or {}
+    if transport.get("production_connection_policy_match") is not True:
+        limitations.append((
+            "Production transport: not matched",
+            f"{transport.get('http_protocol', 'HTTP protocol not recorded')}; "
+            f"{transport.get('connection_policy', 'connection policy not recorded')}. "
+            "Production pooling, reuse, and HTTP-version parity are unknown."))
+    if calibration_count:
+        calibration_word = (
+            "request" if calibration_count == 1 else "requests")
+        limitations.append((
+            "Cold-start behavior: not tested",
+            f"{calibration_count} calibration {calibration_word} ran first "
+            "and may have "
+            "warmed routing, workers, model state, or caches."))
+    limitations.append((
+        "Answer quality: not evaluated",
+        "A completed stream does not prove correctness, task success, or usefulness."))
+    limitations_html = (
+        "<section class='customer-section limitations' id='limitations' "
+        "aria-labelledby='limitations-heading'><h2 id='limitations-heading'>"
+        "What this run does not prove</h2><p class='section-copy'>These are "
+        "decision boundaries, not footnotes.</p><div class='limitation-grid'>"
+        + "".join(
+            f"<div class='limitation'><div><b>{esc(label)}</b><br>"
+            f"{esc(message)}</div></div>" for label, message in limitations)
+        + "</div></section>")
+
+    def latency_card(
+            label: str, code: str, table: dict, target_key: str) -> str:
+        n_value = metric_n(table)
+        median_label = (
+            "p50" if n_value is not None
+            and n_value >= PERCENTILE_MIN_SAMPLES["p50"] else
+            "Observed median")
+        target_rows = (s.get("sla") or {}).get(target_key) or []
+        requested_quantiles = {
+            row.get("quantile") for row in target_rows
+            if isinstance(row, dict)}
+        tail_text = (
+            f"p95 {num(table.get('p95'))} ms"
+            if n_value is not None
+            and n_value >= PERCENTILE_MIN_SAMPLES["p95"] else
+            (("p95: " if n_value is not None
+              and n_value >= PERCENTILE_MIN_SAMPLES["p50"] else "")
+             + "Insufficient sample for tail latency")
+            + (f" - need 200, have {n_value}" if n_value is not None else ""))
+        if n_value is not None \
+                and PERCENTILE_MIN_SAMPLES["p95"] <= n_value \
+                < PERCENTILE_MIN_SAMPLES["p99"]:
+            tail_text += (
+                f" · p95 supported (n={n_value}); p99 requires 1,000 "
+                f"eligible successful observations; have {n_value}")
+        for quantile in ("p90", "p99"):
+            if quantile in requested_quantiles and n_value is not None \
+                    and n_value >= PERCENTILE_MIN_SAMPLES[quantile]:
+                tail_text += (
+                    f" · requested {quantile} "
+                    f"{num(table.get(quantile))} ms")
+        target_html = []
+        measurement_valid = (
+            (decision.get("measurement_validity") or {}).get("code") ==
+            "VALID")
+        evidence_verified = (
+            (decision.get("evidence_integrity") or {}).get("code") ==
+            "VERIFIED")
+        canonical_sla_pass = (
+            sla_state.get("code") == "PASS"
+            and sla_state.get("severity") == "pass")
+        for row in target_rows:
+            quantile = row.get("quantile")
+            required = PERCENTILE_MIN_SAMPLES.get(str(quantile))
+            sample_supported = (
+                required is not None and n_value is not None
+                and n_value >= required)
+            if row.get("met") is False:
+                result_label, result_class = "MISS", "target-miss"
+            elif not sample_supported and row.get("actual_ms") is not None:
+                result_label, result_class = "NOT PROVEN", "target-unproven"
+            elif row.get("statistically_demonstrated") is True \
+                    and measurement_valid and evidence_verified \
+                    and canonical_sla_pass:
+                result_label, result_class = "PASS", "target-pass"
+            elif row.get("statistically_demonstrated") is True:
+                result_label = "NOT PROVEN - OBSERVED MET"
+                result_class = "target-unproven"
+            elif row.get("actual_ms") is None:
+                result_label, result_class = "NOT MEASURED", "target-unproven"
+            else:
+                result_label, result_class = "NOT PROVEN", "target-unproven"
+            if row.get("actual_ms") is not None:
+                target_text, observed_text = _decision_pair_display(
+                    row.get("target_ms"), row.get("actual_ms"),
+                    minimum_decimals=0)
+            else:
+                target_text, observed_text = num(row.get("target_ms")), "n/a"
+            actual_text = (
+                f"observed {observed_text} ms"
+                if sample_supported and row.get("actual_ms") is not None else
+                f"Insufficient sample - need {required}, have {n_value}"
+                if required is not None and n_value is not None else
+                "observed value unavailable")
+            target_html.append(
+                "<div class='target-row'><div class='target-metric'>"
+                f"<b>Customer target {esc(quantile)}</b> ≤ "
+                f"{esc(target_text)} ms · {esc(actual_text)}</div>"
+                f"<span class='target-result {result_class}'>"
+                f"{result_label}</span></div>")
+        return (
+            "<article class='latency-card'>"
+            f"<h3>{esc(label)} <span class='pill neutral'>{esc(code)}</span></h3>"
+            f"<div class='primary'>{num(table.get('p50'))} <span>ms</span></div>"
+            f"<div class='range'>{esc(median_label)} · "
+            f"{esc(metric_range(table))}"
+            + (f" · n={n_value}" if n_value is not None else "")
+            + "</div>"
+            f"<div class='sample-state'>{esc(tail_text)}</div>"
+            f"<div class='target-list'>{''.join(target_html)}</div></article>")
+
+    observations_block = s.get("latency_observations") or {}
+    observation_rows = observations_block.get("rows") or []
+    waterfall_html = ""
+    complete_totals = [
+        row.get("caller_complete_ms") for row in observation_rows
+        if isinstance(row, dict)
+        and isinstance(row.get("caller_complete_ms"), (int, float))
+        and not isinstance(row.get("caller_complete_ms"), bool)]
+    if complete_totals:
+        scale = max(float(value) for value in complete_totals) or 1.0
+        waterfall_rows = []
+        for row in observation_rows:
+            total = row.get("caller_complete_ms")
+            if not isinstance(total, (int, float)) or isinstance(total, bool):
+                continue
+            decomposition_status = row.get("decomposition_status")
+            if decomposition_status == "complete":
+                parts = [
+                    ("wf-client", row.get("client_before_connection_ms"),
+                     "client before connection"),
+                    ("wf-connect", row.get("connection_setup_ms"),
+                     "connection setup"),
+                    ("wf-first", row.get("request_to_first_response_ms"),
+                     "request to first response"),
+                    ("wf-complete", row.get("first_response_to_complete_ms"),
+                     "first response to complete"),
+                    ("wf-unattributed", row.get("retry_or_unattributed_ms"),
+                     "retry or unattributed caller time"),
+                ]
+            else:
+                reason = (
+                    "caller total; retry segment attribution unavailable"
+                    if decomposition_status == "total_only_after_retry" else
+                    "caller total; component attribution unavailable")
+                parts = [("wf-unattributed", total, reason)]
+            segments = "".join(
+                f"<span class='{css}' style='width:{max(float(value or 0), 0.0) / scale * 100:.2f}%' "
+                f"title='{esc(label)}: {num(value)} ms'></span>"
+                for css, value, label in parts)
+            breakdown = " · ".join(
+                f"{label} {num(value)} ms" for _, value, label in parts)
+            result_bits = [
+                f"HTTP {row.get('status')}" if row.get("status") is not None
+                else "HTTP status unknown",
+                str(row.get("finish_reason") or "finish unknown"),
+            ]
+            if row.get("prompt_tokens") is not None \
+                    or row.get("completion_tokens") is not None:
+                result_bits.append(
+                    f"{row.get('prompt_tokens', '?')}→"
+                    f"{row.get('completion_tokens', '?')} tokens")
+            waterfall_rows.append(
+                "<div class='waterfall-row'>"
+                f"<div class='waterfall-label'>Request {esc(row.get('request'))}</div>"
+                f"<div class='waterfall-track' role='img' aria-label='"
+                f"{esc(breakdown)}'>{segments}</div>"
+                f"<div class='waterfall-total'>{num(row.get('caller_complete_ms'))} ms</div>"
+                f"<div class='waterfall-values'>{esc(breakdown)}<br>"
+                f"{esc(' · '.join(result_bits))}</div></div>")
+        waterfall_html = (
+            "<div class='request-observations'><h3>Every measured request</h3>"
+            "<p class='cap'>The same small sample shown directly. Bar length is "
+            "caller elapsed time; it is not a percentile chart.</p>"
+            "<div class='waterfall-legend'>"
+            "<span style='--legend-color:#b8c4d4'>Client</span>"
+            "<span style='--legend-color:#6f8fb9'>Connection</span>"
+            "<span style='--legend-color:#1876d2'>Request → first response</span>"
+            "<span style='--legend-color:#63a7e5'>First response → complete</span>"
+            "<span style='--legend-color:#8b95a5'>Retry / unattributed</span>"
+            "</div>" + "".join(waterfall_rows) + "</div>")
+
+    connect_table = s.get("connect_ms") or {}
+    connect_context = (
+        f"Connection setup was {metric_range(connect_table).lower()}. "
+        if has(connect_table) else "Connection setup was not measured. ")
+    latency_basis_text = (
+        "Caller elapsed time includes client scheduling, connection setup, "
+        "retries, and fallbacks. "
+        if caller_latency_available else
+        "Exact caller elapsed time was unavailable, so these cards use the "
+        "final request attempt. ")
+    latency_section_heading = (
+        "Latency experienced by the caller" if caller_latency_available else
+        "Latency for the final request attempt")
+    customer_latency_html = (
+        "<section class='customer-section' id='latency' "
+        "aria-labelledby='latency-heading'><h2 id='latency-heading'>"
+        f"{esc(latency_section_heading)}</h2><p class='section-copy'>Descriptive "
+        "small-sample values are kept separate from decision-grade tail latency."
+        "</p><div class='customer-latency-grid'>"
+        + latency_card("Time to first response", first_event["short_label"],
+                       customer_first, "ttft_vs_target")
+        + latency_card("Complete response", "E2E", customer_e2e,
+                       "ttfg_vs_target")
+        + "</div><div class='latency-note'><b>How to interpret this:</b> "
+        f"{esc(latency_basis_text)} {esc(connect_context)} Request-path timing "
+        "in Engineering excludes connection setup; do not subtract network "
+        "diagnostics from latency.</div>" + waterfall_html + "</section>")
+
+    timeout_evidence = s.get("timeout_failures") or {}
+    timeout_count = known_count(timeout_evidence.get("count"))
+    timeout_complete = timeout_evidence.get("classification_complete") is True
+    if failed == 0:
+        timeout_display = "0"
+        timeout_note = "No measured replay request failed."
+    elif timeout_count is not None and timeout_complete:
+        timeout_display = str(timeout_count)
+        timeout_note = "Every failed row had error text for timeout classification."
+    elif timeout_count:
+        timeout_display = f"at least {timeout_count}"
+        timeout_note = str(timeout_evidence.get("note") or
+                           "Timeout classification coverage was incomplete.")
+    else:
+        timeout_display = "unknown"
+        timeout_note = str(timeout_evidence.get("note") or
+                           "Exact timeout classification was not retained.")
+    http_429_display = (
+        str(http_429_count) if isinstance(http_429_count, int)
+        and not isinstance(http_429_count, bool) else "unknown")
+    reliability_items = [
+        (ok_text, completion_label, ""),
+        (failed_text, "Failed", "bad" if failed else ""),
+        (str(retry_count) if retry_count is not None else "unknown",
+         "Requests retried", ""),
+        (f"{http_429_display} HTTP 429", "Quota rejections",
+         "quota-neutral neutral"),
+        (timeout_display, "Timeouts", ""),
+        (str(truncated) if isinstance(truncated, int) else "unknown",
+         "Reached output limit", "caution" if truncated else ""),
+    ]
+    refusals = customer_answers.get("model_refusal_outcomes")
+    if (isinstance(refusals, int) and not isinstance(refusals, bool)
+            and refusals >= 0):
+        reliability_items.append((str(refusals), "Model refusals",
+                                  "caution" if refusals else ""))
+
+    def reliability_item(value: str, label: str, css: str) -> str:
+        value_class = (
+            "v neutral quota-neutral" if "quota-neutral" in css else "v")
+        return (
+            f"<div class='reliability-item {css}'>"
+            f"<div class='{value_class}'>{esc(value)}</div>"
+            f"<div class='k'>{esc(label)}</div></div>")
+
+    reliability_html = (
+        "<section class='customer-section' id='reliability' "
+        "aria-labelledby='reliability-heading'><h2 id='reliability-heading'>"
+        "Reliability and completion</h2><p class='section-copy'>Completion, "
+        "failure, retry, timeout, and output-limit counts describe measured "
+        "replay requests. HTTP 429 covers all captured inference phases, "
+        "including setup traffic. Zero means no rejection was seen "
+        "at the tested load; it does not establish quota headroom. "
+        f"{esc(timeout_note)}</p>"
+        "<div class='reliability-grid'>"
+        + "".join(reliability_item(value, label, css)
+                  for value, label, css in reliability_items)
+        + "</div><div class='latency-note'><b>Answer quality was not evaluated.</b> "
+        "Protocol completion and readable content do not establish correctness, "
+        "task success, or usefulness.</div></section>")
+
+    request_params = run.get("request_params") or {}
+    extra_body = request_params.get("extra_body") or {}
+    entity_details = (endpoint_meta.get("served_entities") or [])
+    foundation_names = [
+        str((entity.get("foundation_model") or {}).get("name"))
+        for entity in entity_details if isinstance(entity, dict)
+        and isinstance(entity.get("foundation_model"), dict)
+        and (entity.get("foundation_model") or {}).get("name")]
+    token_targeting = s.get("token_targeting") or {}
+
+    def token_span(table: dict) -> str:
+        low, high = table.get("min"), table.get("max")
+        reported = known_count(table.get("n"))
+        eligible = known_count(token_targeting.get("usage_eligible_requests"))
+        if not all(isinstance(value, (int, float))
+                   and not isinstance(value, bool) for value in (low, high)):
+            return "not reported by endpoint"
+        coverage = (
+            f"; endpoint usage reported for {reported}/{eligible} replay requests"
+            if reported is not None and eligible is not None else "")
+        return f"{num(low)}–{num(high)} tokens{coverage}"
+
+    intended_cache = s.get("intended_cache_fraction") or {}
+    achieved_cache = s.get("achieved_cache_fraction") or {}
+    cache_scope = (
+        f"intended median {num(intended_cache.get('p50'), 2)}; "
+        f"endpoint-reported median {num(achieved_cache.get('p50'), 2)}"
+        if has(intended_cache) or has(achieved_cache) else "not reported")
+    def setup_count_text(count: int | None, singular: str) -> str:
+        if count is None:
+            return f"{singular}: not recorded"
+        return f"{count} {singular}{'' if count == 1 else 's'}"
+
+    setup_scope = "; ".join((
+        setup_count_text(preflight_count, "preflight request"),
+        setup_count_text(calibration_count, "calibration request"),
+        setup_count_text(probe_count, "reasoning-control probe"),
+    ))
+    window_start = measured_window.get("started_at_utc")
+    window_end = measured_window.get("ended_at_utc")
+    window_text = (
+        f"{window_start} → {window_end}"
+        if window_start and window_end else "not recorded")
+    window_coverage = measured_window.get("completion_time_coverage")
+    window_evidence_parts = []
+    if measured_window.get("end_basis"):
+        window_evidence_parts.append(
+            f"end basis: {measured_window['end_basis']}")
+    if isinstance(window_coverage, (int, float)) \
+            and not isinstance(window_coverage, bool):
+        window_evidence_parts.append(
+            f"Completion-time coverage: {float(window_coverage):.1%}")
+    if measured_window.get("warning"):
+        window_evidence_parts.append(str(measured_window["warning"]))
+    window_evidence_text = "; ".join(window_evidence_parts) or "not recorded"
+    logical_request_count = (
+        tested_requests if isinstance(tested_requests, int)
+        and not isinstance(tested_requests, bool) else total)
+    logical_population_text = (
+        f"{logical_request_count:,} logical requests over "
+        f"{tested_seconds if tested_seconds is not None else 'unknown'} s"
+        if isinstance(logical_request_count, int)
+        and not isinstance(logical_request_count, bool) else
+        "logical request count or duration not recorded")
+    physical_population_text = ""
+    if all_phase_physical_attempts is not None:
+        physical_population_text = (
+            f"; {all_phase_physical_attempts:,} all-phase physical HTTP POST "
+            "attempts across replay plus setup phases")
+    traffic_scope = (
+        f"Bursty schedule; {schedule_peak_text} (not a sustained rate); "
+        f"{physical_peak_text} (not a sustained rate); Average over logical "
+        f"window {achieved_display} req/s; {logical_population_text}"
+        f"{physical_population_text}"
+        if is_bursty_load else
+        f"{'Not classified as bursty' if schedule_state.get('spiky') is False else 'Schedule shape not recorded'}; "
+        f"{schedule_peak_text}; {physical_peak_text}; "
+        f"{logical_population_text}{physical_population_text}; "
+        f"{achieved_display} achieved logical req/s")
+    scope_rows = [
+        ("Workload", "Synthetic workload shape" if mode == "profile"
+         else "Supplied customer prompts" if mode == "prompts"
+         else "Input mode not recorded"),
+        *(([("Declared workload", str(run.get("profile_label")))])
+          if mode == "profile" and run.get("profile_label") else []),
+        ("Endpoint", str(endpoint_meta.get("name")
+                         or run.get("endpoint_path") or "not recorded")),
+        ("Requested model", str(run.get("endpoint_model") or "not recorded")),
+        ("Active served entity", ", ".join(entity_names) or "not recorded"),
+        ("Foundation model", ", ".join(foundation_names) or "not recorded"),
+        ("Traffic", traffic_scope),
+        ("UTC correlation window", window_text),
+        ("Window evidence", window_evidence_text),
+        ("Concurrency", f"peak {peak_display} in flight"),
+        ("Prompt size", token_span(
+            token_targeting.get("observed_prompt_tokens") or {})),
+        ("Output size", token_span(
+            token_targeting.get("observed_completion_tokens") or {})),
+        *(([("Prompt fidelity", str(token_targeting.get("warning")))])
+          if token_shape_mismatch else []),
+        ("Cache profile", cache_scope),
+        ("Generation controls", f"temperature {request_params.get('temperature', 'not recorded')}; "
+         f"reasoning effort {extra_body.get('reasoning_effort', 'not recorded')}; "
+         f"global output cap {request_params.get('max_output_tokens_cap', 'not recorded')}") ,
+        ("Transport", f"{transport.get('http_protocol', 'not recorded')}; "
+         f"{transport.get('connection_policy', 'connection policy not recorded')}") ,
+        ("Setup phases (not replay)", setup_scope),
+        ("Measured population", "Setup rows are excluded from replay performance; "
+         "they are included in captured-traffic and quota evidence when supplied"),
+    ]
+    test_scope_html = (
+        "<section class='customer-section' id='test-scope' "
+        "aria-labelledby='test-scope-heading'><h2 id='test-scope-heading'>"
+        "What was tested</h2><p class='section-copy'>The result applies only "
+        "to this endpoint, workload shape, transport, and offered load.</p>"
+        "<dl class='scope-grid'>"
+        + "".join(f"<div><dt>{esc(label)}</dt><dd>{esc(value)}</dd></div>"
+                  for label, value in scope_rows)
+        + "</dl><div class='latency-note'><b>What calibration means:</b> "
+          "Calibration estimates characters per token with an inference "
+          "request sent before measured replay. It may be billable, and no "
+          "measured replay load is scheduled alongside it. It is excluded "
+          "from latency and capacity metrics, included in captured-traffic "
+          "and quota evidence, and may warm "
+          "routing, workers, model state, or caches.</div></section>")
+
+    next_test_html = (
+        "<section class='customer-section next-test' id='next-test' "
+        "aria-labelledby='next-test-heading'><h2 id='next-test-heading'>"
+        "Recommended next test</h2><ol class='next-actions'>"
+        "<li><b>Freeze customer targets first:</b> time-to-first-response and "
+        "complete-response p95, success rate, hard TTFT/E2E timeout caps, and "
+        "maximum inter-event gap.</li>"
+        "<li><b>Match production transport:</b> run from the production region "
+        "with its keep-alive, pooling, HTTP version, retry, and timeout policy.</li>"
+        "<li><b>Collect enough evidence:</b> at least 200 eligible requests for "
+        "p95 and multiple sustained windows; use at least 1,000 eligible "
+        "successful observations for p99.</li>"
+        "<li><b>Sweep load deliberately:</b> increase RPS/concurrency in frozen "
+        "rungs until the first acceptance, quota, or stability boundary.</li>"
+        "<li><b>Enable backend attribution:</b> retain provider correlation IDs "
+        "and align ingress queue, model scheduling, worker, batch, cache, and "
+        "autoscaling telemetry to the exact UTC run window.</li>"
+        "</ol></section>")
+
     decision_html = _html_decision_hero(decision, banner)
+    routing_html = (
+        "<div class='card routing-card'><h2>Issue-routing guide</h2>"
+        "<div class='cap'>Use the first matching signal. Client-only evidence "
+        "cannot distinguish Databricks ingress queueing from model scheduling "
+        "or execution.</div><table><caption class='sr-only'>Observed signal "
+        "and likely investigation route</caption><thead><tr><th>Signal</th>"
+        "<th>Likely route</th><th>Next evidence</th></tr></thead><tbody>"
+        "<tr><th class='lbl'>Caller latency high; request path normal</th>"
+        "<td>Client / network / harness</td><td>Transport parity and client clocks</td></tr>"
+        "<tr><th class='lbl'>Request-path first response high</th>"
+        "<td>Gateway / admission / prefill / backend</td><td>Provider correlation "
+        "ID and server-stage timing</td></tr>"
+        "<tr><th class='lbl'>Generation pacing high</th><td>Decode / worker</td>"
+        "<td>Token timing, worker, batch, and replica telemetry</td></tr>"
+        "<tr><th class='lbl'>Dispatch or pending delay high</th><td>Load generator</td>"
+        "<td>Dispatcher, pool, CPU, and socket saturation</td></tr>"
+        "<tr><th class='lbl'>HTTP 429</th><td>Quota / admission / capacity</td>"
+        "<td>Enforcing limit, workspace traffic, and throttle telemetry</td></tr>"
+        "<tr><th class='lbl'>Completed but poor answer</th><td>Model / application quality</td>"
+        "<td>Task-specific evaluation; this report does not score quality</td></tr>"
+        "<tr><th class='lbl'>Insufficient sample or missing correlation</th>"
+        "<td>Unable to attribute</td><td>Rerun with the next-test contract</td></tr>"
+        "</tbody></table></div>")
+    backend_attribution_html = (
+        "<div class='card'><h2>Backend attribution boundary</h2>"
+        "<div class='not-captured'><b>Not captured: required for backend "
+        "attribution:</b> provider/server correlation ID, ingress queue duration, "
+        "model scheduling/start, worker or replica identity, batch size, server "
+        "cache hit, autoscaling/cold-start events, and server throttle decision. "
+        "Absent backend fields are unknown, never zero.</div></div>")
+
+    def engineering_group(title_text: str, copy_text: str, content: str) -> str:
+        return (
+            "<section class='engineering-group'>"
+            f"<h2>{esc(title_text)}</h2><p class='group-copy'>"
+            f"{esc(copy_text)}</p>{content}</section>")
+
+    engineering_groups = (
+        engineering_group(
+            "1. Triage and attribution",
+            "Route the symptom first, then state where client evidence ends.",
+            routing_html + backend_attribution_html)
+        + engineering_group(
+            "2. Decision gates and acceptance",
+            "Canonical integrity, validity, SLA, quota, capacity, and run-context evidence.",
+            decision_html + provenance_html + sample_banner + sla_html)
+        + engineering_group(
+            "3. Load delivery and workload reproduction",
+            "Confirm the generator delivered the intended traffic and reproduced the token/cache shape.",
+            facts_html + stats + ans_html)
+        + engineering_group(
+            "4. Latency decomposition and stability",
+            "Separate caller elapsed time, final request-path time, generation pacing, and change over time.",
+            corr_html + lat_html + drift_html)
+        + engineering_group(
+            "5. Endpoint, quota, throughput, and cost",
+            "Bind the endpoint snapshot and keep observed traffic separate from configured limits and user-supplied rates.",
+            em_html + extra_cards + cost_html)
+        + engineering_group(
+            "6. Measurement evidence",
+            "Inspect transport, cache, identity, retries, and other evidence before attributing a backend issue.",
+            believe))
+    engineering_html = (
+        "<details class='disclosure engineering-disclosure' id='engineering'>"
+        "<summary><span class='summary-title'>Databricks engineering diagnostics"
+        "</span><span class='summary-note'>Request-path decomposition, load "
+        "delivery, workload fidelity, quota evidence, endpoint metadata, and "
+        "canonical decision gates.</span></summary><div class='detail-body'>"
+        "<p class='engineering-intro'>Use this section to determine whether a "
+        "symptom belongs to the client, network, gateway/admission layer, model "
+        "backend, quota, or test design.</p>"
+        f"{engineering_groups}</div></details>")
+    glossary_html = (
+        "<details class='disclosure glossary-disclosure' id='field-glossary'>"
+        "<summary><span class='summary-title'>Field definitions and raw evidence"
+        "</span><span class='summary-note'>Plain-language definitions for every "
+        "technical field and missing-evidence state.</span></summary>"
+        "<div class='detail-body'><div class='banner warn'>Missing, unknown, "
+        "NOT REPORTED, and null are evidence states; not zeros and not "
+        "successes.</div><dl class='glossary-list'>" + "".join(
+            f"<dt><b>{esc(name)}</b></dt><dd>{esc(definition)}</dd>"
+            for name, definition in _REPORT_FIELD_GLOSSARY)
+        + "</dl></div></details>")
     artifact_label = display_text(
         (s.get("run") or {}).get("artifact_id") or "NOT RECORDED", 120)
     if verified_view:
         print_stamp = (
             "<div class='print-footer' role='note'>EXTERNAL VERIFIED VIEW · "
-            "PRINT/PDF DERIVATIVE: source artifact "
-            f"{esc(verified_view['source_artifact_id'])} · full manifest "
-            f"SHA-256 {esc(verified_view['source_manifest_sha256'])} · "
-            f"verified by llm-traffic-replay "
-            f"{esc(verified_view['verifier_version'])} at "
-            f"{esc(verified_view['verified_at_utc'])} · "
-            f"source reproducibility "
-            f"{esc(verified_view['source_reproducibility']['code'])} · "
-            f"verifier reproducibility "
-            f"{esc(verified_view['verifier_reproducibility']['code'])} · "
-            f"{esc(verified_view['assurance'])}</div>")
+            "PRINT/PDF DERIVATIVE · full artifact identity, hashes, and "
+            "reproducibility states are in the verification appendix.</div>")
         foot_html = (
             "<div class='foot'>EXTERNAL VERIFIED VIEW · source run remains "
             "immutable · internal hash consistency is not a digital "
@@ -7191,11 +9242,11 @@ def render_html(summary: dict, title: str, *,
             "<div class='foot'>llm-traffic-replay report · artifact integrity "
             "requires manifest verification</div>")
     body = (
-        f"<main class='wrap'>{verified_banner_html}{header_html}{print_stamp}"
-        f"{nav_html}{customer_html}{facts_html}{decision_html}{provenance_html}"
-        f"{sample_banner}{stats}{believe}"
-        f"{em_html}{ans_html}{sla_html}{corr_html}{lat_html}"
-        f"{drift_html}{extra_cards}{cost_html}"
+        f"<main class='wrap'>{header_html}{print_stamp}{nav_html}"
+        f"{customer_summary_html}{customer_html}{limitations_html}{customer_latency_html}"
+        f"{reliability_html}{test_scope_html}{next_test_html}"
+        "<div class='appendix-label'>Optional technical detail</div>"
+        f"{engineering_html}{verification_details_html}{glossary_html}"
         f"{foot_html}</main>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,"

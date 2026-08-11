@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "name": "glm52_p2t_canary_illustrative",
   "input_tokens": {
     "p50": 1000,
@@ -12,6 +13,13 @@
     "p50": 0.0,
     "p95": 0.0
   },
-  "provenance": "Illustrative instrument-conformance shape created and quota-revalidated on 2026-08-08. The paired GLM 5.2 canary uses the serving-owner-confirmed top-level request-body control reasoning_effort=none and intentionally targets the direct /serving-endpoints path. The same field is confirmed for AI Gateway, but this canary's quota and endpoint-binding evidence does not establish Gateway control-plane or route stability or Gateway production capacity. The profile itself describes workload shape only and does not apply request controls. The 320/480-token output budgets deliberately derive a 720-token request cap so the complete 12-attempt fallback envelope remains below 80% of the dated 20,000 output-token/minute quota. These values are not measured customer output demand, a natural-answer-length estimate, or a Databricks performance recommendation.",
+  "sampling": {
+    "mode": "quantile_cdf",
+    "probabilities": [0.5, 0.95],
+    "input_tokens": [1000, 2000],
+    "output_tokens": [320, 480],
+    "cache_fraction": [0.0, 0.0]
+  },
+  "provenance": "Illustrative instrument-conformance workload shape created and quota-revalidated on 2026-08-10. This profile describes workload shape only: synthetic input, output, and reusable-prefix quantiles. Endpoint identity, adapter, route, API, reasoning controls, quota assertions, and model behavior belong to the run configuration and its dated evidence. When used unchanged by the documented one-row canary command, the 320/480-token output budgets derive a 720-token request cap and its complete 12-attempt fallback envelope remains below 80% of the separately supplied 20,000 output-token/minute quota snapshot. The profile alone does not enforce that request population or attempt envelope. These values are not measured customer output demand, a natural-answer-length estimate, or a Databricks performance recommendation.",
   "label": "ILLUSTRATIVE CANARY ONLY: use a quota-planned, low-rate preflight to test transport, answer completeness, usage, and timing; expect workload-fidelity caution and never quote this profile as customer demand, performance, or capacity."
 }

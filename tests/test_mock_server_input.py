@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import http.client
-import json
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -73,9 +71,9 @@ def test_mock_remains_usable_after_bad_json(mock_endpoint):
     assert len(truth.read_text().splitlines()) == 1
 
 
-def test_runner_seals_prior_cli_traffic_and_includes_it_in_quota_windows(
-        mock_endpoint, tmp_path):
-    port, _truth = mock_endpoint
+def test_runner_rejects_legacy_unbound_prior_cli_traffic_before_network(
+        tmp_path):
+    port = 9
     prompts = tmp_path / "prompts.jsonl"
     prompts.write_text('{"prompt":"hello"}\n')
     trace = tmp_path / "trace.txt"
@@ -90,6 +88,8 @@ def test_runner_seals_prior_cli_traffic_and_includes_it_in_quota_windows(
         "completion_tokens": 1, "max_tokens_requested": 2,
         "request_attempts": 1, "connection_attempts": 1, "retries": 0,
         "retry_reasons": [], "stream_complete": True, "parse_errors": 0,
+        "endpoint_adapter": "openai.chat_completions.sse/v1",
+        "response_mode": "streaming",
     }
     config = RunConfig(
         prompts_file=str(prompts), timestamps_file=str(trace), duration_s=1,
@@ -104,14 +104,6 @@ def test_runner_seals_prior_cli_traffic_and_includes_it_in_quota_windows(
         measure_network_path=False, out_dir=str(tmp_path / "results"),
     )
 
-    output = run(config, quiet=True, prior_request_rows=[prior])
-    run_dir = output["out_dir"]
-    rows = [json.loads(line) for line in
-            (Path(run_dir) / "requests.jsonl").read_text().splitlines()]
-
-    assert [row["phase"] for row in rows].count("preflight") == 1
-    assert [row["phase"] for row in rows].count("replay") == 1
-    windows = output["summary"]["observed_rate_windows"]
-    assert windows["traffic_scope"]["phases"]["preflight"]["sent_rows"] == 1
-    assert windows["traffic_scope"]["phases"]["replay"]["sent_rows"] == 1
-    assert windows["input_tokens_by_first_send"]["max"] >= 6
+    with pytest.raises(ValueError, match="legacy carried rows fail closed"):
+        run(config, quiet=True, prior_request_rows=[prior])
+    assert not (tmp_path / "results").exists()

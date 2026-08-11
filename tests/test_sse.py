@@ -1,11 +1,65 @@
 """SSE parsing: TTFT keys on first CONTENT delta (role-only chunks must not
 trigger it), usage extraction is defensive across provider field names."""
 import json
+import time
+
+import pytest
 
 from traffic_replay.sse import (StreamState, extract_usage,
                                 finalize_tool_calls, iter_sse_events,
                                 parse_sse_line, update_state)
 from traffic_replay.client import EndpointClient, EndpointConfig
+
+
+def test_client_records_first_parsed_stream_event_before_content_milestones():
+    class _Socket:
+        def settimeout(self, value):
+            self.timeout = value
+
+    class _Response:
+        status = 200
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+            time.sleep(0.015)
+            yield (b'data: {"choices":[{"delta":{"content":"ok"},'
+                   b'"finish_reason":"stop"}]}\n\n')
+            yield b'data: [DONE]\n\n'
+
+    class _Connection:
+        def __init__(self):
+            self.sock = _Socket()
+
+        def connect(self):
+            pass
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            return _Response()
+
+        def close(self):
+            pass
+
+    client = EndpointClient(
+        EndpointConfig(base_url="http://127.0.0.1:1", path="/chat"), None)
+    client._connect = _Connection
+    scheduled = time.monotonic()
+    result = client.send(
+        [{"role": "user", "content": "hello"}], 8, "ttse", 0.0, 0.0,
+        (1, 8, None, -1), 5, scheduled_monotonic=scheduled)
+
+    assert result.ok is True
+    assert result.ttfb_ms is not None
+    assert result.ttse_ms is not None
+    assert result.ttft_ms is not None
+    assert result.ttfv_ms is not None
+    assert result.ttfb_ms <= result.ttse_ms < result.ttft_ms
+    assert result.ttft_ms - result.ttse_ms >= 8
+    assert result.caller_ttfb_ms <= result.caller_ttse_ms \
+        < result.caller_ttft_ms
+
 
 
 def test_role_only_chunk_is_not_content():
@@ -1043,3 +1097,52 @@ def test_usage_rejects_invalid_token_counts_without_crashing():
     assert u["prompt_tokens"] == 10
     assert u["completion_tokens"] == 2
     assert u["cached_tokens"] is None
+
+
+@pytest.mark.parametrize("usage, expected", [
+    ({
+        "prompt_tokens": 20,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 8},
+        "cached_tokens": 7,
+    }, "conflicting cached-token aliases"),
+    ({
+        "prompt_tokens": 20,
+        "completion_tokens": 10,
+        "completion_tokens_details": {"reasoning_tokens": 6},
+        "reasoning_tokens": 5,
+    }, "conflicting reasoning-token aliases"),
+])
+def test_conflicting_usage_aliases_fail_closed(usage, expected):
+    state = StreamState()
+    update_state(state, {
+        "object": "chat.completion.chunk",
+        "choices": [],
+        "usage": usage,
+    })
+    assert any(expected in detail for detail in state.errors)
+    assert state.usage is None
+
+
+def test_identical_usage_aliases_are_allowed_and_source_is_deterministic():
+    state = StreamState()
+    update_state(state, {
+        "object": "chat.completion.chunk",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 8},
+            "cached_tokens": 8,
+            "completion_tokens_details": {"reasoning_tokens": 6},
+            "reasoning_tokens": 6,
+        },
+    })
+    assert not state.errors
+    normalized = extract_usage(state.usage)
+    assert normalized["cached_tokens"] == 8
+    assert normalized["cached_tokens_source"] == \
+        "prompt_tokens_details.cached_tokens"
+    assert normalized["reasoning_tokens"] == 6
+    assert normalized["reasoning_tokens_source"] == \
+        "completion_tokens_details.reasoning_tokens"

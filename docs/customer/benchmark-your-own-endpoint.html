@@ -217,12 +217,12 @@
   <section class="page page1" aria-label="What this benchmark proves">
     <div class="topbar">
       <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / Field Guide</div>
-      <div class="date">Evidence boundary: 08 Aug 2026</div>
+      <div class="date">Source facts rechecked: 10 Aug 2026</div>
     </div>
 
     <p class="kicker">Benchmark your own endpoint</p>
     <h1>Turn a traffic profile into evidence you can defend.</h1>
-    <p class="lede">Replay a measured workload as <strong>open-loop traffic</strong>, score it against customer-owned acceptance targets, preserve the exact run record, and state only what the evidence supports.</p>
+    <p class="lede"><strong>Current implemented/tested scope:</strong> text-only, streaming OpenAI-compatible Chat Completions; engagement-retained live conformance, not distributed with this guide, only on the standard Databricks workspace-origin direct route. Replay measured <strong>open-loop traffic</strong> and score only customer-owned targets.</p>
 
     <div class="section-head">
       <h2>The decision path</h2>
@@ -258,7 +258,7 @@
           <li>Caller-experienced latency and delivery at the exact tested arrival schedule.</li>
           <li>Whether customer-owned TTFT, full-generation, and answer-rate targets held.</li>
           <li>HTTP status, stream completion, parse integrity, usage coverage, and observed 429 evidence.</li>
-          <li>Achieved cache reuse only where the endpoint reports cached-token usage, plus response-model identity and pre-run/post-drain endpoint stability.</li>
+          <li>Reported cache-token usage, when present; response-model identity; pre-run/post-drain endpoint stability. Cache fields do not establish portable semantics.</li>
         </ul>
       </div>
       <div class="panel boundary">
@@ -278,7 +278,7 @@
     </div>
     <div class="evidence-strip">
       <div><span class="file">start.json</span><span class="tiny">Exact configuration, source state, input identities, and declared experiment.</span></div>
-      <div><span class="file">requests.jsonl</span><span class="tiny">One metadata row per request operation, with per-attempt admission events, attempt counts, and the terminal outcome.</span></div>
+      <div><span class="file">requests.jsonl</span><span class="tiny">Per-operation metadata with admission events, physical-attempt counts, and the terminal outcome.</span></div>
       <div><span class="file">summary.json</span><span class="tiny">Canonical metrics and exactly five independent decision dimensions.</span></div>
       <div><span class="file">manifest.json</span><span class="tiny">Schema-v3 artifact hashes, byte counts, row counts, and run identity.</span></div>
       <div><span class="file">report.html / .md</span><span class="tiny">Readable views derived from the same canonical summary.</span></div>
@@ -308,11 +308,12 @@
 
     <div class="code-title"><span>Local instrument gate</span><span>No provider traffic</span></div>
     <pre><span class="cmd">python3</span> -m pytest
-<span class="cmd">python3</span> -m traffic_replay validate <span class="arg">--port 0 --format json</span></pre>
+<span class="cmd">python3</span> -m traffic_replay validate <span class="arg">--port 0 --format json</span>
+<span class="cmd">python3</span> -m traffic_replay adapters <span class="arg">--format json</span></pre>
 
     <div class="section-head">
       <h2>Published Enterprise P2T defaults: tier and headroom not verified</h2>
-      <div class="section-note">Dated 2026-08-07; rechecked 2026-08-08. Verify Enterprise tier and shared-workspace headroom before paid traffic.</div>
+      <div class="section-note">Dated 2026-08-07; rechecked 2026-08-10. Verify Enterprise tier and shared-workspace headroom before paid traffic.</div>
     </div>
     <div class="quota-grid">
       <div class="stat"><span class="value">200,000</span><span class="label">Input tokens / minute</span></div>
@@ -347,16 +348,18 @@
 
     <p class="kicker">Stage one, continued</p>
     <h2>Exercise the endpoint contract without making a timing claim.</h2>
-    <p class="lede">This command deterministically plans <strong>two preflight rows + one calibration row + one measured replay row</strong>, with no probes. Its illustrative output-budget p50/p95 is <strong>320/480 tokens</strong>, deriving a <strong>720-token request cap</strong>. The default fallback envelope permits at most <strong>12 physical POST attempts</strong>. With the explicit managed thinking-off control, its offline peak plan is <strong>89,202 input and 4,464 output tokens/minute</strong>. Those are conservative admission reservations, not observed usage. It qualifies mechanics only: <strong>no report-latency, throughput, SLA, or capacity claim.</strong></p>
+    <p class="lede">This command deterministically plans <strong>two preflight rows + one calibration row + one measured replay row</strong>, with no probes. Its illustrative output-budget p50/p95 is <strong>320/480 tokens</strong>, deriving a <strong>720-token request cap</strong>. The default fallback envelope permits at most <strong>12 physical POST attempts</strong>. With the explicit managed thinking-off control, its offline peak plan is <strong>89,142 input and 4,320 output tokens/minute</strong>. Those are conservative admission reservations, not observed usage. It qualifies mechanics only: <strong>no report-latency, throughput, SLA, or capacity claim.</strong></p>
 
     <div class="code-title"><span>GLM 5.2 instrument canary</span><span>Real, billable requests</span></div>
     <pre><span class="cmd">python3</span> -m traffic_replay benchmark \
   <span class="arg">--host</span> https://YOUR-WORKSPACE-HOST \
   <span class="arg">--endpoint</span> databricks-glm-5-2 \
+  <span class="arg">--endpoint-adapter</span> openai.chat_completions.sse/v1 \
   <span class="arg">--auth-profile</span> YOUR-DATABRICKS-PROFILE \
   <span class="arg">--profile</span> configs/profile_glm52_canary_illustrative.json \
   <span class="arg">--extra-body</span> '{"reasoning_effort":"none"}' \
   <span class="arg">--fixed-rate</span> 0.1 <span class="arg">--duration</span> 12 \
+  <span class="arg">--calibrate-requests</span> 1 \
   <span class="arg">--ttft-definition</span> first_visible \
   <span class="arg">--rate-limits</span> configs/rate_limits_databricks_glm_5_2_enterprise_p2t_2026-08-07.json \
   <span class="arg">--out-dir</span> results/glm52-instrument-canary \
@@ -370,13 +373,15 @@
 
     <div class="callout stop">
       <span class="callout-icon">R</span>
-      <p><strong>Managed GLM 5.2 reasoning control:</strong> Owner-confirmed behavior establishes that top-level <code>{"reasoning_effort":"none"}</code> disables reasoning on Unity AI Gateway <code>system.ai.glm-5-2</code> and the direct endpoint; omission selects maximum reasoning. The public guide names the field without enumerating GLM values. This release qualifies only direct <code>/serving-endpoints/.../invocations</code>; Gateway is protocol-diagnostic because destination identity, routing/fallback, and combined quotas are not bound, so it supports no quota or capacity conclusion. Direct SGLang uses <code>{"chat_template_kwargs":{"enable_thinking":false}}</code>; with thinking on, unset is <code>Max</code> and <code>"high"</code> is <code>High</code>. The canary selects no reasoning and must still pass full preflight; HTTP 200 alone is insufficient.</p>
+      <p><strong>Managed GLM 5.2 reasoning control:</strong> Serving-engineering-confirmed behavior for the tested Databricks GLM 5.2 route says top-level <code>{"reasoning_effort":"none"}</code> disables thinking and omission selects maximum reasoning; the bounded direct-route canary on 2026-08-10 was consistent with that statement. The public reasoning guide names the field but does not enumerate GLM-specific values or defaults, so verify behavior again for every route and model revision. Keep the identities distinct: the public P2T endpoint is <code>databricks-glm-5-2</code>; the confirmed Unity AI Gateway model-service name is <code>system.ai.glm-5-2</code>; and the tested workspace exposed foundation entity <code>system.ai.databricks-glm-5-2</code>. Only the standard direct <code>/serving-endpoints/.../invocations</code> route has engagement-retained live conformance evidence; it is not distributed with this guide. Any Gateway invocation is protocol-diagnostic only, and no Gateway, PT, quota-headroom, SLA, or capacity conclusion follows. For self-hosted SGLang, its GLM 5.2 cookbook separately documents <code>{"chat_template_kwargs":{"enable_thinking":false}}</code>; that is not the Databricks request control or proof this adapter qualifies an SGLang deployment.</p>
     </div>
 
     <div class="source-links">
-      <a href="https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits">Databricks limits and quotas</a>
-      <a href="https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models">Databricks reasoning-model guide</a>
-      <a href="https://docs.databricks.com/aws/en/ai-gateway/query-model-services">Unity AI Gateway model services</a>
+      <a href="https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/limits">Databricks limits</a>
+      <a href="https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/supported-models">Supported-model catalog</a>
+      <a href="https://docs.databricks.com/aws/en/machine-learning/model-serving/query-reason-models">Reasoning guide</a>
+      <a href="https://docs.databricks.com/aws/en/ai-gateway/query-model-services">Gateway model services</a>
+      <a href="https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.2">SGLang GLM 5.2</a>
     </div>
 
     <div class="footer">
@@ -387,21 +392,24 @@
 
   <section class="page page4" aria-label="Measured fixed rate and guarded sweep">
     <div class="topbar">
-      <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / Production Protocol</div>
+      <div class="brand"><span class="mark" aria-hidden="true"></span> LLM Traffic Replay / Direct Databricks P2T</div>
       <div class="date">Measure, decide, verify</div>
     </div>
 
     <p class="kicker">Stage two</p>
     <h2>Run the customer contract, then separate SLA from capacity.</h2>
-    <p class="lede">Build <code>configs/profile_measured.json</code> from approved request metrics, review its digest and dropped rows, then set rates, customer-owned targets, and client bounds from the authorized experiment.</p>
+    <p class="lede">Build <code>configs/profile_measured.json</code> from approved request metrics, review its digest and dropped rows, then set rates, customer-owned targets, and client bounds from the authorized experiment. These templates are specifically for direct Databricks pay-per-token GLM 5.2 over the installed Chat/SSE adapter. Provisioned throughput or another provider requires its own verified route, adapter when the wire contract differs, and applicable safety controls; do not reuse this P2T quota snapshot.</p>
 
     <div class="code-title"><span>Measured fixed-rate run</span><span>Template - replace every YOUR_* value</span></div>
     <pre><span class="cmd">python3</span> -m traffic_replay benchmark \
   <span class="arg">--host</span> https://YOUR-WORKSPACE-HOST \
-  <span class="arg">--endpoint</span> YOUR-ENDPOINT-NAME \
+  <span class="arg">--endpoint</span> databricks-glm-5-2 \
+  <span class="arg">--endpoint-adapter</span> openai.chat_completions.sse/v1 \
   <span class="arg">--auth-profile</span> YOUR-DATABRICKS-PROFILE \
   <span class="arg">--profile</span> configs/profile_measured.json \
+  <span class="arg">--temperature</span> 0 <span class="arg">--extra-body</span> '{"reasoning_effort":"none"}' \
   <span class="arg">--fixed-rate</span> YOUR-AUTHORIZED-RPS <span class="arg">--duration</span> 300 \
+  <span class="arg">--calibrate-requests</span> YOUR-AUTHORIZED-CALIBRATION-COUNT \
   <span class="arg">--max-concurrency</span> YOUR-TESTED-WORKER-BOUND \
   <span class="arg">--max-pending-requests</span> YOUR-TESTED-PENDING-BOUND \
   <span class="arg">--ttft-definition</span> first_visible \
@@ -411,14 +419,16 @@
 
     <div class="callout">
       <span class="callout-icon">R</span>
-      <p><strong>Arrival rate is the load axis.</strong> Do not use legacy <code>--concurrency</code>. <code>--max-concurrency</code> is only a client safety bound; the report shows observed in-flight concurrency. The harness opens a fresh HTTP/1.1 connection per physical attempt, so capacity stays inconclusive for an unknown, pooled, or HTTP/2 production client. Add <code>--production-connection-policy fresh_http1_per_physical_attempt</code> only when that is the real application's exact policy; the recorded assertion is not an observation of production. For reasoning models this template explicitly scores <code>first_visible</code>; use <code>first_content</code> only when visible, reasoning, or refusal onset is the customer-owned target.</p>
+      <p><strong>Keep the reviewed request contract exact.</strong> This GLM template retains numeric <code>temperature: 0</code> and top-level <code>reasoning_effort: none</code>; omission is a different configuration. Choose and authorize calibration before traffic. A positive count warms endpoint state; zero disables harness calibration but does not prove cold cache. Arrival rate is the load axis, and <code>--max-concurrency</code> is only a client safety bound. With fresh HTTP/1.1 per physical attempt, capacity stays inconclusive for a pooled, HTTP/2, or unknown production client. Add <code>--production-connection-policy fresh_http1_per_physical_attempt</code> only when the real application is independently known to use that exact behavior.</p>
     </div>
 
     <div class="code-title"><span>Guarded rate sweep</span><span>Sequential and stateful</span></div>
     <pre><span class="cmd">python3</span> -m traffic_replay sweep \
-  <span class="arg">--host</span> https://YOUR-WORKSPACE-HOST <span class="arg">--endpoint</span> YOUR-ENDPOINT-NAME \
+  <span class="arg">--host</span> https://YOUR-WORKSPACE-HOST <span class="arg">--endpoint</span> databricks-glm-5-2 \
+  <span class="arg">--endpoint-adapter</span> openai.chat_completions.sse/v1 \
   <span class="arg">--auth-profile</span> YOUR-DATABRICKS-PROFILE \
   <span class="arg">--profile</span> configs/profile_measured.json \
+  <span class="arg">--temperature</span> 0 <span class="arg">--extra-body</span> '{"reasoning_effort":"none"}' \
   <span class="arg">--rate</span> YOUR-RUNG-1,YOUR-RUNG-2,YOUR-RUNG-3 \
   <span class="arg">--duration</span> 120 <span class="arg">--cooldown</span> 60 \
   <span class="arg">--cpt</span> YOUR-PREMEASURED-CHARACTERS-PER-TOKEN \
@@ -436,7 +446,7 @@
 
     <div class="callout">
       <span class="callout-icon">i</span>
-      <p><strong>Interchunk is a stream-gap diagnostic, not token-to-token latency.</strong> It is the maximum gap between consecutive nonempty visible, reasoning, or refusal SSE delta events. Tool fragments, usage-only events, heartbeats, and streams with only one eligible event are excluded. TTFB is the first nonempty bounded response-body chunk returned by the client read, not the first socket byte or first parsed SSE line.</p>
+      <p><strong>Interchunk is a stream-gap diagnostic, not token-to-token latency.</strong> It is the maximum gap between consecutive nonempty visible, reasoning, or refusal SSE delta events. Tool fragments, usage-only events, heartbeats, and streams with only one eligible event are excluded. TTFB is the first nonempty bounded response-body chunk returned by the client read, not the first socket byte or first parsed SSE line. TTSE is the first complete framed event emitted by the selected adapter parser; it can be usage-only, terminal, or a content-free parse diagnostic and is not a token or content clock.</p>
     </div>
 
     <div class="footer">
@@ -463,7 +473,7 @@
       <thead><tr><th>Dimension</th><th>Question answered</th><th>Required reading</th></tr></thead>
       <tbody>
         <tr><td>Evidence integrity</td><td>Do current bytes match the manifest and completion chain?</td><td>Verify externally; a fresh run cannot verify the manifest that encloses it.</td></tr>
-        <tr><td>Measurement validity</td><td>Did errors, delivery, parsing, sample size, response identity, transport mismatch, or endpoint stability undermine inference?</td><td>Mixed response models, mismatch with an explicit request model, an unexpected Databricks served-model-name, or changed endpoint metadata invalidates the claim; incomplete or production-mismatched transport evidence is caution.</td></tr>
+        <tr><td>Measurement validity</td><td>Did errors, delivery, parsing, sample size, response identity, transport mismatch, or endpoint stability undermine inference?</td><td>Mixed response models, an unexpected Databricks served-model-name, or changed endpoint metadata invalidates. One stable request/response alias mismatch is unverified caution, not proof of a different model.</td></tr>
         <tr><td>Acceptance checks</td><td>Did the run meet the customer-owned explicit targets?</td><td>PASS, MISS, INCONCLUSIVE, or NOT EVALUATED. A reliability pass also requires the one-sided 95% Wilson lower confidence bound to meet the target.</td></tr>
         <tr><td>Quota state</td><td>Was every physical POST locally admitted, and was terminal HTTP 429 observed on any supplied request row?</td><td>A local denial sends no POST and is not provider rate limiting. Zero observed 429s is not quota headroom. One row can contain multiple attempts.</td></tr>
         <tr><td>Endpoint capacity</td><td>Did the endpoint hold at this exact tested load?</td><td>Never translate one held rung into a ceiling or guarantee.</td></tr>

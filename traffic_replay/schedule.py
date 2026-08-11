@@ -332,10 +332,10 @@ def load_trace(path, duration_cap_s: float | None = None, *,
     """Replace the synthetic schedule with a real arrival trace.
 
     Accepts a file of arrival timestamps in seconds, one per line (plain
-    text or JSONL with a `t` field). Timestamps are shifted to start at 0
-    and sorted. This is the bring-your-own-trace path: the customer's
-    production arrival log becomes the schedule, and every downstream
-    stage (sizing, cache construction, measurement) is unchanged.
+    text or JSONL containing exactly a `t` field). Timestamps are shifted to
+    start at 0 and sorted. This is intentionally an arrival-only input, not a
+    request envelope: rejecting additional JSON fields prevents a caller from
+    believing payload or workflow metadata stayed paired while sorting.
     """
     import json as _json
 
@@ -359,8 +359,10 @@ def load_trace(path, duration_cap_s: float | None = None, *,
         try:
             if line.startswith("{"):
                 value = loads_strict(line)
-                if not isinstance(value, dict) or "t" not in value:
-                    raise ValueError("JSON row must be an object with a t field")
+                if not isinstance(value, dict) or set(value) != {"t"}:
+                    raise ValueError(
+                        "JSON row must be an object containing exactly the t "
+                        "field; arrival traces cannot carry request metadata")
                 raw_timestamp = value["t"]
                 if isinstance(raw_timestamp, bool) or not isinstance(
                         raw_timestamp, (int, float)):

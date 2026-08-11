@@ -41,7 +41,8 @@ def test_preflight_pass_cannot_be_bound_to_non_200_response_rows(tmp_path):
         "preflight_http_200": 0,
     }
 
-    with pytest.raises(ValueError, match="preflight gate counts disagree"):
+    with pytest.raises(ValueError, match=(
+            "invalid or inconsistent preflight gate")):
         _validate_preflight_gate_consistency(
             tmp_path, summary, start, evidence)
 
@@ -89,6 +90,7 @@ def _request_row() -> dict:
         "queue_wait_ms": 0.0,
         "dispatch_lag_ms": 0.0,
         "ttfb_ms": 50.0,
+        "ttse_ms": 70.0,
         "ttft_ms": 100.0,
         "e2e_ms": 200.0,
         "interchunk_max_ms": 20.0,
@@ -315,7 +317,9 @@ def test_receipt_is_external_self_sealed_and_source_is_unchanged(tmp_path):
         "source_run"]["artifacts"]["summary.json"]
     assert payload["decision"]["evidence_integrity"]["code"] == "VERIFIED"
     assert payload["decision"]["endpoint_capacity"]["code"] == \
-        "HELD_AT_TESTED_LOAD"
+        "INCONCLUSIVE"
+    assert "PREFLIGHT_NOT_ESTABLISHED" in payload["decision"][
+        "measurement_validity"]["reason_codes"]
     manifest = json.loads((receipt / "manifest.json").read_text())
     for name in (
             "verification.json", "verified-report.md",
@@ -382,7 +386,22 @@ def test_unreconstructible_source_never_gets_held_capacity(
     assert reason_code in reconstructibility["reason_codes"]
     capacity = verified["decision"]["endpoint_capacity"]
     assert capacity["code"] == "INCONCLUSIVE"
-    assert "SOURCE_NOT_RECONSTRUCTIBLE" in capacity["reason_codes"]
+    # This fixture deliberately has no preflight, so measurement validity is
+    # already the capacity blocker. Exercise source gating independently with
+    # an otherwise held decision instead of depending on blocker precedence.
+    assert "MEASUREMENT_NOT_VALID" in capacity["reason_codes"]
+    gated = verification_module._gate_capacity_on_source({
+        "endpoint_capacity": {
+            "code": "HELD_AT_TESTED_LOAD",
+            "label": "Held",
+            "severity": "pass",
+            "reason": "fixture",
+            "reason_codes": [],
+        },
+    }, reconstructibility)
+    assert gated["endpoint_capacity"]["code"] == "INCONCLUSIVE"
+    assert "SOURCE_NOT_RECONSTRUCTIBLE" in gated[
+        "endpoint_capacity"]["reason_codes"]
     receipt = create_run_verification_receipt(run, tmp_path / "receipt")
     payload = verify_run_receipt(receipt)
     assert payload["decision"]["endpoint_capacity"]["code"] == \
@@ -400,7 +419,7 @@ def test_dirty_external_verifier_never_issues_held_capacity(
         tmp_path, monkeypatch):
     run = _seal_run(tmp_path / "run")
     assert verify_run_output(run)["decision"]["endpoint_capacity"][
-        "code"] == "HELD_AT_TESTED_LOAD"
+        "code"] == "INCONCLUSIVE"
     monkeypatch.setattr(
         verification_module,
         "snapshot_source_state",
@@ -415,7 +434,19 @@ def test_dirty_external_verifier_never_issues_held_capacity(
         "reconstructible"] is False
     capacity = payload["decision"]["endpoint_capacity"]
     assert capacity["code"] == "INCONCLUSIVE"
-    assert "VERIFIER_SOURCE_NOT_RECONSTRUCTIBLE" in capacity["reason_codes"]
+    assert "MEASUREMENT_NOT_VALID" in capacity["reason_codes"]
+    gated = verification_module._gate_capacity_on_generator({
+        "endpoint_capacity": {
+            "code": "HELD_AT_TESTED_LOAD",
+            "label": "Held",
+            "severity": "pass",
+            "reason": "fixture",
+            "reason_codes": [],
+        },
+    }, payload["verifier_source_reconstructibility"])
+    assert gated["endpoint_capacity"]["code"] == "INCONCLUSIVE"
+    assert "VERIFIER_SOURCE_NOT_RECONSTRUCTIBLE" in gated[
+        "endpoint_capacity"]["reason_codes"]
     markdown = (receipt / "verified-report.md").read_text()
     html = (receipt / "verified-report.html").read_text()
     assert "Source reproducibility: **PASS**" in markdown
@@ -461,8 +492,16 @@ def test_renderer_rejects_held_capacity_with_failed_reproducibility(tmp_path):
         verification_module.IntegrityContext(
             "verified", "internal consistency fixture"),
     )
+    context["decision"]["endpoint_capacity"] = {
+        **context["decision"]["endpoint_capacity"],
+        "code": "HELD_AT_TESTED_LOAD",
+        "label": "Held at tested load",
+        "severity": "pass",
+        "reason_codes": [],
+    }
 
-    with pytest.raises(ValueError, match="cannot claim held capacity"):
+    with pytest.raises(ValueError, match=(
+            "cannot claim held capacity|endpoint_capacity does not match")):
         render_html(_summary(), "fixture", verification_context=context)
 
 
@@ -560,7 +599,8 @@ def test_source_identity_disagreement_blocks_held_capacity(tmp_path):
     ("request_totals", "requests_ok disagrees"),
     ("answer_counts", "answers.acceptable_outcomes disagrees"),
     ("http_429_count", "http_429_count disagrees"),
-    ("replay_phase", "index_identity SHA-256 disagrees|replay row count disagrees"),
+    ("replay_phase", "index_identity SHA-256 disagrees|replay row count "
+                     "disagrees|setup request binding"),
     ("request_outcome", "requests_ok disagrees"),
     ("scheduled_time", "schedule_identity SHA-256 disagrees"),
     ("global_index", "index_identity SHA-256 disagrees"),
@@ -626,6 +666,25 @@ def test_external_verifier_rejects_non_boolean_refusal_evidence(tmp_path):
         tmp_path / "run", row=malformed, summary=_summary(canonical))
 
     with pytest.raises(ValueError, match="invalid answer-outcome fields"):
+        verify_run_output(run)
+
+
+@pytest.mark.parametrize(("field", "value", "match"), (
+    ("ttse_ms", 40.0, "TTSE before"),
+    ("ttse_ms", True, "invalid ttse_ms"),
+    ("caller_ttse_ms", -1.0, "invalid caller_ttse_ms"),
+))
+def test_external_verifier_rejects_invalid_stream_event_clocks(
+        tmp_path, field, value, match):
+    canonical = _request_row()
+    malformed = dict(canonical)
+    malformed[field] = value
+    if field == "caller_ttse_ms":
+        malformed["caller_ttfb_ms"] = 50.0
+    run = _seal_run(
+        tmp_path / "run", row=malformed, summary=_summary(canonical))
+
+    with pytest.raises(ValueError, match=match):
         verify_run_output(run)
 
 

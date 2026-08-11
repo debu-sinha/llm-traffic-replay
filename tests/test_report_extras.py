@@ -3,6 +3,8 @@ metadata in the report. These are the confidence features: they make a short
 or misleading run say so, and they record what was actually tested."""
 from __future__ import annotations
 
+import hashlib
+import json
 import random
 
 from traffic_replay import __version__
@@ -15,6 +17,55 @@ def _rows(n, base_ttft=100.0, t0=0.0, dt=1.0):
              "ttfb_ms": 1.0, "e2e_ms": base_ttft * 2, "connect_ms": 8.0,
              "dispatch_lag_ms": 0.0, "prompt_tokens": 100,
              "completion_tokens": 10} for i in range(n)]
+
+
+def test_first_parsed_stream_event_is_a_separate_diagnostic_metric():
+    rows = _rows(4)
+    for index, row in enumerate(rows):
+        row.update(
+            ttse_ms=2.0 + index,
+            caller_ttse_ms=12.0 + index,
+            caller_ttfb_ms=11.0 + index,
+            caller_ttft_ms=110.0 + index,
+            caller_e2e_ms=210.0 + index,
+        )
+    summary = summarize(rows)
+
+    assert summary["ttse_ms"]["n"] == 4
+    assert summary["ttse_corrected_ms"]["n"] == 4
+    assert summary["stream_event_definition"]["excludes_claims"] == [
+        "model_token", "reasoning_content", "visible_content",
+        "successful_response",
+    ]
+    markdown = render_markdown(summary, "TTSE test")
+    html = render_html(summary, "TTSE test")
+    assert "TTSE (first parsed stream event; diagnostic)" in markdown
+    assert "TTSE (first parsed stream event; diagnostic)" in html
+    assert "first token" not in summary["stream_event_definition"]["meaning"]
+
+
+def _reasoning_probe(candidate, *, index=1, disposition="accepted"):
+    canonical = json.dumps(
+        candidate, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"))
+    rejected = disposition == "rejected"
+    return {
+        "schema_version": "reasoning-control-probe-evidence/v1",
+        "candidate_index": index,
+        "candidate_redacted": candidate,
+        "candidate_canonical_sha256": hashlib.sha256(
+            canonical.encode("utf-8")).hexdigest(),
+        "disposition": disposition,
+        "evidence_method": (
+            "request_validation_response" if rejected else
+            "single_request_behavior_observation"),
+        "effective_status": (
+            "not_applied_request_rejected" if rejected else "unknown"),
+        "effective_value": None,
+        "request_id": f"probe-{index:02d}",
+        "logical_request_body_sha256": "a" * 64,
+        "physical_request_body_sha256s": ["b" * 64],
+    }
 
 
 def test_the_sample_gate_names_which_quantiles_it_supports():
@@ -154,9 +205,130 @@ def test_report_does_not_project_unobserved_answer_length_from_percentiles():
     markdown = render_markdown(summary, "observed TPOT")
 
     assert summary["tpot_ms"]["n"] == 30
+    assert summary["completion_tpot_ms"] == summary["tpot_ms"]
+    assert summary["tpot_scope"] == "all_endpoint_reported_completion_tokens"
     assert "(e2e - ttft) / (completion_tokens - 1)" in markdown
+    assert "all-completion TPOT" in markdown
+    assert "not visible-output TPOT" in markdown
     assert "500-token" not in markdown
     assert "unobserved answer length" in markdown
+
+
+def test_reasoning_completion_tokens_are_not_visible_output_metrics():
+    rows = _rows(30)
+    for row in rows:
+        row.update(reasoning_seen=True, reasoning_tokens=8,
+                   reasoning_chunks=3, visible_content_seen=True,
+                   stream_complete=True)
+    summary = summarize(rows)
+    throughput = summary["throughput"]
+
+    assert throughput["completion_tokens_per_min"] == \
+        throughput["output_tokens_per_min"]
+    assert throughput["output_tokens_per_min_legacy_alias_of"] == \
+        "completion_tokens_per_min"
+    assert "visible_output_tokens_per_min" not in throughput
+    assert throughput["visible_output_token_accounting"]["status"] == \
+        "unavailable"
+    assert "visible_tpot_ms" not in summary
+
+    markdown = render_markdown(summary, "reasoning completion accounting")
+    html = render_html(summary, "reasoning completion accounting")
+    for rendered in (markdown, html):
+        assert "all-completion" in rendered
+        assert "completion token" in rendered
+    assert "time per output token (TPOT)" not in markdown
+    assert "output throughput" not in html
+
+
+def test_visible_output_metrics_require_exact_source_labeled_accounting():
+    rows = _rows(30)
+    for row in rows:
+        row.update(
+            visible_output_tokens=4,
+            visible_output_tokens_source="provider.usage.visible_tokens",
+            ttfv_ms=125.0,
+            visible_content_seen=True,
+            stream_complete=True,
+        )
+    summary = summarize(rows)
+
+    throughput = summary["throughput"]
+    assert throughput["visible_output_token_accounting"]["status"] == \
+        "available"
+    assert throughput["visible_output_tokens_per_min"] > 0
+    assert summary["visible_tpot_ms"]["n"] == 30
+    assert "explicitly accounted visible output token" in \
+        render_markdown(summary, "visible accounting")
+
+
+def test_reasoning_probe_section_is_safe_linked_and_non_inferential():
+    candidate = {
+        "reasoning_effort": "none",
+        "display_marker": "</td><script>alert(1)</script>|`probe`",
+    }
+    probe = _reasoning_probe(candidate)
+    summary = summarize(_rows(30), run_meta={
+        "preflight_gate": {
+            "reasoning_probe_requests": 1,
+            "reasoning_control_probes": [probe],
+        },
+    })
+
+    markdown = render_markdown(summary, "probe evidence")
+    html = render_html(summary, "probe evidence")
+    digest = probe["candidate_canonical_sha256"]
+
+    assert "## Reasoning-control probes" in markdown
+    assert digest in markdown and digest in html
+    assert "reasoning\\_effort" in markdown and "reasoning_effort" in html
+    assert "does not prove the provider applied" in markdown.lower()
+    assert "Accepted does not" in html
+    assert "unknown" in markdown.lower() and "unknown" in html.lower()
+    assert "[requests.jsonl](requests.jsonl)" in markdown
+    assert "href='requests.jsonl'" in html
+    assert probe["request_id"] in markdown and probe["request_id"] in html
+    assert probe["logical_request_body_sha256"] in markdown
+    assert probe["physical_request_body_sha256s"][0] in html
+    assert "<script>alert(1)</script>" not in markdown
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in markdown
+    assert "&lt;script&gt;" in html
+
+
+def test_reasoning_probe_effect_is_only_known_for_request_rejection():
+    rejected = _reasoning_probe(
+        {"reasoning_effort": "unsupported"}, disposition="rejected")
+    summary = summarize(_rows(30), run_meta={
+        "preflight_gate": {
+            "reasoning_probe_requests": 1,
+            "reasoning_control_probes": [rejected],
+        },
+    })
+
+    markdown = render_markdown(summary, "rejected probe")
+    html = render_html(summary, "rejected probe")
+    assert "not applied - request rejected" in markdown
+    assert "not applied - request rejected" in html
+
+
+def test_reasoning_probe_report_withholds_unsupported_effect_claim():
+    probe = _reasoning_probe({"reasoning_effort": "none"})
+    probe["effective_status"] = "thinking_disabled"
+    probe["effective_value"] = False
+    summary = summarize(_rows(30), run_meta={
+        "preflight_gate": {
+            "reasoning_probe_requests": 1,
+            "reasoning_control_probes": [probe],
+        },
+    })
+
+    markdown = render_markdown(summary, "bad effective claim")
+    html = render_html(summary, "bad effective claim")
+    for rendered in (markdown, html):
+        assert "unsupported effective-behavior claim withheld" in rendered
+        assert "unknown" in rendered.lower()
+        assert "thinking_disabled" not in rendered
 
 
 def test_missing_visible_content_does_not_invent_a_finish_reason():
@@ -195,10 +367,13 @@ def test_stability_card_present_for_long_run():
 
 
 def test_warmup_is_not_reported_as_stable():
-    """A cold endpoint: window 0 is 15x slower than the last window
-    because the endpoint was cold. Comparing only first to last calls that
-    an improvement and passes it as stable, which would let a caller quote a
-    blended p95 from a run that never reached steady state."""
+    """Window 0 is 15x slower than the last window.
+
+    Comparing only first to last calls that an improvement and passes it as
+    stable, which would let a caller quote a blended p95 from a run whose
+    measured path changed materially. Client evidence must not assign the
+    cause to a cold endpoint without correlated backend telemetry.
+    """
     cold = _rows(25, base_ttft=31000.0, t0=0.0, dt=1.0)
     mid = _rows(25, base_ttft=3500.0, t0=70.0, dt=1.0)
     warm = _rows(25, base_ttft=2000.0, t0=140.0, dt=1.0)
@@ -207,7 +382,9 @@ def test_warmup_is_not_reported_as_stable():
     assert d["drift_kind"] == "warming"
     assert d["ttft_p95_spread_ratio"] > 1.3
     assert d["ttft_p95_drift_ratio"] < 1.0      # end/end alone looks like a win
-    assert "cold start" in d["drift_headline"]
+    assert "worst in the first window" in d["drift_headline"]
+    assert "cannot attribute the cause" in d["drift_headline"]
+    assert "cold start" not in d["drift_headline"]
 
 
 def test_midrun_spike_is_not_reported_as_stable():
@@ -238,7 +415,8 @@ def test_degrading_run_is_labeled_degrading():
     late = _rows(25, base_ttft=400.0, t0=140.0, dt=1.0)
     d = _drift_block(early + mid + late)
     assert d["drift_kind"] == "degrading"
-    assert "slower" in d["drift_headline"]
+    assert "measured caller path slowed" in d["drift_headline"]
+    assert "cannot attribute the cause" in d["drift_headline"]
 
 
 def test_first_visible_stability_scores_visible_latency_not_reasoning_start():
@@ -365,10 +543,16 @@ def test_prompts_mode_warns_when_prompts_are_recycled():
     report has to say so."""
     meta = {"input_mode": "prompts", "endpoint_path": "/e",
             "prompts_file": "p.jsonl", "prompts_count": 10}
-    s = summarize(_rows(100), run_meta=meta)
+    rows = _rows(100)
+    for index, row in enumerate(rows):
+        row["prompt_index"] = index % 10
+    s = summarize(rows, run_meta=meta)
     r = s["replay"]
     assert r["distinct_prompts"] == 10
     assert r["avg_sends_per_prompt"] == 10
+    assert r["sent"]["repeat_requests"] == 90
+    assert r["attempted"]["repeat_requests"] == 90
+    assert r["successful"]["repeat_requests"] == 90
     assert "prompt cache" in r["warning"]
     assert "CAUTION (prompt replay)" in render_markdown(s, "replay")
     assert "banner warn" in render_html(s, "replay")
@@ -377,14 +561,123 @@ def test_prompts_mode_warns_when_prompts_are_recycled():
 def test_prompts_mode_quiet_when_every_prompt_is_sent_once():
     meta = {"input_mode": "prompts", "endpoint_path": "/e",
             "prompts_file": "p.jsonl", "prompts_count": 120}
-    s = summarize(_rows(100), run_meta=meta)
+    rows = _rows(100)
+    for index, row in enumerate(rows):
+        row["prompt_index"] = index
+    s = summarize(rows, run_meta=meta)
     assert s["replay"]["warning"] is None
+
+
+def test_prompt_repeats_use_persisted_indexes_despite_failure_and_interleave():
+    """A failed request still reached the wire and may prime a cache. The
+    successful-row count must not erase a later reuse of prompt zero."""
+    rows = _rows(3)
+    for row, prompt_index in zip(rows, (0, 1, 0)):
+        row["prompt_index"] = prompt_index
+    rows[1].update(ok=False, status=503, error="upstream unavailable")
+    summary = summarize(rows, run_meta={
+        "input_mode": "prompts", "endpoint_path": "/e",
+        "prompts_file": "p.jsonl", "prompts_count": 2,
+    })
+
+    replay = summary["replay"]
+    assert replay["attempted"]["repeat_requests"] == 1
+    assert replay["sent"]["repeat_requests"] == 1
+    assert replay["successful"]["repeat_requests"] == 1
+    assert replay["repeat_requests"] == 1
+    assert "1 of 3 requests that reached the wire" in replay["warning"]
+
+
+def test_prompt_repeat_count_is_unavailable_when_indexes_are_missing():
+    rows = _rows(3)
+    rows[0]["prompt_index"] = 0
+    rows[2]["prompt_index"] = 0
+    summary = summarize(rows, run_meta={
+        "input_mode": "prompts", "endpoint_path": "/e",
+        "prompts_file": "p.jsonl", "prompts_count": 2,
+    })
+
+    replay = summary["replay"]
+    assert replay["sent"]["status"] == "unavailable"
+    assert replay["sent"]["repeat_requests"] is None
+    assert replay["repeat_requests"] is None
+    assert "No repeat count was inferred" in replay["warning"]
 
 
 def test_profile_mode_has_no_replay_block():
     s = summarize(_rows(100), run_meta={"input_mode": "profile",
                                         "endpoint_path": "/e"})
     assert "replay" not in s
+
+
+def _calibration_evidence(*, overlap: bool, missing_hash: bool = False):
+    replay = _rows(2)
+    for index, row in enumerate(replay):
+        row.update(phase="replay", request_body_sha256=(
+            ("a" if index == 0 else "b") * 64))
+    calibration = _rows(1, t0=-1.0)[0]
+    calibration.update(
+        phase="calibration",
+        request_body_sha256=("a" if overlap else "c") * 64)
+    if missing_hash:
+        replay[1].pop("request_body_sha256")
+    return replay, [calibration, *replay]
+
+
+def test_calibration_reports_exact_payload_overlap_and_blocks_cold_claim():
+    replay, all_rows = _calibration_evidence(overlap=True)
+    summary = summarize(replay, rate_limit_results=all_rows)
+    calibration = summary["calibration_warmth"]
+
+    assert calibration["status"] == "caution"
+    assert calibration["exact_overlap_status"] == "available"
+    assert calibration["overlapping_request_body_sha256_count"] == 1
+    assert calibration["replay_rows_with_calibrated_payload"] == 1
+    assert calibration["replay_share_with_calibrated_payload"] == 0.5
+    assert "must not be described as cold-cache" in calibration["warning"]
+    markdown = render_markdown(summary, "calibrated")
+    html = render_html(summary, "calibrated")
+    assert "CAUTION (calibration warm state)" in markdown
+    assert "CALIBRATION_WARM_STATE" in markdown
+    assert "Calibration and warm state" in html
+    assert "CALIBRATION_WARM_STATE" in html
+
+
+def test_calibration_without_exact_overlap_still_warns_about_warm_state():
+    replay, all_rows = _calibration_evidence(overlap=False)
+    calibration = summarize(
+        replay, rate_limit_results=all_rows)["calibration_warmth"]
+
+    assert calibration["exact_overlap_status"] == "available"
+    assert calibration["overlapping_request_body_sha256_count"] == 0
+    assert calibration["replay_rows_with_calibrated_payload"] == 0
+    assert "No exact request-body SHA-256 overlap" in calibration["warning"]
+    assert "still warms endpoint" in calibration["warning"]
+
+
+def test_calibration_overlap_is_unavailable_when_any_hash_is_missing():
+    replay, all_rows = _calibration_evidence(
+        overlap=True, missing_hash=True)
+    calibration = summarize(
+        replay, rate_limit_results=all_rows)["calibration_warmth"]
+
+    assert calibration["exact_overlap_status"] == "unavailable"
+    assert calibration["overlapping_request_body_sha256_count"] is None
+    assert calibration["replay_rows_with_calibrated_payload"] is None
+    assert calibration["replay_body_hashes_reported"] == 1
+    assert "Exact payload overlap is unavailable" in calibration["warning"]
+
+
+def test_no_calibration_has_no_warm_state_warning():
+    replay = _rows(2)
+    for index, row in enumerate(replay):
+        row.update(phase="replay", request_body_sha256=("ab" * 32))
+    calibration = summarize(
+        replay, rate_limit_results=replay)["calibration_warmth"]
+
+    assert calibration["status"] == "not_run"
+    assert calibration["calibration_requests"] == 0
+    assert calibration["warning"] is None
 
 
 def test_tiny_trailing_window_cannot_manufacture_a_verdict():
@@ -532,7 +825,55 @@ def test_consistent_response_model_is_bound_and_fingerprint_rotation_is_context(
     identity = summary["response_identity"]
     assert identity["status"] == "bound"
     assert identity["invalid"] is None
+    assert identity["request_model_match"] == "exact"
     assert identity["system_fingerprints"]["distinct_values_at_least"] == 2
+
+
+def test_consistent_resolved_model_alias_is_route_bound_but_unverified():
+    rows = _rows(20)
+    for row in rows:
+        row.update({
+            "status": 200,
+            "response_model": "vendor-model-2026-08-10",
+            "served_model_name": "production-route-a",
+            "response_object": "chat.completion.chunk",
+        })
+    summary = summarize(rows, run_meta={
+        "endpoint_model": "vendor-model-latest",
+        "endpoint_metadata": {
+            "name": "customer-endpoint",
+            "served_entities": [{"name": "production-route-a"}],
+        },
+    })
+
+    identity = summary["response_identity"]
+    assert identity["status"] == "caution"
+    assert identity["invalid"] is None
+    assert identity["request_model_match"] == \
+        "consistent_difference_unverified"
+    assert identity["unexpected_models"] == ["vendor-model-2026-08-10"]
+    assert "binds the route but does not prove" in identity["warning"]
+    assert "RESPONSE_MODEL_IDENTITY_UNVERIFIED" in \
+        render_markdown(summary, "alias")
+
+
+def test_consistent_different_model_without_binding_is_caution_not_bound():
+    rows = _rows(20)
+    for row in rows:
+        row.update({
+            "status": 200,
+            "response_model": "wrong-or-resolved-model",
+            "response_object": "chat.completion.chunk",
+        })
+    identity = summarize(
+        rows, run_meta={"endpoint_model": "requested-model"})[
+            "response_identity"]
+
+    assert identity["status"] == "caution"
+    assert identity["invalid"] is None
+    assert identity["request_model_match"] == \
+        "consistent_difference_unverified"
+    assert "trusted alias map" in identity["warning"]
 
 
 def test_custom_endpoint_name_is_not_mistaken_for_response_model_identity():
@@ -601,7 +942,9 @@ def test_endpoint_collapsing_into_errors_is_not_stable():
     assert d["drift_kind"] == "failing"
     assert d["drift_flag"] is True
     assert "84 percent" in d["drift_headline"]
-    assert "not what it was asked" in d["drift_headline"]
+    assert "surviving numbers" in d["drift_headline"]
+    assert "latency comparison is not reported for a failing run" \
+        in d["drift_headline"]
     # the named window is the biggest failure, so the clause reconciling it
     # against the highest RATE has to be there too, or the two disagree
     assert "highest loss rate was window 3" in d["drift_headline"]

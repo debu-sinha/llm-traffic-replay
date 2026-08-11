@@ -869,10 +869,12 @@ def test_absolute_deadline_also_covers_connection_setup():
         def __init__(self):
             self.timeout = None
             self.closed = False
+            self.connect_calls = 0
 
         def connect(self):
             # A fake transport can ignore the requested socket timeout; the
             # client still checks the absolute clock immediately afterwards.
+            self.connect_calls += 1
             time.sleep(0.025)
 
         def close(self):
@@ -901,7 +903,14 @@ def test_absolute_deadline_also_covers_connection_setup():
     assert result.first_attempt_unix is not None
     assert result.first_send_unix is None
     assert result.finished_unix is not None
-    assert conn.timeout <= 0.01
+    if conn.connect_calls:
+        assert 0 < conn.timeout <= 0.01
+    else:
+        # Under scheduler contention the absolute 10 ms budget can expire
+        # after the connection object is registered but before connect setup
+        # begins. That is still a correct no-send timeout outcome, and no
+        # socket timeout needs to be installed on an unused connection.
+        assert conn.timeout is None
     assert conn.closed is True
 
 
@@ -1081,6 +1090,7 @@ def test_failure_before_http_send_is_not_claimed_as_a_wire_send():
 
 def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     seen = []
+    seen_bytes = []
 
     events = (
         b'data: {"choices":[{"delta":{"content":"ok"},'
@@ -1098,6 +1108,7 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
             pass
 
         def request(self, method, path, body, headers):
+            seen_bytes.append(body)
             seen.append(json.loads(body))
 
         def getresponse(self):
@@ -1130,6 +1141,10 @@ def test_stream_options_fallback_is_counted_as_a_physical_request_retry():
     assert result.request_attempts == 2
     assert result.retries == 1
     assert result.retry_reasons == ["stream_options_rejected"]
+    assert result.physical_request_body_sha256s == [
+        hashlib.sha256(body).hexdigest() for body in seen_bytes]
+    assert result.physical_request_body_sha256s[0] != \
+        result.physical_request_body_sha256s[1]
 
 
 def test_runtime_quota_denial_occurs_before_the_physical_post():

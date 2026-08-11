@@ -35,8 +35,8 @@ def test_customer_guide_publishes_the_current_safety_contract():
             "sweep.html", "one-sided 95% Wilson lower",
             "two preflight rows + one calibration row + one measured replay row",
             "320/480 tokens", "720-token request cap",
-            "12 physical POST attempts", "89,202 input",
-            "4,464 output tokens/minute", "Read five decisions",
+            "12 physical POST attempts", "89,142 input",
+            "4,320 output tokens/minute", "Read five decisions",
             "exactly five independent decision dimensions",
             "first nonempty bounded response-body chunk",
             "YOUR-FRACTION-STRICTLY-BETWEEN-0-AND-1",
@@ -47,11 +47,22 @@ def test_customer_guide_publishes_the_current_safety_contract():
             "capacity stays inconclusive",
             "Published Enterprise P2T defaults: tier and headroom not verified",
             "Verify Enterprise tier and shared-workspace headroom before paid traffic",
-            'Owner-confirmed behavior',
+            "Source facts rechecked: 10 Aug 2026",
+            "Current implemented/tested scope",
+            "text-only, streaming OpenAI-compatible Chat Completions",
+            "standard Databricks workspace-origin direct route",
+            "traffic_replay adapters",
+            'Serving-engineering-confirmed behavior',
             '{"reasoning_effort":"none"}',
             '{"chat_template_kwargs":{"enable_thinking":false}}',
+            "public P2T endpoint",
+            "system.ai.glm-5-2",
+            "system.ai.databricks-glm-5-2",
+            "https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.2",
             build_customer_pdf.STAMP):
         assert required in body
+    assert body.count(
+        "--endpoint-adapter</span> openai.chat_completions.sse/v1") == 3
     assert body.count("--ttft-definition</span> first_visible") == 3
     assert body.count("<tr><td>") == 5
     assert "Read eight decisions" not in body
@@ -111,6 +122,7 @@ def test_published_glm_canary_numbers_are_recomputed_from_its_exact_command(
         auth_profile=None,
         token_env="DATABRICKS_TOKEN",
         model=None,
+        endpoint_adapter=flag("--endpoint-adapter"),
         production_connection_policy=None,
         extra_body=flag("--extra-body"),
         fixed_rate=float(flag("--fixed-rate")),
@@ -142,6 +154,8 @@ def test_published_glm_canary_numbers_are_recomputed_from_its_exact_command(
         probe_extra_body=[],
     )
     config = _benchmark_config(args)
+    assert config["endpoint"]["adapter"] == (
+        "openai.chat_completions.sse/v1")
     frozen = tmp_path / "frozen-inputs"
     frozen.mkdir()
     config, prevalidated = _freeze_and_prevalidate_cli_config(config, frozen)
@@ -160,13 +174,13 @@ def test_published_glm_canary_numbers_are_recomputed_from_its_exact_command(
     assert plan["status"] == "within_configured_harness_warning_budget"
     assert plan["planned_physical_attempts_worst_case"] == 12
     assert plan["windows"]["input_tokens_per_minute"][
-        "planned_peak"] == 89_202
+        "planned_peak"] == 89_142
     assert plan["windows"]["input_tokens_per_minute"][
-        "ratio_to_configured_limit"] == pytest.approx(0.44601)
+        "ratio_to_configured_limit"] == pytest.approx(0.44571)
     assert plan["windows"]["output_tokens_per_minute"][
-        "planned_peak"] == 4_464
+        "planned_peak"] == 4_320
     assert plan["windows"]["output_tokens_per_minute"][
-        "ratio_to_configured_limit"] == pytest.approx(0.2232)
+        "ratio_to_configured_limit"] == pytest.approx(0.216)
 
 
 def _fake_git(source: Path, *, dirty: bool):

@@ -24,6 +24,9 @@ from .artifacts import sanitize_display_text
 
 
 DECISION_SCHEMA_VERSION = 1
+PERCENTILE_MIN_SAMPLES = {
+    "p50": 20, "p90": 100, "p95": 200, "p99": 1000,
+}
 
 
 @dataclass(frozen=True)
@@ -319,7 +322,7 @@ def _quota_state(facts: dict) -> dict:
             "NOT_OBSERVED", "No quota rejection observed",
             f"No HTTP 429 was observed in {rows}/{rows} captured request "
             "rows. This does not establish provider quota headroom.",
-            ["HTTP_429_NOT_OBSERVED"], severity="pass")
+            ["HTTP_429_NOT_OBSERVED"], severity="neutral")
     out["http_429"] = evidence
     out["runtime_quota_admission"] = local_evidence
     out["provider_headroom_established"] = False
@@ -571,6 +574,7 @@ def _sla_state(summary: Mapping) -> dict:
     confidence_not_demonstrated = 0
     latency_confidence_not_demonstrated = 0
     success_confidence_not_demonstrated = 0
+    latency_sample_not_supported = 0
     for key in ("ttft_vs_target", "ttfg_vs_target"):
         rows = sla.get(key)
         if not isinstance(rows, list):
@@ -582,7 +586,18 @@ def _sla_state(summary: Mapping) -> dict:
             if row.get("met") is False:
                 misses += 1
             elif row.get("met") is True:
-                if row.get("statistically_demonstrated") is False:
+                quantile = row.get("quantile")
+                minimum = PERCENTILE_MIN_SAMPLES.get(str(quantile))
+                eligible = _nonnegative_int(row.get("eligible_outcomes"))
+                sample_supported = row.get("sample_supported")
+                if sample_supported is None and minimum is not None \
+                        and eligible is not None:
+                    sample_supported = (
+                        eligible >= minimum)
+                if sample_supported is False:
+                    unmeasured += 1
+                    latency_sample_not_supported += 1
+                elif row.get("statistically_demonstrated") is False:
                     unmeasured += 1
                     confidence_not_demonstrated += 1
                     latency_confidence_not_demonstrated += 1
@@ -665,6 +680,7 @@ def _sla_state(summary: Mapping) -> dict:
             success_confidence_not_demonstrated),
         "latency_confidence_not_demonstrated": (
             latency_confidence_not_demonstrated),
+        "latency_sample_not_supported": latency_sample_not_supported,
         "targets_source": (_one_line(sla["targets_source"])
                            if isinstance(sla.get("targets_source"), str)
                            else None),
@@ -676,6 +692,8 @@ def _sla_state(summary: Mapping) -> dict:
             miss_codes.append("SLA_TARGET_UNMEASURED")
         if latency_confidence_not_demonstrated:
             miss_codes.append("LATENCY_CONFIDENCE_NOT_DEMONSTRATED")
+        if latency_sample_not_supported:
+            miss_codes.append("LATENCY_SAMPLE_SIZE_NOT_SUPPORTED")
         if success_confidence_not_demonstrated:
             miss_codes.append(
                 "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED")
@@ -686,7 +704,13 @@ def _sla_state(summary: Mapping) -> dict:
             miss_codes, severity="fail")
     elif unmeasured:
         ordinary_unmeasured = unmeasured - confidence_not_demonstrated
-        if confidence_not_demonstrated and not ordinary_unmeasured:
+        if latency_sample_not_supported and (
+                unmeasured == latency_sample_not_supported):
+            reason = (
+                "The observed latency point estimate met its target, but the "
+                "eligible sample did not meet the report's minimum for that "
+                "percentile; no acceptance pass is claimed.")
+        elif confidence_not_demonstrated and not ordinary_unmeasured:
             reason = (
                 "The observed point estimate met its target, but its one-sided "
                 "95% Wilson lower confidence bound did not; no acceptance pass "
@@ -705,6 +729,9 @@ def _sla_state(summary: Mapping) -> dict:
         if latency_confidence_not_demonstrated:
             inconclusive_codes.append(
                 "LATENCY_CONFIDENCE_NOT_DEMONSTRATED")
+        if latency_sample_not_supported:
+            inconclusive_codes.append(
+                "LATENCY_SAMPLE_SIZE_NOT_SUPPORTED")
         if success_confidence_not_demonstrated:
             inconclusive_codes.append(
                 "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED")
@@ -918,5 +945,6 @@ def build_report_decision(
 __all__ = [
     "DECISION_SCHEMA_VERSION",
     "IntegrityContext",
+    "PERCENTILE_MIN_SAMPLES",
     "build_report_decision",
 ]

@@ -12,7 +12,7 @@ evidence; they never mean zero or success.
 | `preflight` | Real setup requests that prove representative request/stream compatibility before replay. Excluded from replay performance; included in complete traffic/quota evidence. |
 | `probe` | Optional real setup request for an explicitly supplied provider control after an unreadable preflight. Acceptance proves only that the request was accepted, not that the control changed behavior. |
 | `sizing` | Unloaded real requests used to convert `sizing_concurrency` into one fixed open-loop rate. Not replay performance. |
-| `calibration` | Real, paid, unloaded requests used only to estimate the synthetic generator's characters per endpoint-reported prompt token. They are not warm-up exclusions, quality checks, latency/capacity samples, or quota reservations. They are excluded from replay performance and included in complete traffic/quota evidence. Any positive count can warm routing, workers, model state, and caches. `calibrate_n=0` disables them; actual count is `min(calibrate_n, replay rows)`. Calibration affects synthetic input construction only; it does not make the requested output length more likely. |
+| `calibration` | Inference requests sent before measured replay only to estimate the synthetic generator's characters per endpoint-reported prompt token. They may be billable; no measured replay load is scheduled alongside them. They are not warm-up exclusions, quality checks, latency/capacity samples, or quota reservations. They are excluded from replay performance and included in complete traffic/quota evidence. Any positive count can warm routing, workers, model state, and caches. `calibrate_n=0` disables them; actual count is `min(calibrate_n, replay rows)`. Calibration affects synthetic input construction only; it does not make the requested output length more likely. |
 | `replay` | Logical workload rows scheduled inside the measured open-loop load window. Headline performance and acceptance populations come from eligible replay rows only. |
 
 One logical row can make multiple physical POST attempts because of retries.
@@ -24,7 +24,8 @@ earlier attempts. `caller_*` latency includes the caller's total scheduled wait.
 
 Quantile blocks (`*_ms`, intended/achieved fractions, and similar objects) use
 `p50`, `p90`, `p95`, and `p99` for observed percentiles, `n` for the eligible
-row count, and optional coverage/note fields to name the population and source.
+row count, `min`/`max` for the observed range, and optional coverage/note fields
+to name the population and source.
 
 | Field | Meaning |
 |---|---|
@@ -35,15 +36,18 @@ row count, and optional coverage/note fields to name the population and source.
 | `requests_retried`, `physical_post_attempts` | Retry-marked logical rows and reconciled logical-row/physical-attempt counts and trigger coverage. |
 | `error_rate` | `requests_failed / requests_total`; not an HTTP-only error rate. |
 | `failures_by_error`, `failures_by_http_status` | Stable error categories and terminal HTTP-status counts for failed rows. |
+| `timeout_failures` | Timeout-classified failure count over the complete, untruncated failed-row population, plus error-text coverage. If any failed row lacks error text, the count is a lower bound rather than a known zero. |
 | `http_429`, `http_429_count`, `http_429_rate`, `quota_limited` | Captured row-level HTTP 429 evidence, denominator/coverage/phase details, compatibility aliases, and whether quota rejection was observed. Zero does not establish provider headroom. |
 | `runtime_quota_admission` | Command-local per-attempt admission reconciliation: configured limits, admitted/denied attempts, baselines, snapshots, and invariant errors. It excludes unrelated workspace traffic. |
 | `rate_limits`, `observed_rate_windows` | Reviewed provider snapshot evaluation and observed rolling QPS/QPH/token/request-byte windows, including coverage and phase scope. |
 | `sample` | Evidence thresholds for percentiles and which quantiles are indicative because `n` is too small. |
+| `measured_window` | Exact UTC start of the first recorded replay request and the later of the last recorded replay start/completion, with completion-time coverage, an explicit end basis, and a warning when completion clocks are incomplete. This is the customer/engineering correlation window; setup traffic can precede it. |
 | `answers` | Readable/visible/refusal/tool-call/finish-reason outcome counts and answer-judgment coverage. |
 | `latency_population` | Exact eligibility rule and row count used for headline latency. Failed/unacceptable rows remain in error evidence. |
 | `latency_basis` | Plain-language clock boundary for headline request-path latency. |
 | `stream_event_definition` | Exact parser/content boundaries for first event, reasoning, refusal, visible content, tool calls, and terminal completion. |
 | `latency_correction_note`, `latency_correction_provenance` | Explanation and source clocks for exact caller-experienced latency; this is not a numerical post-hoc subtraction. |
+| `latency_observations` | Bounded, latency-only request rows emitted only when the eligible latency population is at most 20. A single-attempt row with all exact clocks decomposes client-before-connection, connection setup, request-to-first-response, first-response-to-complete, and any nonnegative unattributed remainder. Retried or incomplete-clock rows retain caller total only because final-attempt components cannot explain retry/backoff time. Rows include only status, finish reason, token counts, and retry count; never request IDs, prompts, bodies, headers, or hashes. This supports descriptive small-sample ranges and request bars without presenting interpolated tails as decision-grade evidence. |
 | `ttfb_ms` | Final-attempt send to first response byte; connection setup excluded. |
 | `ttse_ms`, `ttse_corrected_ms` | Final-attempt and exact-caller time to first parsed SSE event. This is a protocol event, not necessarily visible content. |
 | `ttft_definition` | Whether scored response start is `first_content` or `first_visible`. |
@@ -63,7 +67,7 @@ row count, and optional coverage/note fields to name the population and source.
 | `intended_cache_fraction` | Synthetic workload's constructed reusable-prefix token share. Not a cache-hit probability. |
 | `achieved_cache_fraction` | Endpoint-reported cached/prompt token share with source-field and coverage evidence. Missing means unknown, not zero. |
 | `cache_fidelity` | Paired achieved-versus-intended cache fraction comparison, coverage, error, and warning. |
-| `token_targeting` | Endpoint-reported prompt/completion tokens versus intended synthetic targets, usage coverage, errors, and finish reasons. `max_tokens` is only a cap. |
+| `token_targeting` | Endpoint-reported prompt/completion token ranges and coverage, plus comparison with intended synthetic targets, errors, and finish reasons. `max_tokens` is only a cap. |
 | `calibration_warmth` | Calibration row count, body-hash coverage, exact calibration/replay payload overlap, replay overlap share, and warm-state warning. It does not assert a cache hit. |
 | `sla` | Customer-owned target configuration and scored evidence. Latency rows contain the required and observed meeting fractions, nearest-rank point estimate, one-sided 95% Wilson lower bound, and `statistically_demonstrated`; a point-estimate hit without confidence is `NOT PROVEN`, not an acceptance pass. Success-rate evidence uses the same confidence rule. |
 

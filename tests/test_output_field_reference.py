@@ -32,7 +32,9 @@ def test_report_embeds_crystal_clear_calibration_and_metric_glossary():
             render_markdown(summary, "field glossary"),
             render_html(summary, "field glossary")):
         assert "Calibration request" in rendered
-        assert "real, paid, unloaded request" in rendered
+        assert "inference request sent before measured replay" in rendered
+        assert "may be billable" in rendered
+        assert "No measured replay load is scheduled alongside it" in rendered
         assert "not a warm-up exclusion" in rendered
         assert "Actual count is min(calibrate_n, replay rows)" in rendered
         assert "Logical request vs physical attempt" in rendered

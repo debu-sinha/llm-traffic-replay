@@ -54,16 +54,16 @@ def test_noninteractive_init_writes_separate_owned_inputs_and_plain_preview(
     sla = json.loads((output / "customer-sla.json").read_text())
     run = json.loads((output / "run-config.json").read_text())
 
+    assert profile["schema_version"] == 2
+    assert profile["sampling"]["mode"] == "empirical_joint"
     assert profile["extraction"] == {
         "total_records": 4,
-        "usable_input_records": 4,
-        "dropped_input_records": 0,
-        "usable_output_records": 4,
-        "dropped_output_records": 0,
-        "usable_cache_records": 4,
-        "dropped_cache_records": 0,
         "complete_joint_records": 4,
         "dropped_incomplete_joint_records": 0,
+        "records_missing_input": 0,
+        "records_missing_output": 0,
+        "records_missing_cache": 0,
+        "unique_joint_rows": 4,
     }
     assert sla["targets_are"] == "Customer contract dated 2026-08-10"
     assert sla["ttft_ms"] == {"p95": 500.0}
@@ -77,9 +77,15 @@ def test_noninteractive_init_writes_separate_owned_inputs_and_plain_preview(
     assert "CONFIG VALID - ZERO ENDPOINT TRAFFIC SENT" in shown
     assert "prompt tokens p50" in shown and "p90" in shown
     assert "cache meaning: reusable prompt-token share" in shown
+    assert "modeling: empirical_joint" in shown
     assert "recovered rows: 4; dropped input/output/cache: 0/0/0" in shown
     assert "95% must show visible answer content within 500 ms" in shown
     assert "4 measured replay + 1 calibration + 0 preflight" in shown
+    assert "calibration meaning: setup requests estimate synthetic characters" \
+        in shown
+    assert "next step (SENDS REAL ENDPOINT TRAFFIC):" in shown
+    assert "python3 -m traffic_replay run --config \"" in shown
+    assert "open in a browser:" in shown
     assert "COST NOT CALCULATED" in shown
 
 
@@ -100,6 +106,31 @@ def test_check_config_is_repeatable_and_sends_no_endpoint_traffic(
     shown = capsys.readouterr().out
     assert shown.startswith("CONFIG VALID - ZERO ENDPOINT TRAFFIC SENT")
     assert "estimated replay tokens:" in shown
+
+
+def test_check_config_models_the_exact_frozen_request_count(
+        tmp_path, capsys, monkeypatch):
+    source = tmp_path / "telemetry.csv"
+    output = tmp_path / "generated"
+    _telemetry(source)
+    main(_init_args(source, output))
+    capsys.readouterr()
+
+    from traffic_replay import profile as profile_module
+    original = profile_module.sample
+    requested_sizes = []
+
+    def recording_sample(profile, n, **kwargs):
+        requested_sizes.append(n)
+        return original(profile, n, **kwargs)
+
+    monkeypatch.setattr(profile_module, "sample", recording_sample)
+    assert main([
+        "check-config", "--config", str(output / "run-config.json")]) == 0
+
+    # Prevalidation performs a zero-row bounds check and then freezes exactly
+    # the four-row workload. check-config must reuse it, not draw 10,000 rows.
+    assert requested_sizes == [0, 4]
 
 
 def test_inline_sla_override_has_explicit_precedence(tmp_path):

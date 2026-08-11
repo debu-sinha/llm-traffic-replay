@@ -3269,7 +3269,7 @@ def cmd_init_config(args) -> int:
 def cmd_check_config(args) -> int:
     """Validate and explain one configuration without endpoint traffic."""
     import numpy as np
-    from .profile import Profile, sample
+    from .profile import Profile
     from .runner import RunConfig, prevalidate_run_inputs
 
     config_path = Path(args.config)
@@ -3282,8 +3282,14 @@ def cmd_check_config(args) -> int:
         raise SystemExit(f"CONFIG INVALID: {exc}") from exc
     replay_count = len((prevalidated.full_schedule or {}).get("timestamps", ()))
     calibration_count = min(rc.calibrate_n, replay_count)
-    modeled = sample(profile, max(replay_count, 10_000), seed=rc.seed,
-                     max_output=rc.max_output_tokens_cap or 8_192)
+    # Use the already prevalidated workload realization that ``run`` will
+    # consume. Drawing again at another population size is not equivalent:
+    # NumPy advances the generator by array, so output/cache arrays can change.
+    workload = prevalidated.workload
+    if workload is None or not hasattr(workload, "draw"):
+        raise SystemExit(
+            "CONFIG INVALID: check-config requires a profile-mode workload")
+    modeled = workload.draw
 
     def quantiles(values) -> str:
         q = np.percentile(values, [50, 90, 95, 99])
@@ -3306,11 +3312,17 @@ def cmd_check_config(args) -> int:
     print("modeling: " + str((profile.sampling or {}).get(
         "mode", "legacy independent quantile model")))
     if extraction:
+        dropped_input = extraction.get(
+            "dropped_input_records", extraction.get("records_missing_input"))
+        dropped_output = extraction.get(
+            "dropped_output_records", extraction.get("records_missing_output"))
+        dropped_cache = extraction.get(
+            "dropped_cache_records", extraction.get("records_missing_cache"))
         print("recovered rows: " + str(extraction.get("total_records", "unknown"))
               + "; dropped input/output/cache: "
-              + "/".join(str(extraction.get(key, "unknown")) for key in (
-                  "dropped_input_records", "dropped_output_records",
-                  "dropped_cache_records")))
+              + "/".join(str(value if value is not None else "unknown")
+                         for value in (
+                             dropped_input, dropped_output, dropped_cache)))
     if start is not None and finish is not None and success is not None:
         print(f"SLA: {target_q[1:]}% must show visible answer content within "
               f"{start:g} ms and finish within {finish:g} ms; at least "
@@ -3325,6 +3337,9 @@ def cmd_check_config(args) -> int:
     print(precedence or "SLA source: inline acceptance_targets")
     print(f"traffic plan: {replay_count} measured replay + "
           f"{calibration_count} calibration + 0 preflight requests")
+    print("calibration meaning: setup requests estimate synthetic characters "
+          "per model token; they are excluded from replay latency/capacity "
+          "metrics but may warm the endpoint and cache state")
     print(f"estimated replay tokens: {estimated_input:,} input + "
           f"{estimated_output:,} output")
     if rc.pricing:
@@ -3351,6 +3366,11 @@ def cmd_check_config(args) -> int:
     print("remaining fields: " + (
         "ILLUSTRATIVE values remain; replace them before acceptance use"
         if illustrative else "no illustrative workload/SLA label detected"))
+    quoted_config = '"' + str(config_path).replace('"', '\\"') + '"'
+    print("next step (SENDS REAL ENDPOINT TRAFFIC):")
+    print("  python3 -m traffic_replay run --config " + quoted_config)
+    print("the completed command prints `open in a browser:` followed by the "
+          "standalone report.html path")
     return 0
 
 
@@ -3705,9 +3725,10 @@ def main(argv=None) -> int:
     s.add_argument("--cached-field", default=None,
                    help="custom cached-prompt-token column")
     s.add_argument("--mode", choices=("quantiles", "empirical-joint"),
-                   default="quantiles",
-                   help="quantiles models independent marginals; empirical-"
-                        "joint preserves complete observed combinations")
+                   default="empirical-joint",
+                   help="empirical-joint (default) preserves observed input/"
+                        "output/cache combinations; quantiles is an explicit "
+                        "lossy fallback that models independent marginals")
     s.add_argument("--name", default=None, help="workload profile name")
     s.add_argument("--response-start-ms", type=float, default=None,
                    help="plain-language response-start target")

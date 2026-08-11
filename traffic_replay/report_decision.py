@@ -569,6 +569,8 @@ def _sla_state(summary: Mapping) -> dict:
     misses = 0
     unmeasured = 0
     confidence_not_demonstrated = 0
+    latency_confidence_not_demonstrated = 0
+    success_confidence_not_demonstrated = 0
     for key in ("ttft_vs_target", "ttfg_vs_target"):
         rows = sla.get(key)
         if not isinstance(rows, list):
@@ -579,7 +581,12 @@ def _sla_state(summary: Mapping) -> dict:
             checks += 1
             if row.get("met") is False:
                 misses += 1
-            elif row.get("met") is not True:
+            elif row.get("met") is True:
+                if row.get("statistically_demonstrated") is False:
+                    unmeasured += 1
+                    confidence_not_demonstrated += 1
+                    latency_confidence_not_demonstrated += 1
+            else:
                 unmeasured += 1
 
     acceptance = sla.get("acceptance_config")
@@ -638,6 +645,7 @@ def _sla_state(summary: Mapping) -> dict:
             if success.get("statistically_demonstrated") is False:
                 unmeasured += 1
                 confidence_not_demonstrated += 1
+                success_confidence_not_demonstrated += 1
         else:
             unmeasured += 1
 
@@ -654,7 +662,9 @@ def _sla_state(summary: Mapping) -> dict:
         "misses": misses,
         "unmeasured": unmeasured,
         "success_rate_confidence_not_demonstrated": (
-            confidence_not_demonstrated),
+            success_confidence_not_demonstrated),
+        "latency_confidence_not_demonstrated": (
+            latency_confidence_not_demonstrated),
         "targets_source": (_one_line(sla["targets_source"])
                            if isinstance(sla.get("targets_source"), str)
                            else None),
@@ -664,7 +674,9 @@ def _sla_state(summary: Mapping) -> dict:
         miss_codes = ["SLA_TARGET_MISSED"]
         if unmeasured > confidence_not_demonstrated:
             miss_codes.append("SLA_TARGET_UNMEASURED")
-        if confidence_not_demonstrated:
+        if latency_confidence_not_demonstrated:
+            miss_codes.append("LATENCY_CONFIDENCE_NOT_DEMONSTRATED")
+        if success_confidence_not_demonstrated:
             miss_codes.append(
                 "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED")
         out = _state(
@@ -676,21 +688,24 @@ def _sla_state(summary: Mapping) -> dict:
         ordinary_unmeasured = unmeasured - confidence_not_demonstrated
         if confidence_not_demonstrated and not ordinary_unmeasured:
             reason = (
-                "The observed success rate met its target, but its one-sided "
-                "95% Wilson lower confidence bound did not; no acceptance "
-                "pass is claimed.")
+                "The observed point estimate met its target, but its one-sided "
+                "95% Wilson lower confidence bound did not; no acceptance pass "
+                "is claimed.")
         else:
             reason = (
                 f"{unmeasured} of {checks} configured acceptance check(s) "
                 "were "
                 "inconclusive"
-                + (f", including {confidence_not_demonstrated} success-rate "
+                + (f", including {confidence_not_demonstrated} statistical "
                    "confidence check(s)" if confidence_not_demonstrated else "")
                 + "; no acceptance pass is claimed.")
         inconclusive_codes = []
         if ordinary_unmeasured:
             inconclusive_codes.append("SLA_TARGET_UNMEASURED")
-        if confidence_not_demonstrated:
+        if latency_confidence_not_demonstrated:
+            inconclusive_codes.append(
+                "LATENCY_CONFIDENCE_NOT_DEMONSTRATED")
+        if success_confidence_not_demonstrated:
             inconclusive_codes.append(
                 "SUCCESS_RATE_CONFIDENCE_NOT_DEMONSTRATED")
         out = _state(

@@ -652,8 +652,10 @@ python3 -m traffic_replay sample \
 ```
 
 The command-line `--mode` spelling is `empirical-joint`; the JSON schema mode
-is `empirical_joint`. The default `--mode quantiles` emits legacy v1 p50/p95
-marginals. The generated profile records extraction counts, byte count, and
+is `empirical_joint`. Guided `init-config` uses this correlation-preserving
+mode by default. Explicit `--mode quantiles` is a lossy legacy fallback that
+emits independent v1 p50/p95 marginals. The generated profile records
+extraction counts, byte count, and
 SHA-256 of the exact frozen source bytes it parsed. It emits token/cache
 statistics, weights, and selected
 provenance only; it does not copy prompt text, arbitrary source fields, or the
@@ -1076,13 +1078,13 @@ The sample gate uses roughly ten observations beyond a quantile:
 | p99 | 1000 |
 
 Below a threshold, the percentile is still printed for diagnosis but is
-marked indicative only. Success-rate scoring reports both the observed
-fraction and a one-sided 95 percent Wilson lower confidence bound. A clean
-verdict requires the lower bound, not only the observed fraction, to meet the
-target. This calculation assumes independent request outcomes. For scale, an
+marked indicative only. Success-rate and latency-target compliance both report
+the observed fraction and a one-sided 95 percent Wilson lower confidence bound.
+A clean verdict requires the lower bound, not only the point estimate, to meet
+the target. This calculation assumes independent request outcomes. For scale, an
 all-success sample needs exactly 2,703 independent attempts before its lower
-bound can substantiate a 0.999 target. The latency floors above are evidence
-rules, not confidence intervals.
+bound can substantiate a 0.999 target. The latency floors above remain
+additional evidence-quality rules; they are not substitutes for confidence.
 
 Cached-token coverage is explicit. `NOT REPORTED` means the endpoint did not
 provide a recognized usage field; it does not mean zero cache reuse. When the

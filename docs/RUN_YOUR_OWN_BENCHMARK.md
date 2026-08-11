@@ -491,10 +491,10 @@ failure-only window has zero event coverage, not a latency percentile. Do not
 call survivor p95 stable while error rate rises or event coverage falls.
 
 Minimum answer-latency sample floors are 20 for p50, 100 for p90, 200 for p95,
-and 1000 for p99. Smaller samples remain diagnostic only. A clean success-rate
-verdict also requires the one-sided 95 percent Wilson lower confidence bound,
-not just the observed fraction, to meet the target. That inference assumes
-independent request outcomes.
+and 1000 for p99. Smaller samples remain diagnostic only. Clean success-rate
+and latency-target verdicts also require the one-sided 95 percent Wilson lower
+confidence bound on their compliance fraction, not just the observed point
+estimate, to meet the target. That inference assumes independent outcomes.
 
 `NOT REPORTED` for cached tokens means missing endpoint evidence, not a zero
 cache rate. Reasoning stream deltas are counts of SSE deltas, not tokens.

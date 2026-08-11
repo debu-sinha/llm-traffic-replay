@@ -808,9 +808,9 @@ evidence floors:
 | p95 | 200 |
 | p99 | 1000 |
 
-Success targets use both the observed fraction and a one-sided 95% Wilson
-lower confidence bound. A pass requires the lower bound to meet the target,
-under the stated independent-request assumption.
+Success and latency targets use both the observed compliance fraction and a
+one-sided 95% Wilson lower confidence bound. A pass requires the lower bound to
+meet the target, under the stated independent-request assumption.
 
 `HELD_AT_TESTED_LOAD` never means an endpoint ceiling, unused provider
 headroom, a future guarantee, or performance on a different route, workload,

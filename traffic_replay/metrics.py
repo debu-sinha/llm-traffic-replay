@@ -3933,6 +3933,7 @@ def _evaluate_sla(results: list[dict], ok: list[dict], summary: dict,
             meeting = sum(value is not None and value <= target
                           for value in values)
             observed = (meeting / eligible) if eligible else None
+            lower_95 = _wilson_lower_95(meeting, eligible)
             acceptance_actual = None
             acceptance_actual_kind = "not_measured"
             if eligible and required is not None:
@@ -3971,10 +3972,17 @@ def _evaluate_sla(results: list[dict], ok: list[dict], summary: dict,
                 "observed_meeting_fraction": (
                     observed if observed is not None else None),
                 "required_meeting_fraction": required,
+                "one_sided_95pct_wilson_lower": lower_95,
+                "statistically_demonstrated": (
+                    lower_95 >= required
+                    if lower_95 is not None and required is not None else None),
                 "scoring_rule": (
                     "nearest-rank empirical quantile over every "
                     "protocol-clean outcome; missing events sort after all "
-                    "measured latencies and do not meet the target"),
+                    "measured latencies and do not meet the target; a clean "
+                    "acceptance pass also requires the one-sided 95% Wilson "
+                    "lower confidence bound on the meeting fraction to clear "
+                    "the requested percentile, assuming independent outcomes"),
             })
         out[name] = rows
 
@@ -4693,14 +4701,6 @@ def render_markdown(summary: dict, title: str, *,
         "Claim boundary: observed tested-load facts do not establish an "
         "endpoint ceiling or provider quota headroom.",
         "",
-        "## Field glossary (how to read every displayed value)",
-        "",
-        "Every displayed field uses the definitions below. Missing, unknown, "
-        "and null are evidence states - not zeros.",
-        "",
-        *[f"- **{name}:** {definition}"
-          for name, definition in _REPORT_FIELD_GLOSSARY],
-        "",
         f"measured replay: {s['requests_total']} requests, "
         f"{s['requests_ok']} harness-successful, "
         f"{s['requests_failed']} failed "
@@ -5239,7 +5239,10 @@ def render_markdown(summary: dict, title: str, *,
         for name, key in ((first_event["short_label"], "ttft_vs_target"),
                           ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
-                met = {True: "yes", False: "NO", None: "-"}[r["met"]]
+                demonstrated = r.get("statistically_demonstrated")
+                met = ("NOT PROVEN" if r["met"] is True
+                       and demonstrated is False else
+                       {True: "yes", False: "NO", None: "-"}[r["met"]])
                 if r["actual_ms"] is not None:
                     target_text, act = _decision_pair_display(
                         r["target_ms"], r["actual_ms"],
@@ -5256,12 +5259,17 @@ def render_markdown(summary: dict, title: str, *,
             lines += ["", "latency-target compliance (missing configured "
                       "events do not meet the target):"]
             for r in scored_rows:
+                lower = r.get("one_sided_95pct_wilson_lower")
+                confidence = (
+                    f"; one-sided 95% lower bound {lower:.1%} "
+                    f"({'proves' if r.get('statistically_demonstrated') else 'does not prove'}) acceptance"
+                    if lower is not None else "")
                 lines.append(
                     f"- {r['scored_metric']} {r['quantile']}: "
                     f"{r['meeting_outcomes']} of {r['eligible_outcomes']} "
                     f"({r['observed_meeting_fraction']:.1%}) met "
                     f"{r['target_ms']} ms; requires "
-                    f"{r['required_meeting_fraction']:.0%}")
+                    f"{r['required_meeting_fraction']:.0%}{confidence}")
         hard_basis = sla.get("hard_timeout_basis") or {}
         hard_timeout_configured = any(
             hard_basis.get(key) is not None
@@ -5394,6 +5402,16 @@ def render_markdown(summary: dict, title: str, *,
             f"reproducibility {verifier_repro['code']} · "
             f"{inline(verified_view['assurance'])}",
         ]
+    lines += [
+        "",
+        "## Field glossary (reference)",
+        "",
+        "Every displayed field uses the definitions below. Missing, unknown, "
+        "and null are evidence states - not zeros.",
+        "",
+        *[f"- **{name}:** {definition}"
+          for name, definition in _REPORT_FIELD_GLOSSARY],
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -6575,12 +6593,17 @@ def render_html(summary: dict, title: str, *,
                           ("TTFG", "ttfg_vs_target")):
             for r in sla.get(key) or []:
                 met = r["met"]
+                demonstrated = r.get("statistically_demonstrated")
                 if met is False:
                     misses += 1
-                elif met is None and r.get("target_ms") is not None:
+                elif (met is None or demonstrated is False) \
+                        and r.get("target_ms") is not None:
                     unmeasured += 1
-                cls = "yes" if met else ("no" if met is False else "na")
-                cell = {True: "PASS", False: "NO", None: "-"}[met]
+                cls = ("na" if met is True and demonstrated is False else
+                       "yes" if met else "no" if met is False else "na")
+                cell = ("NOT PROVEN" if met is True
+                        and demonstrated is False else
+                        {True: "PASS", False: "NO", None: "-"}[met])
                 if r["actual_ms"] is not None:
                     target_text, actual_text = _decision_pair_display(
                         r["target_ms"], r["actual_ms"],
@@ -6667,7 +6690,10 @@ def render_html(summary: dict, title: str, *,
                 f"{row['scored_metric']} {row['quantile']}: "
                 f"{row['meeting_outcomes']}/{row['eligible_outcomes']} "
                 f"({row['observed_meeting_fraction']:.1%}) met the target, "
-                f"requires {row['required_meeting_fraction']:.0%}"
+                f"requires {row['required_meeting_fraction']:.0%}; one-sided "
+                f"95% Wilson lower bound "
+                f"{row.get('one_sided_95pct_wilson_lower', 0):.1%} "
+                f"({'proves' if row.get('statistically_demonstrated') else 'does not prove'} acceptance)"
                 for row in compliance_rows)
             note_bits.append(
                 "Latency targets use outcome compliance, not a percentile over "
@@ -7693,6 +7719,13 @@ def render_html(summary: dict, title: str, *,
         "supplied prompt workload")
     capacity_label = str(decision["endpoint_capacity"].get("label") or
                          "not established")
+    tested = decision.get("tested_load") or {}
+    tested_requests = tested.get("scheduled_requests")
+    tested_seconds = tested.get("scheduled_seconds")
+    workload_identity = (
+        f"{tested_requests} scheduled requests over {tested_seconds} seconds"
+        if tested_requests is not None and tested_seconds is not None else
+        "the recorded request schedule")
     customer_takeaway_html = (
         "<section class='card customer-takeaway' id='customer-takeaway' "
         "aria-labelledby='customer-takeaway-heading'>"
@@ -7706,8 +7739,8 @@ def render_html(summary: dict, title: str, *,
         "correctness, task success, or usefulness.</li>"
         f"<li><b>Completion caveat:</b> {esc(completion_text)}</li>"
         f"<li><b>Workload scope:</b> {esc(mode_scope)}. Results apply only "
-        "to the recorded workload and load shape, not production traffic in "
-        "general.</li>"
+        f"to {esc(workload_identity)} and its recorded load shape, not "
+        "production traffic in general.</li>"
         f"<li><b>Capacity conclusion:</b> {esc(capacity_label)}. A clean run "
         "at this load does not establish an endpoint ceiling, quota headroom, "
         "or a production SLA.</li>"
@@ -7761,11 +7794,11 @@ def render_html(summary: dict, title: str, *,
             "requires manifest verification</div>")
     body = (
         f"<main class='wrap'>{verified_banner_html}{header_html}{print_stamp}"
-        f"{nav_html}{customer_takeaway_html}{decision_html}{glossary_html}"
+        f"{nav_html}{customer_takeaway_html}{decision_html}"
         f"{provenance_html}"
         f"{facts_html}{sample_banner}{stats}{believe}"
         f"{em_html}{ans_html}{sla_html}{corr_html}{lat_html}"
-        f"{drift_html}{extra_cards}{cost_html}"
+        f"{drift_html}{extra_cards}{cost_html}{glossary_html}"
         f"{foot_html}</main>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,"

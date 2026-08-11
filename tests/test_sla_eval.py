@@ -313,6 +313,23 @@ def test_acceptance_actual_and_result_use_the_same_nearest_rank_estimator():
     assert scored["actual_estimator"] == "nearest_rank"
     assert scored["actual_ms"] == 100.0
     assert scored["met"] is True
+    assert scored["statistically_demonstrated"] is False
+    assert _decision(summary)["customer_sla"]["code"] == "INCONCLUSIVE"
+
+
+def test_latency_acceptance_pass_requires_confident_compliance_population():
+    rows = [_row(i, 100.0, 200.0) for i in range(10_000)]
+    rows[-400:] = [
+        _row(i, 1_000.0, 1_100.0) for i in range(9_600, 10_000)]
+
+    summary = summarize(rows, acceptance={"ttft_ms": {"p95": 120}})
+    scored = summary["sla"]["ttft_vs_target"][0]
+
+    assert scored["met"] is True
+    assert scored["observed_meeting_fraction"] == 0.96
+    assert scored["one_sided_95pct_wilson_lower"] > 0.95
+    assert scored["statistically_demonstrated"] is True
+    assert _decision(summary)["customer_sla"]["code"] == "PASS"
 
 
 def test_latency_boundary_persists_and_renders_the_unrounded_scored_value():
